@@ -498,9 +498,9 @@ fn visit_assignment(node: tree_sitter::Node, ctx: &mut VisitContext) {
         })
         .map(|n| {
             let text = node_text(n, source).to_string();
-            // Обрезаем до 200 символов
-            if text.len() > 200 {
-                text[..200].to_string()
+            // Обрезаем до 200 символов (безопасно для UTF-8)
+            if text.chars().count() > 200 {
+                text.chars().take(200).collect::<String>()
             } else {
                 text
             }

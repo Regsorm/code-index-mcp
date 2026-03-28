@@ -2,6 +2,7 @@
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
+use code_index_mcp::indexer::config::IndexConfig;
 use code_index_mcp::indexer::Indexer;
 use code_index_mcp::mcp::CodeIndexServer;
 use code_index_mcp::storage::Storage;
@@ -53,6 +54,13 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         path: String,
     },
+
+    /// Создать конфигурацию .code-index/config.json с настройками по умолчанию
+    Init {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
 }
 
 /// Получить путь к БД для проекта
@@ -91,11 +99,14 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("Не удалось создать директорию: {}", e))?;
             }
 
+            // Загрузить конфигурацию проекта
+            let config = IndexConfig::load(&root)?;
+
             // Открыть хранилище
             let mut storage = Storage::open_file(&db_path)?;
 
             // Начальная индексация проекта
-            let mut indexer = Indexer::new(&mut storage);
+            let mut indexer = Indexer::with_config(&mut storage, config);
             let index_result = indexer.full_reindex(&root, false)?;
             eprintln!(
                 "Индексация завершена: {} файлов за {} мс",
@@ -125,13 +136,16 @@ async fn main() -> anyhow::Result<()> {
             let db_path = db_dir.join("index.db");
             let mut storage = Storage::open_file(&db_path)?;
 
-            // 4. Создать Indexer
-            let mut indexer = Indexer::new(&mut storage);
+            // 4. Загрузить конфигурацию проекта
+            let config = IndexConfig::load(&abs_path)?;
 
-            // 5. Запустить индексацию
+            // 5. Создать Indexer с конфигом
+            let mut indexer = Indexer::with_config(&mut storage, config);
+
+            // 6. Запустить индексацию
             let result = indexer.full_reindex(&abs_path, force)?;
 
-            // 6. Вывести результат
+            // 7. Вывести результат
             println!("Индексация завершена за {} мс", result.elapsed_ms);
             println!("  Найдено файлов:        {}", result.files_scanned);
             println!("  Проиндексировано:      {}", result.files_indexed);
@@ -249,6 +263,32 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+        }
+
+        Commands::Init { path } => {
+            // 1. Разрешить путь до абсолютного
+            let abs_path = Path::new(&path)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&path));
+
+            let config_path = abs_path.join(".code-index").join("config.json");
+
+            if config_path.exists() {
+                println!("Конфигурация уже существует: {}", config_path.display());
+                println!("Для перезаписи удалите файл вручную.");
+                return Ok(());
+            }
+
+            // 2. Создать конфиг по умолчанию
+            let config = IndexConfig::default();
+            config.save(&abs_path)?;
+
+            println!("Создан файл конфигурации: {}", config_path.display());
+            println!("Отредактируйте его при необходимости:");
+            println!("  exclude_dirs          — дополнительные директории для исключения");
+            println!("  extra_text_extensions — дополнительные расширения для FTS-индексации");
+            println!("  max_file_size         — максимальный размер файла в байтах (по умолчанию 1 МБ)");
+            println!("  max_files             — лимит файлов (0 = без лимита)");
         }
     }
 

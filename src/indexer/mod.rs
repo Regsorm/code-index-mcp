@@ -1,4 +1,5 @@
 /// Модуль индексатора — обход директорий, определение типов файлов, хеширование
+pub mod config;
 pub mod file_types;
 pub mod hasher;
 
@@ -12,7 +13,8 @@ use crate::parser;
 use crate::parser::text::TextParser;
 use crate::storage::models::*;
 use crate::storage::Storage;
-use file_types::{categorize_file, is_excluded_dir, FileCategory};
+use config::IndexConfig;
+use file_types::{categorize_file, FileCategory};
 
 /// Результат одного прохода индексации
 #[derive(Debug)]
@@ -34,12 +36,22 @@ pub struct IndexResult {
 /// Индексатор файловой системы
 pub struct Indexer<'a> {
     storage: &'a mut Storage,
+    /// Конфигурация индексатора
+    config: IndexConfig,
 }
 
 impl<'a> Indexer<'a> {
-    /// Создать индексатор с уже открытым хранилищем
+    /// Создать индексатор с уже открытым хранилищем и конфигурацией по умолчанию
     pub fn new(storage: &'a mut Storage) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            config: IndexConfig::default(),
+        }
+    }
+
+    /// Создать индексатор с явно переданной конфигурацией
+    pub fn with_config(storage: &'a mut Storage, config: IndexConfig) -> Self {
+        Self { storage, config }
     }
 
     /// Полная переиндексация директории `root`.
@@ -72,11 +84,14 @@ impl<'a> Indexer<'a> {
         // Набор путей, реально встреченных при обходе диска
         let mut seen_paths: HashSet<String> = HashSet::new();
 
+        // Снимаем копию конфига, чтобы использовать в замыкании filter_entry
+        let config_for_filter = self.config.clone();
+
         // Обходим директорию, исключая нежелательные папки
-        let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
+        let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
             if e.file_type().is_dir() {
                 if let Some(name) = e.file_name().to_str() {
-                    return !is_excluded_dir(name);
+                    return !config_for_filter.is_excluded_dir(name);
                 }
             }
             true
@@ -87,6 +102,11 @@ impl<'a> Indexer<'a> {
                 continue;
             }
 
+            // Проверяем лимит количества файлов (0 = без лимита)
+            if self.config.max_files > 0 && result.files_scanned >= self.config.max_files {
+                break;
+            }
+
             let path = entry.path();
             let category = categorize_file(path);
 
@@ -95,7 +115,27 @@ impl<'a> Indexer<'a> {
                 continue;
             }
 
+            // Проверяем размер файла
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() as usize > self.config.max_file_size {
+                    result.files_skipped += 1;
+                    continue;
+                }
+            }
+
             result.files_scanned += 1;
+
+            // Прогресс-лог каждые 500 файлов
+            let total_processed = result.files_scanned + result.files_skipped;
+            if total_processed > 0 && total_processed % 500 == 0 {
+                eprintln!(
+                    "[{}/???] Обработано {} файлов, {} проиндексировано, {} пропущено...",
+                    total_processed,
+                    total_processed,
+                    result.files_indexed,
+                    result.files_skipped
+                );
+            }
 
             // Нормализуем путь относительно корня с прямыми слэшами
             let rel_path = path
@@ -477,5 +517,47 @@ class App:
 
         let hash3 = hasher::content_hash(b"different content");
         assert_ne!(hash1, hash3, "разные данные дают разные хеши");
+    }
+
+    #[test]
+    fn test_with_config_custom_exclude() {
+        let tmp = TempDir::new().unwrap();
+        // Создаём директорию vendor с файлом
+        fs::create_dir(tmp.path().join("vendor")).unwrap();
+        fs::write(tmp.path().join("vendor").join("lib.py"), "x = 1\n").unwrap();
+        // Основной файл проекта
+        fs::write(tmp.path().join("app.py"), "y = 2\n").unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let config = IndexConfig {
+            exclude_dirs: vec!["vendor".to_string()],
+            ..Default::default()
+        };
+        let mut indexer = Indexer::with_config(&mut storage, config);
+        let r = indexer.full_reindex(tmp.path(), false).unwrap();
+
+        // vendor/ исключён через конфиг — только app.py
+        assert_eq!(r.files_indexed, 1, "vendor должен быть исключён через конфиг");
+    }
+
+    #[test]
+    fn test_with_config_max_file_size() {
+        let tmp = TempDir::new().unwrap();
+        // Маленький файл — пройдёт
+        fs::write(tmp.path().join("small.py"), "x = 1\n").unwrap();
+        // Большой файл — пропустим (лимит 10 байт)
+        fs::write(tmp.path().join("big.py"), "y = 'a very long string that exceeds limit'\n").unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let config = IndexConfig {
+            max_file_size: 10, // 10 байт
+            ..Default::default()
+        };
+        let mut indexer = Indexer::with_config(&mut storage, config);
+        let r = indexer.full_reindex(tmp.path(), false).unwrap();
+
+        // big.py пропущен из-за лимита размера
+        assert_eq!(r.files_indexed, 1, "только маленький файл должен быть проиндексирован");
+        assert_eq!(r.files_skipped, 1, "большой файл должен быть в skipped");
     }
 }
