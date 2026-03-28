@@ -1,7 +1,12 @@
 pub mod types;
 pub mod python;
+pub mod javascript;
+pub mod typescript;
+pub mod java;
 pub mod text;
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use anyhow::Result;
 use types::ParseResult;
 
@@ -17,11 +22,128 @@ pub trait LanguageParser: Send + Sync {
     fn parse(&self, source: &str, file_path: &str) -> Result<ParseResult>;
 }
 
-/// Получить парсер по расширению файла.
-/// Возвращает None, если язык не поддерживается.
+/// Реестр парсеров — хранит активные парсеры, индексированные по расширению файла.
+/// Используем Arc<dyn LanguageParser>, чтобы один парсер мог обслуживать
+/// несколько расширений без дублирования.
+pub struct ParserRegistry {
+    parsers: HashMap<String, Arc<dyn LanguageParser>>,
+}
+
+impl ParserRegistry {
+    /// Создать реестр со всеми доступными парсерами
+    pub fn new_all() -> Self {
+        let mut registry = Self { parsers: HashMap::new() };
+        registry.register(Arc::new(python::PythonParser::new()));
+        registry.register(Arc::new(javascript::JavaScriptParser::new()));
+        registry.register(Arc::new(typescript::TypeScriptParser::new()));
+        registry.register(Arc::new(java::JavaParser::new()));
+        registry
+    }
+
+    /// Создать реестр только с указанными языками
+    pub fn from_languages(languages: &[String]) -> Self {
+        let mut registry = Self { parsers: HashMap::new() };
+        for lang in languages {
+            match lang.as_str() {
+                "python" => registry.register(Arc::new(python::PythonParser::new())),
+                "javascript" => {
+                    // JS-парсер обрабатывает .js и .jsx
+                    registry.register(Arc::new(javascript::JavaScriptParser::new()));
+                }
+                "typescript" => {
+                    // TS-парсер обрабатывает .ts и .tsx
+                    registry.register(Arc::new(typescript::TypeScriptParser::new()));
+                }
+                "java" => registry.register(Arc::new(java::JavaParser::new())),
+                _ => {} // Неизвестный язык — пропускаем без ошибки
+            }
+        }
+        registry
+    }
+
+    /// Зарегистрировать парсер: добавить по всем его расширениям
+    fn register(&mut self, parser: Arc<dyn LanguageParser>) {
+        for ext in parser.file_extensions() {
+            self.parsers.insert(ext.to_string(), Arc::clone(&parser));
+        }
+    }
+
+    /// Получить парсер по расширению файла
+    pub fn get_parser(&self, extension: &str) -> Option<&dyn LanguageParser> {
+        self.parsers.get(extension).map(|p| p.as_ref())
+    }
+
+    /// Список всех поддерживаемых расширений
+    pub fn supported_extensions(&self) -> Vec<&str> {
+        self.parsers.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Получить парсер по расширению файла (обратная совместимость).
+/// Предпочтительно использовать ParserRegistry::new_all().
 pub fn get_parser_for_extension(ext: &str) -> Option<Box<dyn LanguageParser>> {
     match ext {
         "py" => Some(Box::new(python::PythonParser::new())),
+        "js" | "jsx" => Some(Box::new(javascript::JavaScriptParser::new())),
+        "ts" | "tsx" => Some(Box::new(typescript::TypeScriptParser::new())),
+        "java" => Some(Box::new(java::JavaParser::new())),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parser_registry_new_all() {
+        let reg = ParserRegistry::new_all();
+        assert!(reg.get_parser("py").is_some(), "Python парсер должен быть в реестре");
+        assert!(reg.get_parser("js").is_some(), "JavaScript парсер должен быть в реестре");
+        assert!(reg.get_parser("jsx").is_some(), "JSX парсер должен быть в реестре");
+        assert!(reg.get_parser("ts").is_some(), "TypeScript парсер должен быть в реестре");
+        assert!(reg.get_parser("tsx").is_some(), "TSX парсер должен быть в реестре");
+        assert!(reg.get_parser("java").is_some(), "Java парсер должен быть в реестре");
+        assert!(reg.get_parser("unknown").is_none(), "Неизвестное расширение должно давать None");
+    }
+
+    #[test]
+    fn test_parser_registry_from_languages() {
+        let reg = ParserRegistry::from_languages(&["python".to_string()]);
+        assert!(reg.get_parser("py").is_some(), "Python должен быть при явном указании");
+        assert!(reg.get_parser("js").is_none(), "JS не должен быть — не указан");
+        assert!(reg.get_parser("ts").is_none(), "TS не должен быть — не указан");
+        assert!(reg.get_parser("java").is_none(), "Java не должен быть — не указан");
+    }
+
+    #[test]
+    fn test_parser_registry_from_languages_js_ts() {
+        let reg = ParserRegistry::from_languages(&[
+            "javascript".to_string(),
+            "typescript".to_string(),
+        ]);
+        assert!(reg.get_parser("js").is_some());
+        assert!(reg.get_parser("jsx").is_some());
+        assert!(reg.get_parser("ts").is_some());
+        assert!(reg.get_parser("tsx").is_some());
+        assert!(reg.get_parser("py").is_none());
+    }
+
+    #[test]
+    fn test_parser_registry_unknown_language() {
+        // Неизвестный язык не должен вызывать панику
+        let reg = ParserRegistry::from_languages(&["rust".to_string(), "go".to_string()]);
+        assert!(reg.get_parser("rs").is_none());
+        assert!(reg.get_parser("go").is_none());
+    }
+
+    #[test]
+    fn test_get_parser_for_extension_compat() {
+        // Функция обратной совместимости
+        assert!(get_parser_for_extension("py").is_some());
+        assert!(get_parser_for_extension("js").is_some());
+        assert!(get_parser_for_extension("ts").is_some());
+        assert!(get_parser_for_extension("java").is_some());
+        assert!(get_parser_for_extension("cpp").is_none());
     }
 }

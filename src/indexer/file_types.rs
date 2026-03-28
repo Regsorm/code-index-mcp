@@ -14,6 +14,11 @@ pub enum FileCategory {
 /// Расширения файлов с поддержкой AST-парсинга и соответствующие названия языков
 const CODE_EXTENSIONS: &[(&str, &str)] = &[
     ("py", "python"),
+    ("js", "javascript"),
+    ("jsx", "javascript"),
+    ("ts", "typescript"),
+    ("tsx", "typescript"),
+    ("java", "java"),
 ];
 
 /// Расширения текстовых файлов для полнотекстового поиска

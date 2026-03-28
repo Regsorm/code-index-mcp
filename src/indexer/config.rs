@@ -27,6 +27,11 @@ pub struct IndexConfig {
     /// перед загрузкой удаляются индексы и триггеры, а после — пересоздаются.
     #[serde(default = "default_bulk_threshold")]
     pub bulk_threshold: usize,
+
+    /// Активные языки для AST-парсинга (по умолчанию все).
+    /// Допустимые значения: "python", "javascript", "typescript", "java"
+    #[serde(default = "default_languages")]
+    pub languages: Vec<String>,
 }
 
 fn default_max_file_size() -> usize {
@@ -37,6 +42,16 @@ fn default_bulk_threshold() -> usize {
     10
 }
 
+/// Языки по умолчанию — все поддерживаемые
+fn default_languages() -> Vec<String> {
+    vec![
+        "python".to_string(),
+        "javascript".to_string(),
+        "typescript".to_string(),
+        "java".to_string(),
+    ]
+}
+
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
@@ -45,6 +60,7 @@ impl Default for IndexConfig {
             max_file_size: default_max_file_size(),
             max_files: 0,
             bulk_threshold: default_bulk_threshold(),
+            languages: default_languages(),
         }
     }
 }

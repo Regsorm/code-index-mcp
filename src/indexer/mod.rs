@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 use walkdir::WalkDir;
 
-use crate::parser;
+use crate::parser::ParserRegistry;
 use crate::parser::text::TextParser;
 use crate::storage::models::*;
 use crate::storage::Storage;
@@ -102,6 +102,9 @@ impl<'a> Indexer<'a> {
             self.storage.prepare_bulk_load()?;
         }
 
+        // Создаём реестр парсеров из конфигурации — один раз для всего прохода
+        let registry = ParserRegistry::from_languages(&self.config.languages);
+
         // ── Второй проход: полная индексация кандидатов ───────────────────────
         for (rel_path, content, hash, category) in &candidate_files {
             // Прогресс-лог каждые 500 файлов
@@ -116,7 +119,7 @@ impl<'a> Indexer<'a> {
                 );
             }
 
-            match self.index_single_file(rel_path, content, hash, category) {
+            match self.index_single_file(rel_path, content, hash, category, &registry) {
                 Ok(_) => result.files_indexed += 1,
                 Err(e) => result.errors.push((rel_path.clone(), e.to_string())),
             }
@@ -276,17 +279,18 @@ impl<'a> Indexer<'a> {
         content: &str,
         content_hash: &str,
         category: &FileCategory,
+        registry: &ParserRegistry,
     ) -> Result<()> {
         match category {
             FileCategory::Code(language) => {
-                // Определяем парсер по расширению файла
+                // Определяем парсер по расширению файла через реестр
                 let ext = Path::new(rel_path)
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
 
-                let parser = parser::get_parser_for_extension(&ext)
+                let parser = registry.get_parser(&ext)
                     .ok_or_else(|| anyhow::anyhow!("Нет парсера для расширения: {}", ext))?;
 
                 let parse_result = parser.parse(content, rel_path)?;
