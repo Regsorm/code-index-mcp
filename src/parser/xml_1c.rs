@@ -66,7 +66,10 @@ fn sha256_hex(data: &str) -> String {
 /// Проверить, является ли содержимое файла выгрузкой 1С.
 /// Ищем тег <MetaDataObject в первых 500 байтах — быстрая проверка без полного парсинга.
 fn is_1c_xml(source: &str) -> bool {
-    let probe = &source[..source.len().min(500)];
+    // Безопасная обрезка по границе символов UTF-8
+    let end = source.len().min(500);
+    let safe_end = source.floor_char_boundary(end);
+    let probe = &source[..safe_end];
     probe.contains("<MetaDataObject")
 }
 
