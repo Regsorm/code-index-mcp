@@ -19,6 +19,7 @@ const CODE_EXTENSIONS: &[(&str, &str)] = &[
     ("ts", "typescript"),
     ("tsx", "typescript"),
     ("java", "java"),
+    ("rs", "rust"),
 ];
 
 /// Расширения текстовых файлов для полнотекстового поиска
@@ -26,7 +27,7 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "md", "txt", "rst",
     "json", "yaml", "yml", "toml",
     "xml", "html", "css",
-    "rs", "go", "c", "h", "cpp", "hpp", "cs", "rb", "php", "swift", "kt",
+    "go", "c", "h", "cpp", "hpp", "cs", "rb", "php", "swift", "kt",
     "csv", "env", "ini", "cfg",
     "sql", "sh", "bat", "ps1",
 ];

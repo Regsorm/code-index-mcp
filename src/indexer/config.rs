@@ -49,6 +49,7 @@ fn default_languages() -> Vec<String> {
         "javascript".to_string(),
         "typescript".to_string(),
         "java".to_string(),
+        "rust".to_string(),
     ]
 }
 

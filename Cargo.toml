@@ -25,6 +25,7 @@ tree-sitter-python = "0.25"
 tree-sitter-javascript = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-java = "0.23"
+tree-sitter-rust = "0.23"
 
 # База данных
 rusqlite = { version = "0.39", features = ["bundled"] }

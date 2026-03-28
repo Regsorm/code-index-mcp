@@ -3,6 +3,7 @@ pub mod python;
 pub mod javascript;
 pub mod typescript;
 pub mod java;
+pub mod rust_lang;
 pub mod text;
 
 use std::collections::HashMap;
@@ -37,6 +38,7 @@ impl ParserRegistry {
         registry.register(Arc::new(javascript::JavaScriptParser::new()));
         registry.register(Arc::new(typescript::TypeScriptParser::new()));
         registry.register(Arc::new(java::JavaParser::new()));
+        registry.register(Arc::new(rust_lang::RustParser::new()));
         registry
     }
 
@@ -55,6 +57,7 @@ impl ParserRegistry {
                     registry.register(Arc::new(typescript::TypeScriptParser::new()));
                 }
                 "java" => registry.register(Arc::new(java::JavaParser::new())),
+                "rust" => registry.register(Arc::new(rust_lang::RustParser::new())),
                 _ => {} // Неизвестный язык — пропускаем без ошибки
             }
         }
@@ -87,6 +90,7 @@ pub fn get_parser_for_extension(ext: &str) -> Option<Box<dyn LanguageParser>> {
         "js" | "jsx" => Some(Box::new(javascript::JavaScriptParser::new())),
         "ts" | "tsx" => Some(Box::new(typescript::TypeScriptParser::new())),
         "java" => Some(Box::new(java::JavaParser::new())),
+        "rs" => Some(Box::new(rust_lang::RustParser::new())),
         _ => None,
     }
 }
@@ -104,6 +108,7 @@ mod tests {
         assert!(reg.get_parser("ts").is_some(), "TypeScript парсер должен быть в реестре");
         assert!(reg.get_parser("tsx").is_some(), "TSX парсер должен быть в реестре");
         assert!(reg.get_parser("java").is_some(), "Java парсер должен быть в реестре");
+        assert!(reg.get_parser("rs").is_some(), "Rust парсер должен быть в реестре");
         assert!(reg.get_parser("unknown").is_none(), "Неизвестное расширение должно давать None");
     }
 
@@ -131,9 +136,11 @@ mod tests {
 
     #[test]
     fn test_parser_registry_unknown_language() {
-        // Неизвестный язык не должен вызывать панику
+        // Неизвестный язык не должен вызывать панику; go — не поддерживается
         let reg = ParserRegistry::from_languages(&["rust".to_string(), "go".to_string()]);
-        assert!(reg.get_parser("rs").is_none());
+        // Rust теперь поддерживается — .rs должен найтись
+        assert!(reg.get_parser("rs").is_some());
+        // Go не поддерживается — остаётся None
         assert!(reg.get_parser("go").is_none());
     }
 
