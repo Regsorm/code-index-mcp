@@ -5,6 +5,7 @@ pub mod typescript;
 pub mod java;
 pub mod rust_lang;
 pub mod text;
+pub mod bsl;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,6 +40,7 @@ impl ParserRegistry {
         registry.register(Arc::new(typescript::TypeScriptParser::new()));
         registry.register(Arc::new(java::JavaParser::new()));
         registry.register(Arc::new(rust_lang::RustParser::new()));
+        registry.register(Arc::new(bsl::BslParser::new()));
         registry
     }
 
@@ -58,6 +60,7 @@ impl ParserRegistry {
                 }
                 "java" => registry.register(Arc::new(java::JavaParser::new())),
                 "rust" => registry.register(Arc::new(rust_lang::RustParser::new())),
+                "bsl" => registry.register(Arc::new(bsl::BslParser::new())),
                 _ => {} // Неизвестный язык — пропускаем без ошибки
             }
         }
@@ -91,6 +94,7 @@ pub fn get_parser_for_extension(ext: &str) -> Option<Box<dyn LanguageParser>> {
         "ts" | "tsx" => Some(Box::new(typescript::TypeScriptParser::new())),
         "java" => Some(Box::new(java::JavaParser::new())),
         "rs" => Some(Box::new(rust_lang::RustParser::new())),
+        "bsl" | "os" => Some(Box::new(bsl::BslParser::new())),
         _ => None,
     }
 }

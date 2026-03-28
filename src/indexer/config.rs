@@ -50,6 +50,7 @@ fn default_languages() -> Vec<String> {
         "typescript".to_string(),
         "java".to_string(),
         "rust".to_string(),
+        "bsl".to_string(),
     ]
 }
 

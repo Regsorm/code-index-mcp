@@ -20,6 +20,8 @@ const CODE_EXTENSIONS: &[(&str, &str)] = &[
     ("tsx", "typescript"),
     ("java", "java"),
     ("rs", "rust"),
+    ("bsl", "bsl"),
+    ("os", "bsl"),
 ];
 
 /// Расширения текстовых файлов для полнотекстового поиска
