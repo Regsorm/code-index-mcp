@@ -106,7 +106,7 @@ impl<'a> Indexer<'a> {
             elapsed_ms: 0,
         };
 
-        // Загружаем текущее состояние БД: path -> (id, content_hash)
+        // ── Этап 0: загрузка состояния БД ─────────────────────────────────────
         let existing_files: HashMap<String, (i64, String)> = self
             .storage
             .get_all_files()?
@@ -116,17 +116,31 @@ impl<'a> Indexer<'a> {
             })
             .collect();
 
-        // ── Первый проход: только хеши, без парсинга ──────────────────────────
-        // Определяем список файлов, которые реально нужно переиндексировать.
-        // Это позволяет заранее решить, включать ли bulk-load.
+        // Определяем: это первичная индексация (пустая БД) или обновление
+        let is_fresh_db = existing_files.is_empty();
 
+        // ── Этап 1: сбор кандидатов ───────────────────────────────────────────
+        let candidates_start = std::time::Instant::now();
         let candidate_files = self.collect_candidates(root, force, &existing_files, &mut result)?;
+        let candidates_ms = candidates_start.elapsed().as_millis();
+        eprintln!("[timing] Сбор кандидатов: {} мс ({} файлов)", candidates_ms, candidate_files.len());
 
         // Включаем bulk-load если количество файлов для индексации превышает порог
         let bulk_mode = candidate_files.len() > self.config.bulk_threshold;
-        if bulk_mode {
+
+        if bulk_mode && is_fresh_db {
+            // Первичная индексация: таблицы уже созданы через initialize(),
+            // дропаем индексы которые были созданы вместе со схемой
             eprintln!(
-                "[bulk-load] {} файлов > порога {}: удаляем индексы и триггеры",
+                "[bulk] Первичная индексация {} файлов (порог {}): удаляем индексы",
+                candidate_files.len(),
+                self.config.bulk_threshold
+            );
+            self.storage.prepare_bulk_load()?;
+        } else if bulk_mode {
+            // Обновление существующей БД: дропаем индексы перед массовой загрузкой
+            eprintln!(
+                "[bulk] Обновление {} файлов (порог {}): удаляем индексы",
                 candidate_files.len(),
                 self.config.bulk_threshold
             );
@@ -139,9 +153,10 @@ impl<'a> Indexer<'a> {
         // ParserRegistry: Send + Sync, что требуется для par_iter.
         let registry = ParserRegistry::from_languages(&self.config.languages);
 
-        // ── Параллельный парсинг (CPU-bound) ─────────────────────────────────
+        // ── Этап 2: параллельный парсинг (CPU-bound) ─────────────────────────
         // tree-sitter парсинг выполняется в нескольких потоках через rayon.
         // Чтение файлов уже выполнено в collect_candidates — здесь только AST.
+        let parse_start = std::time::Instant::now();
         let parse_results: Vec<ParsedFile> = candidate_files
             .par_iter()
             .map(|(rel_path, content, hash, category)| {
@@ -214,9 +229,12 @@ impl<'a> Indexer<'a> {
                 }
             })
             .collect();
+        let parse_ms = parse_start.elapsed().as_millis();
+        eprintln!("[timing] Парсинг (rayon): {} мс ({} файлов)", parse_ms, parse_results.len());
 
-        // ── Последовательная запись в SQLite ──────────────────────────────────
+        // ── Этап 3: последовательная запись в SQLite ──────────────────────────
         // SQLite не поддерживает параллельную запись — пишем из основного потока.
+        let write_start = std::time::Instant::now();
         let batch_size = self.config.batch_size;
         let mut batch_count = 0usize;
 
@@ -252,6 +270,7 @@ impl<'a> Indexer<'a> {
                         *lines_total,
                         ast_hash,
                         parse_result,
+                        is_fresh_db,
                     ) {
                         Ok(_) => {
                             result.files_indexed += 1;
@@ -268,7 +287,7 @@ impl<'a> Indexer<'a> {
                     lines_total,
                     content,
                 } => {
-                    match self.write_text_to_db(rel_path, content_hash, *lines_total, content) {
+                    match self.write_text_to_db(rel_path, content_hash, *lines_total, content, is_fresh_db) {
                         Ok(_) => {
                             result.files_indexed += 1;
                             batch_count += 1;
@@ -293,17 +312,25 @@ impl<'a> Indexer<'a> {
 
         // Коммитим оставшиеся записи последнего неполного батча
         self.storage.commit_batch()?;
+        let write_ms = write_start.elapsed().as_millis();
+        eprintln!("[timing] Запись в БД: {} мс ({} файлов)", write_ms, result.files_indexed);
 
+        // ── Этап 4: индексы + FTS rebuild ────────────────────────────────────
         // Завершаем bulk-load: пересоздаём индексы, триггеры, rebuild FTS
         if bulk_mode {
-            eprintln!("[bulk-load] Пересоздаём индексы и перестраиваем FTS...");
+            let idx_start = std::time::Instant::now();
+            eprintln!("[bulk] Создание B-tree индексов и перестройка FTS...");
             self.storage.finish_bulk_load()?;
+            let idx_ms = idx_start.elapsed().as_millis();
+            eprintln!("[timing] Индексы + FTS rebuild: {} мс", idx_ms);
         }
 
+        // ── Этап 5: удаление устаревших записей ──────────────────────────────
         // Набор путей, реально встреченных при обходе диска (из кандидатов + пропущенных)
         // Пересчитываем seen_paths из кандидатов — они были собраны в первом проходе,
         // но нам нужен полный список (включая пропущенные неизменённые файлы).
         // Используем existing_files как основу и вычитаем то, что больше не на диске.
+        let cleanup_start = std::time::Instant::now();
         let seen_paths = self.collect_seen_paths(root, &existing_files);
 
         // Удаляем из БД файлы, которых больше нет на диске — в одной транзакции
@@ -315,12 +342,18 @@ impl<'a> Indexer<'a> {
             }
         }
         self.storage.commit_batch()?;
+        let cleanup_ms = cleanup_start.elapsed().as_millis();
+        if result.files_deleted > 0 {
+            eprintln!("[timing] Удаление устаревших: {} мс ({} файлов)", cleanup_ms, result.files_deleted);
+        }
 
         result.elapsed_ms = start.elapsed().as_millis() as u64;
+        eprintln!("[timing] Итого: {} мс", result.elapsed_ms);
         Ok(result)
     }
 
     /// Записать код-файл в БД: метаданные + символы (функции, классы, импорты и т.д.)
+    /// skip_delete: при первичной индексации пропускать DELETE (БД пуста, удалять нечего)
     fn write_code_to_db(
         &self,
         rel_path: &str,
@@ -329,6 +362,7 @@ impl<'a> Indexer<'a> {
         lines_total: usize,
         ast_hash: &str,
         parse_result: &ParseResult,
+        skip_delete: bool,
     ) -> Result<()> {
         // Сохраняем запись о файле
         let file_record = FileRecord {
@@ -345,11 +379,14 @@ impl<'a> Indexer<'a> {
         let file_id = self.storage.upsert_file(&file_record)?;
 
         // Удаляем старые данные перед вставкой новых
-        self.storage.delete_functions_by_file(file_id)?;
-        self.storage.delete_classes_by_file(file_id)?;
-        self.storage.delete_imports_by_file(file_id)?;
-        self.storage.delete_calls_by_file(file_id)?;
-        self.storage.delete_variables_by_file(file_id)?;
+        // При первичной индексации (skip_delete) — пропускаем, БД пуста
+        if !skip_delete {
+            self.storage.delete_functions_by_file(file_id)?;
+            self.storage.delete_classes_by_file(file_id)?;
+            self.storage.delete_imports_by_file(file_id)?;
+            self.storage.delete_calls_by_file(file_id)?;
+            self.storage.delete_variables_by_file(file_id)?;
+        }
 
         // Конвертируем и сохраняем функции
         let functions: Vec<FunctionRecord> = parse_result
@@ -444,6 +481,7 @@ impl<'a> Indexer<'a> {
         content_hash: &str,
         lines_total: usize,
         content: &str,
+        skip_delete: bool,
     ) -> Result<()> {
         let file_record = FileRecord {
             id: None,
@@ -459,7 +497,9 @@ impl<'a> Indexer<'a> {
         let file_id = self.storage.upsert_file(&file_record)?;
 
         // Удаляем старую запись текстового файла и вставляем новую
-        self.storage.delete_text_file_by_file(file_id)?;
+        if !skip_delete {
+            self.storage.delete_text_file_by_file(file_id)?;
+        }
 
         let text_record = TextFileRecord {
             id: None,
@@ -952,5 +992,70 @@ class App:
         // helper-функции тоже проиндексированы
         let found_helper = storage.search_functions("helper_0", 10, None).unwrap();
         assert!(!found_helper.is_empty(), "FTS должен находить helper_0");
+    }
+
+    /// Тест: первичная индексация пустой БД в bulk-режиме.
+    ///
+    /// Проверяет, что при is_fresh_db=true + bulk_mode=true:
+    /// - все файлы проиндексированы корректно
+    /// - FTS-поиск работает после rebuild индексов
+    /// - повторная индексация пропускает все неизменённые файлы
+    #[test]
+    fn test_bulk_fresh_db() {
+        let tmp = TempDir::new().unwrap();
+
+        // Создаём 20 Python-файлов с уникальными функциями
+        for i in 0..20 {
+            fs::write(
+                tmp.path().join(format!("fresh_{i}.py")),
+                format!(
+                    "def fresh_func_{i}(x):\n    \"\"\"Свежая функция {i}.\"\"\"\n    return x + {i}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        // Порог bulk_threshold=5 — при 20 файлах гарантированно активируется bulk-режим
+        let config = IndexConfig {
+            bulk_threshold: 5,
+            ..Default::default()
+        };
+
+        let mut storage = Storage::open_in_memory().unwrap();
+
+        // Первичная индексация пустой БД (is_fresh_db = true)
+        let result = {
+            let mut indexer = Indexer::with_config(&mut storage, config.clone());
+            indexer.full_reindex(tmp.path(), false).unwrap()
+        };
+
+        assert_eq!(result.files_indexed, 20, "все 20 файлов должны быть проиндексированы");
+        assert_eq!(result.files_skipped, 0, "пропущенных файлов быть не должно");
+        assert_eq!(result.errors.len(), 0, "ошибок быть не должно");
+
+        // Проверяем статистику
+        let stats = storage.get_stats().unwrap();
+        assert_eq!(stats.total_files, 20, "в БД должно быть 20 файлов");
+        assert_eq!(stats.total_functions, 20, "по одной функции на файл");
+
+        // Проверяем FTS-поиск после bulk rebuild
+        let found_0 = storage.search_functions("fresh_func_0", 10, None).unwrap();
+        assert!(!found_0.is_empty(), "FTS должен находить fresh_func_0 после bulk-load rebuild");
+
+        let found_19 = storage.search_functions("fresh_func_19", 10, None).unwrap();
+        assert!(!found_19.is_empty(), "FTS должен находить fresh_func_19 после bulk-load rebuild");
+
+        // Повторная индексация (is_fresh_db = false) — все файлы должны быть пропущены
+        let result2 = {
+            let mut indexer = Indexer::with_config(&mut storage, config);
+            indexer.full_reindex(tmp.path(), false).unwrap()
+        };
+
+        assert_eq!(result2.files_skipped, 20, "при повторной индексации все 20 файлов неизменны");
+        assert_eq!(result2.files_indexed, 0, "ни одного файла не должно быть переиндексировано");
+
+        // FTS по-прежнему работает после повторного прохода
+        let found_after = storage.search_functions("fresh_func_10", 10, None).unwrap();
+        assert!(!found_after.is_empty(), "FTS должен работать и после повторной индексации");
     }
 }

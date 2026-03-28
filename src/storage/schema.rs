@@ -185,6 +185,22 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_text_files USING fts5(
 );
 ";
 
+/// Создать только таблицы и FTS-виртуальные таблицы БЕЗ индексов и триггеров.
+///
+/// Используется при массовой первичной загрузке — индексы создаются после INSERT,
+/// что значительно ускоряет процесс (один проход вместо инкрементальных обновлений).
+pub fn initialize_tables_only(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA foreign_keys=ON;
+        PRAGMA cache_size=-64000;
+    ")?;
+    // Только таблицы + FTS-виртуальные таблицы — без INDEXES_SQL и TRIGGERS_SQL
+    conn.execute_batch(SQL_SCHEMA)?;
+    Ok(())
+}
+
 /// Инициализирует базу данных: применяет PRAGMA и создаёт схему
 pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // Включаем WAL для параллельного чтения/записи
