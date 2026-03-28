@@ -7,6 +7,9 @@ pub mod rust_lang;
 pub mod go;
 pub mod text;
 pub mod bsl;
+/// Парсер XML-выгрузок 1С (quick-xml, не tree-sitter)
+/// Не регистрируется в ParserRegistry — вызывается напрямую из indexer
+pub mod xml_1c;
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 
 use crate::parser::types::ParseResult;
 use crate::parser::ParserRegistry;
+use crate::parser::LanguageParser;
 use crate::parser::text::TextParser;
 use crate::storage::models::*;
 use crate::storage::Storage;
@@ -177,7 +178,30 @@ impl<'a> Indexer<'a> {
                         }
                     }
                     FileCategory::Text => {
-                        // Текстовый «парсинг» — просто подсчёт строк, очень быстрый
+                        // Проверяем: это XML-файл выгрузки 1С?
+                        let ext = Path::new(rel_path.as_str())
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("");
+                        if ext == "xml" {
+                            let xml_parser = crate::parser::xml_1c::Xml1CParser;
+                            if let Ok(pr) = xml_parser.parse(content, rel_path) {
+                                if !pr.functions.is_empty()
+                                    || !pr.classes.is_empty()
+                                    || !pr.variables.is_empty()
+                                {
+                                    return ParsedFile::Code {
+                                        rel_path: rel_path.clone(),
+                                        content_hash: hash.clone(),
+                                        language: "xml_1c".to_string(),
+                                        lines_total: pr.lines_total,
+                                        ast_hash: pr.ast_hash.clone(),
+                                        parse_result: pr,
+                                    };
+                                }
+                            }
+                        }
+                        // Fallback: текстовая индексация
                         let text_result = TextParser::parse(content);
                         ParsedFile::Text {
                             rel_path: rel_path.clone(),
