@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use code_index_mcp::indexer::config::IndexConfig;
 use code_index_mcp::indexer::Indexer;
 use code_index_mcp::mcp::CodeIndexServer;
+use code_index_mcp::storage::memory::StorageConfig;
 use code_index_mcp::storage::Storage;
 use rmcp::ServiceExt;
 
@@ -109,8 +110,12 @@ async fn main() -> anyhow::Result<()> {
             // Загрузить конфигурацию проекта
             let config = IndexConfig::load(&root)?;
 
-            // Открыть хранилище
-            let mut storage = Storage::open_file(&db_path)?;
+            // Открыть хранилище с автоопределением режима
+            let storage_config = StorageConfig {
+                mode: config.storage_mode.clone(),
+                memory_max_percent: config.memory_max_percent,
+            };
+            let mut storage = Storage::open_auto(&db_path, &storage_config)?;
 
             // Начальная индексация проекта
             let mut indexer = Indexer::with_config(&mut storage, config);
@@ -119,6 +124,9 @@ async fn main() -> anyhow::Result<()> {
                 "Индексация завершена: {} файлов за {} мс",
                 index_result.files_indexed, index_result.elapsed_ms
             );
+
+            // Если работаем в in-memory режиме — сохранить результаты на диск
+            storage.flush_to_disk(&db_path)?;
 
             // Запуск MCP-сервера через stdio-транспорт
             let server = CodeIndexServer::new(storage);
@@ -139,12 +147,16 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&db_dir)
                 .map_err(|e| anyhow::anyhow!("Не удалось создать директорию {:?}: {}", db_dir, e))?;
 
-            // 3. Открыть Storage
+            // 3. Загрузить конфигурацию проекта
             let db_path = db_dir.join("index.db");
-            let mut storage = Storage::open_file(&db_path)?;
-
-            // 4. Загрузить конфигурацию проекта
             let config = IndexConfig::load(&abs_path)?;
+
+            // 4. Открыть Storage с автоопределением режима
+            let storage_config = StorageConfig {
+                mode: config.storage_mode.clone(),
+                memory_max_percent: config.memory_max_percent,
+            };
+            let mut storage = Storage::open_auto(&db_path, &storage_config)?;
 
             // 5. Создать Indexer с конфигом
             let mut indexer = Indexer::with_config(&mut storage, config);
@@ -152,7 +164,10 @@ async fn main() -> anyhow::Result<()> {
             // 6. Запустить индексацию
             let result = indexer.full_reindex(&abs_path, force)?;
 
-            // 7. Вывести результат
+            // 7. Если работаем в in-memory режиме — сохранить результаты на диск
+            storage.flush_to_disk(&db_path)?;
+
+            // 8. Вывести результат
             println!("Индексация завершена за {} мс", result.elapsed_ms);
             println!("  Найдено файлов:        {}", result.files_scanned);
             println!("  Проиндексировано:      {}", result.files_indexed);

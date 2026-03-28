@@ -33,7 +33,7 @@ tree-sitter-go = "0.23"
 quick-xml = "0.37"
 
 # База данных
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled", "backup"] }
 
 # Сериализация
 serde = { version = "1", features = ["derive"] }
@@ -54,6 +54,9 @@ thiserror = "2"
 # Логирование
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Системная информация (RAM для in-memory решения)
+sysinfo = "0.32"
 
 # Утилиты
 hex = "0.4"

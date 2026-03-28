@@ -39,6 +39,27 @@ pub struct IndexConfig {
     /// что устраняет fsync на каждую запись и ускоряет массовую индексацию.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// Режим хранения SQLite: "auto" | "memory" | "disk".
+    ///
+    /// "auto" — автоматически выбирает in-memory если БД помещается в RAM,
+    /// иначе работает с файлом. "memory" — всегда in-memory. "disk" — всегда файл.
+    #[serde(default = "default_storage_mode")]
+    pub storage_mode: String,
+
+    /// Максимальный процент свободной RAM, который разрешено занять под БД.
+    ///
+    /// Используется только при `storage_mode = "auto"`. По умолчанию 25%.
+    #[serde(default = "default_memory_max_percent")]
+    pub memory_max_percent: u8,
+}
+
+fn default_storage_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_memory_max_percent() -> u8 {
+    25
 }
 
 fn default_max_file_size() -> usize {
@@ -76,6 +97,8 @@ impl Default for IndexConfig {
             bulk_threshold: default_bulk_threshold(),
             languages: default_languages(),
             batch_size: default_batch_size(),
+            storage_mode: default_storage_mode(),
+            memory_max_percent: default_memory_max_percent(),
         }
     }
 }

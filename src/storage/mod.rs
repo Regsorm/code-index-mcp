@@ -1,4 +1,5 @@
 /// Модуль хранилища — SQLite через rusqlite (bundled)
+pub mod memory;
 pub mod models;
 pub mod schema;
 
@@ -29,6 +30,63 @@ impl Storage {
         let conn = Connection::open_in_memory().context("Не удалось создать in-memory БД")?;
         schema::initialize(&conn).context("Ошибка инициализации схемы in-memory БД")?;
         Ok(Self { conn })
+    }
+
+    /// Открыть хранилище с автоопределением режима (in-memory или disk).
+    ///
+    /// Если выбран режим InMemory и файл БД существует — данные загружаются
+    /// из файла в память через SQLite Backup API. Если файл не существует —
+    /// создаётся чистая in-memory БД.
+    pub fn open_auto(db_path: &Path, storage_config: &memory::StorageConfig) -> Result<Self> {
+        let mode = memory::determine_storage_mode(storage_config, db_path);
+
+        match mode {
+            memory::StorageMode::InMemory => {
+                eprintln!("[storage] Режим: in-memory (БД загружена в RAM)");
+
+                if db_path.exists() {
+                    // Загрузить данные с диска в память через backup API
+                    let disk_conn = Connection::open(db_path)
+                        .with_context(|| format!("Не удалось открыть файл БД: {}", db_path.display()))?;
+                    let mut memory_conn = Connection::open_in_memory()
+                        .context("Не удалось создать in-memory БД")?;
+
+                    // Копируем disk → memory (Backup::new(src, &mut dst))
+                    {
+                        let backup = rusqlite::backup::Backup::new(&disk_conn, &mut memory_conn)
+                            .context("Не удалось инициализировать backup disk→memory")?;
+                        backup
+                            .run_to_completion(100, std::time::Duration::from_millis(0), None)
+                            .context("Ошибка при копировании БД disk→memory")?;
+                    }
+
+                    Ok(Self { conn: memory_conn })
+                } else {
+                    // Новая БД — чистая in-memory со схемой
+                    Self::open_in_memory()
+                }
+            }
+            memory::StorageMode::Disk => {
+                eprintln!("[storage] Режим: disk (WAL)");
+                Self::open_file(db_path)
+            }
+        }
+    }
+
+    /// Сохранить содержимое in-memory БД на диск.
+    ///
+    /// Используется после индексации в режиме InMemory, чтобы персистировать
+    /// результаты. Безопасно вызывать и для disk-режима (создаст копию файла).
+    pub fn flush_to_disk(&self, db_path: &Path) -> Result<()> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Не удалось создать директорию: {}", parent.display()))?;
+        }
+        // Connection::backup() открывает dst сам и не требует &mut dst
+        self.conn
+            .backup(rusqlite::MAIN_DB, db_path, None)
+            .with_context(|| format!("Ошибка flush_to_disk: {}", db_path.display()))?;
+        Ok(())
     }
 
     // ── Files ────────────────────────────────────────────────────────────────
@@ -1035,5 +1093,91 @@ mod tests {
         let results = storage.search_functions("tree-sitter-python", 10, None)
             .expect("поиск с дефисом не должен падать");
         assert_eq!(results.len(), 1, "должна найтись функция с дефисом в docstring");
+    }
+
+    #[test]
+    fn test_flush_to_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+
+        // Создать in-memory БД и записать данные
+        let storage = Storage::open_in_memory().unwrap();
+        let rec = FileRecord {
+            id: None,
+            path: "test.py".to_string(),
+            content_hash: "abc".to_string(),
+            ast_hash: None,
+            language: "python".to_string(),
+            lines_total: 10,
+            indexed_at: "2026-01-01".to_string(),
+        };
+        storage.upsert_file(&rec).unwrap();
+
+        // Flush на диск
+        storage.flush_to_disk(&db_path).unwrap();
+        assert!(db_path.exists(), "файл БД должен появиться на диске");
+
+        // Открыть с диска и проверить данные
+        let storage2 = Storage::open_file(&db_path).unwrap();
+        let file = storage2.get_file_by_path("test.py").unwrap();
+        assert!(file.is_some(), "файл должен быть найден в дисковой копии");
+        assert_eq!(file.unwrap().content_hash, "abc");
+    }
+
+    #[test]
+    fn test_open_auto_in_memory_for_new_db() {
+        // Новая БД (файл не существует) — должен выбрать in-memory
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let config = memory::StorageConfig {
+            mode: "auto".to_string(),
+            memory_max_percent: 25,
+        };
+
+        let storage = Storage::open_auto(&db_path, &config)
+            .expect("open_auto должен работать для новой БД");
+
+        // Проверяем что БД работает — вставляем файл
+        storage.upsert_file(&make_file("/hello.py")).unwrap();
+        let found = storage.get_file_by_path("/hello.py").unwrap();
+        assert!(found.is_some());
+    }
+
+    #[test]
+    fn test_open_auto_disk_mode() {
+        // Явный режим disk — должен открыть файл
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let config = memory::StorageConfig {
+            mode: "disk".to_string(),
+            memory_max_percent: 25,
+        };
+
+        let storage = Storage::open_auto(&db_path, &config)
+            .expect("open_auto disk режим");
+        storage.upsert_file(&make_file("/hello.rs")).unwrap();
+        assert!(db_path.exists(), "файл БД должен существовать в disk-режиме");
+    }
+
+    #[test]
+    fn test_open_auto_loads_existing_db() {
+        // Сначала создаём файл БД, потом открываем через open_auto memory
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // Создать файловую БД с данными
+        {
+            let s = Storage::open_file(&db_path).unwrap();
+            s.upsert_file(&make_file("/existing.py")).unwrap();
+        }
+
+        // Открыть через open_auto в режиме memory — данные должны загрузиться
+        let config = memory::StorageConfig {
+            mode: "memory".to_string(),
+            memory_max_percent: 25,
+        };
+        let storage = Storage::open_auto(&db_path, &config).unwrap();
+        let found = storage.get_file_by_path("/existing.py").unwrap();
+        assert!(found.is_some(), "данные из файла должны быть доступны в in-memory БД");
     }
 }
