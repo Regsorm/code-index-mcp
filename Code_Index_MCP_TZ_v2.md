@@ -160,12 +160,14 @@ Tree-sitter — универсальный инкрементальный пар
 
 | Язык | Crate | Приоритет | Статус |
 |---|---|---|---|
-| Python | tree-sitter-python | P0 (MVP) | Есть прототип |
-| JavaScript | tree-sitter-javascript | P1 | Планируется |
-| TypeScript | tree-sitter-typescript | P1 | Планируется |
-| Java | tree-sitter-java | P1 | Планируется |
-| 1С (BSL) | tree-sitter-bsl (custom?) | P2 | Нужна грамматика |
-| C# / Rust / Go | tree-sitter-* | P3 | По запросу |
+| Python | tree-sitter-python 0.25 | P0 (MVP) | ✅ Реализован, 6 тестов |
+| JavaScript | tree-sitter-javascript 0.23 | P1 | ✅ Реализован, 7 тестов |
+| TypeScript | tree-sitter-typescript 0.23 | P1 | ✅ Реализован, 6 тестов (TS + TSX) |
+| Java | tree-sitter-java 0.23 | P1 | ✅ Реализован, 6 тестов |
+| Rust | tree-sitter-rust 0.23 | P1 | ✅ Реализован, 6 тестов |
+| Go | tree-sitter-go 0.23 | P1 | ✅ Реализован, 6 тестов |
+| 1С (BSL) | tree-sitter-onescript 0.1 | P2 | ✅ Реализован, 9 тестов |
+| 1С XML | quick-xml 0.37 (SAX) | P2 | ✅ Реализован, 6 тестов |
 
 ### 7.2. Универсальный извлекатель
 
@@ -421,32 +423,51 @@ and complete.
 
 ## 12. Этапы разработки
 
-### Этап 1: MVP (Rust парсер + CLI)
+### Этап 1: MVP (Rust парсер + CLI) — ✅ ВЫПОЛНЕН
 
-- Rust: tree-sitter парсер для Python, запись в SQLite
-- Rust: CLI (`index`, `stats`, `query`)
-- Rust: MCP-сервер (HTTP, 10 инструментов)
-- Тест на проекте 5000+ строк — подтвердить < 5 мс
+- ✅ Tree-sitter парсер для Python, запись в SQLite (FTS5)
+- ✅ CLI: `index`, `stats`, `query`, `serve`, `init`, `clean`
+- ✅ MCP-сервер через stdio (rmcp 1.3.0, 11 инструментов)
+- ✅ 30 юнит-тестов
 
-### Этап 2: Daemon + VS Code
+### Этап 1.5: Оптимизации + мультиязычность — ✅ ВЫПОЛНЕН
 
-- Rust: daemon режим (stdin/stdout IPC)
-- Rust: in-memory SQLite + periodic flush
-- Rust: инкрементальный парсинг (tree-sitter edit)
-- JS: VS Code расширение (onChange, debounce, hash check)
+- ✅ 7 парсеров: Python, JavaScript, TypeScript, Java, Rust, Go, BSL (1С)
+- ✅ XML-парсер выгрузок 1С (quick-xml): метаданные, реквизиты, табличные части
+- ✅ ParserRegistry с активацией через config.json (languages)
+- ✅ Конфигурируемый exclude (.code-index/config.json)
+- ✅ Bulk-load: DROP INDEX → INSERT → CREATE INDEX + FTS rebuild
+- ✅ Батчинг INSERT: транзакции по batch_size (по умолчанию 500)
+- ✅ Параллельный парсинг через rayon (многопоточный CPU)
+- ✅ In-memory SQLite с автоопределением (sysinfo)
+- ✅ Фильтр language в MCP-инструментах
+- ✅ FTS5 sanitize (дефисы, спецсимволы)
+- ✅ 100 юнит-тестов
 
-### Этап 3: Мультиязычность
+### Бенчмарк (реальные данные)
 
-- Tree-sitter грамматики: JavaScript, TypeScript, Java
-- Универсальный маппинг узлов (декларативный конфиг)
-- 1С (BSL): custom tree-sitter грамматика или адаптация существующей
+| Проект | Файлов | Функций | Вызовов | Время |
+|---|---|---|---|---|
+| code-index-mcp (Rust) | 26 | 330 | 2362 | 231 мс |
+| MCP-Servers (Python) | 76 | 209 | 1877 | 533 мс |
+| 1c-finance (Python) | 42 | 69 | 439 | 193 мс |
+| RepoUT (1С, 16K BSL + 46K XML) | 61706 | 282575 | 1533337 | ~90 мин* |
 
-### Этап 4: Полировка
+*Без rayon и батчинга. С оптимизациями ожидается ~10-15 мин.
 
-- MCP-протокол SSE/stdio для Claude Desktop
-- Системный промпт для AI-моделей (из коробки)
-- Публикация: VS Code Marketplace + crates.io
-- Документация, примеры, бенчмарки
+### Этап 2: Daemon + VS Code — частично выполнен
+
+- ✅ In-memory SQLite + flush на диск
+- ⬜ Daemon режим (stdin/stdout IPC с VS Code)
+- ⬜ Инкрементальный парсинг (tree-sitter edit)
+- ⬜ VS Code расширение (onChange, debounce, hash check)
+
+### Этап 3: Полировка
+
+- ⬜ MCP-протокол SSE для Claude Desktop
+- ⬜ Системный промпт для AI-моделей (из коробки)
+- ⬜ Публикация: VS Code Marketplace + crates.io
+- ⬜ Документация, примеры
 
 ---
 
