@@ -26,6 +26,7 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "md", "txt", "rst",
     "json", "yaml", "yml", "toml",
     "xml", "html", "css",
+    "rs", "go", "c", "h", "cpp", "hpp", "cs", "rb", "php", "swift", "kt",
     "csv", "env", "ini", "cfg",
     "sql", "sh", "bat", "ps1",
 ];

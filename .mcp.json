@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "code-index": {
+      "command": "C:\\Db_ai\\target\\release\\code-index.exe",
+      "args": ["serve", "--path", "C:\\Db_ai"]
+    }
+  }
+}
