@@ -32,10 +32,21 @@ pub struct IndexConfig {
     /// Допустимые значения: "python", "javascript", "typescript", "java"
     #[serde(default = "default_languages")]
     pub languages: Vec<String>,
+
+    /// Размер батча транзакций при индексации (по умолчанию 500).
+    ///
+    /// Каждые `batch_size` файлов накопленные INSERT-ы коммитятся одной транзакцией,
+    /// что устраняет fsync на каждую запись и ускоряет массовую индексацию.
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
 }
 
 fn default_max_file_size() -> usize {
     1_048_576 // 1 МБ
+}
+
+fn default_batch_size() -> usize {
+    500
 }
 
 fn default_bulk_threshold() -> usize {
@@ -64,6 +75,7 @@ impl Default for IndexConfig {
             max_files: 0,
             bulk_threshold: default_bulk_threshold(),
             languages: default_languages(),
+            batch_size: default_batch_size(),
         }
     }
 }

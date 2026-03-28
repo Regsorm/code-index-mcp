@@ -105,11 +105,17 @@ impl<'a> Indexer<'a> {
         // Создаём реестр парсеров из конфигурации — один раз для всего прохода
         let registry = ParserRegistry::from_languages(&self.config.languages);
 
-        // ── Второй проход: полная индексация кандидатов ───────────────────────
+        // ── Второй проход: полная индексация кандидатов в батч-транзакциях ───
+        let batch_size = self.config.batch_size;
+        let mut batch_count = 0usize;
+
+        // Открываем первую транзакцию перед началом цикла
+        self.storage.begin_batch()?;
+
         for (rel_path, content, hash, category) in &candidate_files {
-            // Прогресс-лог каждые 500 файлов
-            let total_processed = result.files_indexed + result.files_skipped + result.errors.len();
-            if total_processed > 0 && total_processed % 500 == 0 {
+            // Прогресс-лог каждые batch_size файлов
+            let total_processed = result.files_indexed + result.errors.len();
+            if total_processed > 0 && total_processed % batch_size == 0 {
                 eprintln!(
                     "[{}/{}] Проиндексировано {}, пропущено {}...",
                     total_processed,
@@ -120,10 +126,27 @@ impl<'a> Indexer<'a> {
             }
 
             match self.index_single_file(rel_path, content, hash, category, &registry) {
-                Ok(_) => result.files_indexed += 1,
-                Err(e) => result.errors.push((rel_path.clone(), e.to_string())),
+                Ok(_) => {
+                    result.files_indexed += 1;
+                    batch_count += 1;
+
+                    // Коммитим накопленный батч и открываем новую транзакцию
+                    if batch_count >= batch_size {
+                        self.storage.commit_batch()?;
+                        self.storage.begin_batch()?;
+                        batch_count = 0;
+                    }
+                }
+                Err(e) => {
+                    // Ошибка парсинга/хранения одного файла не откатывает весь батч —
+                    // добавляем в список ошибок и продолжаем в той же транзакции
+                    result.errors.push((rel_path.clone(), e.to_string()));
+                }
             }
         }
+
+        // Коммитим оставшиеся записи последнего неполного батча
+        self.storage.commit_batch()?;
 
         // Завершаем bulk-load: пересоздаём индексы, триггеры, rebuild FTS
         if bulk_mode {
@@ -137,13 +160,15 @@ impl<'a> Indexer<'a> {
         // Используем existing_files как основу и вычитаем то, что больше не на диске.
         let seen_paths = self.collect_seen_paths(root, &existing_files);
 
-        // Удаляем из БД файлы, которых больше нет на диске
+        // Удаляем из БД файлы, которых больше нет на диске — в одной транзакции
+        self.storage.begin_batch()?;
         for (path, (id, _)) in &existing_files {
             if !seen_paths.contains(path) {
                 self.storage.delete_file(*id)?;
                 result.files_deleted += 1;
             }
         }
+        self.storage.commit_batch()?;
 
         result.elapsed_ms = start.elapsed().as_millis() as u64;
         Ok(result)
@@ -701,5 +726,52 @@ class App:
         // big.py пропущен из-за лимита размера
         assert_eq!(r.files_indexed, 1, "только маленький файл должен быть проиндексирован");
         assert_eq!(r.files_skipped, 1, "большой файл должен быть в skipped");
+    }
+
+    #[test]
+    fn test_batch_transactions() {
+        let tmp = TempDir::new().unwrap();
+
+        // Создаём 20 Python-файлов с уникальными функциями
+        for i in 0..20 {
+            fs::write(
+                tmp.path().join(format!("module_{i}.py")),
+                format!(
+                    "def batch_func_{i}(x):\n    \"\"\"Функция батча {i}.\"\"\"\n    return x * {i}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let mut storage = Storage::open_in_memory().unwrap();
+
+        // Устанавливаем маленький batch_size = 5, чтобы проверить несколько коммитов
+        let config = IndexConfig {
+            batch_size: 5,
+            bulk_threshold: 100, // отключаем bulk-mode, чтобы проверять именно батч-транзакции
+            ..Default::default()
+        };
+
+        let result = {
+            let mut indexer = Indexer::with_config(&mut storage, config);
+            indexer.full_reindex(tmp.path(), false).unwrap()
+        };
+
+        // Все 20 файлов должны быть успешно проиндексированы
+        assert_eq!(result.files_indexed, 20, "все 20 файлов должны быть проиндексированы");
+        assert_eq!(result.files_skipped, 0, "пропущенных файлов быть не должно");
+        assert_eq!(result.errors.len(), 0, "ошибок быть не должно");
+
+        // Данные реально записаны в БД — проверяем через get_stats
+        let stats = storage.get_stats().unwrap();
+        assert_eq!(stats.total_files, 20, "в БД должно быть 20 файлов");
+        assert_eq!(stats.total_functions, 20, "по одной функции на файл");
+
+        // FTS должен находить функции
+        let found = storage.search_functions("batch_func_0", 10, None).unwrap();
+        assert!(!found.is_empty(), "FTS должен находить batch_func_0");
+
+        let found_19 = storage.search_functions("batch_func_19", 10, None).unwrap();
+        assert!(!found_19.is_empty(), "FTS должен находить batch_func_19 (последний батч)");
     }
 }
