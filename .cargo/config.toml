@@ -1,0 +1,9 @@
+[env]
+CC = "C:\\w64devkit\\bin\\gcc.exe"
+AR = "C:\\w64devkit\\bin\\ar.exe"
+CFLAGS = "-BC:\\w64devkit\\bin"
+
+[target.x86_64-pc-windows-gnu]
+# w64devkit не содержит libgcc_eh — заменяем на libgcc (содержит sjlj)
+rustflags = ["-C", "link-arg=-lgcc", "-C", "link-arg=-lmingwex"]
+linker = "C:\\w64devkit\\bin\\gcc.exe"

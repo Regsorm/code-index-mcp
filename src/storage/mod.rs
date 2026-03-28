@@ -1,0 +1,777 @@
+/// Модуль хранилища — SQLite через rusqlite (bundled)
+pub mod models;
+pub mod schema;
+
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
+use std::path::Path;
+
+use models::*;
+
+/// Основная структура хранилища — обёртка над SQLite-соединением
+pub struct Storage {
+    conn: Connection,
+}
+
+impl Storage {
+    // ── Конструкторы ────────────────────────────────────────────────────────
+
+    /// Открыть (или создать) файловую базу данных
+    pub fn open_file(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)
+            .with_context(|| format!("Не удалось открыть БД: {}", path.display()))?;
+        schema::initialize(&conn).context("Ошибка инициализации схемы БД")?;
+        Ok(Self { conn })
+    }
+
+    /// Открыть базу данных в памяти (используется в тестах)
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("Не удалось создать in-memory БД")?;
+        schema::initialize(&conn).context("Ошибка инициализации схемы in-memory БД")?;
+        Ok(Self { conn })
+    }
+
+    // ── Files ────────────────────────────────────────────────────────────────
+
+    /// Вставить или обновить запись файла; возвращает id строки
+    pub fn upsert_file(&self, record: &FileRecord) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO files (path, content_hash, ast_hash, language, lines_total, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path) DO UPDATE SET
+                 content_hash = excluded.content_hash,
+                 ast_hash     = excluded.ast_hash,
+                 language     = excluded.language,
+                 lines_total  = excluded.lines_total,
+                 indexed_at   = excluded.indexed_at",
+            params![
+                record.path,
+                record.content_hash,
+                record.ast_hash,
+                record.language,
+                record.lines_total as i64,
+                record.indexed_at,
+            ],
+        )
+        .context("upsert_file: ошибка выполнения запроса")?;
+
+        // Получаем id — либо только что вставленной, либо существующей строки
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM files WHERE path = ?1",
+            params![record.path],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Получить запись файла по пути
+    pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, content_hash, ast_hash, language, lines_total, indexed_at
+             FROM files WHERE path = ?1",
+        )?;
+        let result = stmt.query_row(params![path], row_to_file);
+        match result {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Получить все файлы в индексе
+    pub fn get_all_files(&self) -> Result<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, content_hash, ast_hash, language, lines_total, indexed_at
+             FROM files ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], row_to_file)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Удалить файл и все связанные записи (каскадно через FK)
+    pub fn delete_file(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM files WHERE id = ?1", params![file_id])
+            .context("delete_file: ошибка удаления")?;
+        Ok(())
+    }
+
+    // ── Functions ────────────────────────────────────────────────────────────
+
+    /// Пакетная вставка функций
+    pub fn insert_functions(&self, records: &[FunctionRecord]) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO functions
+                 (file_id, name, qualified_name, line_start, line_end,
+                  args, return_type, docstring, body, is_async, node_hash)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        )?;
+        for r in records {
+            stmt.execute(params![
+                r.file_id,
+                r.name,
+                r.qualified_name,
+                r.line_start as i64,
+                r.line_end as i64,
+                r.args,
+                r.return_type,
+                r.docstring,
+                r.body,
+                r.is_async as i32,
+                r.node_hash,
+            ])
+            .context("insert_functions: ошибка вставки строки")?;
+        }
+        Ok(())
+    }
+
+    /// Удалить все функции файла
+    pub fn delete_functions_by_file(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM functions WHERE file_id = ?1", params![file_id])
+            .context("delete_functions_by_file")?;
+        Ok(())
+    }
+
+    // ── Classes ──────────────────────────────────────────────────────────────
+
+    /// Пакетная вставка классов
+    pub fn insert_classes(&self, records: &[ClassRecord]) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO classes
+                 (file_id, name, line_start, line_end, bases, docstring, body, node_hash)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        )?;
+        for r in records {
+            stmt.execute(params![
+                r.file_id,
+                r.name,
+                r.line_start as i64,
+                r.line_end as i64,
+                r.bases,
+                r.docstring,
+                r.body,
+                r.node_hash,
+            ])
+            .context("insert_classes: ошибка вставки строки")?;
+        }
+        Ok(())
+    }
+
+    /// Удалить все классы файла
+    pub fn delete_classes_by_file(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM classes WHERE file_id = ?1", params![file_id])
+            .context("delete_classes_by_file")?;
+        Ok(())
+    }
+
+    // ── Imports ──────────────────────────────────────────────────────────────
+
+    /// Пакетная вставка импортов
+    pub fn insert_imports(&self, records: &[ImportRecord]) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO imports (file_id, module, name, alias, line, kind)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+        )?;
+        for r in records {
+            stmt.execute(params![
+                r.file_id,
+                r.module,
+                r.name,
+                r.alias,
+                r.line as i64,
+                r.kind,
+            ])
+            .context("insert_imports: ошибка вставки строки")?;
+        }
+        Ok(())
+    }
+
+    /// Удалить все импорты файла
+    pub fn delete_imports_by_file(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM imports WHERE file_id = ?1", params![file_id])
+            .context("delete_imports_by_file")?;
+        Ok(())
+    }
+
+    // ── Calls ────────────────────────────────────────────────────────────────
+
+    /// Пакетная вставка вызовов
+    pub fn insert_calls(&self, records: &[CallRecord]) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO calls (file_id, caller, callee, line) VALUES (?1,?2,?3,?4)",
+        )?;
+        for r in records {
+            stmt.execute(params![r.file_id, r.caller, r.callee, r.line as i64])
+                .context("insert_calls: ошибка вставки строки")?;
+        }
+        Ok(())
+    }
+
+    /// Удалить все вызовы файла
+    pub fn delete_calls_by_file(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM calls WHERE file_id = ?1", params![file_id])
+            .context("delete_calls_by_file")?;
+        Ok(())
+    }
+
+    // ── Variables ────────────────────────────────────────────────────────────
+
+    /// Пакетная вставка переменных
+    pub fn insert_variables(&self, records: &[VariableRecord]) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO variables (file_id, name, value, line) VALUES (?1,?2,?3,?4)",
+        )?;
+        for r in records {
+            stmt.execute(params![r.file_id, r.name, r.value, r.line as i64])
+                .context("insert_variables: ошибка вставки строки")?;
+        }
+        Ok(())
+    }
+
+    /// Удалить все переменные файла
+    pub fn delete_variables_by_file(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM variables WHERE file_id = ?1", params![file_id])
+            .context("delete_variables_by_file")?;
+        Ok(())
+    }
+
+    // ── Text files ───────────────────────────────────────────────────────────
+
+    /// Вставить запись текстового файла
+    pub fn insert_text_file(&self, record: &TextFileRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO text_files (file_id, content) VALUES (?1, ?2)",
+            params![record.file_id, record.content],
+        )
+        .context("insert_text_file")?;
+        Ok(())
+    }
+
+    /// Удалить запись текстового файла
+    pub fn delete_text_file_by_file(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM text_files WHERE file_id = ?1", params![file_id])
+            .context("delete_text_file_by_file")?;
+        Ok(())
+    }
+
+    // ── Поисковые запросы ────────────────────────────────────────────────────
+
+    /// Полнотекстовый поиск функций через FTS5
+    pub fn search_functions(&self, query: &str, limit: usize) -> Result<Vec<FunctionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.id, f.file_id, f.name, f.qualified_name, f.line_start, f.line_end,
+                    f.args, f.return_type, f.docstring, f.body, f.is_async, f.node_hash
+             FROM fts_functions ft
+             JOIN functions f ON f.id = ft.rowid
+             WHERE fts_functions MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, limit as i64], row_to_function)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Полнотекстовый поиск классов через FTS5
+    pub fn search_classes(&self, query: &str, limit: usize) -> Result<Vec<ClassRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.file_id, c.name, c.line_start, c.line_end,
+                    c.bases, c.docstring, c.body, c.node_hash
+             FROM fts_classes ft
+             JOIN classes c ON c.id = ft.rowid
+             WHERE fts_classes MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, limit as i64], row_to_class)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Полнотекстовый поиск по текстовым файлам; возвращает (path, фрагмент контента)
+    pub fn search_text(&self, query: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fi.path, snippet(fts_text_files, 0, '[', ']', '...', 20)
+             FROM fts_text_files ft
+             JOIN text_files tf ON tf.id = ft.rowid
+             JOIN files fi ON fi.id = tf.file_id
+             WHERE fts_text_files MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Найти функции по точному имени
+    pub fn get_function_by_name(&self, name: &str) -> Result<Vec<FunctionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, qualified_name, line_start, line_end,
+                    args, return_type, docstring, body, is_async, node_hash
+             FROM functions WHERE name = ?1",
+        )?;
+        let rows = stmt.query_map(params![name], row_to_function)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Найти классы по точному имени
+    pub fn get_class_by_name(&self, name: &str) -> Result<Vec<ClassRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, line_start, line_end,
+                    bases, docstring, body, node_hash
+             FROM classes WHERE name = ?1",
+        )?;
+        let rows = stmt.query_map(params![name], row_to_class)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Найти все вызовы, где данная функция является caller
+    pub fn get_callees(&self, function_name: &str) -> Result<Vec<CallRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, caller, callee, line FROM calls WHERE caller = ?1",
+        )?;
+        let rows = stmt.query_map(params![function_name], row_to_call)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Найти все вызовы, где данная функция является callee
+    pub fn get_callers(&self, function_name: &str) -> Result<Vec<CallRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, caller, callee, line FROM calls WHERE callee = ?1",
+        )?;
+        let rows = stmt.query_map(params![function_name], row_to_call)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Объединённый поиск символа по имени (функции + классы + переменные + импорты)
+    pub fn find_symbol(&self, name: &str) -> Result<SymbolSearchResult> {
+        // Функции
+        let functions = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, file_id, name, qualified_name, line_start, line_end,
+                        args, return_type, docstring, body, is_async, node_hash
+                 FROM functions WHERE name = ?1 OR qualified_name = ?1",
+            )?;
+            let rows = stmt.query_map(params![name], row_to_function)?;
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
+        };
+        // Классы
+        let classes = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, file_id, name, line_start, line_end,
+                        bases, docstring, body, node_hash
+                 FROM classes WHERE name = ?1",
+            )?;
+            let rows = stmt.query_map(params![name], row_to_class)?;
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
+        };
+        // Переменные
+        let variables = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, file_id, name, value, line FROM variables WHERE name = ?1",
+            )?;
+            let rows = stmt.query_map(params![name], row_to_variable)?;
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
+        };
+        // Импорты
+        let imports = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, file_id, module, name, alias, line, kind
+                 FROM imports WHERE name = ?1 OR alias = ?1",
+            )?;
+            let rows = stmt.query_map(params![name], row_to_import)?;
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        Ok(SymbolSearchResult { functions, classes, variables, imports })
+    }
+
+    /// Получить все импорты файла
+    pub fn get_imports_by_file(&self, file_id: i64) -> Result<Vec<ImportRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, module, name, alias, line, kind
+             FROM imports WHERE file_id = ?1 ORDER BY line",
+        )?;
+        let rows = stmt.query_map(params![file_id], row_to_import)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Найти все импорты указанного модуля
+    pub fn get_imports_by_module(&self, module: &str) -> Result<Vec<ImportRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, module, name, alias, line, kind
+             FROM imports WHERE module = ?1",
+        )?;
+        let rows = stmt.query_map(params![module], row_to_import)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Сводная информация о файле по пути
+    pub fn get_file_summary(&self, path: &str) -> Result<Option<FileSummary>> {
+        let file = match self.get_file_by_path(path)? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let file_id = file.id.unwrap();
+
+        // Функции файла
+        let functions = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, file_id, name, qualified_name, line_start, line_end,
+                        args, return_type, docstring, body, is_async, node_hash
+                 FROM functions WHERE file_id = ?1 ORDER BY line_start",
+            )?;
+            let rows = stmt.query_map(params![file_id], row_to_function)?;
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
+        };
+        // Классы файла
+        let classes = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, file_id, name, line_start, line_end,
+                        bases, docstring, body, node_hash
+                 FROM classes WHERE file_id = ?1 ORDER BY line_start",
+            )?;
+            let rows = stmt.query_map(params![file_id], row_to_class)?;
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
+        };
+        // Импорты файла
+        let imports = self.get_imports_by_file(file_id)?;
+        // Переменные файла
+        let variables = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, file_id, name, value, line
+                 FROM variables WHERE file_id = ?1 ORDER BY line",
+            )?;
+            let rows = stmt.query_map(params![file_id], row_to_variable)?;
+            rows.map(|r| r.map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        Ok(Some(FileSummary { file, functions, classes, imports, variables }))
+    }
+
+    /// Статистика базы данных
+    pub fn get_stats(&self) -> Result<DbStats> {
+        let count = |table: &str| -> Result<usize> {
+            let n: i64 = self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(n as usize)
+        };
+        Ok(DbStats {
+            total_files:      count("files")?,
+            total_functions:  count("functions")?,
+            total_classes:    count("classes")?,
+            total_imports:    count("imports")?,
+            total_calls:      count("calls")?,
+            total_variables:  count("variables")?,
+            total_text_files: count("text_files")?,
+        })
+    }
+
+    // ── Транзакции ───────────────────────────────────────────────────────────
+
+    /// Выполнить функцию внутри транзакции
+    pub fn execute_in_transaction<F, T>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&rusqlite::Transaction) -> Result<T>,
+    {
+        let tx = self.conn.transaction().context("Не удалось начать транзакцию")?;
+        let result = f(&tx)?;
+        tx.commit().context("Не удалось закоммитить транзакцию")?;
+        Ok(result)
+    }
+}
+
+// ── Вспомогательные функции маппинга строк ───────────────────────────────────
+
+fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
+    Ok(FileRecord {
+        id:           Some(row.get(0)?),
+        path:         row.get(1)?,
+        content_hash: row.get(2)?,
+        ast_hash:     row.get(3)?,
+        language:     row.get(4)?,
+        lines_total:  row.get::<_, i64>(5)? as usize,
+        indexed_at:   row.get(6)?,
+    })
+}
+
+fn row_to_function(row: &rusqlite::Row<'_>) -> rusqlite::Result<FunctionRecord> {
+    Ok(FunctionRecord {
+        id:             Some(row.get(0)?),
+        file_id:        row.get(1)?,
+        name:           row.get(2)?,
+        qualified_name: row.get(3)?,
+        line_start:     row.get::<_, i64>(4)? as usize,
+        line_end:       row.get::<_, i64>(5)? as usize,
+        args:           row.get(6)?,
+        return_type:    row.get(7)?,
+        docstring:      row.get(8)?,
+        body:           row.get(9)?,
+        is_async:       row.get::<_, i32>(10)? != 0,
+        node_hash:      row.get(11)?,
+    })
+}
+
+fn row_to_class(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClassRecord> {
+    Ok(ClassRecord {
+        id:        Some(row.get(0)?),
+        file_id:   row.get(1)?,
+        name:      row.get(2)?,
+        line_start: row.get::<_, i64>(3)? as usize,
+        line_end:   row.get::<_, i64>(4)? as usize,
+        bases:     row.get(5)?,
+        docstring: row.get(6)?,
+        body:      row.get(7)?,
+        node_hash: row.get(8)?,
+    })
+}
+
+fn row_to_import(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRecord> {
+    Ok(ImportRecord {
+        id:      Some(row.get(0)?),
+        file_id: row.get(1)?,
+        module:  row.get(2)?,
+        name:    row.get(3)?,
+        alias:   row.get(4)?,
+        line:    row.get::<_, i64>(5)? as usize,
+        kind:    row.get(6)?,
+    })
+}
+
+fn row_to_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
+    Ok(CallRecord {
+        id:      Some(row.get(0)?),
+        file_id: row.get(1)?,
+        caller:  row.get(2)?,
+        callee:  row.get(3)?,
+        line:    row.get::<_, i64>(4)? as usize,
+    })
+}
+
+fn row_to_variable(row: &rusqlite::Row<'_>) -> rusqlite::Result<VariableRecord> {
+    Ok(VariableRecord {
+        id:      Some(row.get(0)?),
+        file_id: row.get(1)?,
+        name:    row.get(2)?,
+        value:   row.get(3)?,
+        line:    row.get::<_, i64>(4)? as usize,
+    })
+}
+
+// ── Тесты ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Вспомогательный FileRecord для тестов
+    fn make_file(path: &str) -> FileRecord {
+        FileRecord {
+            id: None,
+            path: path.to_string(),
+            content_hash: "abc123".to_string(),
+            ast_hash: None,
+            language: "python".to_string(),
+            lines_total: 100,
+            indexed_at: "2026-01-01T00:00:00".to_string(),
+        }
+    }
+
+    /// Вспомогательный FunctionRecord для тестов
+    fn make_function(file_id: i64, name: &str) -> FunctionRecord {
+        FunctionRecord {
+            id: None,
+            file_id,
+            name: name.to_string(),
+            qualified_name: Some(format!("module.{name}")),
+            line_start: 1,
+            line_end: 10,
+            args: Some("(x, y)".to_string()),
+            return_type: Some("int".to_string()),
+            docstring: Some(format!("Вычисляет {name}")),
+            body: format!("def {name}(x, y):\n    return x + y"),
+            is_async: false,
+            node_hash: "hash123".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_create_and_query_file() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания in-memory БД");
+
+        let rec = make_file("/src/main.py");
+        let id = storage.upsert_file(&rec).expect("upsert_file");
+        assert!(id > 0, "id должен быть положительным");
+
+        let found = storage.get_file_by_path("/src/main.py")
+            .expect("get_file_by_path")
+            .expect("файл должен существовать");
+        assert_eq!(found.path, "/src/main.py");
+        assert_eq!(found.language, "python");
+        assert_eq!(found.lines_total, 100);
+    }
+
+    #[test]
+    fn test_upsert_updates_existing() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания in-memory БД");
+
+        let rec = make_file("/src/utils.py");
+        let id1 = storage.upsert_file(&rec).expect("первый upsert");
+
+        // Обновляем hash
+        let mut rec2 = rec.clone();
+        rec2.content_hash = "newHash".to_string();
+        rec2.lines_total = 200;
+        let id2 = storage.upsert_file(&rec2).expect("второй upsert");
+
+        assert_eq!(id1, id2, "id не должен меняться при обновлении");
+        let found = storage.get_file_by_path("/src/utils.py")
+            .unwrap().unwrap();
+        assert_eq!(found.content_hash, "newHash");
+        assert_eq!(found.lines_total, 200);
+    }
+
+    #[test]
+    fn test_functions_crud() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+
+        let file_id = storage.upsert_file(&make_file("/src/funcs.py")).unwrap();
+        let funcs = vec![
+            make_function(file_id, "add"),
+            make_function(file_id, "subtract"),
+        ];
+        storage.insert_functions(&funcs).expect("insert_functions");
+
+        // Поиск по точному имени
+        let found = storage.get_function_by_name("add").expect("get_function_by_name");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "add");
+
+        // Удаление
+        storage.delete_functions_by_file(file_id).expect("delete_functions_by_file");
+        let empty = storage.get_function_by_name("add").unwrap();
+        assert!(empty.is_empty(), "после удаления функций не должно быть");
+    }
+
+    #[test]
+    fn test_fts_search() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+
+        let file_id = storage.upsert_file(&make_file("/src/algo.py")).unwrap();
+        let funcs = vec![
+            FunctionRecord {
+                id: None,
+                file_id,
+                name: "binary_search".to_string(),
+                qualified_name: None,
+                line_start: 1,
+                line_end: 20,
+                args: Some("(arr, target)".to_string()),
+                return_type: Some("int".to_string()),
+                docstring: Some("Бинарный поиск в отсортированном массиве".to_string()),
+                body: "def binary_search(arr, target):\n    pass".to_string(),
+                is_async: false,
+                node_hash: "hs1".to_string(),
+            },
+            FunctionRecord {
+                id: None,
+                file_id,
+                name: "linear_scan".to_string(),
+                qualified_name: None,
+                line_start: 22,
+                line_end: 30,
+                args: None,
+                return_type: None,
+                docstring: Some("Линейный обход списка".to_string()),
+                body: "def linear_scan():\n    pass".to_string(),
+                is_async: false,
+                node_hash: "hs2".to_string(),
+            },
+        ];
+        storage.insert_functions(&funcs).unwrap();
+
+        // FTS-поиск по слову в имени
+        let results = storage.search_functions("binary_search", 10).expect("search_functions");
+        assert_eq!(results.len(), 1, "должна найтись ровно одна функция");
+        assert_eq!(results[0].name, "binary_search");
+    }
+
+    #[test]
+    fn test_cascade_delete() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+
+        let file_id = storage.upsert_file(&make_file("/src/cascade.py")).unwrap();
+        storage.insert_functions(&[make_function(file_id, "foo")]).unwrap();
+        storage.insert_classes(&[ClassRecord {
+            id: None, file_id, name: "Bar".into(),
+            line_start: 1, line_end: 5, bases: None, docstring: None,
+            body: "class Bar: pass".into(), node_hash: "h".into(),
+        }]).unwrap();
+
+        // Удаляем файл — ожидаем каскадное удаление
+        storage.delete_file(file_id).unwrap();
+
+        let funcs = storage.get_function_by_name("foo").unwrap();
+        assert!(funcs.is_empty(), "функции должны быть удалены каскадно");
+
+        let classes = storage.get_class_by_name("Bar").unwrap();
+        assert!(classes.is_empty(), "классы должны быть удалены каскадно");
+    }
+
+    #[test]
+    fn test_find_symbol() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+
+        let file_id = storage.upsert_file(&make_file("/src/symbols.py")).unwrap();
+        storage.insert_functions(&[make_function(file_id, "compute")]).unwrap();
+        storage.insert_variables(&[VariableRecord {
+            id: None, file_id, name: "compute".into(),
+            value: Some("42".into()), line: 5,
+        }]).unwrap();
+
+        let result = storage.find_symbol("compute").expect("find_symbol");
+        assert_eq!(result.functions.len(), 1, "должна найтись 1 функция");
+        assert_eq!(result.variables.len(), 1, "должна найтись 1 переменная");
+        assert!(result.classes.is_empty());
+        assert!(result.imports.is_empty());
+    }
+
+    #[test]
+    fn test_stats() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+
+        // Пустая база
+        let stats = storage.get_stats().expect("get_stats");
+        assert_eq!(stats.total_files, 0);
+
+        let file_id = storage.upsert_file(&make_file("/src/stats.py")).unwrap();
+        storage.insert_functions(&[
+            make_function(file_id, "f1"),
+            make_function(file_id, "f2"),
+        ]).unwrap();
+        storage.insert_calls(&[CallRecord {
+            id: None, file_id, caller: "f1".into(), callee: "f2".into(), line: 5,
+        }]).unwrap();
+
+        let stats = storage.get_stats().expect("get_stats после вставки");
+        assert_eq!(stats.total_files, 1);
+        assert_eq!(stats.total_functions, 2);
+        assert_eq!(stats.total_calls, 1);
+    }
+}
