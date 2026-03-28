@@ -2,12 +2,11 @@
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
+use code_index_mcp::daemon::DaemonConfig;
 use code_index_mcp::indexer::config::IndexConfig;
 use code_index_mcp::indexer::Indexer;
-use code_index_mcp::mcp::CodeIndexServer;
 use code_index_mcp::storage::memory::StorageConfig;
 use code_index_mcp::storage::Storage;
-use rmcp::ServiceExt;
 
 #[derive(Parser)]
 #[command(name = "code-index", version, about = "Высокопроизводительный индексатор кода с MCP-протоколом")]
@@ -27,6 +26,14 @@ enum Commands {
         /// Транспорт: stdio или http
         #[arg(short, long, default_value = "stdio")]
         transport: String,
+
+        /// Запустить без file watcher (только startup индексация + MCP)
+        #[arg(long)]
+        no_watch: bool,
+
+        /// Интервал периодической записи БД на диск (в секундах)
+        #[arg(long, default_value = "30")]
+        flush_interval: u64,
     },
 
     /// Проиндексировать директорию (однократно)
@@ -92,8 +99,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { path, transport } => {
-            tracing::info!("Запуск MCP-сервера: path={}, transport={}", path, transport);
+        Commands::Serve { path, transport, no_watch, flush_interval } => {
+            tracing::info!(
+                "Запуск MCP-сервера: path={}, transport={}, no_watch={}, flush_interval={}s",
+                path, transport, no_watch, flush_interval
+            );
 
             // Разрешить путь до абсолютного
             let root = Path::new(&path)
@@ -108,30 +118,24 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Загрузить конфигурацию проекта
-            let config = IndexConfig::load(&root)?;
+            let index_config = IndexConfig::load(&root)?;
 
-            // Открыть хранилище с автоопределением режима
+            // Подготовить конфигурацию хранилища
             let storage_config = StorageConfig {
-                mode: config.storage_mode.clone(),
-                memory_max_percent: config.memory_max_percent,
+                mode: index_config.storage_mode.clone(),
+                memory_max_percent: index_config.memory_max_percent,
             };
-            let mut storage = Storage::open_auto(&db_path, &storage_config)?;
 
-            // Начальная индексация проекта
-            let mut indexer = Indexer::with_config(&mut storage, config);
-            let index_result = indexer.full_reindex(&root, false)?;
-            eprintln!(
-                "Индексация завершена: {} файлов за {} мс",
-                index_result.files_indexed, index_result.elapsed_ms
-            );
-
-            // Если работаем в in-memory режиме — сохранить результаты на диск
-            storage.flush_to_disk(&db_path)?;
-
-            // Запуск MCP-сервера через stdio-транспорт
-            let server = CodeIndexServer::new(storage);
-            let service = server.serve(rmcp::transport::io::stdio()).await?;
-            service.waiting().await?;
+            // Запустить daemon (startup scan + MCP + watcher)
+            let daemon_config = DaemonConfig {
+                root,
+                db_path,
+                index_config,
+                storage_config,
+                no_watch,
+                flush_interval_sec: flush_interval,
+            };
+            code_index_mcp::daemon::run_daemon(daemon_config).await?;
         }
 
         Commands::Index { path, force } => {

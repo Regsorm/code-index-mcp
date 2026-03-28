@@ -43,6 +43,8 @@ schemars = "1"
 # Файловая система
 walkdir = "2"
 rayon = "1.10"
+notify = "7"
+notify-debouncer-full = "0.4"
 
 # Хеширование
 sha2 = "0.10"

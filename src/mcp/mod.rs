@@ -83,6 +83,17 @@ impl CodeIndexServer {
             tool_router: Self::tool_router(),
         }
     }
+
+    /// Создать сервер из уже разделяемого хранилища (для daemon-режима).
+    ///
+    /// Принимает Arc<Mutex<Storage>> снаружи — сервер и watcher
+    /// будут работать с одной и той же БД.
+    pub fn new_from_shared(storage: Arc<Mutex<Storage>>) -> Self {
+        Self {
+            storage,
+            tool_router: Self::tool_router(),
+        }
+    }
 }
 
 // ── Регистрация инструментов ──────────────────────────────────────────────────

@@ -354,7 +354,7 @@ impl<'a> Indexer<'a> {
 
     /// Записать код-файл в БД: метаданные + символы (функции, классы, импорты и т.д.)
     /// skip_delete: при первичной индексации пропускать DELETE (БД пуста, удалять нечего)
-    fn write_code_to_db(
+    pub fn write_code_to_db(
         &self,
         rel_path: &str,
         content_hash: &str,
@@ -475,7 +475,7 @@ impl<'a> Indexer<'a> {
     }
 
     /// Записать текстовый файл в БД: метаданные + полное содержимое для FTS
-    fn write_text_to_db(
+    pub fn write_text_to_db(
         &self,
         rel_path: &str,
         content_hash: &str,

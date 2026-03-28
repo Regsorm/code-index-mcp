@@ -52,6 +52,26 @@ pub struct IndexConfig {
     /// Используется только при `storage_mode = "auto"`. По умолчанию 25%.
     #[serde(default = "default_memory_max_percent")]
     pub memory_max_percent: u8,
+
+    /// Задержка debounce для file watcher в миллисекундах.
+    ///
+    /// Ждёт `debounce_ms` тишины после последнего события, затем обрабатывает батч.
+    /// По умолчанию 1500 мс.
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+
+    /// Максимальное время накопления батча для file watcher в миллисекундах.
+    ///
+    /// Даже при непрерывных событиях батч обрабатывается через `batch_ms`.
+    /// По умолчанию 2000 мс.
+    #[serde(default = "default_batch_ms")]
+    pub batch_ms: u64,
+
+    /// Интервал периодической записи БД на диск в секундах (для daemon).
+    ///
+    /// По умолчанию 30 секунд.
+    #[serde(default = "default_flush_interval")]
+    pub flush_interval_sec: u64,
 }
 
 fn default_storage_mode() -> String {
@@ -60,6 +80,18 @@ fn default_storage_mode() -> String {
 
 fn default_memory_max_percent() -> u8 {
     25
+}
+
+fn default_debounce_ms() -> u64 {
+    1500
+}
+
+fn default_batch_ms() -> u64 {
+    2000
+}
+
+fn default_flush_interval() -> u64 {
+    30
 }
 
 fn default_max_file_size() -> usize {
@@ -99,6 +131,9 @@ impl Default for IndexConfig {
             batch_size: default_batch_size(),
             storage_mode: default_storage_mode(),
             memory_max_percent: default_memory_max_percent(),
+            debounce_ms: default_debounce_ms(),
+            batch_ms: default_batch_ms(),
+            flush_interval_sec: default_flush_interval(),
         }
     }
 }
