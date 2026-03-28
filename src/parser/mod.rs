@@ -4,6 +4,7 @@ pub mod javascript;
 pub mod typescript;
 pub mod java;
 pub mod rust_lang;
+pub mod go;
 pub mod text;
 pub mod bsl;
 
@@ -40,6 +41,7 @@ impl ParserRegistry {
         registry.register(Arc::new(typescript::TypeScriptParser::new()));
         registry.register(Arc::new(java::JavaParser::new()));
         registry.register(Arc::new(rust_lang::RustParser::new()));
+        registry.register(Arc::new(go::GoParser::new()));
         registry.register(Arc::new(bsl::BslParser::new()));
         registry
     }
@@ -60,6 +62,7 @@ impl ParserRegistry {
                 }
                 "java" => registry.register(Arc::new(java::JavaParser::new())),
                 "rust" => registry.register(Arc::new(rust_lang::RustParser::new())),
+                "go" => registry.register(Arc::new(go::GoParser::new())),
                 "bsl" => registry.register(Arc::new(bsl::BslParser::new())),
                 _ => {} // Неизвестный язык — пропускаем без ошибки
             }
@@ -94,6 +97,7 @@ pub fn get_parser_for_extension(ext: &str) -> Option<Box<dyn LanguageParser>> {
         "ts" | "tsx" => Some(Box::new(typescript::TypeScriptParser::new())),
         "java" => Some(Box::new(java::JavaParser::new())),
         "rs" => Some(Box::new(rust_lang::RustParser::new())),
+        "go" => Some(Box::new(go::GoParser::new())),
         "bsl" | "os" => Some(Box::new(bsl::BslParser::new())),
         _ => None,
     }
@@ -140,12 +144,14 @@ mod tests {
 
     #[test]
     fn test_parser_registry_unknown_language() {
-        // Неизвестный язык не должен вызывать панику; go — не поддерживается
-        let reg = ParserRegistry::from_languages(&["rust".to_string(), "go".to_string()]);
-        // Rust теперь поддерживается — .rs должен найтись
+        // Неизвестный язык не должен вызывать панику
+        let reg = ParserRegistry::from_languages(&["rust".to_string(), "go".to_string(), "cobol".to_string()]);
+        // Rust поддерживается — .rs должен найтись
         assert!(reg.get_parser("rs").is_some());
-        // Go не поддерживается — остаётся None
-        assert!(reg.get_parser("go").is_none());
+        // Go теперь поддерживается — .go должен найтись
+        assert!(reg.get_parser("go").is_some());
+        // Неизвестный язык — None
+        assert!(reg.get_parser("cob").is_none());
     }
 
     #[test]

@@ -13,18 +13,18 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 }
 
 /// FTS-поиск функций по запросу
-pub async fn search_function(server: &CodeIndexServer, query: String, limit: Option<usize>) -> String {
+pub async fn search_function(server: &CodeIndexServer, query: String, limit: Option<usize>, language: Option<String>) -> String {
     let storage = server.storage.lock().await;
-    match storage.search_functions(&query, limit.unwrap_or(20)) {
+    match storage.search_functions(&query, limit.unwrap_or(20), language.as_deref()) {
         Ok(results) => to_json(&results),
         Err(e) => format!("{{\"error\": \"search_function: {}\"}}", e),
     }
 }
 
 /// FTS-поиск классов по запросу
-pub async fn search_class(server: &CodeIndexServer, query: String, limit: Option<usize>) -> String {
+pub async fn search_class(server: &CodeIndexServer, query: String, limit: Option<usize>, language: Option<String>) -> String {
     let storage = server.storage.lock().await;
-    match storage.search_classes(&query, limit.unwrap_or(20)) {
+    match storage.search_classes(&query, limit.unwrap_or(20), language.as_deref()) {
         Ok(results) => to_json(&results),
         Err(e) => format!("{{\"error\": \"search_class: {}\"}}", e),
     }
@@ -49,27 +49,27 @@ pub async fn get_class(server: &CodeIndexServer, name: String) -> String {
 }
 
 /// Кто вызывает данную функцию
-pub async fn get_callers(server: &CodeIndexServer, function_name: String) -> String {
+pub async fn get_callers(server: &CodeIndexServer, function_name: String, language: Option<String>) -> String {
     let storage = server.storage.lock().await;
-    match storage.get_callers(&function_name) {
+    match storage.get_callers(&function_name, language.as_deref()) {
         Ok(results) => to_json(&results),
         Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
     }
 }
 
 /// Что вызывает данная функция
-pub async fn get_callees(server: &CodeIndexServer, function_name: String) -> String {
+pub async fn get_callees(server: &CodeIndexServer, function_name: String, language: Option<String>) -> String {
     let storage = server.storage.lock().await;
-    match storage.get_callees(&function_name) {
+    match storage.get_callees(&function_name, language.as_deref()) {
         Ok(results) => to_json(&results),
         Err(e) => format!("{{\"error\": \"get_callees: {}\"}}", e),
     }
 }
 
 /// Универсальный поиск символа (функции + классы + переменные + импорты)
-pub async fn find_symbol(server: &CodeIndexServer, name: String) -> String {
+pub async fn find_symbol(server: &CodeIndexServer, name: String, language: Option<String>) -> String {
     let storage = server.storage.lock().await;
-    match storage.find_symbol(&name) {
+    match storage.find_symbol(&name, language.as_deref()) {
         Ok(result) => to_json(&result),
         Err(e) => format!("{{\"error\": \"find_symbol: {}\"}}", e),
     }
@@ -80,18 +80,19 @@ pub async fn get_imports(
     server: &CodeIndexServer,
     file_id: Option<i64>,
     module: Option<String>,
+    language: Option<String>,
 ) -> String {
     let storage = server.storage.lock().await;
-    // Если задан file_id — поиск по файлу
+    // Если задан file_id — поиск по файлу (language не применяется, file_id уникален)
     if let Some(fid) = file_id {
         return match storage.get_imports_by_file(fid) {
             Ok(results) => to_json(&results),
             Err(e) => format!("{{\"error\": \"get_imports_by_file: {}\"}}", e),
         };
     }
-    // Если задан модуль — поиск по модулю
+    // Если задан модуль — поиск по модулю с необязательным фильтром по языку
     if let Some(ref m) = module {
-        return match storage.get_imports_by_module(m) {
+        return match storage.get_imports_by_module(m, language.as_deref()) {
             Ok(results) => to_json(&results),
             Err(e) => format!("{{\"error\": \"get_imports_by_module: {}\"}}", e),
         };
@@ -120,9 +121,9 @@ pub async fn get_stats(server: &CodeIndexServer) -> String {
 }
 
 /// FTS-поиск по текстовым файлам
-pub async fn search_text(server: &CodeIndexServer, query: String, limit: Option<usize>) -> String {
+pub async fn search_text(server: &CodeIndexServer, query: String, limit: Option<usize>, language: Option<String>) -> String {
     let storage = server.storage.lock().await;
-    match storage.search_text(&query, limit.unwrap_or(20)) {
+    match storage.search_text(&query, limit.unwrap_or(20), language.as_deref()) {
         Ok(results) => {
             // Преобразуем Vec<(String, String)> в массив объектов для удобства
             let items: Vec<serde_json::Value> = results

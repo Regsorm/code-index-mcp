@@ -667,10 +667,10 @@ class App:
         assert_eq!(stats.total_functions, 15, "по одной функции на файл");
 
         // Проверяем, что FTS работает после rebuild
-        let found = storage.search_functions("func_0", 10).unwrap();
+        let found = storage.search_functions("func_0", 10, None).unwrap();
         assert!(!found.is_empty(), "FTS должен находить func_0 после bulk-load rebuild");
 
-        let found_5 = storage.search_functions("func_5", 10).unwrap();
+        let found_5 = storage.search_functions("func_5", 10, None).unwrap();
         assert!(!found_5.is_empty(), "FTS должен находить func_5 после bulk-load rebuild");
 
         // Второй проход: повторная индексация — все файлы должны быть пропущены

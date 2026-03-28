@@ -24,6 +24,8 @@ pub struct SearchParams {
     pub query: String,
     /// Максимальное количество результатов (по умолчанию 20)
     pub limit: Option<usize>,
+    /// Фильтр по языку программирования (например: "python", "rust", "javascript")
+    pub language: Option<String>,
 }
 
 /// Параметры поиска по точному имени
@@ -31,6 +33,8 @@ pub struct SearchParams {
 pub struct NameParams {
     /// Точное имя (функции, класса или символа)
     pub name: String,
+    /// Фильтр по языку программирования (например: "python", "rust", "javascript")
+    pub language: Option<String>,
 }
 
 /// Параметры для поиска вызывателей/вызываемых
@@ -38,6 +42,8 @@ pub struct NameParams {
 pub struct FunctionNameParams {
     /// Имя функции
     pub function_name: String,
+    /// Фильтр по языку программирования (например: "python", "rust", "javascript")
+    pub language: Option<String>,
 }
 
 /// Параметры получения импортов (file_id или имя модуля)
@@ -47,6 +53,8 @@ pub struct ImportParams {
     pub file_id: Option<i64>,
     /// Имя модуля для поиска импортов
     pub module: Option<String>,
+    /// Фильтр по языку программирования (применяется только при поиске по module)
+    pub language: Option<String>,
 }
 
 /// Параметры получения карты файла
@@ -85,14 +93,14 @@ impl CodeIndexServer {
     /// Возвращает JSON-массив найденных функций.
     #[tool(description = "FTS поиск функций: по имени, docstring, телу. Возвращает JSON-массив FunctionRecord.")]
     async fn search_function(&self, Parameters(p): Parameters<SearchParams>) -> String {
-        tools::search_function(self, p.query, p.limit).await
+        tools::search_function(self, p.query, p.limit, p.language).await
     }
 
     /// Полнотекстовый поиск классов по запросу (FTS5).
     /// Возвращает JSON-массив найденных классов.
     #[tool(description = "FTS поиск классов: по имени, docstring, телу. Возвращает JSON-массив ClassRecord.")]
     async fn search_class(&self, Parameters(p): Parameters<SearchParams>) -> String {
-        tools::search_class(self, p.query, p.limit).await
+        tools::search_class(self, p.query, p.limit, p.language).await
     }
 
     /// Найти функцию по точному имени.
@@ -113,28 +121,28 @@ impl CodeIndexServer {
     /// Возвращает JSON-массив записей вызовов.
     #[tool(description = "Найти вызывателей функции (callers). Возвращает JSON-массив CallRecord.")]
     async fn get_callers(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
-        tools::get_callers(self, p.function_name).await
+        tools::get_callers(self, p.function_name, p.language).await
     }
 
     /// Найти все функции, которые вызывает данная функция (callees).
     /// Возвращает JSON-массив записей вызовов.
     #[tool(description = "Найти что вызывает функция (callees). Возвращает JSON-массив CallRecord.")]
     async fn get_callees(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
-        tools::get_callees(self, p.function_name).await
+        tools::get_callees(self, p.function_name, p.language).await
     }
 
     /// Универсальный поиск символа: функции + классы + переменные + импорты.
     /// Возвращает JSON-объект SymbolSearchResult.
     #[tool(description = "Универсальный поиск символа по точному имени. Возвращает JSON-объект {functions, classes, variables, imports}.")]
     async fn find_symbol(&self, Parameters(p): Parameters<NameParams>) -> String {
-        tools::find_symbol(self, p.name).await
+        tools::find_symbol(self, p.name, p.language).await
     }
 
     /// Получить импорты файла (по file_id) или импорты модуля (по имени).
     /// Возвращает JSON-массив ImportRecord.
     #[tool(description = "Импорты файла (file_id) или модуля (module). Возвращает JSON-массив ImportRecord.")]
     async fn get_imports(&self, Parameters(p): Parameters<ImportParams>) -> String {
-        tools::get_imports(self, p.file_id, p.module).await
+        tools::get_imports(self, p.file_id, p.module, p.language).await
     }
 
     /// Получить сводную карту файла: все функции, классы, импорты, переменные.
@@ -155,7 +163,7 @@ impl CodeIndexServer {
     /// Возвращает JSON-массив объектов {path, snippet}.
     #[tool(description = "FTS поиск по текстовым файлам (md, txt, yaml, toml). Возвращает JSON-массив [{path, snippet}].")]
     async fn search_text(&self, Parameters(p): Parameters<SearchParams>) -> String {
-        tools::search_text(self, p.query, p.limit).await
+        tools::search_text(self, p.query, p.limit, p.language).await
     }
 }
 

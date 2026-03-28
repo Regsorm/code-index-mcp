@@ -263,50 +263,108 @@ impl Storage {
     // ── Поисковые запросы ────────────────────────────────────────────────────
 
     /// Полнотекстовый поиск функций через FTS5
-    pub fn search_functions(&self, query: &str, limit: usize) -> Result<Vec<FunctionRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT f.id, f.file_id, f.name, f.qualified_name, f.line_start, f.line_end,
-                    f.args, f.return_type, f.docstring, f.body, f.is_async, f.node_hash
-             FROM fts_functions ft
-             JOIN functions f ON f.id = ft.rowid
-             WHERE fts_functions MATCH ?1
-             ORDER BY rank
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![query, limit as i64], row_to_function)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+    pub fn search_functions(&self, query: &str, limit: usize, language: Option<&str>) -> Result<Vec<FunctionRecord>> {
+        let safe_query = sanitize_fts_query(query);
+        match language {
+            Some(lang) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT f.id, f.file_id, f.name, f.qualified_name, f.line_start, f.line_end,
+                            f.args, f.return_type, f.docstring, f.body, f.is_async, f.node_hash
+                     FROM fts_functions ft
+                     JOIN functions f ON f.id = ft.rowid
+                     JOIN files fi ON fi.id = f.file_id
+                     WHERE fts_functions MATCH ?1 AND fi.language = ?2
+                     ORDER BY rank
+                     LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![safe_query, lang, limit as i64], row_to_function)?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT f.id, f.file_id, f.name, f.qualified_name, f.line_start, f.line_end,
+                            f.args, f.return_type, f.docstring, f.body, f.is_async, f.node_hash
+                     FROM fts_functions ft
+                     JOIN functions f ON f.id = ft.rowid
+                     WHERE fts_functions MATCH ?1
+                     ORDER BY rank
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![safe_query, limit as i64], row_to_function)?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+        }
     }
 
     /// Полнотекстовый поиск классов через FTS5
-    pub fn search_classes(&self, query: &str, limit: usize) -> Result<Vec<ClassRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.file_id, c.name, c.line_start, c.line_end,
-                    c.bases, c.docstring, c.body, c.node_hash
-             FROM fts_classes ft
-             JOIN classes c ON c.id = ft.rowid
-             WHERE fts_classes MATCH ?1
-             ORDER BY rank
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![query, limit as i64], row_to_class)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+    pub fn search_classes(&self, query: &str, limit: usize, language: Option<&str>) -> Result<Vec<ClassRecord>> {
+        let safe_query = sanitize_fts_query(query);
+        match language {
+            Some(lang) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT c.id, c.file_id, c.name, c.line_start, c.line_end,
+                            c.bases, c.docstring, c.body, c.node_hash
+                     FROM fts_classes ft
+                     JOIN classes c ON c.id = ft.rowid
+                     JOIN files fi ON fi.id = c.file_id
+                     WHERE fts_classes MATCH ?1 AND fi.language = ?2
+                     ORDER BY rank
+                     LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![safe_query, lang, limit as i64], row_to_class)?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT c.id, c.file_id, c.name, c.line_start, c.line_end,
+                            c.bases, c.docstring, c.body, c.node_hash
+                     FROM fts_classes ft
+                     JOIN classes c ON c.id = ft.rowid
+                     WHERE fts_classes MATCH ?1
+                     ORDER BY rank
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![safe_query, limit as i64], row_to_class)?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+        }
     }
 
     /// Полнотекстовый поиск по текстовым файлам; возвращает (path, фрагмент контента)
-    pub fn search_text(&self, query: &str, limit: usize) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT fi.path, snippet(fts_text_files, 0, '[', ']', '...', 20)
-             FROM fts_text_files ft
-             JOIN text_files tf ON tf.id = ft.rowid
-             JOIN files fi ON fi.id = tf.file_id
-             WHERE fts_text_files MATCH ?1
-             ORDER BY rank
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+    pub fn search_text(&self, query: &str, limit: usize, language: Option<&str>) -> Result<Vec<(String, String)>> {
+        let safe_query = sanitize_fts_query(query);
+        match language {
+            Some(lang) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT fi.path, snippet(fts_text_files, 0, '[', ']', '...', 20)
+                     FROM fts_text_files ft
+                     JOIN text_files tf ON tf.id = ft.rowid
+                     JOIN files fi ON fi.id = tf.file_id
+                     WHERE fts_text_files MATCH ?1 AND fi.language = ?2
+                     ORDER BY rank
+                     LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![safe_query, lang, limit as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT fi.path, snippet(fts_text_files, 0, '[', ']', '...', 20)
+                     FROM fts_text_files ft
+                     JOIN text_files tf ON tf.id = ft.rowid
+                     JOIN files fi ON fi.id = tf.file_id
+                     WHERE fts_text_files MATCH ?1
+                     ORDER BY rank
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![safe_query, limit as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+        }
     }
 
     /// Найти функции по точному имени
@@ -332,48 +390,100 @@ impl Storage {
     }
 
     /// Найти все вызовы, где данная функция является caller
-    pub fn get_callees(&self, function_name: &str) -> Result<Vec<CallRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, file_id, caller, callee, line FROM calls WHERE caller = ?1",
-        )?;
-        let rows = stmt.query_map(params![function_name], row_to_call)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+    pub fn get_callees(&self, function_name: &str, language: Option<&str>) -> Result<Vec<CallRecord>> {
+        match language {
+            Some(lang) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT c.id, c.file_id, c.caller, c.callee, c.line
+                     FROM calls c JOIN files fi ON fi.id = c.file_id
+                     WHERE c.caller = ?1 AND fi.language = ?2",
+                )?;
+                let rows = stmt.query_map(params![function_name, lang], row_to_call)?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, file_id, caller, callee, line FROM calls WHERE caller = ?1",
+                )?;
+                let rows = stmt.query_map(params![function_name], row_to_call)?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+        }
     }
 
     /// Найти все вызовы, где данная функция является callee
-    pub fn get_callers(&self, function_name: &str) -> Result<Vec<CallRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, file_id, caller, callee, line FROM calls WHERE callee = ?1",
-        )?;
-        let rows = stmt.query_map(params![function_name], row_to_call)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+    pub fn get_callers(&self, function_name: &str, language: Option<&str>) -> Result<Vec<CallRecord>> {
+        match language {
+            Some(lang) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT c.id, c.file_id, c.caller, c.callee, c.line
+                     FROM calls c JOIN files fi ON fi.id = c.file_id
+                     WHERE c.callee = ?1 AND fi.language = ?2",
+                )?;
+                let rows = stmt.query_map(params![function_name, lang], row_to_call)?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, file_id, caller, callee, line FROM calls WHERE callee = ?1",
+                )?;
+                let rows = stmt.query_map(params![function_name], row_to_call)?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+        }
     }
 
     /// Объединённый поиск символа по имени (функции + классы + переменные + импорты)
-    pub fn find_symbol(&self, name: &str) -> Result<SymbolSearchResult> {
+    pub fn find_symbol(&self, name: &str, language: Option<&str>) -> Result<SymbolSearchResult> {
         // Функции
         let functions = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, file_id, name, qualified_name, line_start, line_end,
-                        args, return_type, docstring, body, is_async, node_hash
-                 FROM functions WHERE name = ?1 OR qualified_name = ?1",
-            )?;
-            let rows = stmt.query_map(params![name], row_to_function)?;
-            rows.map(|r| r.map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?
+            match language {
+                Some(lang) => {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT f.id, f.file_id, f.name, f.qualified_name, f.line_start, f.line_end,
+                                f.args, f.return_type, f.docstring, f.body, f.is_async, f.node_hash
+                         FROM functions f JOIN files fi ON fi.id = f.file_id
+                         WHERE (f.name = ?1 OR f.qualified_name = ?1) AND fi.language = ?2",
+                    )?;
+                    let rows = stmt.query_map(params![name, lang], row_to_function)?;
+                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                }
+                None => {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT id, file_id, name, qualified_name, line_start, line_end,
+                                args, return_type, docstring, body, is_async, node_hash
+                         FROM functions WHERE name = ?1 OR qualified_name = ?1",
+                    )?;
+                    let rows = stmt.query_map(params![name], row_to_function)?;
+                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                }
+            }
         };
         // Классы
         let classes = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, file_id, name, line_start, line_end,
-                        bases, docstring, body, node_hash
-                 FROM classes WHERE name = ?1",
-            )?;
-            let rows = stmt.query_map(params![name], row_to_class)?;
-            rows.map(|r| r.map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?
+            match language {
+                Some(lang) => {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT c.id, c.file_id, c.name, c.line_start, c.line_end,
+                                c.bases, c.docstring, c.body, c.node_hash
+                         FROM classes c JOIN files fi ON fi.id = c.file_id
+                         WHERE c.name = ?1 AND fi.language = ?2",
+                    )?;
+                    let rows = stmt.query_map(params![name, lang], row_to_class)?;
+                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                }
+                None => {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT id, file_id, name, line_start, line_end,
+                                bases, docstring, body, node_hash
+                         FROM classes WHERE name = ?1",
+                    )?;
+                    let rows = stmt.query_map(params![name], row_to_class)?;
+                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                }
+            }
         };
-        // Переменные
+        // Переменные (фильтр language не применяется — variables не имеют прямой связи с language)
         let variables = {
             let mut stmt = self.conn.prepare(
                 "SELECT id, file_id, name, value, line FROM variables WHERE name = ?1",
@@ -384,13 +494,25 @@ impl Storage {
         };
         // Импорты
         let imports = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, file_id, module, name, alias, line, kind
-                 FROM imports WHERE name = ?1 OR alias = ?1",
-            )?;
-            let rows = stmt.query_map(params![name], row_to_import)?;
-            rows.map(|r| r.map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?
+            match language {
+                Some(lang) => {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT i.id, i.file_id, i.module, i.name, i.alias, i.line, i.kind
+                         FROM imports i JOIN files fi ON fi.id = i.file_id
+                         WHERE (i.name = ?1 OR i.alias = ?1) AND fi.language = ?2",
+                    )?;
+                    let rows = stmt.query_map(params![name, lang], row_to_import)?;
+                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                }
+                None => {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT id, file_id, module, name, alias, line, kind
+                         FROM imports WHERE name = ?1 OR alias = ?1",
+                    )?;
+                    let rows = stmt.query_map(params![name], row_to_import)?;
+                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                }
+            }
         };
 
         Ok(SymbolSearchResult { functions, classes, variables, imports })
@@ -407,13 +529,26 @@ impl Storage {
     }
 
     /// Найти все импорты указанного модуля
-    pub fn get_imports_by_module(&self, module: &str) -> Result<Vec<ImportRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, file_id, module, name, alias, line, kind
-             FROM imports WHERE module = ?1",
-        )?;
-        let rows = stmt.query_map(params![module], row_to_import)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+    pub fn get_imports_by_module(&self, module: &str, language: Option<&str>) -> Result<Vec<ImportRecord>> {
+        match language {
+            Some(lang) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT i.id, i.file_id, i.module, i.name, i.alias, i.line, i.kind
+                     FROM imports i JOIN files fi ON fi.id = i.file_id
+                     WHERE i.module = ?1 AND fi.language = ?2",
+                )?;
+                let rows = stmt.query_map(params![module, lang], row_to_import)?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, file_id, module, name, alias, line, kind
+                     FROM imports WHERE module = ?1",
+                )?;
+                let rows = stmt.query_map(params![module], row_to_import)?;
+                rows.map(|r| r.map_err(Into::into)).collect()
+            }
+        }
     }
 
     /// Сводная информация о файле по пути
@@ -516,6 +651,22 @@ impl Storage {
         let result = f(&tx)?;
         tx.commit().context("Не удалось закоммитить транзакцию")?;
         Ok(result)
+    }
+}
+
+// ── Вспомогательные функции ───────────────────────────────────────────────────
+
+/// Экранировать спецсимволы FTS5 в поисковом запросе.
+///
+/// FTS5 интерпретирует дефис как NOT, «+» и «*» как операторы.
+/// Если запрос содержит такие символы внутри слова — оборачиваем всё в кавычки,
+/// чтобы FTS5 искал буквальную фразу.
+fn sanitize_fts_query(query: &str) -> String {
+    // Проверяем наличие FTS-спецсимволов внутри токенов
+    if query.contains('-') || query.contains('+') || query.contains('*') {
+        format!("\"{}\"", query)
+    } else {
+        query.to_string()
     }
 }
 
@@ -729,7 +880,7 @@ mod tests {
         storage.insert_functions(&funcs).unwrap();
 
         // FTS-поиск по слову в имени
-        let results = storage.search_functions("binary_search", 10).expect("search_functions");
+        let results = storage.search_functions("binary_search", 10, None).expect("search_functions");
         assert_eq!(results.len(), 1, "должна найтись ровно одна функция");
         assert_eq!(results[0].name, "binary_search");
     }
@@ -767,7 +918,7 @@ mod tests {
             value: Some("42".into()), line: 5,
         }]).unwrap();
 
-        let result = storage.find_symbol("compute").expect("find_symbol");
+        let result = storage.find_symbol("compute", None).expect("find_symbol");
         assert_eq!(result.functions.len(), 1, "должна найтись 1 функция");
         assert_eq!(result.variables.len(), 1, "должна найтись 1 переменная");
         assert!(result.classes.is_empty());
@@ -795,5 +946,69 @@ mod tests {
         assert_eq!(stats.total_files, 1);
         assert_eq!(stats.total_functions, 2);
         assert_eq!(stats.total_calls, 1);
+    }
+
+    #[test]
+    fn test_language_filter() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+
+        // Python-файл
+        let py_id = storage.upsert_file(&make_file("/src/algo.py")).unwrap();
+        // Rust-файл
+        let rs_rec = FileRecord {
+            id: None,
+            path: "/src/main.rs".to_string(),
+            content_hash: "rustHash".to_string(),
+            ast_hash: None,
+            language: "rust".to_string(),
+            lines_total: 50,
+            indexed_at: "2026-01-01T00:00:00".to_string(),
+        };
+        let rs_id = storage.upsert_file(&rs_rec).unwrap();
+
+        // Вставляем функции в оба файла
+        storage.insert_functions(&[make_function(py_id, "py_func")]).unwrap();
+        storage.insert_functions(&[make_function(rs_id, "rs_func")]).unwrap();
+
+        // Без фильтра — обе функции
+        let all = storage.search_functions("func", 10, None).expect("поиск без фильтра");
+        assert_eq!(all.len(), 2, "без фильтра должны найтись обе функции");
+
+        // Только Python
+        let py_only = storage.search_functions("func", 10, Some("python")).expect("поиск python");
+        assert_eq!(py_only.len(), 1, "с фильтром python — только одна функция");
+        assert_eq!(py_only[0].name, "py_func");
+
+        // Только Rust
+        let rs_only = storage.search_functions("func", 10, Some("rust")).expect("поиск rust");
+        assert_eq!(rs_only.len(), 1, "с фильтром rust — только одна функция");
+        assert_eq!(rs_only[0].name, "rs_func");
+    }
+
+    #[test]
+    fn test_fts_with_dashes() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+
+        let file_id = storage.upsert_file(&make_file("/src/deps.py")).unwrap();
+        let func = FunctionRecord {
+            id: None,
+            file_id,
+            name: "use_tree_sitter".to_string(),
+            qualified_name: None,
+            line_start: 1,
+            line_end: 5,
+            args: None,
+            return_type: None,
+            docstring: Some("Использует tree-sitter-python для разбора".to_string()),
+            body: "def use_tree_sitter(): pass".to_string(),
+            is_async: false,
+            node_hash: "h_ts".to_string(),
+        };
+        storage.insert_functions(&[func]).unwrap();
+
+        // Поиск с дефисом не должен вернуть ошибку FTS5
+        let results = storage.search_functions("tree-sitter-python", 10, None)
+            .expect("поиск с дефисом не должен падать");
+        assert_eq!(results.len(), 1, "должна найтись функция с дефисом в docstring");
     }
 }

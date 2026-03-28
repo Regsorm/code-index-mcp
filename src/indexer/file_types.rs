@@ -20,6 +20,7 @@ const CODE_EXTENSIONS: &[(&str, &str)] = &[
     ("tsx", "typescript"),
     ("java", "java"),
     ("rs", "rust"),
+    ("go", "go"),
     ("bsl", "bsl"),
     ("os", "bsl"),
 ];
@@ -29,7 +30,7 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "md", "txt", "rst",
     "json", "yaml", "yml", "toml",
     "xml", "html", "css",
-    "go", "c", "h", "cpp", "hpp", "cs", "rb", "php", "swift", "kt",
+    "c", "h", "cpp", "hpp", "cs", "rb", "php", "swift", "kt",
     "csv", "env", "ini", "cfg",
     "sql", "sh", "bat", "ps1",
 ];

@@ -61,6 +61,13 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         path: String,
     },
+
+    /// Удалить из индекса файлы, которых нет на диске
+    Clean {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
 }
 
 /// Получить путь к БД для проекта
@@ -190,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
             let storage = Storage::open_file(&db_path)?;
 
             // 2. Поиск символа
-            let result = storage.find_symbol(&symbol)?;
+            let result = storage.find_symbol(&symbol, None)?;
 
             let total = result.functions.len()
                 + result.classes.len()
@@ -263,6 +270,48 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+        }
+
+        Commands::Clean { path } => {
+            tracing::info!("Очистка индекса: path={}", path);
+
+            // 1. Открыть БД
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+
+            // 2. Разрешить корневой путь проекта
+            let project_root = std::path::Path::new(&path)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+
+            // 3. Получить все файлы из индекса
+            let files = storage.get_all_files()?;
+            let total = files.len();
+            let mut deleted = 0usize;
+
+            // 4. Для каждого файла проверить существование на диске
+            for file in files {
+                // Путь в индексе может быть абсолютным или относительным от корня проекта
+                let on_disk = if std::path::Path::new(&file.path).is_absolute() {
+                    std::path::PathBuf::from(&file.path)
+                } else {
+                    project_root.join(&file.path)
+                };
+
+                if !on_disk.exists() {
+                    if let Some(id) = file.id {
+                        storage.delete_file(id)?;
+                        deleted += 1;
+                        println!("  Удалён: {}", file.path);
+                    }
+                }
+            }
+
+            // 5. Итог
+            println!(
+                "Очистка завершена: проверено {} файлов, удалено {} записей.",
+                total, deleted
+            );
         }
 
         Commands::Init { path } => {
