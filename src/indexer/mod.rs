@@ -59,6 +59,10 @@ impl<'a> Indexer<'a> {
     /// Если `force = true` — перезаписать все файлы независимо от хеша.
     /// Если `force = false` — пропустить файлы с неизменённым content_hash.
     ///
+    /// При количестве файлов для индексации > `config.bulk_threshold` автоматически
+    /// включается bulk-load режим: индексы и FTS-триггеры удаляются перед загрузкой
+    /// и пересоздаются (с rebuild FTS) после — это значительно ускоряет INSERT.
+    ///
     /// По завершении удаляет из БД записи файлов, которых больше нет на диске.
     pub fn full_reindex(&mut self, root: &Path, force: bool) -> Result<IndexResult> {
         let start = std::time::Instant::now();
@@ -81,13 +85,82 @@ impl<'a> Indexer<'a> {
             })
             .collect();
 
-        // Набор путей, реально встреченных при обходе диска
-        let mut seen_paths: HashSet<String> = HashSet::new();
+        // ── Первый проход: только хеши, без парсинга ──────────────────────────
+        // Определяем список файлов, которые реально нужно переиндексировать.
+        // Это позволяет заранее решить, включать ли bulk-load.
 
-        // Снимаем копию конфига, чтобы использовать в замыкании filter_entry
+        let candidate_files = self.collect_candidates(root, force, &existing_files, &mut result)?;
+
+        // Включаем bulk-load если количество файлов для индексации превышает порог
+        let bulk_mode = candidate_files.len() > self.config.bulk_threshold;
+        if bulk_mode {
+            eprintln!(
+                "[bulk-load] {} файлов > порога {}: удаляем индексы и триггеры",
+                candidate_files.len(),
+                self.config.bulk_threshold
+            );
+            self.storage.prepare_bulk_load()?;
+        }
+
+        // ── Второй проход: полная индексация кандидатов ───────────────────────
+        for (rel_path, content, hash, category) in &candidate_files {
+            // Прогресс-лог каждые 500 файлов
+            let total_processed = result.files_indexed + result.files_skipped + result.errors.len();
+            if total_processed > 0 && total_processed % 500 == 0 {
+                eprintln!(
+                    "[{}/{}] Проиндексировано {}, пропущено {}...",
+                    total_processed,
+                    candidate_files.len(),
+                    result.files_indexed,
+                    result.files_skipped
+                );
+            }
+
+            match self.index_single_file(rel_path, content, hash, category) {
+                Ok(_) => result.files_indexed += 1,
+                Err(e) => result.errors.push((rel_path.clone(), e.to_string())),
+            }
+        }
+
+        // Завершаем bulk-load: пересоздаём индексы, триггеры, rebuild FTS
+        if bulk_mode {
+            eprintln!("[bulk-load] Пересоздаём индексы и перестраиваем FTS...");
+            self.storage.finish_bulk_load()?;
+        }
+
+        // Набор путей, реально встреченных при обходе диска (из кандидатов + пропущенных)
+        // Пересчитываем seen_paths из кандидатов — они были собраны в первом проходе,
+        // но нам нужен полный список (включая пропущенные неизменённые файлы).
+        // Используем existing_files как основу и вычитаем то, что больше не на диске.
+        let seen_paths = self.collect_seen_paths(root, &existing_files);
+
+        // Удаляем из БД файлы, которых больше нет на диске
+        for (path, (id, _)) in &existing_files {
+            if !seen_paths.contains(path) {
+                self.storage.delete_file(*id)?;
+                result.files_deleted += 1;
+            }
+        }
+
+        result.elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(result)
+    }
+
+    /// Первый проход: обойти директорию, собрать список файлов для индексации.
+    ///
+    /// Возвращает вектор (rel_path, content, hash, category) для файлов,
+    /// которые нужно переиндексировать. Обновляет счётчики result.files_scanned
+    /// и result.files_skipped для файлов, пропущенных по хешу или размеру.
+    fn collect_candidates(
+        &self,
+        root: &Path,
+        force: bool,
+        existing_files: &HashMap<String, (i64, String)>,
+        result: &mut IndexResult,
+    ) -> Result<Vec<(String, String, String, FileCategory)>> {
+        let mut candidates = Vec::new();
         let config_for_filter = self.config.clone();
 
-        // Обходим директорию, исключая нежелательные папки
         let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
             if e.file_type().is_dir() {
                 if let Some(name) = e.file_name().to_str() {
@@ -125,26 +198,12 @@ impl<'a> Indexer<'a> {
 
             result.files_scanned += 1;
 
-            // Прогресс-лог каждые 500 файлов
-            let total_processed = result.files_scanned + result.files_skipped;
-            if total_processed > 0 && total_processed % 500 == 0 {
-                eprintln!(
-                    "[{}/???] Обработано {} файлов, {} проиндексировано, {} пропущено...",
-                    total_processed,
-                    total_processed,
-                    result.files_indexed,
-                    result.files_skipped
-                );
-            }
-
             // Нормализуем путь относительно корня с прямыми слэшами
             let rel_path = path
                 .strip_prefix(root)
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-
-            seen_paths.insert(rel_path.clone());
 
             // Читаем файл и вычисляем хеш
             let (content, hash) = match hasher::file_hash(path) {
@@ -165,23 +224,49 @@ impl<'a> Indexer<'a> {
                 }
             }
 
-            // Индексируем файл
-            match self.index_single_file(&rel_path, &content, &hash, &category) {
-                Ok(_) => result.files_indexed += 1,
-                Err(e) => result.errors.push((rel_path, e.to_string())),
-            }
+            candidates.push((rel_path, content, hash, category));
         }
 
-        // Удаляем из БД файлы, которых больше нет на диске
-        for (path, (id, _)) in &existing_files {
-            if !seen_paths.contains(path) {
-                self.storage.delete_file(*id)?;
-                result.files_deleted += 1;
+        Ok(candidates)
+    }
+
+    /// Собрать множество путей, реально присутствующих на диске.
+    ///
+    /// Используется для определения файлов, удалённых с диска после прошлой индексации.
+    fn collect_seen_paths(
+        &self,
+        root: &Path,
+        _existing_files: &HashMap<String, (i64, String)>,
+    ) -> HashSet<String> {
+        let mut seen = HashSet::new();
+        let config_for_filter = self.config.clone();
+
+        let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
+            if e.file_type().is_dir() {
+                if let Some(name) = e.file_name().to_str() {
+                    return !config_for_filter.is_excluded_dir(name);
+                }
             }
+            true
+        });
+
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if matches!(categorize_file(path), FileCategory::Binary) {
+                continue;
+            }
+            let rel_path = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            seen.insert(rel_path);
         }
 
-        result.elapsed_ms = start.elapsed().as_millis() as u64;
-        Ok(result)
+        seen
     }
 
     /// Индексировать один файл: сохранить в БД метаданные и извлечённые символы.
@@ -538,6 +623,59 @@ class App:
 
         // vendor/ исключён через конфиг — только app.py
         assert_eq!(r.files_indexed, 1, "vendor должен быть исключён через конфиг");
+    }
+
+    #[test]
+    fn test_bulk_load_mode() {
+        let tmp = TempDir::new().unwrap();
+
+        // Создаём 15 Python-файлов с уникальными функциями
+        for i in 0..15 {
+            fs::write(
+                tmp.path().join(format!("module_{i}.py")),
+                format!(
+                    "def func_{i}(x):\n    \"\"\"Функция номер {i}.\"\"\"\n    return x + {i}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let mut storage = Storage::open_in_memory().unwrap();
+
+        // Устанавливаем порог 10 — при 15 файлах должен включиться bulk-load
+        let config = IndexConfig {
+            bulk_threshold: 10,
+            ..Default::default()
+        };
+
+        // Первый проход: индексируем все 15 файлов в bulk-load режиме
+        {
+            let mut indexer = Indexer::with_config(&mut storage, config.clone());
+            let result = indexer.full_reindex(tmp.path(), false).unwrap();
+            assert_eq!(result.files_indexed, 15, "все 15 файлов должны быть проиндексированы");
+            assert_eq!(result.files_skipped, 0, "пропущенных файлов быть не должно");
+            assert_eq!(result.errors.len(), 0, "ошибок быть не должно");
+        }
+
+        // Проверяем статистику в БД (indexer уже дропнут)
+        let stats = storage.get_stats().unwrap();
+        assert_eq!(stats.total_files, 15, "в БД должно быть 15 файлов");
+        assert_eq!(stats.total_functions, 15, "по одной функции на файл");
+
+        // Проверяем, что FTS работает после rebuild
+        let found = storage.search_functions("func_0", 10).unwrap();
+        assert!(!found.is_empty(), "FTS должен находить func_0 после bulk-load rebuild");
+
+        let found_5 = storage.search_functions("func_5", 10).unwrap();
+        assert!(!found_5.is_empty(), "FTS должен находить func_5 после bulk-load rebuild");
+
+        // Второй проход: повторная индексация — все файлы должны быть пропущены
+        {
+            let mut indexer = Indexer::with_config(&mut storage, config);
+            let result2 = indexer.full_reindex(tmp.path(), false).unwrap();
+            assert_eq!(result2.files_skipped, 15, "при повторной индексации все файлы неизменны");
+            assert_eq!(result2.files_indexed, 0, "ни одного файла не должно быть переиндексировано");
+        }
     }
 
     #[test]

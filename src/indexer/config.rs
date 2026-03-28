@@ -20,10 +20,21 @@ pub struct IndexConfig {
     /// Максимальное количество файлов для индексации (0 = без лимита)
     #[serde(default)]
     pub max_files: usize,
+
+    /// Порог количества файлов для включения bulk-load режима (по умолчанию 10).
+    ///
+    /// Если число файлов, требующих индексации, превышает этот порог —
+    /// перед загрузкой удаляются индексы и триггеры, а после — пересоздаются.
+    #[serde(default = "default_bulk_threshold")]
+    pub bulk_threshold: usize,
 }
 
 fn default_max_file_size() -> usize {
     1_048_576 // 1 МБ
+}
+
+fn default_bulk_threshold() -> usize {
+    10
 }
 
 impl Default for IndexConfig {
@@ -33,6 +44,7 @@ impl Default for IndexConfig {
             extra_text_extensions: vec![],
             max_file_size: default_max_file_size(),
             max_files: 0,
+            bulk_threshold: default_bulk_threshold(),
         }
     }
 }
