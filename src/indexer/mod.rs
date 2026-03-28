@@ -7,8 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
+use crate::parser::types::ParseResult;
 use crate::parser::ParserRegistry;
 use crate::parser::text::TextParser;
 use crate::storage::models::*;
@@ -31,6 +33,31 @@ pub struct IndexResult {
     pub errors: Vec<(String, String)>,
     /// Время работы в миллисекундах
     pub elapsed_ms: u64,
+}
+
+/// Результат параллельного парсинга одного файла
+enum ParsedFile {
+    /// Файл с исходным кодом успешно распаршен
+    Code {
+        rel_path: String,
+        content_hash: String,
+        language: String,
+        lines_total: usize,
+        ast_hash: String,
+        parse_result: ParseResult,
+    },
+    /// Текстовый файл (без AST)
+    Text {
+        rel_path: String,
+        content_hash: String,
+        lines_total: usize,
+        content: String,
+    },
+    /// Ошибка парсинга
+    Error {
+        rel_path: String,
+        error: String,
+    },
 }
 
 /// Индексатор файловой системы
@@ -62,6 +89,9 @@ impl<'a> Indexer<'a> {
     /// При количестве файлов для индексации > `config.bulk_threshold` автоматически
     /// включается bulk-load режим: индексы и FTS-триггеры удаляются перед загрузкой
     /// и пересоздаются (с rebuild FTS) после — это значительно ускоряет INSERT.
+    ///
+    /// Парсинг (tree-sitter, CPU-bound) выполняется параллельно через rayon.
+    /// Запись в SQLite (I/O-bound) — последовательно из основного потока.
     ///
     /// По завершении удаляет из БД записи файлов, которых больше нет на диске.
     pub fn full_reindex(&mut self, root: &Path, force: bool) -> Result<IndexResult> {
@@ -102,46 +132,138 @@ impl<'a> Indexer<'a> {
             self.storage.prepare_bulk_load()?;
         }
 
-        // Создаём реестр парсеров из конфигурации — один раз для всего прохода
+        // Создаём реестр парсеров из конфигурации — один раз для всего прохода.
+        // ParserRegistry содержит HashMap<String, Arc<dyn LanguageParser>>.
+        // LanguageParser: Send + Sync, Arc: Send + Sync, HashMap: Send+Sync →
+        // ParserRegistry: Send + Sync, что требуется для par_iter.
         let registry = ParserRegistry::from_languages(&self.config.languages);
 
-        // ── Второй проход: полная индексация кандидатов в батч-транзакциях ───
+        // ── Параллельный парсинг (CPU-bound) ─────────────────────────────────
+        // tree-sitter парсинг выполняется в нескольких потоках через rayon.
+        // Чтение файлов уже выполнено в collect_candidates — здесь только AST.
+        let parse_results: Vec<ParsedFile> = candidate_files
+            .par_iter()
+            .map(|(rel_path, content, hash, category)| {
+                match category {
+                    FileCategory::Code(language) => {
+                        // Определяем парсер по расширению файла
+                        let ext = Path::new(rel_path.as_str())
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+
+                        match registry.get_parser(&ext) {
+                            Some(parser) => {
+                                match parser.parse(content, rel_path) {
+                                    Ok(pr) => ParsedFile::Code {
+                                        rel_path: rel_path.clone(),
+                                        content_hash: hash.clone(),
+                                        language: language.clone(),
+                                        lines_total: pr.lines_total,
+                                        ast_hash: pr.ast_hash.clone(),
+                                        parse_result: pr,
+                                    },
+                                    Err(e) => ParsedFile::Error {
+                                        rel_path: rel_path.clone(),
+                                        error: e.to_string(),
+                                    },
+                                }
+                            }
+                            None => ParsedFile::Error {
+                                rel_path: rel_path.clone(),
+                                error: format!("Нет парсера для расширения: {}", ext),
+                            },
+                        }
+                    }
+                    FileCategory::Text => {
+                        // Текстовый «парсинг» — просто подсчёт строк, очень быстрый
+                        let text_result = TextParser::parse(content);
+                        ParsedFile::Text {
+                            rel_path: rel_path.clone(),
+                            content_hash: hash.clone(),
+                            lines_total: text_result.lines_total,
+                            content: text_result.content,
+                        }
+                    }
+                    FileCategory::Binary => unreachable!("бинарные файлы не должны попасть сюда"),
+                }
+            })
+            .collect();
+
+        // ── Последовательная запись в SQLite ──────────────────────────────────
+        // SQLite не поддерживает параллельную запись — пишем из основного потока.
         let batch_size = self.config.batch_size;
         let mut batch_count = 0usize;
 
         // Открываем первую транзакцию перед началом цикла
         self.storage.begin_batch()?;
 
-        for (rel_path, content, hash, category) in &candidate_files {
+        for parsed in &parse_results {
             // Прогресс-лог каждые batch_size файлов
             let total_processed = result.files_indexed + result.errors.len();
             if total_processed > 0 && total_processed % batch_size == 0 {
                 eprintln!(
                     "[{}/{}] Проиндексировано {}, пропущено {}...",
                     total_processed,
-                    candidate_files.len(),
+                    parse_results.len(),
                     result.files_indexed,
                     result.files_skipped
                 );
             }
 
-            match self.index_single_file(rel_path, content, hash, category, &registry) {
-                Ok(_) => {
-                    result.files_indexed += 1;
-                    batch_count += 1;
-
-                    // Коммитим накопленный батч и открываем новую транзакцию
-                    if batch_count >= batch_size {
-                        self.storage.commit_batch()?;
-                        self.storage.begin_batch()?;
-                        batch_count = 0;
+            match parsed {
+                ParsedFile::Code {
+                    rel_path,
+                    content_hash,
+                    language,
+                    lines_total,
+                    ast_hash,
+                    parse_result,
+                } => {
+                    match self.write_code_to_db(
+                        rel_path,
+                        content_hash,
+                        language,
+                        *lines_total,
+                        ast_hash,
+                        parse_result,
+                    ) {
+                        Ok(_) => {
+                            result.files_indexed += 1;
+                            batch_count += 1;
+                        }
+                        Err(e) => {
+                            result.errors.push((rel_path.clone(), e.to_string()));
+                        }
                     }
                 }
-                Err(e) => {
-                    // Ошибка парсинга/хранения одного файла не откатывает весь батч —
-                    // добавляем в список ошибок и продолжаем в той же транзакции
-                    result.errors.push((rel_path.clone(), e.to_string()));
+                ParsedFile::Text {
+                    rel_path,
+                    content_hash,
+                    lines_total,
+                    content,
+                } => {
+                    match self.write_text_to_db(rel_path, content_hash, *lines_total, content) {
+                        Ok(_) => {
+                            result.files_indexed += 1;
+                            batch_count += 1;
+                        }
+                        Err(e) => {
+                            result.errors.push((rel_path.clone(), e.to_string()));
+                        }
+                    }
                 }
+                ParsedFile::Error { rel_path, error } => {
+                    result.errors.push((rel_path.clone(), error.clone()));
+                }
+            }
+
+            // Коммитим накопленный батч и открываем новую транзакцию
+            if batch_count >= batch_size {
+                self.storage.commit_batch()?;
+                self.storage.begin_batch()?;
+                batch_count = 0;
             }
         }
 
@@ -172,6 +294,157 @@ impl<'a> Indexer<'a> {
 
         result.elapsed_ms = start.elapsed().as_millis() as u64;
         Ok(result)
+    }
+
+    /// Записать код-файл в БД: метаданные + символы (функции, классы, импорты и т.д.)
+    fn write_code_to_db(
+        &self,
+        rel_path: &str,
+        content_hash: &str,
+        language: &str,
+        lines_total: usize,
+        ast_hash: &str,
+        parse_result: &ParseResult,
+    ) -> Result<()> {
+        // Сохраняем запись о файле
+        let file_record = FileRecord {
+            id: None,
+            path: rel_path.to_string(),
+            content_hash: content_hash.to_string(),
+            ast_hash: Some(ast_hash.to_string()),
+            language: language.to_string(),
+            lines_total,
+            indexed_at: chrono::Utc::now()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        };
+        let file_id = self.storage.upsert_file(&file_record)?;
+
+        // Удаляем старые данные перед вставкой новых
+        self.storage.delete_functions_by_file(file_id)?;
+        self.storage.delete_classes_by_file(file_id)?;
+        self.storage.delete_imports_by_file(file_id)?;
+        self.storage.delete_calls_by_file(file_id)?;
+        self.storage.delete_variables_by_file(file_id)?;
+
+        // Конвертируем и сохраняем функции
+        let functions: Vec<FunctionRecord> = parse_result
+            .functions
+            .iter()
+            .map(|f| FunctionRecord {
+                id: None,
+                file_id,
+                name: f.name.clone(),
+                qualified_name: f.qualified_name.clone(),
+                line_start: f.line_start,
+                line_end: f.line_end,
+                args: f.args.clone(),
+                return_type: f.return_type.clone(),
+                docstring: f.docstring.clone(),
+                body: f.body.clone(),
+                is_async: f.is_async,
+                node_hash: f.node_hash.clone(),
+            })
+            .collect();
+        self.storage.insert_functions(&functions)?;
+
+        // Конвертируем и сохраняем классы
+        let classes: Vec<ClassRecord> = parse_result
+            .classes
+            .iter()
+            .map(|c| ClassRecord {
+                id: None,
+                file_id,
+                name: c.name.clone(),
+                line_start: c.line_start,
+                line_end: c.line_end,
+                bases: c.bases.clone(),
+                docstring: c.docstring.clone(),
+                body: c.body.clone(),
+                node_hash: c.node_hash.clone(),
+            })
+            .collect();
+        self.storage.insert_classes(&classes)?;
+
+        // Конвертируем и сохраняем импорты
+        let imports: Vec<ImportRecord> = parse_result
+            .imports
+            .iter()
+            .map(|i| ImportRecord {
+                id: None,
+                file_id,
+                module: i.module.clone(),
+                name: i.name.clone(),
+                alias: i.alias.clone(),
+                line: i.line,
+                kind: i.kind.clone(),
+            })
+            .collect();
+        self.storage.insert_imports(&imports)?;
+
+        // Конвертируем и сохраняем вызовы функций
+        let calls: Vec<CallRecord> = parse_result
+            .calls
+            .iter()
+            .map(|c| CallRecord {
+                id: None,
+                file_id,
+                caller: c.caller.clone(),
+                callee: c.callee.clone(),
+                line: c.line,
+            })
+            .collect();
+        self.storage.insert_calls(&calls)?;
+
+        // Конвертируем и сохраняем переменные
+        let variables: Vec<VariableRecord> = parse_result
+            .variables
+            .iter()
+            .map(|v| VariableRecord {
+                id: None,
+                file_id,
+                name: v.name.clone(),
+                value: v.value.clone(),
+                line: v.line,
+            })
+            .collect();
+        self.storage.insert_variables(&variables)?;
+
+        Ok(())
+    }
+
+    /// Записать текстовый файл в БД: метаданные + полное содержимое для FTS
+    fn write_text_to_db(
+        &self,
+        rel_path: &str,
+        content_hash: &str,
+        lines_total: usize,
+        content: &str,
+    ) -> Result<()> {
+        let file_record = FileRecord {
+            id: None,
+            path: rel_path.to_string(),
+            content_hash: content_hash.to_string(),
+            ast_hash: None,
+            language: "text".to_string(),
+            lines_total,
+            indexed_at: chrono::Utc::now()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        };
+        let file_id = self.storage.upsert_file(&file_record)?;
+
+        // Удаляем старую запись текстового файла и вставляем новую
+        self.storage.delete_text_file_by_file(file_id)?;
+
+        let text_record = TextFileRecord {
+            id: None,
+            file_id,
+            content: content.to_string(),
+        };
+        self.storage.insert_text_file(&text_record)?;
+
+        Ok(())
     }
 
     /// Первый проход: обойти директорию, собрать список файлов для индексации.
@@ -295,168 +568,6 @@ impl<'a> Indexer<'a> {
         }
 
         seen
-    }
-
-    /// Индексировать один файл: сохранить в БД метаданные и извлечённые символы.
-    fn index_single_file(
-        &self,
-        rel_path: &str,
-        content: &str,
-        content_hash: &str,
-        category: &FileCategory,
-        registry: &ParserRegistry,
-    ) -> Result<()> {
-        match category {
-            FileCategory::Code(language) => {
-                // Определяем парсер по расширению файла через реестр
-                let ext = Path::new(rel_path)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-
-                let parser = registry.get_parser(&ext)
-                    .ok_or_else(|| anyhow::anyhow!("Нет парсера для расширения: {}", ext))?;
-
-                let parse_result = parser.parse(content, rel_path)?;
-
-                // Сохраняем запись о файле
-                let file_record = FileRecord {
-                    id: None,
-                    path: rel_path.to_string(),
-                    content_hash: content_hash.to_string(),
-                    ast_hash: Some(parse_result.ast_hash.clone()),
-                    language: language.clone(),
-                    lines_total: parse_result.lines_total,
-                    indexed_at: chrono::Utc::now()
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string(),
-                };
-                let file_id = self.storage.upsert_file(&file_record)?;
-
-                // Удаляем старые данные перед вставкой новых
-                self.storage.delete_functions_by_file(file_id)?;
-                self.storage.delete_classes_by_file(file_id)?;
-                self.storage.delete_imports_by_file(file_id)?;
-                self.storage.delete_calls_by_file(file_id)?;
-                self.storage.delete_variables_by_file(file_id)?;
-
-                // Конвертируем и сохраняем функции
-                let functions: Vec<FunctionRecord> = parse_result
-                    .functions
-                    .iter()
-                    .map(|f| FunctionRecord {
-                        id: None,
-                        file_id,
-                        name: f.name.clone(),
-                        qualified_name: f.qualified_name.clone(),
-                        line_start: f.line_start,
-                        line_end: f.line_end,
-                        args: f.args.clone(),
-                        return_type: f.return_type.clone(),
-                        docstring: f.docstring.clone(),
-                        body: f.body.clone(),
-                        is_async: f.is_async,
-                        node_hash: f.node_hash.clone(),
-                    })
-                    .collect();
-                self.storage.insert_functions(&functions)?;
-
-                // Конвертируем и сохраняем классы
-                let classes: Vec<ClassRecord> = parse_result
-                    .classes
-                    .iter()
-                    .map(|c| ClassRecord {
-                        id: None,
-                        file_id,
-                        name: c.name.clone(),
-                        line_start: c.line_start,
-                        line_end: c.line_end,
-                        bases: c.bases.clone(),
-                        docstring: c.docstring.clone(),
-                        body: c.body.clone(),
-                        node_hash: c.node_hash.clone(),
-                    })
-                    .collect();
-                self.storage.insert_classes(&classes)?;
-
-                // Конвертируем и сохраняем импорты
-                let imports: Vec<ImportRecord> = parse_result
-                    .imports
-                    .iter()
-                    .map(|i| ImportRecord {
-                        id: None,
-                        file_id,
-                        module: i.module.clone(),
-                        name: i.name.clone(),
-                        alias: i.alias.clone(),
-                        line: i.line,
-                        kind: i.kind.clone(),
-                    })
-                    .collect();
-                self.storage.insert_imports(&imports)?;
-
-                // Конвертируем и сохраняем вызовы функций
-                let calls: Vec<CallRecord> = parse_result
-                    .calls
-                    .iter()
-                    .map(|c| CallRecord {
-                        id: None,
-                        file_id,
-                        caller: c.caller.clone(),
-                        callee: c.callee.clone(),
-                        line: c.line,
-                    })
-                    .collect();
-                self.storage.insert_calls(&calls)?;
-
-                // Конвертируем и сохраняем переменные
-                let variables: Vec<VariableRecord> = parse_result
-                    .variables
-                    .iter()
-                    .map(|v| VariableRecord {
-                        id: None,
-                        file_id,
-                        name: v.name.clone(),
-                        value: v.value.clone(),
-                        line: v.line,
-                    })
-                    .collect();
-                self.storage.insert_variables(&variables)?;
-            }
-
-            FileCategory::Text => {
-                // Текстовый файл — только полнотекстовый поиск, без AST
-                let text_result = TextParser::parse(content);
-
-                let file_record = FileRecord {
-                    id: None,
-                    path: rel_path.to_string(),
-                    content_hash: content_hash.to_string(),
-                    ast_hash: None,
-                    language: "text".to_string(),
-                    lines_total: text_result.lines_total,
-                    indexed_at: chrono::Utc::now()
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string(),
-                };
-                let file_id = self.storage.upsert_file(&file_record)?;
-
-                // Удаляем старую запись текстового файла и вставляем новую
-                self.storage.delete_text_file_by_file(file_id)?;
-
-                let text_record = TextFileRecord {
-                    id: None,
-                    file_id,
-                    content: text_result.content,
-                };
-                self.storage.insert_text_file(&text_record)?;
-            }
-
-            FileCategory::Binary => unreachable!("бинарные файлы не должны попасть сюда"),
-        }
-
-        Ok(())
     }
 }
 
@@ -773,5 +884,49 @@ class App:
 
         let found_19 = storage.search_functions("batch_func_19", 10, None).unwrap();
         assert!(!found_19.is_empty(), "FTS должен находить batch_func_19 (последний батч)");
+    }
+
+    #[test]
+    fn test_parallel_reindex() {
+        let tmp = TempDir::new().unwrap();
+
+        // Создаём 30 Python-файлов с разными функциями
+        for i in 0..30 {
+            fs::write(
+                tmp.path().join(format!("parallel_{i}.py")),
+                format!(
+                    "def parallel_func_{i}(a, b):\n    \"\"\"Параллельная функция {i}.\"\"\"\n    return a + b + {i}\n\ndef helper_{i}(x):\n    return x * {i}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let mut indexer = Indexer::new(&mut storage);
+        let result = indexer.full_reindex(tmp.path(), false).unwrap();
+
+        // Все 30 файлов проиндексированы
+        assert_eq!(result.files_indexed, 30, "все 30 файлов должны быть проиндексированы");
+        assert_eq!(result.files_skipped, 0, "пропущенных файлов быть не должно");
+        assert_eq!(result.errors.len(), 0, "ошибок при параллельном парсинге быть не должно");
+
+        // Проверяем что все функции на месте (по 2 на файл = 60 итого)
+        let stats = storage.get_stats().unwrap();
+        assert_eq!(stats.total_files, 30, "в БД должно быть 30 файлов");
+        assert_eq!(stats.total_functions, 60, "по 2 функции на файл = 60 итого");
+
+        // FTS находит функции из разных файлов (порядок парсинга не важен)
+        let found_0 = storage.search_functions("parallel_func_0", 10, None).unwrap();
+        assert!(!found_0.is_empty(), "FTS должен находить parallel_func_0");
+
+        let found_15 = storage.search_functions("parallel_func_15", 10, None).unwrap();
+        assert!(!found_15.is_empty(), "FTS должен находить parallel_func_15");
+
+        let found_29 = storage.search_functions("parallel_func_29", 10, None).unwrap();
+        assert!(!found_29.is_empty(), "FTS должен находить parallel_func_29");
+
+        // helper-функции тоже проиндексированы
+        let found_helper = storage.search_functions("helper_0", 10, None).unwrap();
+        assert!(!found_helper.is_empty(), "FTS должен находить helper_0");
     }
 }
