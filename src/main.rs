@@ -51,9 +51,13 @@ enum Commands {
         /// Путь к корню проекта
         #[arg(short, long, default_value = ".")]
         path: String,
+
+        /// Вывод в JSON вместо текста
+        #[arg(long)]
+        json: bool,
     },
 
-    /// Быстрый поиск символа
+    /// Быстрый поиск символа (функции, классы, переменные, импорты по точному имени)
     Query {
         /// Имя символа для поиска
         symbol: String,
@@ -61,6 +65,14 @@ enum Commands {
         /// Путь к корню проекта
         #[arg(short, long, default_value = ".")]
         path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Вывод в JSON вместо текста
+        #[arg(long)]
+        json: bool,
     },
 
     /// Создать конфигурацию .code-index/config.json с настройками по умолчанию
@@ -75,6 +87,145 @@ enum Commands {
         /// Путь к проекту
         #[arg(short, long, default_value = ".")]
         path: String,
+    },
+
+    /// Полнотекстовый поиск функций по имени/телу (FTS)
+    SearchFunction {
+        /// Поисковый запрос
+        query: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Максимум результатов
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Полнотекстовый поиск классов по имени/телу (FTS)
+    SearchClass {
+        /// Поисковый запрос
+        query: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Максимум результатов
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Получить функцию по точному имени
+    GetFunction {
+        /// Имя функции
+        name: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку (не используется при точном поиске, для совместимости)
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+
+    /// Получить класс по точному имени
+    GetClass {
+        /// Имя класса
+        name: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку (не используется при точном поиске, для совместимости)
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+
+    /// Кто вызывает данную функцию (callers)
+    GetCallers {
+        /// Имя функции
+        function_name: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+
+    /// Что вызывает данная функция (callees)
+    GetCallees {
+        /// Имя функции
+        function_name: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+
+    /// Получить импорты файла или модуля
+    GetImports {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// ID файла в индексе
+        #[arg(long)]
+        file_id: Option<i64>,
+
+        /// Имя модуля
+        #[arg(short, long)]
+        module: Option<String>,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+
+    /// Карта файла: все функции, классы, импорты, переменные
+    GetFileSummary {
+        /// Путь к файлу (как в индексе)
+        file: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
+
+    /// Полнотекстовый поиск по текстовым файлам
+    SearchText {
+        /// Поисковый запрос
+        query: String,
+
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Фильтр по языку
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Максимум результатов
+        #[arg(long, default_value = "20")]
+        limit: usize,
     },
 }
 
@@ -186,7 +337,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Stats { path } => {
+        Commands::Stats { path, json } => {
             tracing::info!("Статистика: path={}", path);
 
             // 1. Открыть БД
@@ -196,19 +347,24 @@ async fn main() -> anyhow::Result<()> {
             // 2. Получить статистику
             let stats = storage.get_stats()?;
 
-            // 3. Вывести таблицу
-            println!("Статистика индекса: {}", db_path.display());
-            println!("─────────────────────────────────────");
-            println!("  Файлов:        {}", stats.total_files);
-            println!("  Функций:       {}", stats.total_functions);
-            println!("  Классов:       {}", stats.total_classes);
-            println!("  Импортов:      {}", stats.total_imports);
-            println!("  Вызовов:       {}", stats.total_calls);
-            println!("  Переменных:    {}", stats.total_variables);
-            println!("  Текст. файлов: {}", stats.total_text_files);
+            if json {
+                // JSON-формат для программного использования
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                // Текстовый формат для человека
+                println!("Статистика индекса: {}", db_path.display());
+                println!("─────────────────────────────────────");
+                println!("  Файлов:        {}", stats.total_files);
+                println!("  Функций:       {}", stats.total_functions);
+                println!("  Классов:       {}", stats.total_classes);
+                println!("  Импортов:      {}", stats.total_imports);
+                println!("  Вызовов:       {}", stats.total_calls);
+                println!("  Переменных:    {}", stats.total_variables);
+                println!("  Текст. файлов: {}", stats.total_text_files);
+            }
         }
 
-        Commands::Query { symbol, path } => {
+        Commands::Query { symbol, path, language, json } => {
             tracing::info!("Поиск символа '{}': path={}", symbol, path);
 
             // 1. Открыть БД
@@ -216,7 +372,13 @@ async fn main() -> anyhow::Result<()> {
             let storage = Storage::open_file(&db_path)?;
 
             // 2. Поиск символа
-            let result = storage.find_symbol(&symbol, None)?;
+            let result = storage.find_symbol(&symbol, language.as_deref())?;
+
+            if json {
+                // JSON-формат для программного использования
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
 
             let total = result.functions.len()
                 + result.classes.len()
@@ -357,6 +519,93 @@ async fn main() -> anyhow::Result<()> {
             println!("  extra_text_extensions — дополнительные расширения для FTS-индексации");
             println!("  max_file_size         — максимальный размер файла в байтах (по умолчанию 1 МБ)");
             println!("  max_files             — лимит файлов (0 = без лимита)");
+        }
+
+        // ── Новые команды: JSON-вывод ─────────────────────────────────────────
+
+        Commands::SearchFunction { query, path, language, limit } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+            let results = storage.search_functions(&query, limit, language.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::SearchClass { query, path, language, limit } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+            let results = storage.search_classes(&query, limit, language.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetFunction { name, path, language: _ } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+            let results = storage.get_function_by_name(&name)?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetClass { name, path, language: _ } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+            let results = storage.get_class_by_name(&name)?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetCallers { function_name, path, language } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+            let results = storage.get_callers(&function_name, language.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetCallees { function_name, path, language } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+            let results = storage.get_callees(&function_name, language.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetImports { path, file_id, module, language } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+
+            // Приоритет: file_id > module; если ничего не указано — ошибка
+            let results = if let Some(fid) = file_id {
+                storage.get_imports_by_file(fid)?
+            } else if let Some(mod_name) = &module {
+                storage.get_imports_by_module(mod_name, language.as_deref())?
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Укажите --file-id <ID> или --module <имя_модуля>"
+                ));
+            };
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        }
+
+        Commands::GetFileSummary { file, path } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+            let result = storage.get_file_summary(&file)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+
+        Commands::SearchText { query, path, language, limit } => {
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+            let results = storage.search_text(&query, limit, language.as_deref())?;
+
+            // Результат — Vec<(String, String)>: путь + сниппет
+            // Преобразуем в удобный JSON-массив объектов
+            let json_results: Vec<serde_json::Value> = results
+                .into_iter()
+                .map(|(file_path, snippet)| {
+                    serde_json::json!({
+                        "path": file_path,
+                        "snippet": snippet
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&json_results)?);
         }
     }
 
