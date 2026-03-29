@@ -1,66 +1,42 @@
 # Code Index MCP
 
-**Instant code search for AI models. Replaces grep with millisecond queries.**
+[Русская версия](README_RU.md)
 
-> 62K files indexed in 43 seconds • 282K functions searchable in < 1ms • 8 languages • 11 MCP tools
+Instant code search for AI models. Replaces grep with millisecond queries.
 
----
+> 62K files indexed in 43s — 282K functions searchable in <1ms — 8 languages — 11 MCP tools
 
-## Проблема
+## Problem
 
-AI-модели (Claude, GPT, Cursor) при работе с кодом делают десятки вызовов `grep` и `find`, тратя время и контекстное окно. На крупных проектах (тысячи файлов) это занимает минуты.
+AI models waste enormous time on repeated grep/find calls just to locate a single symbol. A real example: finding `RuntimeErrorProcessing` in a Java project required 14 sequential grep/find calls, each scanning thousands of files. With Code Index, that is one query returning results in under a millisecond.
 
-**Реальный пример:** поиск `RuntimeErrorProcessing` в Java-проекте — 14 вызовов grep/find. С Code Index — один запрос, мгновенный ответ.
+## Solution
 
-## Решение
+A compiled Rust binary that:
 
-Скомпилированный Rust-бинарник, который:
+1. Parses source code into AST via tree-sitter
+2. Indexes everything into SQLite with FTS5 full-text search
+3. Exposes 11 tools over the MCP protocol for direct AI model use
+4. Watches file changes in daemon mode and re-indexes automatically
 
-1. **Парсит** исходный код в AST через [tree-sitter](https://tree-sitter.github.io/)
-2. **Индексирует** функции, классы, импорты, вызовы в SQLite с полнотекстовым поиском (FTS5)
-3. **Предоставляет** 11 MCP-инструментов для AI-моделей
-4. **Следит** за изменениями файлов (daemon-режим с file watcher)
+## Supported Languages
 
-## Бенчмарки
-
-Протестировано на конфигурации 1С:Управление Торговлей:
-
-| Метрика | Значение |
-|---|---|
-| Файлов в проекте | 61,706 |
-| Функций/процедур | 282,575 |
-| Вызовов (граф) | 1,533,337 |
-| Время индексации | **43 секунды** |
-| Время поиска | **< 1 мс** |
-| Размер бинарника | 13.5 МБ |
-
-Сравнение поиска:
-
-| Операция | grep | Code Index |
-|---|---|---|
-| Найти функцию по имени | O(n) файлов, секунды | < 1 мс |
-| Кто вызывает функцию X? | grep по всем файлам | < 1 мс |
-| Карта файла | cat + анализ | < 1 мс |
-| Полнотекстовый поиск | grep -r, секунды | < 1 мс |
-
-## Поддерживаемые языки
-
-| Язык | Парсер | Расширения |
-|---|---|---|
+| Language | Parser | Extensions |
+|----------|--------|------------|
 | Python | tree-sitter-python | `.py` |
 | JavaScript | tree-sitter-javascript | `.js`, `.jsx` |
 | TypeScript | tree-sitter-typescript | `.ts`, `.tsx` |
 | Java | tree-sitter-java | `.java` |
 | Rust | tree-sitter-rust | `.rs` |
 | Go | tree-sitter-go | `.go` |
-| 1С (BSL) | tree-sitter-onescript | `.bsl`, `.os` |
-| XML (1С) | quick-xml | `.xml` (метаданные конфигураций) |
+| 1C (BSL) | tree-sitter-onescript | `.bsl`, `.os` |
+| XML (1C) | quick-xml | `.xml` (configuration metadata) |
 
-Текстовые файлы (`.md`, `.json`, `.yaml`, `.toml`, `.xml`, `.sql`, `.env` и др.) индексируются для полнотекстового поиска.
+Text files (`.md`, `.json`, `.yaml`, `.toml`, `.xml`, `.sql`, `.env`, etc.) are also indexed for full-text search.
 
-## Быстрый старт
+## Quick Start
 
-### Сборка из исходников
+### Build from source
 
 ```bash
 git clone https://github.com/Regsorm/code-index-mcp.git
@@ -68,37 +44,24 @@ cd code-index-mcp
 cargo build --release
 ```
 
-Бинарник: `target/release/code-index` (Linux/Mac) или `target/release/code-index.exe` (Windows)
+Binary: `target/release/code-index` (Linux/Mac) or `target/release/code-index.exe` (Windows)
 
-### CLI — ручная индексация
+### Index a project
 
 ```bash
-# Проиндексировать проект
 code-index index /path/to/project
-
-# Статистика
-code-index stats --path /path/to/project
-
-# Поиск
-code-index query "function_name" --path /path/to/project
-
-# Очистка устаревших записей
-code-index clean --path /path/to/project
+code-index stats --path /path/to/project --json
 ```
 
-### MCP-сервер — для AI-моделей
+### Run as MCP server
 
 ```bash
-# Запустить daemon (MCP + file watcher + auto-reindex)
 code-index serve --path /path/to/project
-
-# Без file watcher
-code-index serve --path /path/to/project --no-watch
 ```
 
-### Подключение к Claude Code / VS Code
+## Connecting to Claude Code
 
-Добавить в `.mcp.json` проекта:
+Add to `.mcp.json` in your project root:
 
 ```json
 {
@@ -112,91 +75,204 @@ code-index serve --path /path/to/project --no-watch
 }
 ```
 
-## MCP-инструменты
+## MCP Tools
 
-| Инструмент | Описание |
-|---|---|
-| `search_function` | Полнотекстовый поиск по функциям (имя, docstring, тело) |
-| `search_class` | Полнотекстовый поиск по классам |
-| `get_function` | Получить функцию по точному имени |
-| `get_class` | Получить класс по точному имени |
-| `get_callers` | Кто вызывает данную функцию? |
-| `get_callees` | Что вызывает данная функция? |
-| `find_symbol` | Поиск символа везде (функции, классы, переменные, импорты) |
-| `get_imports` | Импорты по модулю или файлу |
-| `get_file_summary` | Полная карта файла без чтения исходника |
-| `get_stats` | Статистика индекса |
-| `search_text` | Полнотекстовый поиск по текстовым файлам |
+| Tool | Description |
+|------|-------------|
+| `search_function` | Full-text search across functions (name, docstring, body) |
+| `search_class` | Full-text search across classes |
+| `get_function` | Get function by exact name |
+| `get_class` | Get class by exact name |
+| `get_callers` | Who calls this function? |
+| `get_callees` | What does this function call? |
+| `find_symbol` | Search everywhere (functions, classes, variables, imports) |
+| `get_imports` | Imports by module or file |
+| `get_file_summary` | Complete file map without reading source |
+| `get_stats` | Index statistics |
+| `search_text` | Full-text search across text files |
 
-Все инструменты поддерживают фильтр по языку: `search_function(query="X", language="bsl")`
+All tools support a language filter: `search_function(query="X", language="python")`
 
-## Daemon-режим
+## CLI Reference
 
-При запуске `code-index serve` daemon:
+```bash
+# MCP server (daemon mode)
+code-index serve --path /project [--no-watch] [--flush-interval 30]
 
-1. **Startup scan** — проверяет все файлы, индексирует новые и изменённые
-2. **File watcher** — отслеживает изменения в реальном времени (notify crate)
-3. **MCP-сервер** — принимает запросы от AI через stdio
-4. **Periodic flush** — сбрасывает in-memory базу на диск каждые 30 секунд
+# One-shot indexing
+code-index index /project [--force]
 
-Изменил файл → через 1.5 сек (debounce) → автоматическая переиндексация.
+# Project management
+code-index init --path /project          # Create config
+code-index clean --path /project         # Remove stale entries
+code-index stats --path /project [--json]
 
-## Конфигурация
+# Symbol search
+code-index query "name" --path /project [--language rust] [--json]
 
-При первом запуске создаётся `.code-index/config.json`:
+# Full-text search (JSON output)
+code-index search-function "query" --path /project [--language python] [--limit 20]
+code-index search-class "query" --path /project [--language python] [--limit 20]
+code-index search-text "query" --path /project [--limit 20]
+
+# Exact lookup (JSON output)
+code-index get-function "exact_name" --path /project
+code-index get-class "exact_name" --path /project
+
+# Call graph (JSON output)
+code-index get-callers "function_name" --path /project [--language python]
+code-index get-callees "function_name" --path /project [--language python]
+
+# Navigation (JSON output)
+code-index get-imports --path /project [--module "name"] [--file-id 42]
+code-index get-file-summary "src/main.rs" --path /project
+```
+
+## Using CLI from Subagents
+
+Subagents launched via the Agent tool in Claude Code do not have access to MCP servers — they run in isolated subprocesses with no connection to the parent MCP session. All 11 MCP tools are mirrored as CLI subcommands that output JSON, making code-index fully usable from any subprocess, script, or subagent.
+
+```bash
+# Instead of an MCP tool call, a subagent runs:
+code-index search-function "authenticate" --path /my/project --language python
+
+# Call graph from CLI:
+code-index get-callers "process_order" --path /my/project
+
+# File map:
+code-index get-file-summary "src/auth/login.py" --path /my/project
+```
+
+Every command outputs valid JSON that the subagent can parse and reason over, identical in structure to what the MCP tools return.
+
+## CLAUDE.md Setup
+
+Add this block to your project's `CLAUDE.md` to instruct Claude Code subagents to use the CLI indexer instead of grep, find, or reading files manually:
+
+```markdown
+## Code Index — fast code search
+
+For code search, use the CLI indexer instead of grep/find/Read:
+- Search: code-index query "name" --path /path/to/project --json
+- FTS search: code-index search-function "query" --path /path/to/project
+- Call graph: code-index get-callers "function" --path /path/to/project
+- File map: code-index get-file-summary "file" --path /path/to/project
+- Stats: code-index stats --path /path/to/project --json
+All commands output JSON. This is instant search over an indexed database.
+```
+
+Use an absolute path to the binary and adjust `/path/to/project` to your setup. On Windows, specify the full path to `code-index.exe`, for example `C:\MCP-Servers\code-index\target\release\code-index.exe`.
+
+## Daemon Mode
+
+When running `code-index serve`, the process goes through four phases:
+
+1. **Startup scan** — indexes new and changed files before accepting any MCP requests
+2. **File watcher** — tracks filesystem changes in real-time using the `notify` crate
+3. **MCP server** — accepts tool calls via stdio (JSON-RPC)
+4. **Periodic flush** — writes the in-memory database to disk every 30 seconds
+
+When a file changes: 1.5s debounce window collects related edits, then the affected files are automatically re-indexed. The MCP server remains responsive throughout.
+
+## Configuration
+
+`.code-index/config.json` is created automatically on first run. Full reference:
 
 ```json
 {
-  "exclude_dirs": ["node_modules", ".venv", "__pycache__", ".git", "output"],
-  "languages": ["python", "bsl", "rust", "java", "go", "javascript", "typescript"],
+  "exclude_dirs": ["node_modules", ".venv", "__pycache__", ".git", "target", "output"],
+  "extra_text_extensions": [],
   "max_file_size": 1048576,
-  "extra_text_extensions": []
+  "max_files": 0,
+  "bulk_threshold": 10,
+  "languages": ["python", "javascript", "typescript", "java", "rust", "go", "bsl"],
+  "batch_size": 500,
+  "storage_mode": "auto",
+  "memory_max_percent": 25,
+  "debounce_ms": 1500,
+  "batch_ms": 2000,
+  "flush_interval_sec": 30
 }
 ```
 
-## Архитектура
+Key fields:
+
+- **storage_mode** — `auto` selects in-memory or disk SQLite based on available RAM; `memory` forces in-memory; `disk` forces on-disk
+- **memory_max_percent** — maximum percentage of system RAM the in-memory database may use before falling back to disk (used in `auto` mode)
+- **debounce_ms** — milliseconds to wait after a file change before triggering re-indexing (collects burst edits into one pass)
+- **batch_size** — number of records per SQLite transaction during indexing (higher = faster bulk inserts, higher peak memory)
+- **bulk_threshold** — minimum number of files that triggers bulk mode (drop indexes, insert, rebuild indexes); faster for large batches
+
+## Benchmarks
+
+Tested on a 1C:Enterprise Trade Management configuration:
+
+| Metric | Value |
+|--------|-------|
+| Files | 61,706 |
+| Functions | 282,575 |
+| Call graph edges | 1,533,337 |
+| Indexing time | 43 seconds |
+| Search time | < 1 ms |
+| Binary size | 13.5 MB |
+
+Comparison with grep:
+
+| Operation | grep | Code Index |
+|-----------|------|------------|
+| Find function by name | O(n) files, seconds | < 1 ms |
+| Who calls function X? | grep all files | < 1 ms |
+| File map | cat + manual analysis | < 1 ms |
+| Full-text search | `grep -r`, seconds | < 1 ms |
+
+## Architecture
 
 ```
-Source Files → Tree-sitter Parser → SQLite (in-memory) → MCP Server → AI Model
-                                         ↑
-                    File Watcher ─────────┘ (auto re-index)
+Source Files -> Tree-sitter Parser -> SQLite (in-memory) -> MCP Server -> AI Model
+                                           ^
+                      File Watcher --------+ (auto re-index)
 ```
 
-Оптимизации:
-- **In-memory SQLite** с периодическим flush на диск
-- **Rayon** — параллельный парсинг на всех ядрах CPU
-- **Bulk mode** — drop indexes → insert → rebuild (первичная индексация)
-- **SHA-256 hash check** — пропуск неизменённых файлов
-- **Batch transactions** — группировка INSERT по 500 записей
+Key optimizations:
 
-## Для 1С-разработчиков
+- **In-memory SQLite with periodic flush** — all reads and writes go to RAM; disk is written every 30 seconds
+- **Rayon parallel parsing** — files are parsed across all CPU cores simultaneously
+- **Bulk mode** — for large batches: drop indexes, bulk insert, rebuild indexes; significantly faster than incremental inserts
+- **SHA-256 hash check** — each file's hash is stored; unchanged files are skipped entirely on re-index
+- **Batch transactions** — 500 records per transaction reduces SQLite overhead by orders of magnitude
 
-Code Index MCP извлекает из BSL-файлов:
-- Процедуры и функции с полным текстом
-- Директивы компиляции (`&НаСервере`, `&НаКлиенте`, `&НаСервереБезКонтекста`)
-- Аннотации расширений (`&Вместо`, `&После`, `&Перед`)
-- Двуязычные ключевые слова
+## For 1C Developers
 
-Из XML-выгрузок:
-- Объекты метаданных (справочники, документы, регистры)
-- Реквизиты, табличные части
-- Формы
+Code Index has first-class support for 1C:Enterprise source files.
 
-## Системные требования
+From **BSL files**, it extracts:
+- Procedures and functions with full body text
+- Compilation directives (`&AtServer`, `&AtClient`, `&AtServerNoContext`)
+- Extension annotations (`&Instead`, `&After`, `&Before`)
+- Bilingual keywords (Russian and English forms are both indexed)
 
-- **ОС:** Windows, Linux, macOS
-- **RAM:** от 512 МБ (малые проекты) до 4 ГБ (крупные конфигурации 1С)
-- **Диск:** размер индекса ≈ 1-2 ГБ для проектов 60K+ файлов
-- **Для сборки:** Rust 1.77+ (`rustup.rs`)
+From **XML configuration exports**, it extracts:
+- Metadata objects: catalogs, documents, registers, and more
+- Attributes and tabular sections
+- Forms and their composition
 
-## Лицензия
+This makes Code Index suitable as an offline search layer over full 1C configuration exports without requiring a running platform instance.
 
-Apache License 2.0. См. [LICENSE](LICENSE).
+## System Requirements
 
-## Благодарности
+- **OS**: Windows, Linux, macOS
+- **RAM**: 512 MB for small projects; up to 4 GB for large 1C configurations (60K+ files)
+- **Disk**: index size is approximately 1-2 GB for projects with 60K+ files
+- **Build**: Rust 1.77 or later — install from [rustup.rs](https://rustup.rs)
 
-- [tree-sitter](https://tree-sitter.github.io/) — инкрементальный парсер
-- [tree-sitter-onescript](https://github.com/1c-syntax/tree-sitter-onescript) — грамматика BSL/OneScript от сообщества 1c-syntax
-- [rusqlite](https://github.com/rusqlite/rusqlite) — SQLite для Rust
-- [rayon](https://github.com/rayon-rs/rayon) — параллелизм данных
-- [rmcp](https://github.com/anthropics/rmcp) — Rust MCP SDK
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+## Acknowledgements
+
+- [tree-sitter](https://tree-sitter.github.io/tree-sitter/) — incremental parsing library
+- [tree-sitter-onescript](https://github.com/1c-syntax/tree-sitter-onescript) — BSL/OneScript grammar by the 1c-syntax community
+- [rusqlite](https://github.com/rusqlite/rusqlite) — SQLite bindings for Rust
+- [rayon](https://github.com/rayon-rs/rayon) — data parallelism for Rust
+- [rmcp](https://github.com/modelcontextprotocol/rust-sdk) — Rust MCP SDK
