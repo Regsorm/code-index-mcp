@@ -4,3 +4,4 @@ target2/
 *.db
 *.db-shm
 *.db-wal
+.cargo/config.toml
