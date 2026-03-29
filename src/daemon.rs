@@ -46,24 +46,42 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         result.files_indexed, result.elapsed_ms
     );
 
-    // Flush после startup — сохраняем результаты на диск
-    storage.flush_to_disk(&config.db_path)?;
-    eprintln!("[daemon] Startup flush выполнен");
-
     // 3. Обернуть storage в Arc<Mutex> для shared доступа
     let shared_storage = Arc::new(Mutex::new(storage));
 
     // 4. Создать MCP-сервер с shared хранилищем
     let mcp_server = CodeIndexServer::new_from_shared(shared_storage.clone());
 
+    // Startup flush убран: данные в памяти, MCP отдаёт их оттуда.
+    // Периодический flush (flush_interval_sec) сохранит на диск позже.
+    // Это критично для больших БД (1+ ГБ), где backup блокирует Mutex на десятки секунд.
+
     if config.no_watch {
-        // Без watcher — только MCP-сервер (режим совместимости)
+        // Без watcher — только MCP-сервер + периодический flush
         eprintln!("[daemon] File watcher отключён (--no-watch)");
+
+        // Периодический flush — сохраняет in-memory БД на диск
+        let storage_for_flush = shared_storage.clone();
+        let db_path_flush = config.db_path.clone();
+        let flush_interval = config.flush_interval_sec;
+        let flush_handle = tokio::spawn(async move {
+            let interval = tokio::time::Duration::from_secs(flush_interval);
+            loop {
+                tokio::time::sleep(interval).await;
+                let storage = storage_for_flush.lock().await;
+                match storage.flush_to_disk(&db_path_flush) {
+                    Ok(_) => eprintln!("[flush] Записано на диск"),
+                    Err(e) => eprintln!("[flush] Ошибка: {}", e),
+                }
+            }
+        });
+
         let service = mcp_server
             .serve(rmcp::transport::io::stdio())
             .await
             .map_err(|e| anyhow::anyhow!("MCP serve error: {}", e))?;
         service.waiting().await.map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
+        flush_handle.abort();
         return Ok(());
     }
 
