@@ -37,7 +37,7 @@ pub struct IndexResult {
 }
 
 /// Результат параллельного парсинга одного файла
-enum ParsedFile {
+pub enum ParsedFile {
     /// Файл с исходным кодом успешно распаршен
     Code {
         rel_path: String,
@@ -633,6 +633,126 @@ impl<'a> Indexer<'a> {
 
         seen
     }
+}
+
+/// Standalone-версия collect_candidates — не требует Storage.
+/// Обходит директорию, собирает файлы для индексации.
+/// Возвращает (candidates, files_scanned, files_skipped, errors).
+pub fn collect_candidates_standalone(
+    root: &Path,
+    config: &IndexConfig,
+    force: bool,
+    existing_files: &HashMap<String, (i64, String)>,
+) -> Result<(Vec<(String, String, String, FileCategory)>, usize, usize, Vec<(String, String)>)> {
+    let mut candidates = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut files_skipped = 0usize;
+    let mut errors = Vec::new();
+    let config_for_filter = config.clone();
+
+    let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
+        if e.file_type().is_dir() {
+            if let Some(name) = e.file_name().to_str() {
+                return !config_for_filter.is_excluded_dir(name);
+            }
+        }
+        true
+    });
+
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        // Проверяем лимит количества файлов (0 = без лимита)
+        if config.max_files > 0 && files_scanned >= config.max_files {
+            break;
+        }
+
+        let path = entry.path();
+        let category = categorize_file(path);
+
+        // Бинарные файлы полностью игнорируем
+        if matches!(category, FileCategory::Binary) {
+            continue;
+        }
+
+        // Проверяем размер файла
+        if let Ok(meta) = entry.metadata() {
+            if meta.len() as usize > config.max_file_size {
+                files_skipped += 1;
+                continue;
+            }
+        }
+
+        files_scanned += 1;
+
+        // Нормализуем путь относительно корня с прямыми слэшами
+        let rel_path = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // Читаем файл и вычисляем хеш
+        let (content, hash) = match hasher::file_hash(path) {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push((rel_path, e.to_string()));
+                continue;
+            }
+        };
+
+        // Проверяем, изменился ли файл
+        if !force {
+            if let Some((_, existing_hash)) = existing_files.get(&rel_path) {
+                if *existing_hash == hash {
+                    files_skipped += 1;
+                    continue;
+                }
+            }
+        }
+
+        candidates.push((rel_path, content, hash, category));
+    }
+
+    Ok((candidates, files_scanned, files_skipped, errors))
+}
+
+/// Standalone-версия collect_seen_paths — только обход диска, без Storage.
+pub fn collect_seen_paths_standalone(
+    root: &Path,
+    config: &IndexConfig,
+) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let config_for_filter = config.clone();
+
+    let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
+        if e.file_type().is_dir() {
+            if let Some(name) = e.file_name().to_str() {
+                return !config_for_filter.is_excluded_dir(name);
+            }
+        }
+        true
+    });
+
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if matches!(categorize_file(path), FileCategory::Binary) {
+            continue;
+        }
+        let rel_path = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        seen.insert(rel_path);
+    }
+
+    seen
 }
 
 #[cfg(test)]

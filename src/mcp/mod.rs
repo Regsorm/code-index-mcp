@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::storage::Storage;
+use crate::storage::models::IndexingStatus;
 
 pub mod tools;
 
@@ -71,6 +72,8 @@ pub struct FilePathParams {
 pub struct CodeIndexServer {
     /// Хранилище — защищено мьютексом для потокобезопасного доступа
     pub storage: Arc<Mutex<Storage>>,
+    /// Статус фоновой индексации (shared с background_reindex)
+    pub indexing_status: Arc<Mutex<IndexingStatus>>,
     /// Роутер инструментов — генерируется макросом tool_router
     tool_router: ToolRouter<Self>,
 }
@@ -80,17 +83,22 @@ impl CodeIndexServer {
     pub fn new(storage: Storage) -> Self {
         Self {
             storage: Arc::new(Mutex::new(storage)),
+            indexing_status: Arc::new(Mutex::new(IndexingStatus::Ready)),
             tool_router: Self::tool_router(),
         }
     }
 
     /// Создать сервер из уже разделяемого хранилища (для daemon-режима).
     ///
-    /// Принимает Arc<Mutex<Storage>> снаружи — сервер и watcher
-    /// будут работать с одной и той же БД.
-    pub fn new_from_shared(storage: Arc<Mutex<Storage>>) -> Self {
+    /// Принимает Arc<Mutex<Storage>> и Arc<Mutex<IndexingStatus>> снаружи —
+    /// сервер, watcher и background_reindex работают с одними данными.
+    pub fn new_from_shared(
+        storage: Arc<Mutex<Storage>>,
+        indexing_status: Arc<Mutex<IndexingStatus>>,
+    ) -> Self {
         Self {
             storage,
+            indexing_status,
             tool_router: Self::tool_router(),
         }
     }

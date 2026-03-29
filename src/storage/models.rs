@@ -102,6 +102,35 @@ pub struct FileSummary {
     pub variables: Vec<VariableRecord>,
 }
 
+/// Статус фоновой индексации
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state")]
+pub enum IndexingStatus {
+    /// Индексация не идёт, данные актуальны
+    Ready,
+    /// Индексация в процессе
+    Indexing {
+        /// Текущая фаза
+        phase: String,
+        /// Обработано файлов
+        files_done: usize,
+        /// Всего файлов
+        files_total: usize,
+    },
+    /// Индексация завершена
+    Completed {
+        /// Проиндексировано файлов
+        files_indexed: usize,
+        /// Время в миллисекундах
+        elapsed_ms: u64,
+    },
+    /// Индексация провалилась
+    Failed {
+        /// Текст ошибки
+        error: String,
+    },
+}
+
 /// Статистика базы данных
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbStats {
@@ -112,4 +141,7 @@ pub struct DbStats {
     pub total_calls: usize,
     pub total_variables: usize,
     pub total_text_files: usize,
+    /// Статус фоновой индексации (заполняется MCP-сервером)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexing_status: Option<IndexingStatus>,
 }

@@ -673,6 +673,7 @@ impl Storage {
             total_calls:      count("calls")?,
             total_variables:  count("variables")?,
             total_text_files: count("text_files")?,
+            indexing_status: None,
         })
     }
 

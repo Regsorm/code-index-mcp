@@ -111,11 +111,16 @@ pub async fn get_file_summary(server: &CodeIndexServer, path: String) -> String 
     }
 }
 
-/// Статистика базы данных
+/// Статистика базы данных + статус индексации
 pub async fn get_stats(server: &CodeIndexServer) -> String {
     let storage = server.storage.lock().await;
     match storage.get_stats() {
-        Ok(stats) => to_json(&stats),
+        Ok(mut stats) => {
+            // Подставляем статус индексации из shared state
+            let status = server.indexing_status.lock().await;
+            stats.indexing_status = Some(status.clone());
+            to_json(&stats)
+        }
         Err(e) => format!("{{\"error\": \"get_stats: {}\"}}", e),
     }
 }
