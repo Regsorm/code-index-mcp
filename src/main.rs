@@ -241,6 +241,7 @@ fn get_db_path(project_path: &str) -> PathBuf {
 async fn main() -> anyhow::Result<()> {
     // Инициализация логирования
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing::Level::INFO.into()),
