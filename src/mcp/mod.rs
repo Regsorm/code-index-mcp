@@ -83,30 +83,42 @@ pub struct GrepBodyParams {
 /// Основная структура MCP-сервера индексатора кода
 #[derive(Clone)]
 pub struct CodeIndexServer {
-    /// Хранилище — защищено мьютексом для потокобезопасного доступа
-    pub storage: Arc<Mutex<Storage>>,
-    /// Статус фоновой индексации (shared с background_reindex)
+    /// Хранилище — None пока идёт инициализация, Some после открытия БД
+    pub storage: Arc<Mutex<Option<Storage>>>,
+    /// Статус фоновой индексации (shared с background_init)
     pub indexing_status: Arc<Mutex<IndexingStatus>>,
     /// Роутер инструментов — генерируется макросом tool_router
     tool_router: ToolRouter<Self>,
 }
 
 impl CodeIndexServer {
-    /// Создать новый сервер с готовым Storage
+    /// Создать новый сервер с готовым Storage (для CLI/тестов)
     pub fn new(storage: Storage) -> Self {
         Self {
-            storage: Arc::new(Mutex::new(storage)),
+            storage: Arc::new(Mutex::new(Some(storage))),
             indexing_status: Arc::new(Mutex::new(IndexingStatus::Ready)),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Создать сервер без Storage — для daemon-режима мгновенного старта.
+    ///
+    /// Storage будет подложен позже через shared Arc, когда background_init
+    /// откроет БД. До этого момента инструменты возвращают ошибку инициализации.
+    pub fn new_empty(indexing_status: Arc<Mutex<IndexingStatus>>) -> Self {
+        Self {
+            storage: Arc::new(Mutex::new(None)),
+            indexing_status,
             tool_router: Self::tool_router(),
         }
     }
 
     /// Создать сервер из уже разделяемого хранилища (для daemon-режима).
     ///
-    /// Принимает Arc<Mutex<Storage>> и Arc<Mutex<IndexingStatus>> снаружи —
-    /// сервер, watcher и background_reindex работают с одними данными.
+    /// Принимает Arc<Mutex<Option<Storage>>> и Arc<Mutex<IndexingStatus>> снаружи —
+    /// сервер, watcher и background_init работают с одними данными.
     pub fn new_from_shared(
-        storage: Arc<Mutex<Storage>>,
+        storage: Arc<Mutex<Option<Storage>>>,
         indexing_status: Arc<Mutex<IndexingStatus>>,
     ) -> Self {
         Self {

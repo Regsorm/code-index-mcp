@@ -1,7 +1,7 @@
 /// Реализации инструментов MCP-сервера
 ///
-/// Каждая функция блокирует мьютекс Storage, вызывает нужный метод,
-/// сериализует результат в JSON и возвращает строку.
+/// Каждая функция блокирует мьютекс Storage, проверяет что он уже инициализирован,
+/// вызывает нужный метод, сериализует результат в JSON и возвращает строку.
 use super::CodeIndexServer;
 
 /// Вспомогательная функция: сериализует значение в JSON или возвращает ошибку
@@ -12,9 +12,22 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
     }
 }
 
+/// Макрос: захватить guard Mutex<Option<Storage>> и вернуть ошибку если Storage ещё не готов.
+/// Использование: let guard = get_storage!(server); let storage = guard.as_ref().unwrap();
+macro_rules! get_storage {
+    ($server:expr) => {{
+        let guard = $server.storage.lock().await;
+        if guard.is_none() {
+            return "{\"error\": \"Сервер инициализируется, подождите...\"}".to_string();
+        }
+        guard
+    }};
+}
+
 /// FTS-поиск функций по запросу
 pub async fn search_function(server: &CodeIndexServer, query: String, limit: Option<usize>, language: Option<String>) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     match storage.search_functions(&query, limit.unwrap_or(20), language.as_deref()) {
         Ok(results) => to_json(&results),
         Err(e) => format!("{{\"error\": \"search_function: {}\"}}", e),
@@ -23,7 +36,8 @@ pub async fn search_function(server: &CodeIndexServer, query: String, limit: Opt
 
 /// FTS-поиск классов по запросу
 pub async fn search_class(server: &CodeIndexServer, query: String, limit: Option<usize>, language: Option<String>) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     match storage.search_classes(&query, limit.unwrap_or(20), language.as_deref()) {
         Ok(results) => to_json(&results),
         Err(e) => format!("{{\"error\": \"search_class: {}\"}}", e),
@@ -32,7 +46,8 @@ pub async fn search_class(server: &CodeIndexServer, query: String, limit: Option
 
 /// Поиск функции по точному имени
 pub async fn get_function(server: &CodeIndexServer, name: String) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     match storage.get_function_by_name(&name) {
         Ok(results) => to_json(&results),
         Err(e) => format!("{{\"error\": \"get_function: {}\"}}", e),
@@ -41,7 +56,8 @@ pub async fn get_function(server: &CodeIndexServer, name: String) -> String {
 
 /// Поиск класса по точному имени
 pub async fn get_class(server: &CodeIndexServer, name: String) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     match storage.get_class_by_name(&name) {
         Ok(results) => to_json(&results),
         Err(e) => format!("{{\"error\": \"get_class: {}\"}}", e),
@@ -50,7 +66,8 @@ pub async fn get_class(server: &CodeIndexServer, name: String) -> String {
 
 /// Кто вызывает данную функцию
 pub async fn get_callers(server: &CodeIndexServer, function_name: String, language: Option<String>) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     match storage.get_callers(&function_name, language.as_deref()) {
         Ok(results) => to_json(&results),
         Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
@@ -59,7 +76,8 @@ pub async fn get_callers(server: &CodeIndexServer, function_name: String, langua
 
 /// Что вызывает данная функция
 pub async fn get_callees(server: &CodeIndexServer, function_name: String, language: Option<String>) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     match storage.get_callees(&function_name, language.as_deref()) {
         Ok(results) => to_json(&results),
         Err(e) => format!("{{\"error\": \"get_callees: {}\"}}", e),
@@ -68,7 +86,8 @@ pub async fn get_callees(server: &CodeIndexServer, function_name: String, langua
 
 /// Универсальный поиск символа (функции + классы + переменные + импорты)
 pub async fn find_symbol(server: &CodeIndexServer, name: String, language: Option<String>) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     match storage.find_symbol(&name, language.as_deref()) {
         Ok(result) => to_json(&result),
         Err(e) => format!("{{\"error\": \"find_symbol: {}\"}}", e),
@@ -82,7 +101,8 @@ pub async fn get_imports(
     module: Option<String>,
     language: Option<String>,
 ) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     // Если задан file_id — поиск по файлу (language не применяется, file_id уникален)
     if let Some(fid) = file_id {
         return match storage.get_imports_by_file(fid) {
@@ -103,7 +123,8 @@ pub async fn get_imports(
 
 /// Сводная карта файла
 pub async fn get_file_summary(server: &CodeIndexServer, path: String) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     match storage.get_file_summary(&path) {
         Ok(Some(summary)) => to_json(&summary),
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден в индексе\"}}", path),
@@ -113,11 +134,22 @@ pub async fn get_file_summary(server: &CodeIndexServer, path: String) -> String 
 
 /// Статистика базы данных + статус индексации
 pub async fn get_stats(server: &CodeIndexServer) -> String {
-    let storage = server.storage.lock().await;
+    let status = server.indexing_status.lock().await;
+    let guard = server.storage.lock().await;
+    // Если Storage ещё не инициализирован — вернуть только статус
+    if guard.is_none() {
+        let stats = serde_json::json!({
+            "indexing_status": *status
+        });
+        return match serde_json::to_string_pretty(&stats) {
+            Ok(s) => s,
+            Err(e) => format!("{{\"error\": \"Ошибка сериализации: {}\"}}", e),
+        };
+    }
+    let storage = guard.as_ref().unwrap();
     match storage.get_stats() {
         Ok(mut stats) => {
             // Подставляем статус индексации из shared state
-            let status = server.indexing_status.lock().await;
             stats.indexing_status = Some(status.clone());
             to_json(&stats)
         }
@@ -133,7 +165,8 @@ pub async fn grep_body(
     language: Option<String>,
     limit: Option<usize>,
 ) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     match storage.grep_body(
         pattern.as_deref(),
         regex.as_deref(),
@@ -147,7 +180,8 @@ pub async fn grep_body(
 
 /// FTS-поиск по текстовым файлам
 pub async fn search_text(server: &CodeIndexServer, query: String, limit: Option<usize>, language: Option<String>) -> String {
-    let storage = server.storage.lock().await;
+    let guard = get_storage!(server);
+    let storage = guard.as_ref().unwrap();
     match storage.search_text(&query, limit.unwrap_or(20), language.as_deref()) {
         Ok(results) => {
             // Преобразуем Vec<(String, String)> в массив объектов для удобства

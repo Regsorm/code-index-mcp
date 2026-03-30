@@ -121,6 +121,8 @@ pub struct GrepBodyMatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "state")]
 pub enum IndexingStatus {
+    /// БД ещё не открыта — сервер только что запустился
+    Initializing,
     /// Индексация не идёт, данные актуальны
     Ready,
     /// Индексация в процессе

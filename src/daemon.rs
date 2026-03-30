@@ -34,28 +34,27 @@ pub struct DaemonConfig {
     pub flush_interval_sec: u64,
 }
 
-/// Запустить daemon: MCP сразу + фоновая индексация + watcher + flush
+/// Запустить daemon: MCP стартует мгновенно, открытие БД и индексация в фоне
 pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
-    // 1. Загрузить/создать базу данных (старые данные с диска доступны сразу)
-    let storage = Storage::open_auto(&config.db_path, &config.storage_config)?;
+    // 1. Создать пустой shared_storage — Storage ещё не открыт
+    let shared_storage: Arc<Mutex<Option<Storage>>> = Arc::new(Mutex::new(None));
 
-    // 2. Обернуть в Arc<Mutex> СРАЗУ — до индексации
-    let shared_storage = Arc::new(Mutex::new(storage));
+    // 2. Статус фоновой инициализации — начинаем с Initializing
+    let indexing_status = Arc::new(Mutex::new(IndexingStatus::Initializing));
 
-    // 3. Статус фоновой индексации
-    let indexing_status = Arc::new(Mutex::new(IndexingStatus::Ready));
-
-    // 4. Создать MCP-сервер с shared хранилищем и статусом
+    // 3. Создать MCP-сервер без Storage — стартует МГНОВЕННО
     let mcp_server = CodeIndexServer::new_from_shared(
         shared_storage.clone(),
         indexing_status.clone(),
     );
 
-    // 5. Запустить фоновую индексацию
-    eprintln!("[daemon] MCP-сервер запускается, индексация в фоне...");
-    let reindex_handle = tokio::spawn(background_reindex(
+    // 4. Запустить фоновую инициализацию: открытие БД + индексация
+    eprintln!("[daemon] MCP-сервер запускается (Storage инициализируется в фоне)...");
+    let reindex_handle = tokio::spawn(background_init(
         shared_storage.clone(),
         indexing_status.clone(),
+        config.db_path.clone(),
+        config.storage_config.clone(),
         config.root.clone(),
         config.index_config.clone(),
     ));
@@ -76,10 +75,13 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             let interval = tokio::time::Duration::from_secs(flush_interval);
             loop {
                 tokio::time::sleep(interval).await;
-                let storage = storage_for_flush.lock().await;
-                match storage.flush_to_disk(&db_path_flush) {
-                    Ok(_) => eprintln!("[flush] Записано на диск"),
-                    Err(e) => eprintln!("[flush] Ошибка: {}", e),
+                let guard = storage_for_flush.lock().await;
+                // Пропускаем flush если Storage ещё не инициализирован
+                if let Some(ref storage) = *guard {
+                    match storage.flush_to_disk(&db_path_flush) {
+                        Ok(_) => eprintln!("[flush] Записано на диск"),
+                        Err(e) => eprintln!("[flush] Ошибка: {}", e),
+                    }
                 }
             }
         });
@@ -133,7 +135,16 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
 
             // Получаем блокировку через tokio runtime
             let rt = tokio::runtime::Handle::current();
-            let mut storage = rt.block_on(storage_for_watcher.lock());
+            let mut guard = rt.block_on(storage_for_watcher.lock());
+
+            // Пропускаем батч если Storage ещё не инициализирован
+            let storage: &mut Storage = match guard.as_mut() {
+                Some(s) => s,
+                None => {
+                    eprintln!("[watcher] Storage ещё не готов, пропускаем батч");
+                    continue;
+                }
+            };
 
             // Начинаем транзакцию батча
             if let Err(e) = storage.begin_batch() {
@@ -174,8 +185,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                                     match parser.parse(&content, &rel_path) {
                                         Ok(parse_result) => {
                                             // Используем Indexer::write_code_to_db
-                                            // Создаём временный Indexer с &mut storage
-                                            let indexer = Indexer::new(&mut storage);
+                                            let indexer = Indexer::new(storage);
                                             if let Err(e) = indexer.write_code_to_db(
                                                 &rel_path,
                                                 &hash,
@@ -213,7 +223,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                                             || !pr.classes.is_empty()
                                             || !pr.variables.is_empty()
                                         {
-                                            let indexer = Indexer::new(&mut storage);
+                                            let indexer = Indexer::new(storage);
                                             let _ = indexer.write_code_to_db(
                                                 &rel_path,
                                                 &hash,
@@ -236,7 +246,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
 
                                 if !indexed_as_code {
                                     let text_result = TextParser::parse(&content);
-                                    let indexer = Indexer::new(&mut storage);
+                                    let indexer = Indexer::new(storage);
                                     if let Err(e) = indexer.write_text_to_db(
                                         &rel_path,
                                         &hash,
@@ -303,10 +313,13 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         let interval = tokio::time::Duration::from_secs(flush_interval);
         loop {
             tokio::time::sleep(interval).await;
-            let storage = storage_for_flush.lock().await;
-            match storage.flush_to_disk(&db_path_for_flush) {
-                Ok(_) => eprintln!("[flush] Записано на диск"),
-                Err(e) => eprintln!("[flush] Ошибка: {}", e),
+            let guard = storage_for_flush.lock().await;
+            // Пропускаем flush если Storage ещё не инициализирован
+            if let Some(ref storage) = *guard {
+                match storage.flush_to_disk(&db_path_for_flush) {
+                    Ok(_) => eprintln!("[flush] Записано на диск"),
+                    Err(e) => eprintln!("[flush] Ошибка: {}", e),
+                }
             }
         }
     });
@@ -328,22 +341,62 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     reindex_handle.abort();
 
     // Финальный flush перед выходом
-    let storage = shared_storage.lock().await;
-    if let Err(e) = storage.flush_to_disk(&db_path_for_final) {
-        eprintln!("[daemon] Ошибка финального flush: {}", e);
-    } else {
-        eprintln!("[daemon] Финальный flush выполнен");
+    let guard = shared_storage.lock().await;
+    if let Some(ref storage) = *guard {
+        if let Err(e) = storage.flush_to_disk(&db_path_for_final) {
+            eprintln!("[daemon] Ошибка финального flush: {}", e);
+        } else {
+            eprintln!("[daemon] Финальный flush выполнен");
+        }
     }
 
     Ok(())
+}
+
+/// Фоновая инициализация: открыть БД, положить в shared_storage, затем запустить индексацию.
+///
+/// Это единственное место, где происходит Storage::open_auto — MCP к этому моменту уже
+/// принимает соединения и отвечает на запросы статусом "Initializing".
+async fn background_init(
+    shared_storage: Arc<Mutex<Option<Storage>>>,
+    indexing_status: Arc<Mutex<IndexingStatus>>,
+    db_path: PathBuf,
+    storage_config: StorageConfig,
+    root: PathBuf,
+    config: IndexConfig,
+) {
+    // Фаза 0: открыть БД (может занять время для большой in-memory базы)
+    eprintln!("[init] Открытие базы данных: {:?}", db_path);
+    let storage = match Storage::open_auto(&db_path, &storage_config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[init] ОШИБКА открытия БД: {}", e);
+            let mut status = indexing_status.lock().await;
+            *status = IndexingStatus::Failed {
+                error: format!("open_auto: {}", e),
+            };
+            return;
+        }
+    };
+
+    // Положить Storage в shared — инструменты начинают работать
+    {
+        let mut guard = shared_storage.lock().await;
+        *guard = Some(storage);
+    }
+    eprintln!("[init] БД загружена, инструменты доступны");
+
+    // Передать управление фоновой индексации
+    background_reindex(shared_storage, indexing_status, root, config).await;
 }
 
 /// Фоновая индексация с пофазным захватом Mutex.
 ///
 /// Фазы 1-2 (сбор файлов + парсинг) не трогают Storage → mutex свободен → tools отвечают.
 /// Фаза 3 (запись) захватывает mutex батчами → между батчами tools отвечают.
+/// Вызывается из background_init после того как Storage уже открыт и помещён в shared.
 async fn background_reindex(
-    shared_storage: Arc<Mutex<Storage>>,
+    shared_storage: Arc<Mutex<Option<Storage>>>,
     indexing_status: Arc<Mutex<IndexingStatus>>,
     root: PathBuf,
     config: IndexConfig,
@@ -361,7 +414,9 @@ async fn background_reindex(
     }
 
     let existing_files: HashMap<String, (i64, String)> = {
-        let storage = shared_storage.lock().await;
+        // Storage гарантированно есть — background_init уже открыл БД
+        let guard = shared_storage.lock().await;
+        let storage = guard.as_ref().unwrap();
         match storage.get_all_files() {
             Ok(files) => files
                 .into_iter()
@@ -556,7 +611,8 @@ async fn background_reindex(
             parse_results.len(),
             config.bulk_threshold
         );
-        let storage = shared_storage.lock().await;
+        let guard = shared_storage.lock().await;
+        let storage = guard.as_ref().unwrap();
         if let Err(e) = storage.prepare_bulk_load() {
             eprintln!("[reindex] Ошибка prepare_bulk_load: {}", e);
             // Продолжаем без bulk — будет медленнее, но работоспособно
@@ -569,7 +625,8 @@ async fn background_reindex(
 
     // Пишем батчами, освобождая mutex между ними
     for chunk in parse_results.chunks(batch_size) {
-        let mut storage = shared_storage.lock().await;
+        let mut guard = shared_storage.lock().await;
+        let storage = guard.as_mut().unwrap();
         if let Err(e) = storage.begin_batch() {
             eprintln!("[reindex] Ошибка begin_batch: {}", e);
             continue;
@@ -585,7 +642,7 @@ async fn background_reindex(
                     ast_hash,
                     parse_result,
                 } => {
-                    let indexer = Indexer::new(&mut storage);
+                    let indexer = Indexer::new(storage);
                     match indexer.write_code_to_db(
                         rel_path,
                         content_hash,
@@ -605,7 +662,7 @@ async fn background_reindex(
                     lines_total,
                     content,
                 } => {
-                    let indexer = Indexer::new(&mut storage);
+                    let indexer = Indexer::new(storage);
                     match indexer.write_text_to_db(rel_path, content_hash, *lines_total, content, is_fresh_db) {
                         Ok(_) => files_indexed += 1,
                         Err(e) => errors.push((rel_path.clone(), e.to_string())),
@@ -638,7 +695,8 @@ async fn background_reindex(
     if bulk_mode {
         let idx_start = std::time::Instant::now();
         eprintln!("[reindex] Создание B-tree индексов и перестройка FTS...");
-        let storage = shared_storage.lock().await;
+        let guard = shared_storage.lock().await;
+        let storage = guard.as_ref().unwrap();
         if let Err(e) = storage.finish_bulk_load() {
             eprintln!("[reindex] Ошибка finish_bulk_load: {}", e);
         }
@@ -657,7 +715,8 @@ async fn background_reindex(
 
     let mut files_deleted = 0usize;
     {
-        let storage = shared_storage.lock().await;
+        let guard = shared_storage.lock().await;
+        let storage = guard.as_ref().unwrap();
         if let Err(e) = storage.begin_batch() {
             eprintln!("[reindex] Ошибка begin_batch (cleanup): {}", e);
         } else {
