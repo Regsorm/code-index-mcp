@@ -263,6 +263,7 @@ fn visit_function(
         body,
         is_async,
         node_hash,
+        ..Default::default()
     });
 
     // Рекурсивно обходим тело функции

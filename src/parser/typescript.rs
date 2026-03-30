@@ -242,6 +242,7 @@ fn visit_function_declaration(
         body,
         is_async,
         node_hash,
+        ..Default::default()
     });
 
     if let Some(body_node) = node.child_by_field_name("body") {
@@ -298,6 +299,7 @@ fn visit_method_definition(
         body,
         is_async,
         node_hash,
+        ..Default::default()
     });
 
     // Тело метода
@@ -492,6 +494,7 @@ fn visit_variable_declarator(
                     body,
                     is_async,
                     node_hash,
+                    ..Default::default()
                 });
 
                 if let Some(body_node) = val.child_by_field_name("body") {

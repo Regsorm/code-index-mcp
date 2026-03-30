@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Извлечённая функция из AST
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ParsedFunction {
     pub name: String,
     pub qualified_name: Option<String>,
@@ -13,6 +13,10 @@ pub struct ParsedFunction {
     pub body: String,
     pub is_async: bool,
     pub node_hash: String,
+    /// Тип переопределения: "Перед", "После", "Вместо" (только BSL-расширения)
+    pub override_type: Option<String>,
+    /// Имя оригинальной процедуры, которую переопределяет аннотация
+    pub override_target: Option<String>,
 }
 
 /// Извлечённый класс

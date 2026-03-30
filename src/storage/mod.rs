@@ -199,8 +199,9 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             "INSERT INTO functions
                  (file_id, name, qualified_name, line_start, line_end,
-                  args, return_type, docstring, body, is_async, node_hash)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                  args, return_type, docstring, body, is_async, node_hash,
+                  override_type, override_target)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         )?;
         for r in records {
             stmt.execute(params![
@@ -215,6 +216,8 @@ impl Storage {
                 r.body,
                 r.is_async as i32,
                 r.node_hash,
+                r.override_type,
+                r.override_target,
             ])
             .context("insert_functions: ошибка вставки строки")?;
         }
@@ -891,18 +894,22 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
 
 fn row_to_function(row: &rusqlite::Row<'_>) -> rusqlite::Result<FunctionRecord> {
     Ok(FunctionRecord {
-        id:             Some(row.get(0)?),
-        file_id:        row.get(1)?,
-        name:           row.get(2)?,
-        qualified_name: row.get(3)?,
-        line_start:     row.get::<_, i64>(4)? as usize,
-        line_end:       row.get::<_, i64>(5)? as usize,
-        args:           row.get(6)?,
-        return_type:    row.get(7)?,
-        docstring:      row.get(8)?,
-        body:           row.get(9)?,
-        is_async:       row.get::<_, i32>(10)? != 0,
-        node_hash:      row.get(11)?,
+        id:              Some(row.get(0)?),
+        file_id:         row.get(1)?,
+        name:            row.get(2)?,
+        qualified_name:  row.get(3)?,
+        line_start:      row.get::<_, i64>(4)? as usize,
+        line_end:        row.get::<_, i64>(5)? as usize,
+        args:            row.get(6)?,
+        return_type:     row.get(7)?,
+        docstring:       row.get(8)?,
+        body:            row.get(9)?,
+        is_async:        row.get::<_, i32>(10)? != 0,
+        node_hash:       row.get(11)?,
+        // Колонки 12 и 13 появились в миграции v2 — читаем через try_get,
+        // чтобы не ломаться на старых индексах без этих колонок
+        override_type:   row.get(12).ok(),
+        override_target: row.get(13).ok(),
     })
 }
 
@@ -986,6 +993,7 @@ mod tests {
             body: format!("def {name}(x, y):\n    return x + y"),
             is_async: false,
             node_hash: "hash123".to_string(),
+            ..Default::default()
         }
     }
 
@@ -1066,6 +1074,7 @@ mod tests {
                 body: "def binary_search(arr, target):\n    pass".to_string(),
                 is_async: false,
                 node_hash: "hs1".to_string(),
+                ..Default::default()
             },
             FunctionRecord {
                 id: None,
@@ -1080,6 +1089,7 @@ mod tests {
                 body: "def linear_scan():\n    pass".to_string(),
                 is_async: false,
                 node_hash: "hs2".to_string(),
+                ..Default::default()
             },
         ];
         storage.insert_functions(&funcs).unwrap();
@@ -1208,6 +1218,7 @@ mod tests {
             body: "def use_tree_sitter(): pass".to_string(),
             is_async: false,
             node_hash: "h_ts".to_string(),
+            ..Default::default()
         };
         storage.insert_functions(&[func]).unwrap();
 

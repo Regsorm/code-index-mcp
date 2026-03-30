@@ -185,6 +185,7 @@ fn visit_function_decl(
         body: body_text,
         is_async: false, // В Go нет async keyword
         node_hash,
+        ..Default::default()
     });
 
     // Рекурсивно обходим тело функции для поиска вызовов
@@ -248,6 +249,7 @@ fn visit_method_decl(
         body: body_text,
         is_async: false,
         node_hash,
+        ..Default::default()
     });
 
     // Рекурсивно обходим тело для вызовов

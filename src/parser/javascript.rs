@@ -229,6 +229,7 @@ fn visit_function_declaration(
         body,
         is_async,
         node_hash,
+        ..Default::default()
     };
     ctx.functions.push(func);
 
@@ -287,6 +288,7 @@ fn visit_method_definition(
         body,
         is_async,
         node_hash,
+        ..Default::default()
     });
 
     // Рекурсивно обходим тело метода
@@ -373,6 +375,7 @@ fn visit_variable_declarator(
                     body,
                     is_async,
                     node_hash,
+                    ..Default::default()
                 });
 
                 // Рекурсивно обходим тело

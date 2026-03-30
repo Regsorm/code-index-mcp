@@ -95,6 +95,40 @@ fn extract_annotation(node: tree_sitter::Node, source: &[u8]) -> Option<String> 
     None
 }
 
+/// Извлечь информацию о переопределении из аннотации расширения.
+/// Для &Перед("Foo"), &После("Foo"), &Вместо("Foo") возвращает (тип, цель).
+fn extract_override_info(node: tree_sitter::Node, source: &[u8]) -> (Option<String>, Option<String>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "annotation" {
+            if let Some(ident) = find_child_by_kind(child, "identifier") {
+                let name = node_text(ident, source).to_lowercase();
+                let override_type = match name.as_str() {
+                    "перед" | "before" => Some("Перед"),
+                    "после" | "after"  => Some("После"),
+                    "вместо" | "instead" => Some("Вместо"),
+                    _ => None,
+                };
+                if let Some(otype) = override_type {
+                    // Ищем annotation_parameter → string (имя целевой процедуры)
+                    if let Some(param) = find_child_by_kind(child, "annotation_parameter") {
+                        if let Some(s) = find_child_by_kind(param, "string") {
+                            let raw = node_text(s, source);
+                            // Убираем кавычки: "Foo" → Foo
+                            let target = raw.trim_matches('"').to_string();
+                            if !target.is_empty() {
+                                return (Some(otype.to_string()), Some(target));
+                            }
+                        }
+                    }
+                    return (Some(otype.to_string()), None);
+                }
+            }
+        }
+    }
+    (None, None)
+}
+
 /// Контекст обхода AST BSL
 struct VisitContext<'a> {
     source: &'a [u8],
@@ -203,6 +237,9 @@ fn visit_proc_or_func(
     // Директива компиляции (annotation) → сохраняем в return_type
     let directive = extract_annotation(node, source);
 
+    // Аннотация переопределения расширения (&Перед/&После/&Вместо)
+    let (override_type, override_target) = extract_override_info(node, source);
+
     // Метаинформация BSL в docstring: тип + директива + экспорт
     let docstring = {
         let mut parts = vec![proc_type.to_string()];
@@ -211,6 +248,9 @@ fn visit_proc_or_func(
         }
         if is_export {
             parts.push("export".to_string());
+        }
+        if let (Some(ref ot), Some(ref otgt)) = (&override_type, &override_target) {
+            parts.push(format!("override:{ot}({otgt})"));
         }
         Some(parts.join(" "))
     };
@@ -232,6 +272,8 @@ fn visit_proc_or_func(
         body,
         is_async: false, // BSL не имеет async
         node_hash,
+        override_type,
+        override_target,
     });
 
     // Рекурсивно обходим тело для извлечения вызовов
@@ -455,5 +497,52 @@ mod tests {
         // docstring содержит "procedure"
         let doc = result.functions[0].docstring.as_deref().unwrap_or("");
         assert!(doc.contains("procedure"));
+    }
+
+    #[test]
+    fn test_parse_bsl_override_before() {
+        let parser = BslParser::new();
+        let source = "&Перед(\"ОригинальнаяПроцедура\")\nПроцедура Ext_ОригинальнаяПроцедура()\nКонецПроцедуры";
+        let result = parser.parse(source, "test.bsl").unwrap();
+        assert_eq!(result.functions.len(), 1);
+        let f = &result.functions[0];
+        assert_eq!(f.override_type.as_deref(), Some("Перед"));
+        assert_eq!(f.override_target.as_deref(), Some("ОригинальнаяПроцедура"));
+        // Директива тоже должна быть извлечена
+        assert_eq!(f.return_type.as_deref(), Some("&Перед"));
+    }
+
+    #[test]
+    fn test_parse_bsl_override_instead() {
+        let parser = BslParser::new();
+        let source = "&Вместо(\"ПолучитьДанные\")\nФункция Ext_ПолучитьДанные()\n    Возврат 42;\nКонецФункции";
+        let result = parser.parse(source, "test.bsl").unwrap();
+        assert_eq!(result.functions.len(), 1);
+        let f = &result.functions[0];
+        assert_eq!(f.override_type.as_deref(), Some("Вместо"));
+        assert_eq!(f.override_target.as_deref(), Some("ПолучитьДанные"));
+    }
+
+    #[test]
+    fn test_parse_bsl_override_after() {
+        let parser = BslParser::new();
+        let source = "&После(\"ПриЗаписи\")\nПроцедура Ext_ПриЗаписи()\nКонецПроцедуры";
+        let result = parser.parse(source, "test.bsl").unwrap();
+        assert_eq!(result.functions.len(), 1);
+        let f = &result.functions[0];
+        assert_eq!(f.override_type.as_deref(), Some("После"));
+        assert_eq!(f.override_target.as_deref(), Some("ПриЗаписи"));
+    }
+
+    #[test]
+    fn test_parse_bsl_no_override_for_regular_directive() {
+        let parser = BslParser::new();
+        let source = "&НаСервере\nПроцедура Тест()\nКонецПроцедуры";
+        let result = parser.parse(source, "test.bsl").unwrap();
+        assert_eq!(result.functions.len(), 1);
+        let f = &result.functions[0];
+        assert!(f.override_type.is_none());
+        assert!(f.override_target.is_none());
+        assert_eq!(f.return_type.as_deref(), Some("&НаСервере"));
     }
 }

@@ -254,6 +254,7 @@ fn visit_function(
         body,
         is_async,
         node_hash,
+        ..Default::default()
     };
     ctx.functions.push(func);
 

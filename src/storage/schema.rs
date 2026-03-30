@@ -112,7 +112,9 @@ CREATE TABLE IF NOT EXISTS functions (
     docstring      TEXT,
     body           TEXT    NOT NULL DEFAULT '',
     is_async       INTEGER NOT NULL DEFAULT 0,
-    node_hash      TEXT    NOT NULL DEFAULT ''
+    node_hash      TEXT    NOT NULL DEFAULT '',
+    override_type   TEXT,
+    override_target TEXT
 );
 
 CREATE TABLE IF NOT EXISTS classes (
@@ -198,6 +200,7 @@ pub fn initialize_tables_only(conn: &rusqlite::Connection) -> rusqlite::Result<(
     ")?;
     // Только таблицы + FTS-виртуальные таблицы — без INDEXES_SQL и TRIGGERS_SQL
     conn.execute_batch(SQL_SCHEMA)?;
+    migrate_v2(conn)?;
     Ok(())
 }
 
@@ -213,10 +216,26 @@ pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA cache_size=-64000;")?;
     // Применяем DDL-схему: таблицы и FTS-виртуальные таблицы
     conn.execute_batch(SQL_SCHEMA)?;
+    migrate_v2(conn)?;
     // Создаём триггеры
     conn.execute_batch(TRIGGERS_SQL)?;
     // Создаём индексы
     conn.execute_batch(INDEXES_SQL)?;
+    Ok(())
+}
+
+/// Миграция v2: добавить колонки override_type/override_target для BSL-расширений.
+/// Безопасно вызывать повторно — проверяет наличие колонки перед ALTER.
+pub fn migrate_v2(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_col = conn
+        .prepare("SELECT override_type FROM functions LIMIT 0")
+        .is_ok();
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE functions ADD COLUMN override_type TEXT;
+             ALTER TABLE functions ADD COLUMN override_target TEXT;",
+        )?;
+    }
     Ok(())
 }
 

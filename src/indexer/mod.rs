@@ -405,6 +405,9 @@ impl<'a> Indexer<'a> {
                 body: f.body.clone(),
                 is_async: f.is_async,
                 node_hash: f.node_hash.clone(),
+                // Поля переопределения BSL-расширения (для других языков = None)
+                override_type: f.override_type.clone(),
+                override_target: f.override_target.clone(),
             })
             .collect();
         self.storage.insert_functions(&functions)?;

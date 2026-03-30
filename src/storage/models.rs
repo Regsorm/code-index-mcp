@@ -13,7 +13,7 @@ pub struct FileRecord {
 }
 
 /// Запись функции
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FunctionRecord {
     pub id: Option<i64>,
     pub file_id: i64,
@@ -27,6 +27,10 @@ pub struct FunctionRecord {
     pub body: String,
     pub is_async: bool,
     pub node_hash: String,
+    /// Тип переопределения: "Перед", "После", "Вместо" (только BSL-расширения)
+    pub override_type: Option<String>,
+    /// Имя оригинальной процедуры, которую переопределяет аннотация
+    pub override_target: Option<String>,
 }
 
 /// Запись класса

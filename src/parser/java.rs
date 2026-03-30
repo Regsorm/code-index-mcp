@@ -294,6 +294,7 @@ fn visit_method(
         body,
         is_async,
         node_hash,
+        ..Default::default()
     });
 
     // Рекурсивно обходим тело метода
@@ -346,6 +347,7 @@ fn visit_constructor(
         body,
         is_async: false,
         node_hash,
+        ..Default::default()
     });
 
     // Рекурсивно обходим тело конструктора
