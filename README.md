@@ -138,6 +138,10 @@ code-index get-callees "function_name" --path /project [--language python]
 # Navigation (JSON output)
 code-index get-imports --path /project [--module "name"] [--file-id 42]
 code-index get-file-summary "src/main.rs" --path /project
+
+# Substring / regex search in function and class bodies (supports dots and special chars)
+code-index grep-body --pattern "Catalog.Contractors" --path /project [--language bsl] [--limit 100]
+code-index grep-body --regex "Catalog\.(Contractors|Organizations)" --path /project
 ```
 
 ## Using CLI from Subagents

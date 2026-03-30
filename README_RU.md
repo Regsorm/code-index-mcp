@@ -142,6 +142,10 @@ code-index get-callees "имя_функции" --path /project [--language pytho
 # Навигация (JSON вывод)
 code-index get-imports --path /project [--module "имя"] [--file-id 42]
 code-index get-file-summary "src/main.rs" --path /project
+
+# Поиск подстроки или regex в телах функций/классов (поддерживает точки и спецсимволы)
+code-index grep-body --pattern "Справочники.Контрагенты" --path /project [--language bsl] [--limit 100]
+code-index grep-body --regex "Справочники\.(Контрагенты|Организации)" --path /project
 ```
 
 ## Использование CLI из субагентов

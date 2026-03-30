@@ -227,6 +227,29 @@ enum Commands {
         #[arg(long, default_value = "20")]
         limit: usize,
     },
+
+    /// Поиск подстроки или regex в телах функций и классов (в отличие от FTS, поддерживает точки и спецсимволы)
+    GrepBody {
+        /// Путь к проекту
+        #[arg(short, long, default_value = ".")]
+        path: String,
+
+        /// Буквальная подстрока для поиска (LIKE). Поддерживает точки и спецсимволы.
+        #[arg(long)]
+        pattern: Option<String>,
+
+        /// Регулярное выражение для поиска (REGEXP). Альтернатива --pattern.
+        #[arg(long)]
+        regex: Option<String>,
+
+        /// Фильтр по языку (bsl, python, rust, java, go, javascript, typescript)
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Максимум результатов
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
 }
 
 /// Получить путь к БД для проекта
@@ -607,6 +630,23 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&json_results)?);
+        }
+
+        Commands::GrepBody { path, pattern, regex, language, limit } => {
+            if pattern.is_none() && regex.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Укажите --pattern <подстрока> или --regex <выражение>"
+                ));
+            }
+            let db_path = get_db_path(&path);
+            let storage = Storage::open_file(&db_path)?;
+            let results = storage.grep_body(
+                pattern.as_deref(),
+                regex.as_deref(),
+                language.as_deref(),
+                limit,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&results)?);
         }
     }
 
