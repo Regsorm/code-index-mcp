@@ -102,6 +102,21 @@ pub struct FileSummary {
     pub variables: Vec<VariableRecord>,
 }
 
+/// Результат grep_body — функция/класс, содержащая паттерн
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepBodyMatch {
+    /// Путь к файлу
+    pub file_path: String,
+    /// Имя функции или класса
+    pub name: String,
+    /// Тип: "function" или "class"
+    pub kind: String,
+    /// Начальная строка
+    pub line_start: usize,
+    /// Конечная строка
+    pub line_end: usize,
+}
+
 /// Статус фоновой индексации
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "state")]

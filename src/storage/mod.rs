@@ -9,6 +9,41 @@ use std::path::Path;
 
 use models::*;
 
+/// Зарегистрировать scalar-функцию REGEXP для поддержки оператора REGEXP в SQL.
+/// Использует crate `regex` — никаких внешних расширений SQLite не нужно.
+/// Кеширует скомпилированный Regex через RefCell — компиляция один раз за запрос.
+fn register_regexp(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    use std::cell::RefCell;
+
+    // Кеш: (паттерн, скомпилированный Regex)
+    let cache: RefCell<Option<(String, regex::Regex)>> = RefCell::new(None);
+
+    conn.create_scalar_function(
+        "regexp",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        move |ctx| {
+            let pattern: String = ctx.get(0)?;
+            let text: String = ctx.get(1)?;
+
+            let mut cached = cache.borrow_mut();
+            let re = match cached.as_ref() {
+                Some((p, re)) if *p == pattern => re,
+                _ => {
+                    let new_re = regex::Regex::new(&pattern)
+                        .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+                    *cached = Some((pattern, new_re));
+                    &cached.as_ref().unwrap().1
+                }
+            };
+            Ok(re.is_match(&text))
+        },
+    )
+    .context("Не удалось зарегистрировать REGEXP")?;
+    Ok(())
+}
+
 /// Основная структура хранилища — обёртка над SQLite-соединением
 pub struct Storage {
     conn: Connection,
@@ -22,6 +57,7 @@ impl Storage {
         let conn = Connection::open(path)
             .with_context(|| format!("Не удалось открыть БД: {}", path.display()))?;
         schema::initialize(&conn).context("Ошибка инициализации схемы БД")?;
+        register_regexp(&conn)?;
         Ok(Self { conn })
     }
 
@@ -29,6 +65,7 @@ impl Storage {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Не удалось создать in-memory БД")?;
         schema::initialize(&conn).context("Ошибка инициализации схемы in-memory БД")?;
+        register_regexp(&conn)?;
         Ok(Self { conn })
     }
 
@@ -60,6 +97,7 @@ impl Storage {
                             .context("Ошибка при копировании БД disk→memory")?;
                     }
 
+                    register_regexp(&memory_conn)?;
                     Ok(Self { conn: memory_conn })
                 } else {
                     // Новая БД — чистая in-memory со схемой
@@ -423,6 +461,79 @@ impl Storage {
                 rows.map(|r| r.map_err(Into::into)).collect()
             }
         }
+    }
+
+    /// Поиск подстроки или regex в телах функций и классов.
+    ///
+    /// `pattern` — буквальная подстрока (LIKE), `regex_pattern` — регулярное выражение (REGEXP).
+    /// Указать одно из двух. Возвращает список совпадений с путём, именем и строками.
+    pub fn grep_body(
+        &self,
+        pattern: Option<&str>,
+        regex_pattern: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<GrepBodyMatch>> {
+        // Определяем условие WHERE для body
+        let (body_condition, body_param) = match (pattern, regex_pattern) {
+            (Some(p), _) => ("body LIKE ?1".to_string(), format!("%{}%", p)),
+            (_, Some(r)) => ("body REGEXP ?1".to_string(), r.to_string()),
+            _ => anyhow::bail!("Необходимо указать pattern или regex"),
+        };
+
+        let sql = match language {
+            Some(_) => format!(
+                "SELECT fi.path, fn.name, 'function' as kind, fn.line_start, fn.line_end
+                 FROM functions fn
+                 JOIN files fi ON fi.id = fn.file_id
+                 WHERE fn.{cond} AND fi.language = ?2
+                 UNION ALL
+                 SELECT fi.path, c.name, 'class' as kind, c.line_start, c.line_end
+                 FROM classes c
+                 JOIN files fi ON fi.id = c.file_id
+                 WHERE c.{cond} AND fi.language = ?2
+                 ORDER BY 1, 4
+                 LIMIT ?3",
+                cond = body_condition
+            ),
+            None => format!(
+                "SELECT fi.path, fn.name, 'function' as kind, fn.line_start, fn.line_end
+                 FROM functions fn
+                 JOIN files fi ON fi.id = fn.file_id
+                 WHERE fn.{cond}
+                 UNION ALL
+                 SELECT fi.path, c.name, 'class' as kind, c.line_start, c.line_end
+                 FROM classes c
+                 JOIN files fi ON fi.id = c.file_id
+                 WHERE c.{cond}
+                 ORDER BY 1, 4
+                 LIMIT ?2",
+                cond = body_condition
+            ),
+        };
+
+        let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<GrepBodyMatch> {
+            Ok(GrepBodyMatch {
+                file_path: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                line_start: row.get::<_, i64>(3)? as usize,
+                line_end: row.get::<_, i64>(4)? as usize,
+            })
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results: Vec<GrepBodyMatch> = match language {
+            Some(lang) => {
+                let rows = stmt.query_map(params![body_param, lang, limit as i64], row_mapper)?;
+                rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+            }
+            None => {
+                let rows = stmt.query_map(params![body_param, limit as i64], row_mapper)?;
+                rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+            }
+        };
+        Ok(results)
     }
 
     /// Найти функции по точному имени

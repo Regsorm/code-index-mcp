@@ -125,6 +125,26 @@ pub async fn get_stats(server: &CodeIndexServer) -> String {
     }
 }
 
+/// Поиск подстроки или regex в телах функций и классов
+pub async fn grep_body(
+    server: &CodeIndexServer,
+    pattern: Option<String>,
+    regex: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+) -> String {
+    let storage = server.storage.lock().await;
+    match storage.grep_body(
+        pattern.as_deref(),
+        regex.as_deref(),
+        language.as_deref(),
+        limit.unwrap_or(100),
+    ) {
+        Ok(results) => to_json(&results),
+        Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
+    }
+}
+
 /// FTS-поиск по текстовым файлам
 pub async fn search_text(server: &CodeIndexServer, query: String, limit: Option<usize>, language: Option<String>) -> String {
     let storage = server.storage.lock().await;

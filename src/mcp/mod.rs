@@ -65,6 +65,19 @@ pub struct FilePathParams {
     pub path: String,
 }
 
+/// Параметры grep_body — поиск подстроки или regex в телах функций/классов
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GrepBodyParams {
+    /// Буквальная подстрока для поиска (LIKE). Поддерживает точки и спецсимволы.
+    pub pattern: Option<String>,
+    /// Регулярное выражение для поиска (REGEXP). Альтернатива pattern.
+    pub regex: Option<String>,
+    /// Фильтр по языку программирования (например: "bsl", "python")
+    pub language: Option<String>,
+    /// Максимальное количество результатов (по умолчанию 100)
+    pub limit: Option<usize>,
+}
+
 // ── Структура MCP-сервера ─────────────────────────────────────────────────────
 
 /// Основная структура MCP-сервера индексатора кода
@@ -183,6 +196,13 @@ impl CodeIndexServer {
     #[tool(description = "FTS поиск по текстовым файлам (md, txt, yaml, toml). Возвращает JSON-массив [{path, snippet}].")]
     async fn search_text(&self, Parameters(p): Parameters<SearchParams>) -> String {
         tools::search_text(self, p.query, p.limit, p.language).await
+    }
+
+    /// Поиск подстроки или regex в телах функций и классов.
+    /// pattern — буквальная подстрока (LIKE), regex — регулярное выражение (REGEXP).
+    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP). Указать одно из двух. Возвращает [{file_path, name, kind, line_start, line_end}].")]
+    async fn grep_body(&self, Parameters(p): Parameters<GrepBodyParams>) -> String {
+        tools::grep_body(self, p.pattern, p.regex, p.language, p.limit).await
     }
 }
 

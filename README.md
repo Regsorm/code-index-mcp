@@ -4,7 +4,7 @@
 
 Instant code search for AI models. Replaces grep with millisecond queries.
 
-> 62K files indexed in 43s — 282K functions searchable in <1ms — 8 languages — 11 MCP tools
+> 62K files indexed in 43s — 282K functions searchable in <1ms — 8 languages — 12 MCP tools
 
 ## Problem
 
@@ -16,7 +16,7 @@ A compiled Rust binary that:
 
 1. Parses source code into AST via tree-sitter
 2. Indexes everything into SQLite with FTS5 full-text search
-3. Exposes 11 tools over the MCP protocol for direct AI model use
+3. Exposes 12 tools over the MCP protocol for direct AI model use
 4. Watches file changes in daemon mode and re-indexes automatically
 
 ## Supported Languages
@@ -90,8 +90,20 @@ Add to `.mcp.json` in your project root:
 | `get_file_summary` | Complete file map without reading source |
 | `get_stats` | Index statistics |
 | `search_text` | Full-text search across text files |
+| `grep_body` | Substring or regex search in function/class bodies |
 
 All tools support a language filter: `search_function(query="X", language="python")`
+
+### grep_body
+
+Unlike FTS search, `grep_body` supports literal substrings (including dots and special characters) and regular expressions. This is essential for finding references like `Catalog.Contractors` or `Справочники.Контрагенты` that break FTS5 syntax.
+
+```
+grep_body(pattern="Справочники.Контрагенты", language="bsl")
+grep_body(regex="Catalog\\.(Contractors|Organizations)", language="bsl")
+```
+
+Returns `[{file_path, name, kind, line_start, line_end}]` — concrete functions/classes containing the match.
 
 ## CLI Reference
 
@@ -130,7 +142,7 @@ code-index get-file-summary "src/main.rs" --path /project
 
 ## Using CLI from Subagents
 
-Subagents launched via the Agent tool in Claude Code do not have access to MCP servers — they run in isolated subprocesses with no connection to the parent MCP session. All 11 MCP tools are mirrored as CLI subcommands that output JSON, making code-index fully usable from any subprocess, script, or subagent.
+Subagents launched via the Agent tool in Claude Code do not have access to MCP servers — they run in isolated subprocesses with no connection to the parent MCP session. All 12 MCP tools are mirrored as CLI subcommands that output JSON, making code-index fully usable from any subprocess, script, or subagent.
 
 ```bash
 # Instead of an MCP tool call, a subagent runs:
@@ -167,7 +179,7 @@ Use an absolute path to the binary and adjust `/path/to/project` to your setup. 
 
 When running `code-index serve`, the process goes through four phases:
 
-1. **Startup scan** — indexes new and changed files before accepting any MCP requests
+1. **Background scan** — indexes new and changed files in the background while the MCP server is already accepting requests
 2. **File watcher** — tracks filesystem changes in real-time using the `notify` crate
 3. **MCP server** — accepts tool calls via stdio (JSON-RPC)
 4. **Periodic flush** — writes the in-memory database to disk every 30 seconds
