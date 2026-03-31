@@ -212,7 +212,7 @@ impl CodeIndexServer {
 
     /// Поиск подстроки или regex в телах функций и классов.
     /// pattern — буквальная подстрока (LIKE), regex — регулярное выражение (REGEXP).
-    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP). Указать одно из двух. Возвращает [{file_path, name, kind, line_start, line_end}].")]
+    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP). Указать одно из двух. Возвращает [{file_path, name, kind, line_start, line_end, match_lines, match_count?}]. match_lines — первые 3 строки совпадений (абсолютные номера в файле). match_count — общее кол-во (только если > 3).")]
     async fn grep_body(&self, Parameters(p): Parameters<GrepBodyParams>) -> String {
         tools::grep_body(self, p.pattern, p.regex, p.language, p.limit).await
     }

@@ -501,12 +501,12 @@ impl Storage {
 
         let sql = match language {
             Some(_) => format!(
-                "SELECT fi.path, fn.name, 'function' as kind, fn.line_start, fn.line_end
+                "SELECT fi.path, fn.name, 'function' as kind, fn.line_start, fn.line_end, fn.body
                  FROM functions fn
                  JOIN files fi ON fi.id = fn.file_id
                  WHERE fn.{cond} AND fi.language = ?2
                  UNION ALL
-                 SELECT fi.path, c.name, 'class' as kind, c.line_start, c.line_end
+                 SELECT fi.path, c.name, 'class' as kind, c.line_start, c.line_end, c.body
                  FROM classes c
                  JOIN files fi ON fi.id = c.file_id
                  WHERE c.{cond} AND fi.language = ?2
@@ -515,12 +515,12 @@ impl Storage {
                 cond = body_condition
             ),
             None => format!(
-                "SELECT fi.path, fn.name, 'function' as kind, fn.line_start, fn.line_end
+                "SELECT fi.path, fn.name, 'function' as kind, fn.line_start, fn.line_end, fn.body
                  FROM functions fn
                  JOIN files fi ON fi.id = fn.file_id
                  WHERE fn.{cond}
                  UNION ALL
-                 SELECT fi.path, c.name, 'class' as kind, c.line_start, c.line_end
+                 SELECT fi.path, c.name, 'class' as kind, c.line_start, c.line_end, c.body
                  FROM classes c
                  JOIN files fi ON fi.id = c.file_id
                  WHERE c.{cond}
@@ -530,18 +530,29 @@ impl Storage {
             ),
         };
 
-        let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<GrepBodyMatch> {
-            Ok(GrepBodyMatch {
+        /// Промежуточный результат SQL-запроса grep_body (с телом для построчного поиска)
+        struct GrepBodyRaw {
+            file_path: String,
+            name: String,
+            kind: String,
+            line_start: usize,
+            line_end: usize,
+            body: String,
+        }
+
+        let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<GrepBodyRaw> {
+            Ok(GrepBodyRaw {
                 file_path: row.get(0)?,
                 name: row.get(1)?,
                 kind: row.get(2)?,
                 line_start: row.get::<_, i64>(3)? as usize,
                 line_end: row.get::<_, i64>(4)? as usize,
+                body: row.get(5)?,
             })
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let results: Vec<GrepBodyMatch> = match language {
+        let raw_results: Vec<GrepBodyRaw> = match language {
             Some(lang) => {
                 let rows = stmt.query_map(params![body_param, lang, limit as i64], row_mapper)?;
                 rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
@@ -551,6 +562,46 @@ impl Storage {
                 rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
             }
         };
+
+        // Компилируем regex один раз (если задан)
+        let compiled_re = regex_pattern
+            .map(|r| regex::Regex::new(r))
+            .transpose()
+            .context("grep_body: невалидный regex")?;
+
+        // Построчный поиск совпадений внутри тел
+        let results = raw_results
+            .into_iter()
+            .map(|raw| {
+                let mut all_match_lines = Vec::new();
+                for (i, line) in raw.body.lines().enumerate() {
+                    let matched = if let Some(ref re) = compiled_re {
+                        re.is_match(line)
+                    } else if let Some(p) = pattern {
+                        // Без учёта регистра, аналогично LIKE
+                        line.to_lowercase().contains(&p.to_lowercase())
+                    } else {
+                        false
+                    };
+                    if matched {
+                        all_match_lines.push(raw.line_start + i);
+                    }
+                }
+                let total = all_match_lines.len();
+                let match_lines: Vec<usize> = all_match_lines.into_iter().take(3).collect();
+                let match_count = if total > 3 { Some(total) } else { None };
+                GrepBodyMatch {
+                    file_path: raw.file_path,
+                    name: raw.name,
+                    kind: raw.kind,
+                    line_start: raw.line_start,
+                    line_end: raw.line_end,
+                    match_lines,
+                    match_count,
+                }
+            })
+            .collect();
+
         Ok(results)
     }
 

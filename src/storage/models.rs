@@ -119,6 +119,11 @@ pub struct GrepBodyMatch {
     pub line_start: usize,
     /// Конечная строка
     pub line_end: usize,
+    /// Номера строк в файле, где найдено совпадение (первые 3)
+    pub match_lines: Vec<usize>,
+    /// Общее количество совпадений (только если > 3)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_count: Option<usize>,
 }
 
 /// Статус фоновой индексации
