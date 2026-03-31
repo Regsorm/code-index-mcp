@@ -364,9 +364,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stats { path, json } => {
             tracing::info!("Статистика: path={}", path);
 
-            // 1. Открыть БД
+            // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
 
             // 2. Получить статистику
             let stats = storage.get_stats()?;
@@ -391,9 +391,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Query { symbol, path, language, json } => {
             tracing::info!("Поиск символа '{}': path={}", symbol, path);
 
-            // 1. Открыть БД
+            // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
 
             // 2. Поиск символа
             let result = storage.find_symbol(&symbol, language.as_deref())?;
@@ -549,49 +549,49 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::SearchFunction { query, path, language, limit } => {
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_functions(&query, limit, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::SearchClass { query, path, language, limit } => {
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_classes(&query, limit, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::GetFunction { name, path, language: _ } => {
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_function_by_name(&name)?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::GetClass { name, path, language: _ } => {
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_class_by_name(&name)?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::GetCallers { function_name, path, language } => {
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_callers(&function_name, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::GetCallees { function_name, path, language } => {
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_callees(&function_name, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::GetImports { path, file_id, module, language } => {
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
 
             // Приоритет: file_id > module; если ничего не указано — ошибка
             let results = if let Some(fid) = file_id {
@@ -608,14 +608,14 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::GetFileSummary { file, path } => {
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
             let result = storage.get_file_summary(&file)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
 
         Commands::SearchText { query, path, language, limit } => {
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_text(&query, limit, language.as_deref())?;
 
             // Результат — Vec<(String, String)>: путь + сниппет
@@ -639,7 +639,7 @@ async fn main() -> anyhow::Result<()> {
                 ));
             }
             let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
+            let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.grep_body(
                 pattern.as_deref(),
                 regex.as_deref(),

@@ -4,7 +4,7 @@ pub mod models;
 pub mod schema;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use std::path::Path;
 
 use models::*;
@@ -57,6 +57,21 @@ impl Storage {
         let conn = Connection::open(path)
             .with_context(|| format!("Не удалось открыть БД: {}", path.display()))?;
         schema::initialize(&conn).context("Ошибка инициализации схемы БД")?;
+        register_regexp(&conn)?;
+        Ok(Self { conn })
+    }
+
+    /// Открыть БД только для чтения — не пишет в БД, не блокирует.
+    /// Используется CLI-командами для параллельной работы с MCP-демоном.
+    pub fn open_file_readonly(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("Не удалось открыть БД (readonly): {}", path.display()))?;
+        schema::initialize_readonly(&conn).context("Ошибка инициализации readonly-схемы")?;
         register_regexp(&conn)?;
         Ok(Self { conn })
     }

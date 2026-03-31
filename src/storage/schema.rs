@@ -224,6 +224,15 @@ pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Инициализация для режима только чтения — без записи в БД.
+/// Устанавливает только read-safe PRAGMA, не создаёт таблиц и индексов.
+pub fn initialize_readonly(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch("PRAGMA cache_size=-64000;")?;
+    conn.execute_batch("PRAGMA query_only=ON;")?;
+    Ok(())
+}
+
 /// Миграция v2: добавить колонки override_type/override_target для BSL-расширений.
 /// Безопасно вызывать повторно — проверяет наличие колонки перед ALTER.
 pub fn migrate_v2(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
