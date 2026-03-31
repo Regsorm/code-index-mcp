@@ -90,7 +90,7 @@ Add to `.mcp.json` in your project root:
 | `get_file_summary` | Complete file map without reading source |
 | `get_stats` | Index statistics |
 | `search_text` | Full-text search across text files |
-| `grep_body` | Substring or regex search in function/class bodies |
+| `grep_body` | Substring or regex search in function/class bodies. Returns `match_lines` (first 3 line numbers) and `match_count` (total, if > 3) |
 
 All tools support a language filter: `search_function(query="X", language="python")`
 
@@ -103,7 +103,22 @@ grep_body(pattern="Справочники.Контрагенты", language="bsl
 grep_body(regex="Catalog\\.(Contractors|Organizations)", language="bsl")
 ```
 
-Returns `[{file_path, name, kind, line_start, line_end}]` — concrete functions/classes containing the match.
+Returns `[{file_path, name, kind, line_start, line_end, match_lines, match_count}]` — concrete functions/classes containing the match.
+
+Each result includes `match_lines` — up to 3 absolute line numbers in the file where the pattern was found. If there are more than 3 matches, `match_count` shows the total.
+
+```json
+[
+  {
+    "file_path": "src/Catalogs/Products/ObjectModule.bsl",
+    "name": "OnWrite",
+    "kind": "function",
+    "line_start": 45,
+    "line_end": 82,
+    "match_lines": [51, 63, 78]
+  }
+]
+```
 
 ## CLI Reference
 
@@ -160,6 +175,8 @@ code-index get-file-summary "src/auth/login.py" --path /my/project
 ```
 
 Every command outputs valid JSON that the subagent can parse and reason over, identical in structure to what the MCP tools return.
+
+> **Note:** CLI read commands use `SQLITE_OPEN_READ_ONLY` mode, so they work in parallel with the MCP daemon without database locking conflicts.
 
 ## CLAUDE.md Setup
 
@@ -266,6 +283,10 @@ From **BSL files**, it extracts:
 - Compilation directives (`&AtServer`, `&AtClient`, `&AtServerNoContext`)
 - Extension annotations (`&Instead`, `&After`, `&Before`)
 - Bilingual keywords (Russian and English forms are both indexed)
+
+These are stored in two dedicated fields:
+- `override_type`: "Перед" (Before), "После" (After), or "Вместо" (Instead)
+- `override_target`: name of the original procedure being overridden
 
 From **XML configuration exports**, it extracts:
 - Metadata objects: catalogs, documents, registers, and more
