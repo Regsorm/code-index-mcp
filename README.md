@@ -223,8 +223,7 @@ When a file changes: 1.5s debounce window collects related edits, then the affec
   "storage_mode": "auto",
   "memory_max_percent": 25,
   "debounce_ms": 1500,
-  "batch_ms": 2000,
-  "flush_interval_sec": 30
+  "batch_ms": 2000
 }
 ```
 
@@ -268,10 +267,24 @@ Source Files -> Tree-sitter Parser -> SQLite (in-memory) -> MCP Server -> AI Mod
 
 Key optimizations:
 
-- **In-memory SQLite with periodic flush** — all reads and writes go to RAM; disk is written every 30 seconds
+- **In-memory SQLite with event-driven flush** — all reads and writes go to RAM; disk is written only when data actually changes (see below)
 - **Rayon parallel parsing** — files are parsed across all CPU cores simultaneously
 - **Bulk mode** — for large batches: drop indexes, bulk insert, rebuild indexes; significantly faster than incremental inserts
 - **SHA-256 hash check** — each file's hash is stored; unchanged files are skipped entirely on re-index
+
+### Flush to disk policy
+
+The daemon works in in-memory mode for maximum performance. The database is flushed to disk **only** when data actually changes — no periodic timers, no unnecessary I/O:
+
+| Event | Flush? | Condition |
+|-------|--------|-----------|
+| Initial indexing completes | Yes | At least 1 file was indexed or deleted |
+| File watcher processes a batch | Yes | At least 1 write/delete occurred in the batch |
+| File watcher fires but nothing changed | **No** | Hash unchanged → no write → no flush |
+| Idle (no file changes) | **No** | Zero disk activity |
+| Daemon shutdown (graceful) | Yes | Always — final safety flush |
+
+This means: if you're just chatting with AI and not editing code, the daemon produces **zero disk I/O**.
 - **Batch transactions** — 500 records per transaction reduces SQLite overhead by orders of magnitude
 
 ## For 1C Developers

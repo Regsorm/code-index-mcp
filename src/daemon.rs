@@ -1,4 +1,4 @@
-/// Daemon-режим: MCP-сервер стартует мгновенно, индексация в фоне + file watcher + flush таймер
+/// Daemon-режим: MCP-сервер стартует мгновенно, индексация в фоне + file watcher
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,39 +59,14 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         config.index_config.clone(),
     ));
 
-    // Startup flush убран: данные в памяти, MCP отдаёт их оттуда.
-    // Периодический flush (flush_interval_sec) сохранит на диск позже.
-    // Это критично для больших БД (1+ ГБ), где backup блокирует Mutex на десятки секунд.
-
     if config.no_watch {
-        // Без watcher — только MCP-сервер + периодический flush
         eprintln!("[daemon] File watcher отключён (--no-watch)");
-
-        // Периодический flush — сохраняет in-memory БД на диск
-        let storage_for_flush = shared_storage.clone();
-        let db_path_flush = config.db_path.clone();
-        let flush_interval = config.flush_interval_sec;
-        let flush_handle = tokio::spawn(async move {
-            let interval = tokio::time::Duration::from_secs(flush_interval);
-            loop {
-                tokio::time::sleep(interval).await;
-                let guard = storage_for_flush.lock().await;
-                // Пропускаем flush если Storage ещё не инициализирован
-                if let Some(ref storage) = *guard {
-                    match storage.flush_to_disk(&db_path_flush) {
-                        Ok(_) => eprintln!("[flush] Записано на диск"),
-                        Err(e) => eprintln!("[flush] Ошибка: {}", e),
-                    }
-                }
-            }
-        });
 
         let service = mcp_server
             .serve(rmcp::transport::io::stdio())
             .await
             .map_err(|e| anyhow::anyhow!("MCP serve error: {}", e))?;
         service.waiting().await.map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
-        flush_handle.abort();
         reindex_handle.abort();
         return Ok(());
     }
@@ -107,13 +82,11 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
 
     // Копии значений для задач
     let root = config.root.clone();
-    let db_path_for_flush = config.db_path.clone();
+    let db_path_for_watcher = config.db_path.clone();
     let db_path_for_final = config.db_path.clone();
     let index_config = config.index_config.clone();
-    let flush_interval = config.flush_interval_sec;
 
     let storage_for_watcher = shared_storage.clone();
-    let storage_for_flush = shared_storage.clone();
 
     // 7. Watcher task — блокирующий поток (notify использует std::sync)
     let watcher_handle = tokio::task::spawn_blocking(move || {
@@ -152,6 +125,8 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                 continue;
             }
 
+            let mut writes = 0usize; // Счётчик реальных записей в БД
+
             for event in &batch {
                 match event {
                     crate::watcher::FileEvent::Modified(path)
@@ -186,19 +161,20 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                                         Ok(parse_result) => {
                                             // Используем Indexer::write_code_to_db
                                             let indexer = Indexer::new(storage);
-                                            if let Err(e) = indexer.write_code_to_db(
+                                            match indexer.write_code_to_db(
                                                 &rel_path,
                                                 &hash,
                                                 language,
                                                 parse_result.lines_total,
                                                 &parse_result.ast_hash,
                                                 &parse_result,
-                                                false, // skip_delete = false (инкрементальное обновление)
+                                                false,
                                             ) {
-                                                eprintln!(
+                                                Ok(_) => writes += 1,
+                                                Err(e) => eprintln!(
                                                     "[watcher] Ошибка write_code_to_db {}: {}",
                                                     rel_path, e
-                                                );
+                                                ),
                                             }
                                         }
                                         Err(e) => {
@@ -224,7 +200,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                                             || !pr.variables.is_empty()
                                         {
                                             let indexer = Indexer::new(storage);
-                                            let _ = indexer.write_code_to_db(
+                                            if indexer.write_code_to_db(
                                                 &rel_path,
                                                 &hash,
                                                 "xml_1c",
@@ -232,7 +208,9 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                                                 &pr.ast_hash,
                                                 &pr,
                                                 false,
-                                            );
+                                            ).is_ok() {
+                                                writes += 1;
+                                            }
                                             true
                                         } else {
                                             false
@@ -247,17 +225,18 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                                 if !indexed_as_code {
                                     let text_result = TextParser::parse(&content);
                                     let indexer = Indexer::new(storage);
-                                    if let Err(e) = indexer.write_text_to_db(
+                                    match indexer.write_text_to_db(
                                         &rel_path,
                                         &hash,
                                         text_result.lines_total,
                                         &text_result.content,
-                                        false, // skip_delete = false
+                                        false,
                                     ) {
-                                        eprintln!(
+                                        Ok(_) => writes += 1,
+                                        Err(e) => eprintln!(
                                             "[watcher] Ошибка write_text_to_db {}: {}",
                                             rel_path, e
-                                        );
+                                        ),
                                     }
                                 }
                             }
@@ -277,13 +256,15 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                         match storage.get_file_by_path(&rel_path) {
                             Ok(Some(file)) => {
                                 if let Some(id) = file.id {
-                                    if let Err(e) = storage.delete_file(id) {
-                                        eprintln!(
+                                    match storage.delete_file(id) {
+                                        Ok(_) => {
+                                            writes += 1;
+                                            eprintln!("[watcher] Удалён из индекса: {}", rel_path);
+                                        }
+                                        Err(e) => eprintln!(
                                             "[watcher] Ошибка delete_file {}: {}",
                                             rel_path, e
-                                        );
-                                    } else {
-                                        eprintln!("[watcher] Удалён из индекса: {}", rel_path);
+                                        ),
                                     }
                                 }
                             }
@@ -303,28 +284,18 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             if let Err(e) = storage.commit_batch() {
                 eprintln!("[watcher] Ошибка commit_batch: {}", e);
             } else {
-                eprintln!("[watcher] Обработано {} событий", batch.len());
-            }
-        }
-    });
-
-    // 8. Flush timer task — периодическая запись на диск
-    let flush_handle = tokio::spawn(async move {
-        let interval = tokio::time::Duration::from_secs(flush_interval);
-        loop {
-            tokio::time::sleep(interval).await;
-            let guard = storage_for_flush.lock().await;
-            // Пропускаем flush если Storage ещё не инициализирован
-            if let Some(ref storage) = *guard {
-                match storage.flush_to_disk(&db_path_for_flush) {
-                    Ok(_) => eprintln!("[flush] Записано на диск"),
-                    Err(e) => eprintln!("[flush] Ошибка: {}", e),
+                eprintln!("[watcher] Обработано {} событий ({} записей)", batch.len(), writes);
+                // Сбрасываем на диск только если были реальные записи
+                if writes > 0 {
+                    if let Err(e) = storage.flush_to_disk(&db_path_for_watcher) {
+                        eprintln!("[watcher] Ошибка flush: {}", e);
+                    }
                 }
             }
         }
     });
 
-    // 9. MCP-сервер — основной цикл, блокирует до завершения клиента
+    // 8. MCP-сервер — основной цикл, блокирует до завершения клиента
     let service = mcp_server
         .serve(rmcp::transport::io::stdio())
         .await
@@ -334,10 +305,9 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
 
-    // 10. Graceful shutdown
+    // 9. Graceful shutdown
     eprintln!("[daemon] Завершение...");
     watcher_handle.abort();
-    flush_handle.abort();
     reindex_handle.abort();
 
     // Финальный flush перед выходом
@@ -387,7 +357,7 @@ async fn background_init(
     eprintln!("[init] БД загружена, инструменты доступны");
 
     // Передать управление фоновой индексации
-    background_reindex(shared_storage, indexing_status, root, config).await;
+    background_reindex(shared_storage, indexing_status, root, config, db_path).await;
 }
 
 /// Фоновая индексация с пофазным захватом Mutex.
@@ -400,6 +370,7 @@ async fn background_reindex(
     indexing_status: Arc<Mutex<IndexingStatus>>,
     root: PathBuf,
     config: IndexConfig,
+    db_path: PathBuf,
 ) {
     let start = std::time::Instant::now();
 
@@ -751,6 +722,18 @@ async fn background_reindex(
         files_indexed,
         elapsed_ms,
     };
+    drop(status);
+
+    // Сбрасываем на диск только если были реальные изменения
+    if files_indexed > 0 || files_deleted > 0 {
+        let guard = shared_storage.lock().await;
+        if let Some(ref storage) = *guard {
+            match storage.flush_to_disk(&db_path) {
+                Ok(_) => eprintln!("[reindex] Flush на диск выполнен"),
+                Err(e) => eprintln!("[reindex] Ошибка flush: {}", e),
+            }
+        }
+    }
 }
 
 /// Вспомогательная функция: обработать изменённый код-файл (для тестов)
