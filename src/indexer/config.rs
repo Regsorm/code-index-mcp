@@ -13,7 +13,8 @@ pub struct IndexConfig {
     #[serde(default)]
     pub extra_text_extensions: Vec<String>,
 
-    /// Максимальный размер файла для индексации (в байтах, по умолчанию 1 МБ)
+    /// Максимальный размер текстового файла для индексации (в байтах, по умолчанию 1 МБ).
+    /// Не применяется к файлам исходного кода — они индексируются независимо от размера.
     #[serde(default = "default_max_file_size")]
     pub max_file_size: usize,
 

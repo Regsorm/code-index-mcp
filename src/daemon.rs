@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::indexer::config::IndexConfig;
 use crate::indexer::file_types::{categorize_file, FileCategory};
 use crate::indexer::hasher;
-use crate::indexer::{collect_candidates_standalone, collect_seen_paths_standalone, Indexer, ParsedFile};
+use crate::indexer::{collect_candidates_standalone, Indexer, ParsedFile};
 use crate::mcp::CodeIndexServer;
 use crate::parser::text::TextParser;
 use crate::parser::LanguageParser;
@@ -420,7 +420,7 @@ async fn background_reindex(
     })
     .await;
 
-    let (candidate_files, files_scanned, files_skipped, collect_errors) = match candidates_result {
+    let (candidate_files, files_scanned, files_skipped, collect_errors, seen_paths) = match candidates_result {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => {
             eprintln!("[reindex] Ошибка сбора кандидатов: {}", e);
@@ -676,14 +676,7 @@ async fn background_reindex(
     }
 
     // ── Phase 5: удаление устаревших файлов (lock) ──────────────────────
-    let config_for_cleanup = config.clone();
-    let root_for_cleanup = root.clone();
-    let seen_paths = tokio::task::spawn_blocking(move || {
-        collect_seen_paths_standalone(&root_for_cleanup, &config_for_cleanup)
-    })
-    .await
-    .unwrap_or_default();
-
+    // seen_paths уже собран в Phase 1 — повторный обход дерева не нужен
     let mut files_deleted = 0usize;
     {
         let guard = shared_storage.lock().await;

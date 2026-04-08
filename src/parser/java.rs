@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
-use sha2::{Digest, Sha256};
-use hex;
 
 use super::types::{
+    sha256_hex, hash_ast,
     ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
 };
 use super::LanguageParser;
@@ -28,13 +27,6 @@ impl LanguageParser for JavaParser {
     fn parse(&self, source: &str, _file_path: &str) -> Result<ParseResult> {
         parse_java(source)
     }
-}
-
-/// Вычислить SHA-256 хеш строки
-fn sha256_hex(data: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 /// Получить текст узла AST из байтового среза
@@ -494,7 +486,7 @@ fn parse_java(source: &str) -> Result<ParseResult> {
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
 
-    let ast_hash = sha256_hex(&root.to_sexp());
+    let ast_hash = hash_ast(root);
     let lines_total = source.lines().count();
 
     let mut ctx = VisitContext::new(source_bytes);

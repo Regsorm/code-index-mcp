@@ -119,9 +119,9 @@ impl<'a> Indexer<'a> {
         // Определяем: это первичная индексация (пустая БД) или обновление
         let is_fresh_db = existing_files.is_empty();
 
-        // ── Этап 1: сбор кандидатов ───────────────────────────────────────────
+        // ── Этап 1: сбор кандидатов (параллельный read+hash) ─────────────────
         let candidates_start = std::time::Instant::now();
-        let candidate_files = self.collect_candidates(root, force, &existing_files, &mut result)?;
+        let (candidate_files, seen_paths) = self.collect_candidates(root, force, &existing_files, &mut result)?;
         let candidates_ms = candidates_start.elapsed().as_millis();
         eprintln!("[timing] Сбор кандидатов: {} мс ({} файлов)", candidates_ms, candidate_files.len());
 
@@ -326,12 +326,8 @@ impl<'a> Indexer<'a> {
         }
 
         // ── Этап 5: удаление устаревших записей ──────────────────────────────
-        // Набор путей, реально встреченных при обходе диска (из кандидатов + пропущенных)
-        // Пересчитываем seen_paths из кандидатов — они были собраны в первом проходе,
-        // но нам нужен полный список (включая пропущенные неизменённые файлы).
-        // Используем existing_files как основу и вычитаем то, что больше не на диске.
+        // seen_paths уже собран в Этапе 1 — повторный обход дерева не нужен
         let cleanup_start = std::time::Instant::now();
-        let seen_paths = self.collect_seen_paths(root, &existing_files);
 
         // Удаляем из БД файлы, которых больше нет на диске — в одной транзакции
         self.storage.begin_batch()?;
@@ -516,19 +512,22 @@ impl<'a> Indexer<'a> {
 
     /// Первый проход: обойти директорию, собрать список файлов для индексации.
     ///
-    /// Возвращает вектор (rel_path, content, hash, category) для файлов,
-    /// которые нужно переиндексировать. Обновляет счётчики result.files_scanned
-    /// и result.files_skipped для файлов, пропущенных по хешу или размеру.
+    /// Двухфазный сбор:
+    /// 1a. WalkDir — быстрый обход, собрать пути + seen_paths (без чтения файлов)
+    /// 1b. rayon par_iter — параллельное чтение + SHA-256 хеш
+    ///
+    /// Возвращает (candidates, seen_paths) — seen_paths используется для очистки
+    /// удалённых файлов без повторного обхода дерева.
     fn collect_candidates(
         &self,
         root: &Path,
         force: bool,
         existing_files: &HashMap<String, (i64, String)>,
         result: &mut IndexResult,
-    ) -> Result<Vec<(String, String, String, FileCategory)>> {
-        let mut candidates = Vec::new();
+    ) -> Result<(Vec<(String, String, String, FileCategory)>, HashSet<String>)> {
         let config_for_filter = self.config.clone();
 
+        // ── Фаза 1a: WalkDir — собрать пути (быстро, без I/O на содержимое) ──
         let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
             if e.file_type().is_dir() {
                 if let Some(name) = e.file_name().to_str() {
@@ -537,6 +536,14 @@ impl<'a> Indexer<'a> {
             }
             true
         });
+
+        struct FileEntry {
+            abs_path: std::path::PathBuf,
+            rel_path: String,
+            category: FileCategory,
+        }
+        let mut entries: Vec<FileEntry> = Vec::new();
+        let mut seen_paths: HashSet<String> = HashSet::new();
 
         for entry in walker.filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
@@ -551,107 +558,92 @@ impl<'a> Indexer<'a> {
             let path = entry.path();
             let category = categorize_file(path);
 
-            // Бинарные файлы полностью игнорируем
             if matches!(category, FileCategory::Binary) {
                 continue;
             }
 
-            // Проверяем размер файла
-            if let Ok(meta) = entry.metadata() {
-                if meta.len() as usize > self.config.max_file_size {
-                    result.files_skipped += 1;
-                    continue;
-                }
-            }
-
-            result.files_scanned += 1;
-
-            // Нормализуем путь относительно корня с прямыми слэшами
-            let rel_path = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
-
-            // Читаем файл и вычисляем хеш
-            let (content, hash) = match hasher::file_hash(path) {
-                Ok(r) => r,
-                Err(e) => {
-                    result.errors.push((rel_path, e.to_string()));
-                    continue;
-                }
-            };
-
-            // Проверяем, изменился ли файл
-            if !force {
-                if let Some((_, existing_hash)) = existing_files.get(&rel_path) {
-                    if *existing_hash == hash {
+            // Лимит размера — только для текстовых файлов, код индексируем всегда
+            if !matches!(category, FileCategory::Code(_)) {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.len() as usize > self.config.max_file_size {
                         result.files_skipped += 1;
                         continue;
                     }
                 }
             }
 
-            candidates.push((rel_path, content, hash, category));
-        }
-
-        Ok(candidates)
-    }
-
-    /// Собрать множество путей, реально присутствующих на диске.
-    ///
-    /// Используется для определения файлов, удалённых с диска после прошлой индексации.
-    fn collect_seen_paths(
-        &self,
-        root: &Path,
-        _existing_files: &HashMap<String, (i64, String)>,
-    ) -> HashSet<String> {
-        let mut seen = HashSet::new();
-        let config_for_filter = self.config.clone();
-
-        let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
-            if e.file_type().is_dir() {
-                if let Some(name) = e.file_name().to_str() {
-                    return !config_for_filter.is_excluded_dir(name);
-                }
-            }
-            true
-        });
-
-        for entry in walker.filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if matches!(categorize_file(path), FileCategory::Binary) {
-                continue;
-            }
             let rel_path = path
                 .strip_prefix(root)
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            seen.insert(rel_path);
+
+            result.files_scanned += 1;
+            seen_paths.insert(rel_path.clone());
+            entries.push(FileEntry {
+                abs_path: path.to_path_buf(),
+                rel_path,
+                category,
+            });
         }
 
-        seen
+        // ── Фаза 1b: параллельное чтение + хеш (rayon) ──────────────────────
+        let read_results: Vec<_> = entries
+            .par_iter()
+            .map(|entry| {
+                match hasher::file_hash(&entry.abs_path) {
+                    Ok((content, hash)) => Ok((entry.rel_path.clone(), content, hash, entry.category.clone())),
+                    Err(e) => Err((entry.rel_path.clone(), e.to_string())),
+                }
+            })
+            .collect();
+
+        // ── Фаза 1c: фильтрация по existing hashes (последовательно, дёшево) ─
+        let mut candidates = Vec::new();
+        for item in read_results {
+            match item {
+                Ok((rel_path, content, hash, category)) => {
+                    if !force {
+                        if let Some((_, existing_hash)) = existing_files.get(&rel_path) {
+                            if *existing_hash == hash {
+                                result.files_skipped += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    candidates.push((rel_path, content, hash, category));
+                }
+                Err((rel_path, error)) => {
+                    result.errors.push((rel_path, error));
+                }
+            }
+        }
+
+        Ok((candidates, seen_paths))
     }
 }
 
 /// Standalone-версия collect_candidates — не требует Storage.
-/// Обходит директорию, собирает файлы для индексации.
-/// Возвращает (candidates, files_scanned, files_skipped, errors).
+/// Двухфазный сбор: WalkDir (пути) → rayon (read+hash).
+/// Возвращает (candidates, files_scanned, files_skipped, errors, seen_paths).
 pub fn collect_candidates_standalone(
     root: &Path,
     config: &IndexConfig,
     force: bool,
     existing_files: &HashMap<String, (i64, String)>,
-) -> Result<(Vec<(String, String, String, FileCategory)>, usize, usize, Vec<(String, String)>)> {
-    let mut candidates = Vec::new();
+) -> Result<(Vec<(String, String, String, FileCategory)>, usize, usize, Vec<(String, String)>, HashSet<String>)> {
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
-    let mut errors = Vec::new();
     let config_for_filter = config.clone();
+
+    // ── Фаза 1a: WalkDir — собрать пути (без чтения файлов) ──────────────
+    struct FileEntry {
+        abs_path: std::path::PathBuf,
+        rel_path: String,
+        category: FileCategory,
+    }
+    let mut entries: Vec<FileEntry> = Vec::new();
+    let mut seen_paths: HashSet<String> = HashSet::new();
 
     let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
         if e.file_type().is_dir() {
@@ -667,7 +659,6 @@ pub fn collect_candidates_standalone(
             continue;
         }
 
-        // Проверяем лимит количества файлов (0 = без лимита)
         if config.max_files > 0 && files_scanned >= config.max_files {
             break;
         }
@@ -675,87 +666,69 @@ pub fn collect_candidates_standalone(
         let path = entry.path();
         let category = categorize_file(path);
 
-        // Бинарные файлы полностью игнорируем
         if matches!(category, FileCategory::Binary) {
             continue;
         }
 
-        // Проверяем размер файла
-        if let Ok(meta) = entry.metadata() {
-            if meta.len() as usize > config.max_file_size {
-                files_skipped += 1;
-                continue;
-            }
-        }
-
-        files_scanned += 1;
-
-        // Нормализуем путь относительно корня с прямыми слэшами
-        let rel_path = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        // Читаем файл и вычисляем хеш
-        let (content, hash) = match hasher::file_hash(path) {
-            Ok(r) => r,
-            Err(e) => {
-                errors.push((rel_path, e.to_string()));
-                continue;
-            }
-        };
-
-        // Проверяем, изменился ли файл
-        if !force {
-            if let Some((_, existing_hash)) = existing_files.get(&rel_path) {
-                if *existing_hash == hash {
+        // Лимит размера — только для текстовых файлов, код индексируем всегда
+        if !matches!(category, FileCategory::Code(_)) {
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() as usize > config.max_file_size {
                     files_skipped += 1;
                     continue;
                 }
             }
         }
 
-        candidates.push((rel_path, content, hash, category));
-    }
-
-    Ok((candidates, files_scanned, files_skipped, errors))
-}
-
-/// Standalone-версия collect_seen_paths — только обход диска, без Storage.
-pub fn collect_seen_paths_standalone(
-    root: &Path,
-    config: &IndexConfig,
-) -> HashSet<String> {
-    let mut seen = HashSet::new();
-    let config_for_filter = config.clone();
-
-    let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
-        if e.file_type().is_dir() {
-            if let Some(name) = e.file_name().to_str() {
-                return !config_for_filter.is_excluded_dir(name);
-            }
-        }
-        true
-    });
-
-    for entry in walker.filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if matches!(categorize_file(path), FileCategory::Binary) {
-            continue;
-        }
         let rel_path = path
             .strip_prefix(root)
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
-        seen.insert(rel_path);
+
+        files_scanned += 1;
+        seen_paths.insert(rel_path.clone());
+        entries.push(FileEntry {
+            abs_path: path.to_path_buf(),
+            rel_path,
+            category,
+        });
     }
 
-    seen
+    // ── Фаза 1b: параллельное чтение + хеш (rayon) ──────────────────────
+    let read_results: Vec<_> = entries
+        .par_iter()
+        .map(|entry| {
+            match hasher::file_hash(&entry.abs_path) {
+                Ok((content, hash)) => Ok((entry.rel_path.clone(), content, hash, entry.category.clone())),
+                Err(e) => Err((entry.rel_path.clone(), e.to_string())),
+            }
+        })
+        .collect();
+
+    // ── Фаза 1c: фильтрация по existing hashes ──────────────────────────
+    let mut candidates = Vec::new();
+    let mut errors = Vec::new();
+    for item in read_results {
+        match item {
+            Ok((rel_path, content, hash, category)) => {
+                if !force {
+                    if let Some((_, existing_hash)) = existing_files.get(&rel_path) {
+                        if *existing_hash == hash {
+                            files_skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+                candidates.push((rel_path, content, hash, category));
+            }
+            Err((rel_path, error)) => {
+                errors.push((rel_path, error));
+            }
+        }
+    }
+
+    Ok((candidates, files_scanned, files_skipped, errors, seen_paths))
 }
 
 #[cfg(test)]
@@ -1008,9 +981,12 @@ class App:
     #[test]
     fn test_with_config_max_file_size() {
         let tmp = TempDir::new().unwrap();
-        // Маленький файл — пройдёт
-        fs::write(tmp.path().join("small.py"), "x = 1\n").unwrap();
-        // Большой файл — пропустим (лимит 10 байт)
+        // Маленький текстовый файл — пройдёт
+        fs::write(tmp.path().join("small.txt"), "x = 1\n").unwrap();
+        // Большой текстовый файл — пропустим (лимит 10 байт)
+        // Лимит max_file_size действует только на Text-файлы, код индексируется всегда
+        fs::write(tmp.path().join("big.txt"), "y = 'a very long string that exceeds limit'\n").unwrap();
+        // Большой код-файл — НЕ пропускается (код индексируется независимо от размера)
         fs::write(tmp.path().join("big.py"), "y = 'a very long string that exceeds limit'\n").unwrap();
 
         let mut storage = Storage::open_in_memory().unwrap();
@@ -1021,9 +997,9 @@ class App:
         let mut indexer = Indexer::with_config(&mut storage, config);
         let r = indexer.full_reindex(tmp.path(), false).unwrap();
 
-        // big.py пропущен из-за лимита размера
-        assert_eq!(r.files_indexed, 1, "только маленький файл должен быть проиндексирован");
-        assert_eq!(r.files_skipped, 1, "большой файл должен быть в skipped");
+        // big.txt пропущен из-за лимита размера, big.py — нет (код не ограничен)
+        assert_eq!(r.files_indexed, 2, "small.txt + big.py (код не ограничен размером)");
+        assert_eq!(r.files_skipped, 1, "big.txt пропущен по размеру");
     }
 
     #[test]

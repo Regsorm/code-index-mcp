@@ -4,10 +4,8 @@
 use anyhow::Result;
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use sha2::{Digest, Sha256};
-use hex;
 
-use super::types::{ParseResult, ParsedClass, ParsedVariable};
+use super::types::{sha256_hex, ParseResult, ParsedClass, ParsedVariable};
 use super::LanguageParser;
 
 /// Парсер XML-файлов выгрузок конфигурации 1С
@@ -54,13 +52,6 @@ impl LanguageParser for Xml1CParser {
     fn parse(&self, source: &str, file_path: &str) -> Result<ParseResult> {
         parse_xml_1c(source, file_path)
     }
-}
-
-/// Вычислить SHA-256 хеш строки
-fn sha256_hex(data: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 /// Проверить, является ли содержимое файла выгрузкой 1С.

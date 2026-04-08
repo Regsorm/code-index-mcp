@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
-use sha2::{Digest, Sha256};
-use hex;
 
 use super::types::{
+    sha256_hex, hash_ast,
     ParseResult, ParsedCall, ParsedFunction, ParsedVariable,
 };
 use super::LanguageParser;
@@ -28,13 +27,6 @@ impl LanguageParser for BslParser {
     fn parse(&self, source: &str, _file_path: &str) -> Result<ParseResult> {
         parse_bsl(source)
     }
-}
-
-/// Вычислить SHA-256 хеш строки
-fn sha256_hex(data: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 /// Получить текст узла AST из байтового среза
@@ -386,7 +378,7 @@ fn parse_bsl(source: &str) -> Result<ParseResult> {
     let source_bytes = source.as_bytes();
 
     // Хеш AST
-    let ast_hash = sha256_hex(&root.to_sexp());
+    let ast_hash = hash_ast(root);
 
     // Количество строк
     let lines_total = source.lines().count();
