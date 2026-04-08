@@ -140,6 +140,15 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                             }
                         };
 
+                        // Получаем mtime и file_size для записи в БД
+                        let file_meta = std::fs::metadata(path).ok();
+                        let watcher_mtime = file_meta.as_ref()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64);
+                        let watcher_file_size = file_meta.as_ref()
+                            .map(|m| m.len() as i64);
+
                         // Нормализуем путь к относительному
                         let rel_path = path
                             .strip_prefix(&root)
@@ -169,6 +178,8 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                                                 &parse_result.ast_hash,
                                                 &parse_result,
                                                 false,
+                                                watcher_mtime,
+                                                watcher_file_size,
                                             ) {
                                                 Ok(_) => writes += 1,
                                                 Err(e) => eprintln!(
@@ -208,6 +219,8 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                                                 &pr.ast_hash,
                                                 &pr,
                                                 false,
+                                                watcher_mtime,
+                                                watcher_file_size,
                                             ).is_ok() {
                                                 writes += 1;
                                             }
@@ -231,6 +244,8 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                                         text_result.lines_total,
                                         &text_result.content,
                                         false,
+                                        watcher_mtime,
+                                        watcher_file_size,
                                     ) {
                                         Ok(_) => writes += 1,
                                         Err(e) => eprintln!(
@@ -384,14 +399,14 @@ async fn background_reindex(
         };
     }
 
-    let existing_files: HashMap<String, (i64, String)> = {
+    let existing_files: HashMap<String, (i64, String, Option<i64>, Option<i64>)> = {
         // Storage гарантированно есть — background_init уже открыл БД
         let guard = shared_storage.lock().await;
         let storage = guard.as_ref().unwrap();
         match storage.get_all_files() {
             Ok(files) => files
                 .into_iter()
-                .filter_map(|f| f.id.map(|id| (f.path.clone(), (id, f.content_hash.clone()))))
+                .filter_map(|f| f.id.map(|id| (f.path.clone(), (id, f.content_hash.clone(), f.mtime, f.file_size))))
                 .collect(),
             Err(e) => {
                 eprintln!("[reindex] Ошибка get_all_files: {}", e);
@@ -420,7 +435,7 @@ async fn background_reindex(
     })
     .await;
 
-    let (candidate_files, files_scanned, files_skipped, collect_errors, seen_paths) = match candidates_result {
+    let (candidate_files, files_scanned, files_skipped, collect_errors, seen_paths, metadata_updates) = match candidates_result {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => {
             eprintln!("[reindex] Ошибка сбора кандидатов: {}", e);
@@ -476,7 +491,7 @@ async fn background_reindex(
 
         let results: Vec<ParsedFile> = candidate_files
             .par_iter()
-            .map(|(rel_path, content, hash, category)| {
+            .map(|(rel_path, content, hash, category, mtime, file_size)| {
                 match category {
                     FileCategory::Code(language) => {
                         let ext = std::path::Path::new(rel_path.as_str())
@@ -494,6 +509,8 @@ async fn background_reindex(
                                     lines_total: pr.lines_total,
                                     ast_hash: pr.ast_hash.clone(),
                                     parse_result: pr,
+                                    mtime: *mtime,
+                                    file_size: *file_size,
                                 },
                                 Err(e) => ParsedFile::Error {
                                     rel_path: rel_path.clone(),
@@ -526,6 +543,8 @@ async fn background_reindex(
                                         lines_total: pr.lines_total,
                                         ast_hash: pr.ast_hash.clone(),
                                         parse_result: pr,
+                                        mtime: *mtime,
+                                        file_size: *file_size,
                                     };
                                 }
                             }
@@ -537,6 +556,8 @@ async fn background_reindex(
                             content_hash: hash.clone(),
                             lines_total: text_result.lines_total,
                             content: text_result.content,
+                            mtime: *mtime,
+                            file_size: *file_size,
                         }
                     }
                     FileCategory::Binary => unreachable!("бинарные файлы не попадают в кандидаты"),
@@ -612,6 +633,8 @@ async fn background_reindex(
                     lines_total,
                     ast_hash,
                     parse_result,
+                    mtime,
+                    file_size,
                 } => {
                     let indexer = Indexer::new(storage);
                     match indexer.write_code_to_db(
@@ -622,6 +645,8 @@ async fn background_reindex(
                         ast_hash,
                         parse_result,
                         is_fresh_db,
+                        Some(*mtime),
+                        Some(*file_size),
                     ) {
                         Ok(_) => files_indexed += 1,
                         Err(e) => errors.push((rel_path.clone(), e.to_string())),
@@ -632,9 +657,19 @@ async fn background_reindex(
                     content_hash,
                     lines_total,
                     content,
+                    mtime,
+                    file_size,
                 } => {
                     let indexer = Indexer::new(storage);
-                    match indexer.write_text_to_db(rel_path, content_hash, *lines_total, content, is_fresh_db) {
+                    match indexer.write_text_to_db(
+                        rel_path,
+                        content_hash,
+                        *lines_total,
+                        content,
+                        is_fresh_db,
+                        Some(*mtime),
+                        Some(*file_size),
+                    ) {
                         Ok(_) => files_indexed += 1,
                         Err(e) => errors.push((rel_path.clone(), e.to_string())),
                     }
@@ -662,6 +697,21 @@ async fn background_reindex(
     let write_ms = write_start.elapsed().as_millis();
     eprintln!("[reindex] Запись в БД: {} мс ({} файлов)", write_ms, files_indexed);
 
+    // Обновляем mtime/file_size для файлов с неизменённым содержимым
+    if !metadata_updates.is_empty() {
+        let mut guard = shared_storage.lock().await;
+        let storage = guard.as_mut().unwrap();
+        if let Err(e) = storage.begin_batch() {
+            eprintln!("[reindex] Ошибка begin_batch metadata: {}", e);
+        } else {
+            for (path, mtime, file_size) in &metadata_updates {
+                let _ = storage.update_file_metadata(path, *mtime, *file_size);
+            }
+            let _ = storage.commit_batch();
+            eprintln!("[reindex] Обновлено метаданных: {}", metadata_updates.len());
+        }
+    }
+
     // ── Phase 4: rebuild индексов (короткий lock) ────────────────────────
     if bulk_mode {
         let idx_start = std::time::Instant::now();
@@ -684,7 +734,7 @@ async fn background_reindex(
         if let Err(e) = storage.begin_batch() {
             eprintln!("[reindex] Ошибка begin_batch (cleanup): {}", e);
         } else {
-            for (path, (id, _)) in &existing_files {
+            for (path, (id, _, _, _)) in &existing_files {
                 if !seen_paths.contains(path) {
                     if let Err(e) = storage.delete_file(*id) {
                         eprintln!("[reindex] Ошибка delete_file {}: {}", path, e);
@@ -763,12 +813,14 @@ pub fn process_code_update(
                     &parse_result.ast_hash,
                     &parse_result,
                     false,
+                    None,
+                    None,
                 )?;
             }
         }
         FileCategory::Text => {
             let text_result = TextParser::parse(&content);
-            indexer.write_text_to_db(&rel_path, &hash, text_result.lines_total, &text_result.content, false)?;
+            indexer.write_text_to_db(&rel_path, &hash, text_result.lines_total, &text_result.content, false, None, None)?;
         }
         FileCategory::Binary => {}
     }

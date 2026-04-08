@@ -7,3 +7,4 @@ pub mod indexer;    // Шаг 4: обход и индексация файлов
 pub mod mcp;        // Шаг 7: MCP-сервер
 pub mod watcher;    // Daemon: file watcher с debounce
 pub mod daemon;     // Daemon: основной цикл daemon-режима
+pub mod pidlock;    // PID-lock: защита от повторного запуска демона

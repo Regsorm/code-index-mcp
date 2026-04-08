@@ -292,6 +292,9 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("Не удалось создать директорию: {}", e))?;
             }
 
+            // PID-lock: не допускать запуск нескольких демонов на одном репозитории
+            let _pid_lock = code_index_mcp::pidlock::acquire(&root.join(".code-index"))?;
+
             // Загрузить конфигурацию проекта
             let index_config = IndexConfig::load(&root)?;
 

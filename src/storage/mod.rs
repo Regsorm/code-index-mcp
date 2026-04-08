@@ -112,6 +112,11 @@ impl Storage {
                             .context("Ошибка при копировании БД disk→memory")?;
                     }
 
+                    // Миграции для существующей БД, загруженной в память
+                    schema::migrate_v2(&memory_conn)
+                        .context("Ошибка миграции v2 (in-memory)")?;
+                    schema::migrate_v3(&memory_conn)
+                        .context("Ошибка миграции v3 (in-memory)")?;
                     register_regexp(&memory_conn)?;
                     Ok(Self { conn: memory_conn })
                 } else {
@@ -178,7 +183,7 @@ impl Storage {
     /// Получить запись файла по пути
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, ast_hash, language, lines_total, indexed_at
+            "SELECT id, path, content_hash, ast_hash, language, lines_total, indexed_at, mtime, file_size
              FROM files WHERE path = ?1",
         )?;
         let result = stmt.query_row(params![path], row_to_file);
@@ -192,11 +197,20 @@ impl Storage {
     /// Получить все файлы в индексе
     pub fn get_all_files(&self) -> Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, ast_hash, language, lines_total, indexed_at
+            "SELECT id, path, content_hash, ast_hash, language, lines_total, indexed_at, mtime, file_size
              FROM files ORDER BY path",
         )?;
         let rows = stmt.query_map([], row_to_file)?;
         rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Обновить только mtime и file_size для существующего файла (без перепарсинга)
+    pub fn update_file_metadata(&self, path: &str, mtime: i64, file_size: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET mtime = ?1, file_size = ?2 WHERE path = ?3",
+            params![mtime, file_size, path],
+        )?;
+        Ok(())
     }
 
     /// Удалить файл и все связанные записи (каскадно через FK)
@@ -955,6 +969,8 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         language:     row.get(4)?,
         lines_total:  row.get::<_, i64>(5)? as usize,
         indexed_at:   row.get(6)?,
+        mtime:        row.get(7)?,
+        file_size:    row.get(8)?,
     })
 }
 
@@ -1041,6 +1057,8 @@ mod tests {
             language: "python".to_string(),
             lines_total: 100,
             indexed_at: "2026-01-01T00:00:00".to_string(),
+            mtime: None,
+            file_size: None,
         }
     }
 
@@ -1244,6 +1262,8 @@ mod tests {
             language: "rust".to_string(),
             lines_total: 50,
             indexed_at: "2026-01-01T00:00:00".to_string(),
+            mtime: None,
+            file_size: None,
         };
         let rs_id = storage.upsert_file(&rs_rec).unwrap();
 
@@ -1309,6 +1329,8 @@ mod tests {
             language: "python".to_string(),
             lines_total: 10,
             indexed_at: "2026-01-01".to_string(),
+            mtime: None,
+            file_size: None,
         };
         storage.upsert_file(&rec).unwrap();
 

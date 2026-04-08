@@ -46,6 +46,8 @@ pub enum ParsedFile {
         lines_total: usize,
         ast_hash: String,
         parse_result: ParseResult,
+        mtime: i64,
+        file_size: i64,
     },
     /// Текстовый файл (без AST)
     Text {
@@ -53,6 +55,8 @@ pub enum ParsedFile {
         content_hash: String,
         lines_total: usize,
         content: String,
+        mtime: i64,
+        file_size: i64,
     },
     /// Ошибка парсинга
     Error {
@@ -107,12 +111,13 @@ impl<'a> Indexer<'a> {
         };
 
         // ── Этап 0: загрузка состояния БД ─────────────────────────────────────
-        let existing_files: HashMap<String, (i64, String)> = self
+        // Тип: path → (id, content_hash, mtime, file_size)
+        let existing_files: HashMap<String, (i64, String, Option<i64>, Option<i64>)> = self
             .storage
             .get_all_files()?
             .into_iter()
             .filter_map(|f| {
-                f.id.map(|id| (f.path.clone(), (id, f.content_hash.clone())))
+                f.id.map(|id| (f.path.clone(), (id, f.content_hash.clone(), f.mtime, f.file_size)))
             })
             .collect();
 
@@ -121,7 +126,7 @@ impl<'a> Indexer<'a> {
 
         // ── Этап 1: сбор кандидатов (параллельный read+hash) ─────────────────
         let candidates_start = std::time::Instant::now();
-        let (candidate_files, seen_paths) = self.collect_candidates(root, force, &existing_files, &mut result)?;
+        let (candidate_files, seen_paths, metadata_updates) = self.collect_candidates(root, force, &existing_files, &mut result)?;
         let candidates_ms = candidates_start.elapsed().as_millis();
         eprintln!("[timing] Сбор кандидатов: {} мс ({} файлов)", candidates_ms, candidate_files.len());
 
@@ -159,7 +164,7 @@ impl<'a> Indexer<'a> {
         let parse_start = std::time::Instant::now();
         let parse_results: Vec<ParsedFile> = candidate_files
             .par_iter()
-            .map(|(rel_path, content, hash, category)| {
+            .map(|(rel_path, content, hash, category, mtime, file_size)| {
                 match category {
                     FileCategory::Code(language) => {
                         // Определяем парсер по расширению файла
@@ -179,6 +184,8 @@ impl<'a> Indexer<'a> {
                                         lines_total: pr.lines_total,
                                         ast_hash: pr.ast_hash.clone(),
                                         parse_result: pr,
+                                        mtime: *mtime,
+                                        file_size: *file_size,
                                     },
                                     Err(e) => ParsedFile::Error {
                                         rel_path: rel_path.clone(),
@@ -212,6 +219,8 @@ impl<'a> Indexer<'a> {
                                         lines_total: pr.lines_total,
                                         ast_hash: pr.ast_hash.clone(),
                                         parse_result: pr,
+                                        mtime: *mtime,
+                                        file_size: *file_size,
                                     };
                                 }
                             }
@@ -223,6 +232,8 @@ impl<'a> Indexer<'a> {
                             content_hash: hash.clone(),
                             lines_total: text_result.lines_total,
                             content: text_result.content,
+                            mtime: *mtime,
+                            file_size: *file_size,
                         }
                     }
                     FileCategory::Binary => unreachable!("бинарные файлы не должны попасть сюда"),
@@ -262,6 +273,8 @@ impl<'a> Indexer<'a> {
                     lines_total,
                     ast_hash,
                     parse_result,
+                    mtime,
+                    file_size,
                 } => {
                     match self.write_code_to_db(
                         rel_path,
@@ -271,6 +284,8 @@ impl<'a> Indexer<'a> {
                         ast_hash,
                         parse_result,
                         is_fresh_db,
+                        Some(*mtime),
+                        Some(*file_size),
                     ) {
                         Ok(_) => {
                             result.files_indexed += 1;
@@ -286,8 +301,10 @@ impl<'a> Indexer<'a> {
                     content_hash,
                     lines_total,
                     content,
+                    mtime,
+                    file_size,
                 } => {
-                    match self.write_text_to_db(rel_path, content_hash, *lines_total, content, is_fresh_db) {
+                    match self.write_text_to_db(rel_path, content_hash, *lines_total, content, is_fresh_db, Some(*mtime), Some(*file_size)) {
                         Ok(_) => {
                             result.files_indexed += 1;
                             batch_count += 1;
@@ -315,6 +332,15 @@ impl<'a> Indexer<'a> {
         let write_ms = write_start.elapsed().as_millis();
         eprintln!("[timing] Запись в БД: {} мс ({} файлов)", write_ms, result.files_indexed);
 
+        // Обновляем mtime/file_size для файлов с неизменённым содержимым
+        if !metadata_updates.is_empty() {
+            self.storage.begin_batch()?;
+            for (path, mtime, file_size) in &metadata_updates {
+                let _ = self.storage.update_file_metadata(path, *mtime, *file_size);
+            }
+            self.storage.commit_batch()?;
+        }
+
         // ── Этап 4: индексы + FTS rebuild ────────────────────────────────────
         // Завершаем bulk-load: пересоздаём индексы, триггеры, rebuild FTS
         if bulk_mode {
@@ -331,7 +357,7 @@ impl<'a> Indexer<'a> {
 
         // Удаляем из БД файлы, которых больше нет на диске — в одной транзакции
         self.storage.begin_batch()?;
-        for (path, (id, _)) in &existing_files {
+        for (path, (id, _, _, _)) in &existing_files {
             if !seen_paths.contains(path) {
                 self.storage.delete_file(*id)?;
                 result.files_deleted += 1;
@@ -359,6 +385,8 @@ impl<'a> Indexer<'a> {
         ast_hash: &str,
         parse_result: &ParseResult,
         skip_delete: bool,
+        mtime: Option<i64>,
+        file_size: Option<i64>,
     ) -> Result<()> {
         // Сохраняем запись о файле
         let file_record = FileRecord {
@@ -371,6 +399,8 @@ impl<'a> Indexer<'a> {
             indexed_at: chrono::Utc::now()
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
+            mtime,
+            file_size,
         };
         let file_id = self.storage.upsert_file(&file_record)?;
 
@@ -481,6 +511,8 @@ impl<'a> Indexer<'a> {
         lines_total: usize,
         content: &str,
         skip_delete: bool,
+        mtime: Option<i64>,
+        file_size: Option<i64>,
     ) -> Result<()> {
         let file_record = FileRecord {
             id: None,
@@ -492,6 +524,8 @@ impl<'a> Indexer<'a> {
             indexed_at: chrono::Utc::now()
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
+            mtime,
+            file_size,
         };
         let file_id = self.storage.upsert_file(&file_record)?;
 
@@ -512,22 +546,25 @@ impl<'a> Indexer<'a> {
 
     /// Первый проход: обойти директорию, собрать список файлов для индексации.
     ///
-    /// Двухфазный сбор:
-    /// 1a. WalkDir — быстрый обход, собрать пути + seen_paths (без чтения файлов)
-    /// 1b. rayon par_iter — параллельное чтение + SHA-256 хеш
+    /// Трёхфазный сбор:
+    /// 1a. WalkDir — быстрый обход, собрать пути + metadata (mtime/size) без чтения содержимого
+    /// 1b. mtime/size pre-filter — пропустить файлы, где mtime+size совпадают с БД
+    /// 1c. rayon par_iter — параллельное чтение + SHA-256 хеш только изменённых файлов
+    /// 1d. hash comparison — пропустить файлы с неизменённым хешем, собрать metadata_updates
     ///
-    /// Возвращает (candidates, seen_paths) — seen_paths используется для очистки
-    /// удалённых файлов без повторного обхода дерева.
+    /// Возвращает (candidates, seen_paths, metadata_updates).
+    /// seen_paths используется для очистки удалённых файлов без повторного обхода дерева.
+    /// metadata_updates содержит файлы, у которых хеш не изменился, но mtime/size обновились.
     fn collect_candidates(
         &self,
         root: &Path,
         force: bool,
-        existing_files: &HashMap<String, (i64, String)>,
+        existing_files: &HashMap<String, (i64, String, Option<i64>, Option<i64>)>,
         result: &mut IndexResult,
-    ) -> Result<(Vec<(String, String, String, FileCategory)>, HashSet<String>)> {
+    ) -> Result<(Vec<(String, String, String, FileCategory, i64, i64)>, HashSet<String>, Vec<(String, i64, i64)>)> {
         let config_for_filter = self.config.clone();
 
-        // ── Фаза 1a: WalkDir — собрать пути (быстро, без I/O на содержимое) ──
+        // ── Фаза 1a: WalkDir — собрать пути + metadata (без чтения содержимого) ──
         let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
             if e.file_type().is_dir() {
                 if let Some(name) = e.file_name().to_str() {
@@ -541,6 +578,8 @@ impl<'a> Indexer<'a> {
             abs_path: std::path::PathBuf,
             rel_path: String,
             category: FileCategory,
+            mtime: i64,
+            file_size: i64,
         }
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut seen_paths: HashSet<String> = HashSet::new();
@@ -562,15 +601,26 @@ impl<'a> Indexer<'a> {
                 continue;
             }
 
+            // Получаем метаданные для всех файлов
+            let meta = entry.metadata().ok();
+
             // Лимит размера — только для текстовых файлов, код индексируем всегда
             if !matches!(category, FileCategory::Code(_)) {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.len() as usize > self.config.max_file_size {
+                if let Some(ref m) = meta {
+                    if m.len() as usize > self.config.max_file_size {
                         result.files_skipped += 1;
                         continue;
                     }
                 }
             }
+
+            // mtime и file_size для быстрой проверки изменений
+            let mtime = meta.as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let file_size_val = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
 
             let rel_path = path
                 .strip_prefix(root)
@@ -584,34 +634,59 @@ impl<'a> Indexer<'a> {
                 abs_path: path.to_path_buf(),
                 rel_path,
                 category,
+                mtime,
+                file_size: file_size_val,
             });
         }
 
-        // ── Фаза 1b: параллельное чтение + хеш (rayon) ──────────────────────
-        let read_results: Vec<_> = entries
+        // ── Фаза 1b: быстрая фильтрация по mtime+size (без чтения файлов) ──
+        let (entries_to_read, mtime_skipped): (Vec<&FileEntry>, usize) = if force {
+            (entries.iter().collect(), 0)
+        } else {
+            let mut to_read = Vec::new();
+            let mut skipped = 0usize;
+            for entry in &entries {
+                match existing_files.get(&entry.rel_path) {
+                    Some((_, _, Some(stored_mtime), Some(stored_size)))
+                        if *stored_mtime == entry.mtime && *stored_size == entry.file_size =>
+                    {
+                        skipped += 1;
+                    }
+                    _ => to_read.push(entry),
+                }
+            }
+            (to_read, skipped)
+        };
+        result.files_skipped += mtime_skipped;
+
+        // ── Фаза 1c: параллельное чтение + хеш изменённых файлов (rayon) ────
+        let read_results: Vec<_> = entries_to_read
             .par_iter()
             .map(|entry| {
                 match hasher::file_hash(&entry.abs_path) {
-                    Ok((content, hash)) => Ok((entry.rel_path.clone(), content, hash, entry.category.clone())),
+                    Ok((content, hash)) => Ok((entry.rel_path.clone(), content, hash, entry.category.clone(), entry.mtime, entry.file_size)),
                     Err(e) => Err((entry.rel_path.clone(), e.to_string())),
                 }
             })
             .collect();
 
-        // ── Фаза 1c: фильтрация по existing hashes (последовательно, дёшево) ─
+        // ── Фаза 1d: фильтрация по hash + metadata-only updates ────────────
         let mut candidates = Vec::new();
+        let mut metadata_updates: Vec<(String, i64, i64)> = Vec::new();
         for item in read_results {
             match item {
-                Ok((rel_path, content, hash, category)) => {
+                Ok((rel_path, content, hash, category, mtime, file_size)) => {
                     if !force {
-                        if let Some((_, existing_hash)) = existing_files.get(&rel_path) {
+                        if let Some((_, existing_hash, _, _)) = existing_files.get(&rel_path) {
                             if *existing_hash == hash {
+                                // Содержимое не изменилось, но mtime/size мог — обновим метаданные
+                                metadata_updates.push((rel_path, mtime, file_size));
                                 result.files_skipped += 1;
                                 continue;
                             }
                         }
                     }
-                    candidates.push((rel_path, content, hash, category));
+                    candidates.push((rel_path, content, hash, category, mtime, file_size));
                 }
                 Err((rel_path, error)) => {
                     result.errors.push((rel_path, error));
@@ -619,28 +694,30 @@ impl<'a> Indexer<'a> {
             }
         }
 
-        Ok((candidates, seen_paths))
+        Ok((candidates, seen_paths, metadata_updates))
     }
 }
 
 /// Standalone-версия collect_candidates — не требует Storage.
-/// Двухфазный сбор: WalkDir (пути) → rayon (read+hash).
-/// Возвращает (candidates, files_scanned, files_skipped, errors, seen_paths).
+/// Трёхфазный сбор: WalkDir (пути+metadata) → mtime/size pre-filter → rayon (read+hash).
+/// Возвращает (candidates, files_scanned, files_skipped, errors, seen_paths, metadata_updates).
 pub fn collect_candidates_standalone(
     root: &Path,
     config: &IndexConfig,
     force: bool,
-    existing_files: &HashMap<String, (i64, String)>,
-) -> Result<(Vec<(String, String, String, FileCategory)>, usize, usize, Vec<(String, String)>, HashSet<String>)> {
+    existing_files: &HashMap<String, (i64, String, Option<i64>, Option<i64>)>,
+) -> Result<(Vec<(String, String, String, FileCategory, i64, i64)>, usize, usize, Vec<(String, String)>, HashSet<String>, Vec<(String, i64, i64)>)> {
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
     let config_for_filter = config.clone();
 
-    // ── Фаза 1a: WalkDir — собрать пути (без чтения файлов) ──────────────
+    // ── Фаза 1a: WalkDir — собрать пути + metadata (без чтения содержимого) ──
     struct FileEntry {
         abs_path: std::path::PathBuf,
         rel_path: String,
         category: FileCategory,
+        mtime: i64,
+        file_size: i64,
     }
     let mut entries: Vec<FileEntry> = Vec::new();
     let mut seen_paths: HashSet<String> = HashSet::new();
@@ -670,15 +747,26 @@ pub fn collect_candidates_standalone(
             continue;
         }
 
+        // Получаем метаданные для всех файлов
+        let meta = entry.metadata().ok();
+
         // Лимит размера — только для текстовых файлов, код индексируем всегда
         if !matches!(category, FileCategory::Code(_)) {
-            if let Ok(meta) = entry.metadata() {
-                if meta.len() as usize > config.max_file_size {
+            if let Some(ref m) = meta {
+                if m.len() as usize > config.max_file_size {
                     files_skipped += 1;
                     continue;
                 }
             }
         }
+
+        // mtime и file_size для быстрой проверки изменений
+        let mtime = meta.as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let file_size_val = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
 
         let rel_path = path
             .strip_prefix(root)
@@ -692,35 +780,60 @@ pub fn collect_candidates_standalone(
             abs_path: path.to_path_buf(),
             rel_path,
             category,
+            mtime,
+            file_size: file_size_val,
         });
     }
 
-    // ── Фаза 1b: параллельное чтение + хеш (rayon) ──────────────────────
-    let read_results: Vec<_> = entries
+    // ── Фаза 1b: быстрая фильтрация по mtime+size (без чтения файлов) ──
+    let (entries_to_read, mtime_skipped): (Vec<&FileEntry>, usize) = if force {
+        (entries.iter().collect(), 0)
+    } else {
+        let mut to_read = Vec::new();
+        let mut skipped = 0usize;
+        for entry in &entries {
+            match existing_files.get(&entry.rel_path) {
+                Some((_, _, Some(stored_mtime), Some(stored_size)))
+                    if *stored_mtime == entry.mtime && *stored_size == entry.file_size =>
+                {
+                    skipped += 1;
+                }
+                _ => to_read.push(entry),
+            }
+        }
+        (to_read, skipped)
+    };
+    files_skipped += mtime_skipped;
+
+    // ── Фаза 1c: параллельное чтение + хеш изменённых файлов (rayon) ────
+    let read_results: Vec<_> = entries_to_read
         .par_iter()
         .map(|entry| {
             match hasher::file_hash(&entry.abs_path) {
-                Ok((content, hash)) => Ok((entry.rel_path.clone(), content, hash, entry.category.clone())),
+                Ok((content, hash)) => Ok((entry.rel_path.clone(), content, hash, entry.category.clone(), entry.mtime, entry.file_size)),
                 Err(e) => Err((entry.rel_path.clone(), e.to_string())),
             }
         })
         .collect();
 
-    // ── Фаза 1c: фильтрация по existing hashes ──────────────────────────
+    // ── Фаза 1d: фильтрация по hash + metadata-only updates ────────────
     let mut candidates = Vec::new();
     let mut errors = Vec::new();
+    let mut metadata_updates: Vec<(String, i64, i64)> = Vec::new();
     for item in read_results {
         match item {
-            Ok((rel_path, content, hash, category)) => {
+            Ok((rel_path, content, hash, category, mtime, file_size)) => {
                 if !force {
-                    if let Some((_, existing_hash)) = existing_files.get(&rel_path) {
+                    if let Some((_, existing_hash, _, _)) = existing_files.get(&rel_path) {
                         if *existing_hash == hash {
+                            // Содержимое не изменилось, но mtime/size мог — обновим метаданные
+                            metadata_updates.push((rel_path, mtime, file_size));
                             files_skipped += 1;
                             continue;
                         }
                     }
                 }
-                candidates.push((rel_path, content, hash, category));
+                candidates.push((rel_path, content, hash, category, mtime, file_size));
             }
             Err((rel_path, error)) => {
                 errors.push((rel_path, error));
@@ -728,7 +841,7 @@ pub fn collect_candidates_standalone(
         }
     }
 
-    Ok((candidates, files_scanned, files_skipped, errors, seen_paths))
+    Ok((candidates, files_scanned, files_skipped, errors, seen_paths, metadata_updates))
 }
 
 #[cfg(test)]

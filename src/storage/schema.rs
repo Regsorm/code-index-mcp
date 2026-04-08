@@ -97,7 +97,9 @@ CREATE TABLE IF NOT EXISTS files (
     ast_hash     TEXT,
     language     TEXT    NOT NULL,
     lines_total  INTEGER NOT NULL DEFAULT 0,
-    indexed_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+    indexed_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    mtime        INTEGER,
+    file_size    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS functions (
@@ -202,6 +204,7 @@ pub fn initialize_tables_only(conn: &rusqlite::Connection) -> rusqlite::Result<(
     // Только таблицы + FTS-виртуальные таблицы — без INDEXES_SQL и TRIGGERS_SQL
     conn.execute_batch(SQL_SCHEMA)?;
     migrate_v2(conn)?;
+    migrate_v3(conn)?;
     Ok(())
 }
 
@@ -220,6 +223,7 @@ pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // Применяем DDL-схему: таблицы и FTS-виртуальные таблицы
     conn.execute_batch(SQL_SCHEMA)?;
     migrate_v2(conn)?;
+    migrate_v3(conn)?;
     // Создаём триггеры
     conn.execute_batch(TRIGGERS_SQL)?;
     // Создаём индексы
@@ -246,6 +250,21 @@ pub fn migrate_v2(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "ALTER TABLE functions ADD COLUMN override_type TEXT;
              ALTER TABLE functions ADD COLUMN override_target TEXT;",
+        )?;
+    }
+    Ok(())
+}
+
+/// Миграция v3: добавить колонки mtime/file_size в таблицу files для mtime pre-filter.
+/// Безопасно вызывать повторно — проверяет наличие колонки перед ALTER.
+pub fn migrate_v3(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_col = conn
+        .prepare("SELECT mtime FROM files LIMIT 0")
+        .is_ok();
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE files ADD COLUMN mtime INTEGER;
+             ALTER TABLE files ADD COLUMN file_size INTEGER;",
         )?;
     }
     Ok(())

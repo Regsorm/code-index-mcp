@@ -10,6 +10,8 @@ pub struct FileRecord {
     pub language: String,
     pub lines_total: usize,
     pub indexed_at: String,
+    pub mtime: Option<i64>,      // Unix timestamp секунды (fs::metadata)
+    pub file_size: Option<i64>,  // размер файла в байтах
 }
 
 /// Запись функции
