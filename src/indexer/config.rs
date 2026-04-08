@@ -100,7 +100,7 @@ fn default_max_file_size() -> usize {
 }
 
 fn default_batch_size() -> usize {
-    500
+    2000
 }
 
 fn default_bulk_threshold() -> usize {

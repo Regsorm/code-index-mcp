@@ -197,6 +197,7 @@ pub fn initialize_tables_only(conn: &rusqlite::Connection) -> rusqlite::Result<(
         PRAGMA synchronous=NORMAL;
         PRAGMA foreign_keys=ON;
         PRAGMA cache_size=-64000;
+        PRAGMA mmap_size=268435456;
     ")?;
     // Только таблицы + FTS-виртуальные таблицы — без INDEXES_SQL и TRIGGERS_SQL
     conn.execute_batch(SQL_SCHEMA)?;
@@ -214,6 +215,8 @@ pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     // Кеш ~64 МБ (отрицательное значение — в кибибайтах)
     conn.execute_batch("PRAGMA cache_size=-64000;")?;
+    // Memory-mapped I/O: 256 МБ — снижает количество read/write syscall на диске
+    conn.execute_batch("PRAGMA mmap_size=268435456;")?;
     // Применяем DDL-схему: таблицы и FTS-виртуальные таблицы
     conn.execute_batch(SQL_SCHEMA)?;
     migrate_v2(conn)?;
