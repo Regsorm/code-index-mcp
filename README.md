@@ -4,7 +4,7 @@
 
 Instant code search for AI models. Replaces grep with millisecond queries.
 
-> 62K files indexed in 43s — 282K functions searchable in <1ms — 8 languages — 12 MCP tools
+> 93K files re-checked in 4s (mtime fast-path) — 282K functions searchable in <1ms — 8 languages — 12 MCP tools
 
 ## Problem
 
@@ -237,14 +237,19 @@ Key fields:
 
 ## Benchmarks
 
-Tested on a 1C:Enterprise Trade Management configuration:
+Tested on 1C:Enterprise configurations (HDD, Windows):
+
+| Project | Files | Initial index | Re-check (no changes) | Speedup |
+|---------|-------|---------------|----------------------|---------|
+| Trade Management | 63K | 65 sec | **5 sec** | 13x |
+| Accounting | 93K | 164 sec | **4 sec** | 40x |
+
+Re-check uses `mtime + file_size` fast-path: only `stat()` per file, zero reads, zero SHA-256 hashes.
 
 | Metric | Value |
 |--------|-------|
-| Files | 61,706 |
-| Functions | 282,575 |
+| Functions indexed | 282,575 |
 | Call graph edges | 1,533,337 |
-| Indexing time | 43 seconds |
 | Search time | < 1 ms |
 | Binary size | 13.5 MB |
 
@@ -270,7 +275,8 @@ Key optimizations:
 - **In-memory SQLite with event-driven flush** — all reads and writes go to RAM; disk is written only when data actually changes (see below)
 - **Rayon parallel parsing** — files are parsed across all CPU cores simultaneously
 - **Bulk mode** — for large batches: drop indexes, bulk insert, rebuild indexes; significantly faster than incremental inserts
-- **SHA-256 hash check** — each file's hash is stored; unchanged files are skipped entirely on re-index
+- **mtime/size fast-path** — on restart, each file is checked via `stat()` (mtime + file_size); if both match the stored values, the file is not read at all — zero I/O, zero SHA-256. Only changed files are read and re-hashed
+- **PID-lock** — prevents multiple daemon instances from competing for the same `index.db`
 
 ### Flush to disk policy
 
