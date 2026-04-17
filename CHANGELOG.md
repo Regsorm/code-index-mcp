@@ -3,6 +3,35 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.5.0-rc3] — 2026-04-17
+
+### Исправлено
+
+- **Race condition при atomic-save редакторов**. Редакторы (VS Code, IDE, `git`) сохраняют файлы атомарно: сначала пишут во временный `<имя>.tmp.<pid>.<ts>`, затем переименовывают в целевой файл. Watcher через `ReadDirectoryChangesW` успевал увидеть событие `Create` на `.tmp`-файле, но к моменту вызова `hasher::file_hash()` файл уже был переименован. В логи лилась стена ошибок вида `file_hash \\?\...\.mcp.json.tmp.10296.1776427368309: Не удается найти указанный файл. (os error 2)`.
+
+  **Фикс**: в [`daemon_core/worker.rs`](src/daemon_core/worker.rs) `apply_event` при `io::ErrorKind::NotFound` от `file_hash` теперь тихо выходит из обработчика. Логируются только настоящие ошибки (permission denied, read error и т.п.).
+
+### Добавлено
+
+- **Поле `exclude_file_patterns` в `.code-index/config.json`** — glob-паттерны имён файлов для исключения из индексации. Дополняет существующее `exclude_dirs`:
+
+  ```json
+  {
+    "exclude_dirs": [".vscode", "experimental"],
+    "exclude_file_patterns": ["*.tmp.*", "*.bak", "*.orig", "*.swp"]
+  }
+  ```
+
+  Паттерны матчатся по **basename** (имя файла без пути). Применяются:
+  - в [`watcher.rs`](src/watcher.rs) — события от файлов, попавших под паттерн, отбрасываются до вызова `file_hash`;
+  - в [`indexer/mod.rs`](src/indexer/mod.rs) `collect_candidates` / `collect_candidates_standalone` — файл исключается из обхода WalkDir до категоризации.
+
+  Синтаксис glob через crate `globset`. Некорректные паттерны логируются и пропускаются (не ломают старт).
+
+### Зависимости
+
+- Добавлен `globset = "0.4"`.
+
 ## [0.5.0-rc2] — 2026-04-17
 
 ### Исправлено

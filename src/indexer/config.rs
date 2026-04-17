@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use anyhow::Result;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 
 /// Конфигурация индексатора для проекта
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +9,11 @@ pub struct IndexConfig {
     /// Дополнительные директории для исключения (кроме стандартных)
     #[serde(default)]
     pub exclude_dirs: Vec<String>,
+
+    /// Glob-паттерны имён файлов для исключения (например: "*.tmp.*", "*.bak", "*.orig").
+    /// Матчится имя файла (basename), не полный путь.
+    #[serde(default)]
+    pub exclude_file_patterns: Vec<String>,
 
     /// Дополнительные расширения для FTS-индексации
     #[serde(default)]
@@ -124,6 +130,7 @@ impl Default for IndexConfig {
     fn default() -> Self {
         Self {
             exclude_dirs: vec![],
+            exclude_file_patterns: vec![],
             extra_text_extensions: vec![],
             max_file_size: default_max_file_size(),
             max_files: 0,
@@ -168,6 +175,25 @@ impl IndexConfig {
         use crate::indexer::file_types::EXCLUDE_DIRS;
         EXCLUDE_DIRS.contains(&dir_name)
             || self.exclude_dirs.iter().any(|d| d == dir_name)
+    }
+
+    /// Скомпилировать GlobSet из exclude_file_patterns для последующего быстрого матчинга.
+    /// Некорректные паттерны логируются в stderr и пропускаются.
+    /// Если список пуст — возвращается пустой GlobSet, который ничего не матчит.
+    pub fn build_file_exclude_matcher(&self) -> GlobSet {
+        let mut builder = GlobSetBuilder::new();
+        for pat in &self.exclude_file_patterns {
+            match Glob::new(pat) {
+                Ok(g) => { builder.add(g); }
+                Err(e) => {
+                    eprintln!("[config] некорректный exclude_file_pattern '{}': {}", pat, e);
+                }
+            }
+        }
+        builder.build().unwrap_or_else(|e| {
+            eprintln!("[config] GlobSetBuilder.build failed: {}", e);
+            GlobSet::empty()
+        })
     }
 }
 

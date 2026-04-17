@@ -1,4 +1,5 @@
 /// Модуль файлового наблюдателя — отслеживает изменения в проекте
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,8 @@ pub struct WatcherConfig {
     pub batch_ms: u64,
     /// Дополнительные директории для исключения
     pub exclude_dirs: Vec<String>,
+    /// Glob-паттерны имён файлов для исключения (например "*.tmp.*", "*.bak")
+    pub exclude_file_patterns: Vec<String>,
 }
 
 impl Default for WatcherConfig {
@@ -32,8 +35,21 @@ impl Default for WatcherConfig {
             debounce_ms: 1500,
             batch_ms: 2000,
             exclude_dirs: vec![],
+            exclude_file_patterns: vec![],
         }
     }
+}
+
+fn build_file_matcher(patterns: &[String]) -> GlobSet {
+    let mut builder = GlobSetBuilder::new();
+    for pat in patterns {
+        if let Ok(g) = Glob::new(pat) {
+            builder.add(g);
+        } else {
+            eprintln!("[watcher] некорректный exclude_file_pattern '{}'", pat);
+        }
+    }
+    builder.build().unwrap_or_else(|_| GlobSet::empty())
 }
 
 /// Создать watcher и вернуть receiver для событий файловой системы.
@@ -46,6 +62,7 @@ pub fn create_watcher(
 ) -> anyhow::Result<(RecommendedWatcher, mpsc::Receiver<FileEvent>)> {
     let (tx, rx) = mpsc::channel();
     let exclude_dirs = config.exclude_dirs.clone();
+    let file_matcher = build_file_matcher(&config.exclude_file_patterns);
     let root_path = root.to_path_buf();
 
     let mut watcher =
@@ -64,6 +81,13 @@ pub fn create_watcher(
                     });
                     if is_excluded {
                         continue;
+                    }
+
+                    // Проверяем exclude_file_patterns по имени файла
+                    if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
+                        if file_matcher.is_match(fname) {
+                            continue;
+                        }
                     }
 
                     // Для событий не-удаления — проверяем, что это файл, а не директория

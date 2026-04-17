@@ -207,6 +207,7 @@ pub fn run_worker(
         debounce_ms,
         batch_ms,
         exclude_dirs: index_config.exclude_dirs.clone(),
+        exclude_file_patterns: index_config.exclude_file_patterns.clone(),
     };
     let (watcher, rx) = match create_watcher(&path, &watcher_config) {
         Ok(pair) => pair,
@@ -330,6 +331,14 @@ fn apply_event(
             let (content, hash) = match hasher::file_hash(abs) {
                 Ok(pair) => pair,
                 Err(e) => {
+                    // Частый случай: atomic-save через .tmp → rename. Watcher увидел
+                    // событие на .tmp, но к моменту хэширования файл уже переименован.
+                    // NotFound — не ошибка, тихо игнорируем.
+                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                        if io_err.kind() == std::io::ErrorKind::NotFound {
+                            return;
+                        }
+                    }
                     eprintln!("[worker:{}] file_hash {}: {}", root.display(), abs.display(), e);
                     return;
                 }

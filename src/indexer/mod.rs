@@ -563,6 +563,7 @@ impl<'a> Indexer<'a> {
         result: &mut IndexResult,
     ) -> Result<(Vec<(String, String, String, FileCategory, i64, i64)>, HashSet<String>, Vec<(String, i64, i64)>)> {
         let config_for_filter = self.config.clone();
+        let file_matcher = self.config.build_file_exclude_matcher();
 
         // ── Фаза 1a: WalkDir — собрать пути + metadata (без чтения содержимого) ──
         let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
@@ -595,6 +596,14 @@ impl<'a> Indexer<'a> {
             }
 
             let path = entry.path();
+
+            // Проверяем exclude_file_patterns по имени файла
+            if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
+                if file_matcher.is_match(fname) {
+                    continue;
+                }
+            }
+
             let category = categorize_file(path);
 
             if matches!(category, FileCategory::Binary) {
@@ -710,6 +719,7 @@ pub fn collect_candidates_standalone(
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
     let config_for_filter = config.clone();
+    let file_matcher = config.build_file_exclude_matcher();
 
     // ── Фаза 1a: WalkDir — собрать пути + metadata (без чтения содержимого) ──
     struct FileEntry {
@@ -741,6 +751,14 @@ pub fn collect_candidates_standalone(
         }
 
         let path = entry.path();
+
+        // Проверяем exclude_file_patterns по имени файла
+        if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
+            if file_matcher.is_match(fname) {
+                continue;
+            }
+        }
+
         let category = categorize_file(path);
 
         if matches!(category, FileCategory::Binary) {
