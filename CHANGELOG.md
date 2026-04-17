@@ -3,6 +3,16 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.5.0-rc4] — 2026-04-17
+
+### Исправлено
+
+- **Демон падал при закрытии консоли на Windows**. `code-index` собирается как console-subsystem приложение: при запуске в пользовательской сессии (Scheduled Task c `LogonType=Interactive`, ручной вызов из `cmd`/PowerShell) процесс получает консольное окно и становится его дочерним. Закрытие окна отправляет `CTRL_CLOSE_EVENT`, и демон уходит вместе с ним. Для штатной установки через `scripts/install-daemon-autostart.ps1` это означало, что окно консоли всплывало при logon и любое его закрытие останавливало индексацию.
+
+  **Фикс**: в [`src/main.rs`](src/main.rs) `handle_daemon` при `daemon run` на Windows выполняет self-detach — перезапускает себя с флагами `DETACHED_PROCESS | CREATE_NO_WINDOW`, выставляет переменную окружения `CODE_INDEX_DAEMON_DETACHED=1` и завершает родительский процесс. Detached-клон работает без консоли и переживает закрытие любой родительской сессии. На Unix self-detach не выполняется — демонизацией управляет `systemd`/`launchd`.
+
+  Реализация использует только `std::os::windows::process::CommandExt::creation_flags`, новых зависимостей не добавляет.
+
 ## [0.5.0-rc3] — 2026-04-17
 
 ### Исправлено

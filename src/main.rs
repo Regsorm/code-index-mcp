@@ -673,11 +673,52 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// На Windows Rust собирается как console-subsystem приложение. При запуске
+/// в пользовательской сессии (Scheduled Task LogonType=Interactive, ручной
+/// вызов в cmd/powershell) процесс получает консольное окно и становится
+/// привязанным к нему: закрытие окна шлёт CTRL_CLOSE_EVENT и убивает демон.
+///
+/// Чтобы демон переживал любой способ запуска, при `daemon run` смотрим
+/// переменную окружения `CODE_INDEX_DAEMON_DETACHED`. Если её нет —
+/// перезапускаем себя с флагами DETACHED_PROCESS | CREATE_NO_WINDOW
+/// и немедленно выходим; detached-клон живёт без консоли до явного
+/// `daemon stop` / `daemon reload`.
+///
+/// На Unix self-detach не нужен — демонизацией управляет systemd/launchd.
+#[cfg(windows)]
+fn detach_from_console_if_needed() -> anyhow::Result<bool> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const ENV_FLAG: &str = "CODE_INDEX_DAEMON_DETACHED";
+
+    if std::env::var_os(ENV_FLAG).is_some() {
+        return Ok(false);
+    }
+
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .arg("daemon")
+        .arg("run")
+        .env(ENV_FLAG, "1")
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+        .spawn()?;
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+fn detach_from_console_if_needed() -> anyhow::Result<bool> {
+    Ok(false)
+}
+
 async fn handle_daemon(action: DaemonAction) -> anyhow::Result<()> {
     use code_index_mcp::daemon_core::{client, runner};
 
     match action {
         DaemonAction::Run => {
+            if detach_from_console_if_needed()? {
+                return Ok(());
+            }
             tracing::info!("Запуск фонового демона code-index");
             runner::run().await?;
         }
