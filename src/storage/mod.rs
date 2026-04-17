@@ -147,6 +147,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Принудительно выполнить checkpoint WAL с усечением файла до минимума.
+    ///
+    /// Используется в disk-режиме после bulk-операций (initial reindex, крупные
+    /// batch'и watcher'а), где `PRAGMA wal_autocheckpoint=500` не успевает
+    /// физически уменьшать WAL-файл — он только переносит страницы в основную БД,
+    /// но сам файл WAL не truncate'ится.
+    ///
+    /// Возвращает (busy, log_pages, checkpointed_pages) — стандартный вывод
+    /// SQLite `PRAGMA wal_checkpoint(TRUNCATE)`. В штатной работе интересен
+    /// только busy=0 (успех); log_pages/checkpointed_pages — для диагностики.
+    pub fn checkpoint_truncate(&self) -> Result<(i64, i64, i64)> {
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                let busy: i64 = row.get(0)?;
+                let log_pages: i64 = row.get(1)?;
+                let checkpointed: i64 = row.get(2)?;
+                Ok((busy, log_pages, checkpointed))
+            })
+            .context("PRAGMA wal_checkpoint(TRUNCATE) failed")
+    }
+
     // ── Files ────────────────────────────────────────────────────────────────
 
     /// Вставить или обновить запись файла; возвращает id строки

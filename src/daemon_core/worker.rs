@@ -171,6 +171,27 @@ pub fn run_worker(
         eprintln!("[worker:{}] переоткрыт в disk-режиме", path.display());
     }
 
+    // Initial reindex мог накопить много страниц в WAL (особенно для больших
+    // репо с 90k+ файлов). `PRAGMA wal_autocheckpoint=500` не гарантирует
+    // физическое уменьшение файла — нужен явный TRUNCATE.
+    match storage.checkpoint_truncate() {
+        Ok((busy, log_pages, _)) if busy == 0 => {
+            eprintln!(
+                "[worker:{}] post-initial WAL checkpoint: {} страниц вытеснено",
+                path.display(), log_pages
+            );
+        }
+        Ok((busy, _, _)) => {
+            eprintln!(
+                "[worker:{}] post-initial WAL checkpoint: busy={} (частичный)",
+                path.display(), busy
+            );
+        }
+        Err(e) => {
+            eprintln!("[worker:{}] post-initial checkpoint_truncate: {}", path.display(), e);
+        }
+    }
+
     // 9. Отпустить permit — следующий worker может начинать initial reindex.
     drop(_permit);
 
@@ -256,8 +277,11 @@ pub fn run_worker(
         if let Err(e) = storage.commit_batch() {
             eprintln!("[worker:{}] commit_batch: {}", path.display(), e);
         }
-        if let Err(e) = storage.flush_to_disk(&db_path) {
-            eprintln!("[worker:{}] flush_to_disk: {}", path.display(), e);
+        // В disk-режиме (а worker сюда попадает всегда в disk после reopen на шаге 7)
+        // flush_to_disk через Connection::backup() — бесполезное копирование БД самой
+        // в себя, WAL не уменьшает. checkpoint_truncate реально схлопывает WAL.
+        if let Err(e) = storage.checkpoint_truncate() {
+            eprintln!("[worker:{}] checkpoint_truncate: {}", path.display(), e);
         }
 
         tokio_block_on(async {
@@ -265,9 +289,9 @@ pub fn run_worker(
         });
     }
 
-    eprintln!("[worker:{}] shutdown, финальный flush", path.display());
-    if let Err(e) = storage.flush_to_disk(&db_path) {
-        eprintln!("[worker:{}] финальный flush: {}", path.display(), e);
+    eprintln!("[worker:{}] shutdown, финальный checkpoint", path.display());
+    if let Err(e) = storage.checkpoint_truncate() {
+        eprintln!("[worker:{}] финальный checkpoint_truncate: {}", path.display(), e);
     }
 }
 
