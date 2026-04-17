@@ -150,6 +150,61 @@ fn event_path(event: &FileEvent) -> &PathBuf {
     }
 }
 
+/// Вариант `collect_batch` с idle-таймаутом: если в течение `idle_ms` не
+/// приходит ни одного события — возвращается `Ok(None)`. Это позволяет
+/// потребителю периодически проверять внешние флаги (например, shutdown).
+///
+/// Если событие пришло — дальше работает как `collect_batch`: накапливает
+/// последующие события с debounce/batch лимитами и отдаёт дедуплицированный
+/// список.
+///
+/// `Err` возвращается только при закрытом канале (watcher умер).
+pub fn poll_batch(
+    rx: &mpsc::Receiver<FileEvent>,
+    idle_ms: u64,
+    debounce_ms: u64,
+    batch_ms: u64,
+) -> Result<Option<Vec<FileEvent>>, mpsc::RecvError> {
+    let mut pending: HashMap<PathBuf, FileEvent> = HashMap::new();
+    let debounce = Duration::from_millis(debounce_ms);
+    let batch_timeout = Duration::from_millis(batch_ms);
+
+    // Ждём первое событие с ограничением по времени.
+    match rx.recv_timeout(Duration::from_millis(idle_ms)) {
+        Ok(event) => {
+            let path = event_path(&event).clone();
+            pending.insert(path, event);
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => return Err(mpsc::RecvError),
+    }
+
+    let batch_start = Instant::now();
+    let mut last_event = Instant::now();
+
+    loop {
+        if batch_start.elapsed() >= batch_timeout {
+            break;
+        }
+        let elapsed_since_last = last_event.elapsed();
+        if elapsed_since_last >= debounce {
+            break;
+        }
+        let wait = debounce.saturating_sub(elapsed_since_last);
+        match rx.recv_timeout(wait) {
+            Ok(event) => {
+                let path = event_path(&event).clone();
+                pending.insert(path, event);
+                last_event = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    Ok(Some(pending.into_values().collect()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

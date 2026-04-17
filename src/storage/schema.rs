@@ -220,6 +220,12 @@ pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA cache_size=-64000;")?;
     // Memory-mapped I/O: 256 МБ — снижает количество read/write syscall на диске
     conn.execute_batch("PRAGMA mmap_size=268435456;")?;
+    // Агрессивный auto-checkpoint WAL: каждые 500 страниц (~2 МБ). Без этого
+    // при длинных транзакциях (update metadata на 93К файлов) WAL растёт до
+    // многогигабайтных размеров и забивает диск.
+    conn.execute_batch("PRAGMA wal_autocheckpoint=500;")?;
+    // Предельный размер WAL — после checkpoint файл truncate'ится до 64 МБ
+    conn.execute_batch("PRAGMA journal_size_limit=67108864;")?;
     // Применяем DDL-схему: таблицы и FTS-виртуальные таблицы
     conn.execute_batch(SQL_SCHEMA)?;
     migrate_v2(conn)?;

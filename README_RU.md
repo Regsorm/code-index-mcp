@@ -14,12 +14,12 @@ AI-модели тратят десятки вызовов `grep`/`find` для 
 
 ## Решение
 
-Скомпилированный Rust-бинарник, который:
+Скомпилированный Rust-бинарник с архитектурой **один писатель, много читателей**:
 
 1. Парсит исходный код в AST через tree-sitter
 2. Индексирует результат в SQLite с FTS5 для полнотекстового поиска
-3. Предоставляет 12 MCP-инструментов для AI-моделей
-4. Следит за изменениями файлов в реальном времени (daemon-режим)
+3. Отдельный **фоновый демон** — единственный писатель: один процесс на машину, который следит за списком папок из своего конфига и поддерживает `.code-index/index.db` в актуальном состоянии.
+4. **MCP-сервер** — тонкий **read-only**-клиент: сколько угодно параллельных Claude Code / VS Code / субагентов могут работать с одним проектом одновременно без конфликтов pidlock и без повторной индексации на каждой сессии.
 
 ## Поддерживаемые языки
 
@@ -48,18 +48,98 @@ cargo build --release
 
 Бинарник: `target/release/code-index` (Linux/macOS) или `target/release/code-index.exe` (Windows).
 
-### Индексация проекта
+### Настройка фонового демона (v0.5+)
+
+Портативная раскладка: одна папка на всё (бинарник + конфиг + runtime-файлы). На неё указывает переменная окружения `CODE_INDEX_HOME`.
+
+1. Создайте папку для демона, положите туда `code-index.exe` (например, `C:\tools\code-index\`).
+
+2. Укажите переменную `CODE_INDEX_HOME`:
+
+   **Windows (постоянно, для пользователя):**
+   ```powershell
+   setx CODE_INDEX_HOME "C:\tools\code-index"
+   # Откройте новую консоль — переменная видна там.
+   ```
+
+   **Linux** — добавьте в `~/.bashrc` или `~/.zshrc`:
+   ```bash
+   export CODE_INDEX_HOME="$HOME/.local/code-index"
+   ```
+
+   **macOS** — то же самое для shell; для launchd-агентов используйте `launchctl setenv`.
+
+   **Любая ОС — локально на уровне одного проекта через `.mcp.json`** (системную переменную трогать не нужно):
+   ```json
+   {
+     "mcpServers": {
+       "code-index": {
+         "command": "C:\\tools\\code-index\\code-index.exe",
+         "args": ["serve", "--path", "."],
+         "env": { "CODE_INDEX_HOME": "C:\\tools\\code-index" }
+       }
+     }
+   }
+   ```
+
+3. Создайте `daemon.toml` в этой папке и перечислите отслеживаемые папки:
+
+   ```toml
+   [daemon]
+   http_port = 0                  # 0 = выбрать свободный порт автоматически
+   max_concurrent_initial = 1     # папки обрабатываются последовательно при initial reindex
+
+   [[paths]]
+   path = "C:\\RepoUT"
+
+   [[paths]]
+   path = "C:\\RepoBP_SS"
+   debounce_ms = 500              # per-папка переопределение: быстрее чем дефолт 1500 мс
+   batch_ms    = 1000
+   ```
+
+   Per-папка `debounce_ms` / `batch_ms` — **необязательны**. Если не заданы, демон использует значения из `.code-index/config.json` проекта, а если и там нет — встроенные дефолты (1500 мс / 2000 мс).
+
+4. Запустите демон (foreground):
+
+   ```bash
+   code-index daemon run
+   ```
+
+   Либо установите автозапуск через Windows Scheduled Task (триггер — вход пользователя; скрипт сам сделает `setx CODE_INDEX_HOME`):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\install-daemon-autostart.ps1 `
+     -BinaryPath "C:\tools\code-index\code-index.exe" `
+     -CodeIndexHome "C:\tools\code-index" `
+     -StartNow
+   ```
+
+5. Проверка статуса:
+
+   ```bash
+   code-index daemon status        # человекочитаемо
+   code-index daemon status --json # JSON
+   code-index daemon reload        # перечитать daemon.toml после редактирования
+   code-index daemon stop
+   ```
+
+Если `CODE_INDEX_HOME` не задан, демон использует fallback: `%APPDATA%\code-index\daemon.toml` для конфига и `%LOCALAPPDATA%\code-index\` для runtime-файлов (на Linux/macOS — соответствующие XDG-каталоги).
+
+### Одноразовая индексация (без демона)
 
 ```bash
 code-index index /path/to/project
 code-index stats --path /path/to/project --json
 ```
 
-### Запуск MCP-сервера
+### Запуск MCP-сервера (read-only)
 
 ```bash
 code-index serve --path /path/to/project
 ```
+
+Это тонкий read-only-клиент демона. Сам он не индексирует — это делает демон. Если папка ещё индексируется или её нет в `daemon.toml`, инструменты возвращают структурированный ответ `{status, message, progress}` вместо падения.
 
 ## Подключение к Claude Code
 
@@ -127,10 +207,16 @@ grep_body(regex="Справочники\\.(Контрагенты|Организ
 Все 14 подкоманд с описанием параметров:
 
 ```bash
-# MCP-сервер (daemon-режим)
-code-index serve --path /project [--no-watch] [--flush-interval 30]
+# Фоновый демон (писатель — один на машину)
+code-index daemon run                          # foreground, запускается Scheduled Task / systemd
+code-index daemon status [--json]              # GET /health через loopback
+code-index daemon reload                       # перечитать daemon.toml
+code-index daemon stop                         # POST /stop
 
-# Однократная индексация
+# MCP-сервер (read-only клиент; используется Claude Code, VS Code, субагентами)
+code-index serve --path /project
+
+# Однократная индексация (без демона)
 code-index index /project [--force]
 
 # Управление проектом
@@ -200,16 +286,36 @@ code-index get-file-summary "src/auth/login.py" --path /my/project
 
 Путь к проекту должен быть абсолютным. На Windows — указывайте полный путь до `.exe`, например `C:\MCP-Servers\code-index\target\release\code-index.exe`.
 
-## Daemon-режим
+## Daemon-режим (v0.5+)
 
-При запуске `code-index serve` выполняются четыре процесса параллельно:
+Начиная с v0.5, `code-index` использует архитектуру **один писатель, много читателей**:
 
-1. **Background scan** — индексирует новые и изменённые файлы в фоне (MCP-сервер доступен сразу)
-2. **File watcher** — отслеживает изменения в реальном времени (notify crate)
-3. **MCP-сервер** — принимает запросы через stdio
-4. **Periodic flush** — сбрасывает in-memory базу на диск каждые 30 секунд
+### Фоновый демон (единственный писатель)
 
-Изменил файл → через 1.5 сек (debounce) → автоматическая переиндексация.
+`code-index daemon run` запускает длительный процесс, который:
+
+1. Читает список отслеживаемых папок из `daemon.toml`.
+2. Для каждой папки открывает `.code-index/index.db`, делает полный reindex с mtime fast-path (v0.4.0), затем переключается на `notify`-watcher и переиндексирует файлы при изменениях (debounce 1.5 с, batch 2 с).
+3. Слушает локальный HTTP-эндпоинт health/управления на loopback (порт записывается в `daemon.json` в каталоге состояния).
+4. Держит глобальный PID-lock (`daemon.pid`), чтобы на одной машине не было двух демонов одновременно.
+
+Жизненный цикл папки: `not_started → initial_indexing → ready ⇄ reindexing_batch / error`. Каждый переход виден через `daemon status`.
+
+### MCP-серверы (сколько угодно read-only читателей)
+
+`code-index serve --path <project>` открывает `.code-index/index.db` в режиме `SQLITE_OPEN_READ_ONLY` и предоставляет MCP-инструменты через stdio. Несколько экземпляров MCP на одном проекте работают параллельно без взаимных блокировок.
+
+Перед каждым tool-call MCP опрашивает у демона статус папки. Если он не `ready` — инструмент возвращает структурированный JSON:
+
+```json
+{ "status": "indexing", "progress": {"files_done": 4200, "files_total": 10000, "percent": 42.0}, "message": "Первичная индексация в процессе" }
+```
+
+Если демон недоступен:
+
+```json
+{ "status": "daemon_offline", "message": "Демон code-index не доступен. Запустите 'code-index daemon run' или Scheduled Task." }
+```
 
 ## Конфигурация
 
@@ -235,9 +341,40 @@ code-index get-file-summary "src/auth/login.py" --path /my/project
 
 - `storage_mode` — режим хранения: `auto` (выбирается автоматически по доступной памяти), `memory` (только in-memory), `disk` (только на диск)
 - `memory_max_percent` — максимальный процент RAM для in-memory базы при `auto`-режиме
-- `debounce_ms` — задержка перед переиндексацией после изменения файла (мс)
+- `debounce_ms` — задержка перед переиндексацией после изменения файла (мс); собирает burst правок в один батч
+- `batch_ms` — верхняя граница накопления событий в одном батче после прихода первого
 - `batch_size` — количество записей в одной транзакции при индексации
 - `bulk_threshold` — минимальное количество файлов для активации bulk-режима (drop indexes → insert → rebuild)
+
+### Настройка реакции watcher'а (`debounce_ms`, `batch_ms`)
+
+Дефолты 1500 мс / 2000 мс — оптимальны для типового сценария IDE (save + форматтер + линтер) и для git-операций, трогающих много файлов сразу. Для интерактивной работы одним пользователем можно уменьшить, пожертвовав батчингом ради быстрой реакции.
+
+Демон разрешает эти значения в порядке (первое найденное выигрывает):
+
+1. **Переопределение per-папка в `daemon.toml`:**
+   ```toml
+   [[paths]]
+   path = "C:/RepoBP_SS"
+   debounce_ms = 500      # реакция ~0.6 с вместо ~1.6 с
+   batch_ms    = 1000
+   ```
+2. **Per-project `.code-index/config.json`** — действует только на эту папку.
+3. **Встроенные дефолты** (1500 / 2000).
+
+Применить после правки `daemon.toml`:
+
+```bash
+code-index daemon reload
+```
+
+Рекомендуемые значения:
+
+| Сценарий | `debounce_ms` |
+|----------|---------------|
+| Интерактивная IDE, точечные правки | 300–500 |
+| 1С-репо / git-операции / массовые правки | 1500 (дефолт) |
+| CI или скриптованные batch-правки | 3000+ |
 
 ## Бенчмарки
 

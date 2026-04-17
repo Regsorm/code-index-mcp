@@ -12,12 +12,12 @@ AI models waste enormous time on repeated grep/find calls just to locate a singl
 
 ## Solution
 
-A compiled Rust binary that:
+A compiled Rust binary with **one-writer / many-readers** architecture:
 
 1. Parses source code into AST via tree-sitter
 2. Indexes everything into SQLite with FTS5 full-text search
-3. Exposes 12 tools over the MCP protocol for direct AI model use
-4. Watches file changes in daemon mode and re-indexes automatically
+3. A separate **background daemon** is the sole writer: one process per machine watches a list of folders from its config and keeps `.code-index/index.db` up to date.
+4. The **MCP server** is a thin **read-only** client: any number of Claude Code / VS Code / subagent sessions can connect to the same project in parallel — no pidlock conflicts, no per-session re-indexing.
 
 ## Supported Languages
 
@@ -46,18 +46,98 @@ cargo build --release
 
 Binary: `target/release/code-index` (Linux/Mac) or `target/release/code-index.exe` (Windows)
 
-### Index a project
+### Set up the background daemon (v0.5+)
+
+Portable layout: one folder for everything (binary + config + runtime files). Pointed to by `CODE_INDEX_HOME` env var.
+
+1. Create the daemon folder and drop `code-index.exe` into it (e.g. `C:\tools\code-index\`).
+
+2. Set the `CODE_INDEX_HOME` environment variable to point at that folder:
+
+   **Windows (persistent, user scope):**
+   ```powershell
+   setx CODE_INDEX_HOME "C:\tools\code-index"
+   # Reopen your shell so the variable is visible.
+   ```
+
+   **Linux** — add to `~/.bashrc` or `~/.zshrc`:
+   ```bash
+   export CODE_INDEX_HOME="$HOME/.local/code-index"
+   ```
+
+   **macOS** — same as Linux for shells; for launchd agents use `launchctl setenv`.
+
+   **Any OS — per-project fallback via `.mcp.json`** (no system env var needed):
+   ```json
+   {
+     "mcpServers": {
+       "code-index": {
+         "command": "C:\\tools\\code-index\\code-index.exe",
+         "args": ["serve", "--path", "."],
+         "env": { "CODE_INDEX_HOME": "C:\\tools\\code-index" }
+       }
+     }
+   }
+   ```
+
+3. Create `daemon.toml` inside that folder and list the paths to watch:
+
+   ```toml
+   [daemon]
+   http_port = 0                  # 0 = pick free port automatically
+   max_concurrent_initial = 1     # folders processed sequentially during initial indexing
+
+   [[paths]]
+   path = "C:\\RepoUT"
+
+   [[paths]]
+   path = "C:\\RepoBP_SS"
+   debounce_ms = 500              # per-folder override: react faster than the default 1500 ms
+   batch_ms    = 1000
+   ```
+
+   Per-folder `debounce_ms` / `batch_ms` are **optional**. If omitted, the daemon falls back to `.code-index/config.json` inside that project, and then to built-in defaults (1500 ms / 2000 ms).
+
+4. Start the daemon (foreground):
+
+   ```bash
+   code-index daemon run
+   ```
+
+   Or install it as a Windows Scheduled Task (auto-start at user logon; the script also sets `CODE_INDEX_HOME` via `setx`):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\install-daemon-autostart.ps1 `
+     -BinaryPath "C:\tools\code-index\code-index.exe" `
+     -CodeIndexHome "C:\tools\code-index" `
+     -StartNow
+   ```
+
+5. Check status:
+
+   ```bash
+   code-index daemon status        # human-readable
+   code-index daemon status --json # JSON
+   code-index daemon reload        # re-read daemon.toml after edits
+   code-index daemon stop
+   ```
+
+If `CODE_INDEX_HOME` is not set, the daemon falls back to `%APPDATA%\code-index\daemon.toml` for config and `%LOCALAPPDATA%\code-index\` for runtime files (on Linux/macOS the XDG-standard equivalents).
+
+### One-shot indexing (no daemon)
 
 ```bash
 code-index index /path/to/project
 code-index stats --path /path/to/project --json
 ```
 
-### Run as MCP server
+### Run as MCP server (read-only)
 
 ```bash
 code-index serve --path /path/to/project
 ```
+
+This is a thin read-only client of the daemon. It does not index anything itself — the daemon does. If the folder is still being indexed or not in `daemon.toml`, tools return a structured `{status, message, progress}` response instead of failing.
 
 ## Connecting to Claude Code
 
@@ -123,10 +203,16 @@ Each result includes `match_lines` — up to 3 absolute line numbers in the file
 ## CLI Reference
 
 ```bash
-# MCP server (daemon mode)
-code-index serve --path /project [--no-watch] [--flush-interval 30]
+# Background daemon (writer — one per machine)
+code-index daemon run                          # foreground, for Scheduled Task / systemd
+code-index daemon status [--json]              # query GET /health via loopback
+code-index daemon reload                       # re-read daemon.toml
+code-index daemon stop                         # POST /stop
 
-# One-shot indexing
+# MCP server (read-only client; used by Claude Code, VS Code, subagents)
+code-index serve --path /project
+
+# One-shot indexing (no daemon)
 code-index index /project [--force]
 
 # Project management
@@ -196,16 +282,36 @@ All commands output JSON. This is instant search over an indexed database.
 
 Use an absolute path to the binary and adjust `/path/to/project` to your setup. On Windows, specify the full path to `code-index.exe`, for example `C:\MCP-Servers\code-index\target\release\code-index.exe`.
 
-## Daemon Mode
+## Daemon Mode (v0.5+)
 
-When running `code-index serve`, the process goes through four phases:
+Starting with v0.5, `code-index` uses a **one-writer / many-readers** architecture:
 
-1. **Background scan** — indexes new and changed files in the background while the MCP server is already accepting requests
-2. **File watcher** — tracks filesystem changes in real-time using the `notify` crate
-3. **MCP server** — accepts tool calls via stdio (JSON-RPC)
-4. **Periodic flush** — writes the in-memory database to disk every 30 seconds
+### Background daemon (single writer)
 
-When a file changes: 1.5s debounce window collects related edits, then the affected files are automatically re-indexed. The MCP server remains responsive throughout.
+`code-index daemon run` starts a long-running process that:
+
+1. Loads the list of watched folders from `daemon.toml`.
+2. For each folder: opens `.code-index/index.db`, runs full reindex with mtime fast-path (v0.4.0), then switches to a `notify` watcher that re-indexes on change (1.5s debounce, 2s batch).
+3. Exposes a local health / management HTTP endpoint on loopback (port written to `daemon.json` in the state directory).
+4. Holds a global PID-lock (`daemon.pid`) to prevent two daemons per machine.
+
+Per-folder lifecycle: `not_started → initial_indexing → ready ⇄ reindexing_batch / error`. Each status transition is visible via `daemon status`.
+
+### MCP servers (many read-only readers)
+
+`code-index serve --path <project>` opens `.code-index/index.db` in `SQLITE_OPEN_READ_ONLY` and exposes MCP tools over stdio. Multiple MCP instances on the same project run in parallel without blocking each other.
+
+Before every tool call the MCP asks the daemon for the per-folder status. If it is not `ready`, the tool returns a structured JSON:
+
+```json
+{ "status": "indexing", "progress": {"files_done": 4200, "files_total": 10000, "percent": 42.0}, "message": "Первичная индексация в процессе" }
+```
+
+If the daemon is offline:
+
+```json
+{ "status": "daemon_offline", "message": "Демон code-index не доступен. Запустите 'code-index daemon run' или Scheduled Task." }
+```
 
 ## Configuration
 
@@ -232,8 +338,39 @@ Key fields:
 - **storage_mode** — `auto` selects in-memory or disk SQLite based on available RAM; `memory` forces in-memory; `disk` forces on-disk
 - **memory_max_percent** — maximum percentage of system RAM the in-memory database may use before falling back to disk (used in `auto` mode)
 - **debounce_ms** — milliseconds to wait after a file change before triggering re-indexing (collects burst edits into one pass)
+- **batch_ms** — upper bound on how long the watcher keeps accumulating events after the first one in a batch
 - **batch_size** — number of records per SQLite transaction during indexing (higher = faster bulk inserts, higher peak memory)
 - **bulk_threshold** — minimum number of files that triggers bulk mode (drop indexes, insert, rebuild indexes); faster for large batches
+
+### Tuning watcher latency (`debounce_ms`, `batch_ms`)
+
+Defaults are 1500 ms / 2000 ms — good for typical IDE save + formatter + linter bursts and for git operations that touch many files at once. For a lively single-user IDE session you can lower the debounce and trade throughput for responsiveness.
+
+The daemon resolves these values in this order (first match wins):
+
+1. **Per-folder override in `daemon.toml`:**
+   ```toml
+   [[paths]]
+   path = "C:/RepoBP_SS"
+   debounce_ms = 500      # react in ~0.6 s instead of ~1.6 s
+   batch_ms    = 1000
+   ```
+2. **Per-project `.code-index/config.json`** — applies to that project only.
+3. **Built-in defaults** (1500 / 2000).
+
+Re-read after editing `daemon.toml`:
+
+```bash
+code-index daemon reload
+```
+
+Recommended values:
+
+| Use case | `debounce_ms` |
+|----------|---------------|
+| Interactive IDE, single-file edits | 300–500 |
+| 1C repos / git operations / large bulk edits | 1500 (default) |
+| CI or scripted batch edits | 3000+ |
 
 ## Benchmarks
 

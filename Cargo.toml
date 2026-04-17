@@ -1,6 +1,6 @@
 [package]
 name = "code-index-mcp"
-version = "0.4.0"
+version = "0.5.0-rc1"
 edition = "2021"
 description = "Высокопроизводительный индексатор кода с MCP-протоколом для AI-моделей"
 license = "MIT"
@@ -66,6 +66,15 @@ sysinfo = "0.32"
 # Утилиты
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
+
+# Демон: HTTP-сервер health/management IPC и клиент
+axum = "0.8"
+tower = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Демон: чтение daemon.toml и кроссплатформенные пути
+toml = "0.8"
+dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"

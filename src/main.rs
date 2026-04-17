@@ -2,7 +2,6 @@
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use code_index_mcp::daemon::DaemonConfig;
 use code_index_mcp::indexer::config::IndexConfig;
 use code_index_mcp::indexer::Indexer;
 use code_index_mcp::storage::memory::StorageConfig;
@@ -17,23 +16,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Запустить MCP-сервер (режим daemon)
+    /// Запустить MCP-сервер (read-only). Индексацию ведёт отдельный демон;
+    /// этот режим используется Claude Code и другими клиентами как MCP-транспорт.
     Serve {
         /// Корневая директория проекта
         #[arg(short, long, default_value = ".")]
         path: String,
 
-        /// Транспорт: stdio или http
+        /// Транспорт (пока поддерживается только stdio)
         #[arg(short, long, default_value = "stdio")]
         transport: String,
-
-        /// Запустить без file watcher (только startup индексация + MCP)
-        #[arg(long)]
-        no_watch: bool,
-
-        /// Интервал периодической записи БД на диск (в секундах)
-        #[arg(long, default_value = "30")]
-        flush_interval: u64,
     },
 
     /// Проиндексировать директорию (однократно)
@@ -250,6 +242,31 @@ enum Commands {
         #[arg(long, default_value = "100")]
         limit: usize,
     },
+
+    /// Управление фоновым демоном индексации
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Запустить демон в foreground (вызывается Scheduled Task / systemd / launchd)
+    Run,
+
+    /// Показать статус демона (GET /health)
+    Status {
+        /// Вывод в JSON вместо человекочитаемого текста
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Попросить демон перечитать конфиг (POST /reload)
+    Reload,
+
+    /// Остановить демон (POST /stop)
+    Stop,
 }
 
 /// Получить путь к БД для проекта
@@ -274,46 +291,44 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { path, transport, no_watch, flush_interval } => {
-            tracing::info!(
-                "Запуск MCP-сервера: path={}, transport={}, no_watch={}, flush_interval={}s",
-                path, transport, no_watch, flush_interval
-            );
+        Commands::Serve { path, transport } => {
+            tracing::info!("MCP read-only (path={}, transport={})", path, transport);
+            if transport != "stdio" {
+                return Err(anyhow::anyhow!(
+                    "Транспорт '{}' пока не поддерживается. Используйте 'stdio'.",
+                    transport
+                ));
+            }
 
-            // Разрешить путь до абсолютного
             let root = Path::new(&path)
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&path));
             let db_path = root.join(".code-index").join("index.db");
 
-            // Создать директорию .code-index/ если не существует
-            if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| anyhow::anyhow!("Не удалось создать директорию: {}", e))?;
-            }
+            // БД создаёт демон при первом индексировании. Если её ещё нет —
+            // запускаем MCP вхолостую: tools будут возвращать `not_started`.
+            use code_index_mcp::mcp::CodeIndexServer;
+            use rmcp::ServiceExt;
 
-            // PID-lock: не допускать запуск нескольких демонов на одном репозитории
-            let _pid_lock = code_index_mcp::pidlock::acquire(&root.join(".code-index"))?;
-
-            // Загрузить конфигурацию проекта
-            let index_config = IndexConfig::load(&root)?;
-
-            // Подготовить конфигурацию хранилища
-            let storage_config = StorageConfig {
-                mode: index_config.storage_mode.clone(),
-                memory_max_percent: index_config.memory_max_percent,
+            let server = if db_path.exists() {
+                CodeIndexServer::open_readonly(root.clone(), &db_path)?
+            } else {
+                // Создаём пустую БД с минимальной схемой, чтобы MCP мог стартовать.
+                // Фактические данные появятся, когда демон её заполнит.
+                std::fs::create_dir_all(db_path.parent().unwrap())?;
+                let storage = Storage::open_file(&db_path)?; // инициализирует схему
+                drop(storage);
+                CodeIndexServer::open_readonly(root.clone(), &db_path)?
             };
 
-            // Запустить daemon (startup scan + MCP + watcher)
-            let daemon_config = DaemonConfig {
-                root,
-                db_path,
-                index_config,
-                storage_config,
-                no_watch,
-                flush_interval_sec: flush_interval,
-            };
-            code_index_mcp::daemon::run_daemon(daemon_config).await?;
+            let service = server
+                .serve(rmcp::transport::io::stdio())
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP serve error: {}", e))?;
+            service
+                .waiting()
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
         }
 
         Commands::Index { path, force } => {
@@ -651,7 +666,66 @@ async fn main() -> anyhow::Result<()> {
             )?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
+
+        Commands::Daemon { action } => handle_daemon(action).await?,
     }
 
     Ok(())
+}
+
+async fn handle_daemon(action: DaemonAction) -> anyhow::Result<()> {
+    use code_index_mcp::daemon_core::{client, runner};
+
+    match action {
+        DaemonAction::Run => {
+            tracing::info!("Запуск фонового демона code-index");
+            runner::run().await?;
+        }
+        DaemonAction::Status { json } => match client::health().await {
+            Ok(h) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&h)?);
+                } else {
+                    print_status_text(&h);
+                }
+            }
+            Err(e) => {
+                eprintln!("Демон недоступен: {}", e);
+                std::process::exit(1);
+            }
+        },
+        DaemonAction::Reload => {
+            let r = client::reload().await?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+        }
+        DaemonAction::Stop => {
+            let r = client::stop().await?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+        }
+    }
+    Ok(())
+}
+
+fn print_status_text(h: &code_index_mcp::daemon_core::ipc::HealthResponse) {
+    println!("Демон code-index");
+    println!("  статус:    {}", h.status);
+    println!("  версия:    {}", h.version);
+    println!("  PID:       {}", h.pid);
+    println!("  старт:     {}", h.started_at);
+    println!("  uptime:    {}с", h.uptime_sec);
+    println!("  папок:     {}", h.paths.len());
+    for p in &h.paths {
+        let status_s = serde_json::to_string(&p.status)
+            .unwrap_or_else(|_| "\"?\"".into());
+        let status_s = status_s.trim_matches('"');
+        let progress_s = match &p.progress {
+            Some(pr) => match pr.percent {
+                Some(pct) => format!(" {}/{} ({}%)", pr.files_done, pr.files_total, pct),
+                None => format!(" {}/{}", pr.files_done, pr.files_total),
+            },
+            None => String::new(),
+        };
+        let err_s = p.error.as_ref().map(|e| format!(" err: {}", e)).unwrap_or_default();
+        println!("    - [{}] {}{}{}", status_s, p.path.display(), progress_s, err_s);
+    }
 }
