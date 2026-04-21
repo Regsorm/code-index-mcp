@@ -96,6 +96,29 @@ pub struct PathEntry {
     /// Переопределение batch_ms для этой папки.
     #[serde(default)]
     pub batch_ms: Option<u64>,
+
+    /// Псевдоним репозитория для MCP-сервера (параметр `repo` в tool-call).
+    /// Поле используется `code-index serve --config ...`; демон его игнорирует.
+    /// Если не задан — вычисляется из последнего сегмента `path`
+    /// (см. [`PathEntry::effective_alias`]).
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+impl PathEntry {
+    /// Эффективный алиас репо: явный из TOML либо нормализованное имя
+    /// последнего сегмента пути (нижний регистр, пробелы → `_`).
+    /// Для пустого пути — `"default"`.
+    pub fn effective_alias(&self) -> String {
+        if let Some(a) = &self.alias {
+            return a.clone();
+        }
+        self.path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase().replace(' ', "_"))
+            .unwrap_or_else(|| "default".to_string())
+    }
 }
 
 /// Прочитать конфиг с указанного пути. Ошибка чтения/парсинга прокидывается наверх.
@@ -154,5 +177,37 @@ mod tests {
         assert_eq!(cfg.paths.len(), 2);
         assert_eq!(cfg.paths[0].path, PathBuf::from("/tmp/a"));
         assert_eq!(cfg.paths[1].debounce_ms, Some(2500));
+        // alias по-умолчанию отсутствует — старые конфиги продолжают работать.
+        assert!(cfg.paths[0].alias.is_none());
+    }
+
+    #[test]
+    fn parses_explicit_alias() {
+        let text = r#"
+            [[paths]]
+            path = "C:/Выгрузка обработок"
+            alias = "widgets"
+
+            [[paths]]
+            path = "C:/RepoUT"
+        "#;
+        let cfg = parse_str(text).unwrap();
+        // Явный алиас из TOML.
+        assert_eq!(cfg.paths[0].alias.as_deref(), Some("widgets"));
+        assert_eq!(cfg.paths[0].effective_alias(), "widgets");
+        // Без явного алиаса — последний сегмент в нижнем регистре.
+        assert_eq!(cfg.paths[1].alias, None);
+        assert_eq!(cfg.paths[1].effective_alias(), "repout");
+    }
+
+    #[test]
+    fn effective_alias_normalizes_spaces() {
+        let entry = PathEntry {
+            path: PathBuf::from("C:/Some Folder Name"),
+            debounce_ms: None,
+            batch_ms: None,
+            alias: None,
+        };
+        assert_eq!(entry.effective_alias(), "some_folder_name");
     }
 }

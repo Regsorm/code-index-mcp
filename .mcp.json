@@ -1,42 +1,8 @@
 {
   "mcpServers": {
     "code-index": {
-      "type": "stdio",
-      "command": "C:\\MCP-Servers\\code-index\\target\\release\\code-index.exe",
-      "args": ["serve", "--no-watch"]
-    },
-    "rag-query": {
-      "type": "stdio",
-      "command": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
-      "args": [
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-i",
-        "C:\\Users\\User\\.ssh\\mcp_rag",
-        "rag@10.50.1.160"
-      ]
-    },
-    "bsl-agent": {
-      "type": "stdio",
-      "command": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
-      "args": [
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-i",
-        "C:\\Users\\User\\.ssh\\mcp_bsl_agent",
-        "rag@10.50.1.160"
-      ]
-    },
-    "vm-shell": {
-      "type": "stdio",
-      "command": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
-      "args": [
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-i",
-        "C:\\Users\\User\\.ssh\\mcp_vm_shell",
-        "rag@10.50.1.160"
-      ]
+      "type": "http",
+      "url": "http://127.0.0.1:8011/mcp"
     }
   }
 }

@@ -1,15 +1,19 @@
 // Реализации MCP-инструментов (v0.5+): read-only, с проверкой статуса папки у демона.
 //
-// Каждая функция сначала спрашивает у демона статус отслеживания `root_path`.
-// Если папка не `Ready` — возвращается `ToolUnavailable` JSON и реальный
-// запрос к БД не выполняется.
+// Multi-repo: каждая функция принимает `&RepoEntry` (конкретный репозиторий, выбранный
+// через `resolve_repo` в mod.rs по параметру `repo`). Диагностические инструменты
+// `get_stats` и `health` принимают весь `&CodeIndexServer`, чтобы собрать сводку
+// по всем подключённым репо.
+//
+// Перед каждым data-tool функция спрашивает у демона статус `root_path` этого репо.
+// Если папка не `Ready` — возвращается `ToolUnavailable` JSON, и реальный запрос
+// к БД не выполняется.
 
-use super::CodeIndexServer;
+use super::{CodeIndexServer, RepoEntry};
 use crate::daemon_core::client;
 use crate::daemon_core::ipc::{PathStatus, ToolUnavailable};
 
-/// Сериализовать `ToolUnavailable` в JSON-строку. Отдельная функция, чтобы макрос
-/// мог её вызвать по полному пути.
+/// Сериализовать `ToolUnavailable` в JSON-строку.
 pub fn format_unavailable(value: ToolUnavailable) -> String {
     match serde_json::to_string_pretty(&value) {
         Ok(s) => s,
@@ -17,11 +21,10 @@ pub fn format_unavailable(value: ToolUnavailable) -> String {
     }
 }
 
-/// Проверяет у демона статус папки сервера. Возвращает `Some(json)` — если нужно
-/// отдать unavailable вместо реального результата. Возвращает `None` — если папка
-/// `Ready` и можно продолжать.
-pub async fn check_path_status(server: &CodeIndexServer) -> Option<String> {
-    match client::path_status_async(&server.root_path).await {
+/// Проверить у демона статус папки репо. `None` — папка Ready, можно продолжать.
+/// `Some(json)` — нужно отдать клиенту этот ToolUnavailable-ответ вместо данных.
+pub async fn check_path_status(entry: &RepoEntry) -> Option<String> {
+    match client::path_status_async(&entry.root_path).await {
         Ok(resp) => match resp.status {
             PathStatus::Ready => None,
             PathStatus::InitialIndexing | PathStatus::ReindexingBatch => Some(format_unavailable(
@@ -36,7 +39,7 @@ pub async fn check_path_status(server: &CodeIndexServer) -> Option<String> {
             PathStatus::NotStarted => Some(format_unavailable(ToolUnavailable::NotStarted {
                 message: format!(
                     "Путь {} не отслеживается демоном. Добавьте его в daemon.toml и вызовите 'code-index daemon reload'.",
-                    server.root_path.display()
+                    entry.root_path.display()
                 ),
             })),
             PathStatus::Error => Some(format_unavailable(ToolUnavailable::Error {
@@ -56,8 +59,8 @@ pub async fn check_path_status(server: &CodeIndexServer) -> Option<String> {
 
 /// Макрос-хелпер: если папка не Ready — вернуть unavailable JSON немедленно.
 macro_rules! bail_if_not_ready {
-    ($server:expr) => {{
-        if let Some(json) = crate::mcp::tools::check_path_status($server).await {
+    ($entry:expr) => {{
+        if let Some(json) = crate::mcp::tools::check_path_status($entry).await {
             return json;
         }
     }};
@@ -73,13 +76,13 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 // ── Реализации инструментов ─────────────────────────────────────────────────
 
 pub async fn search_function(
-    server: &CodeIndexServer,
+    entry: &RepoEntry,
     query: String,
     limit: Option<usize>,
     language: Option<String>,
 ) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     match storage.search_functions(&query, limit.unwrap_or(20), language.as_deref()) {
         Ok(r) => to_json(&r),
         Err(e) => format!("{{\"error\": \"search_function: {}\"}}", e),
@@ -87,31 +90,31 @@ pub async fn search_function(
 }
 
 pub async fn search_class(
-    server: &CodeIndexServer,
+    entry: &RepoEntry,
     query: String,
     limit: Option<usize>,
     language: Option<String>,
 ) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     match storage.search_classes(&query, limit.unwrap_or(20), language.as_deref()) {
         Ok(r) => to_json(&r),
         Err(e) => format!("{{\"error\": \"search_class: {}\"}}", e),
     }
 }
 
-pub async fn get_function(server: &CodeIndexServer, name: String) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+pub async fn get_function(entry: &RepoEntry, name: String) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     match storage.get_function_by_name(&name) {
         Ok(r) => to_json(&r),
         Err(e) => format!("{{\"error\": \"get_function: {}\"}}", e),
     }
 }
 
-pub async fn get_class(server: &CodeIndexServer, name: String) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+pub async fn get_class(entry: &RepoEntry, name: String) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     match storage.get_class_by_name(&name) {
         Ok(r) => to_json(&r),
         Err(e) => format!("{{\"error\": \"get_class: {}\"}}", e),
@@ -119,12 +122,12 @@ pub async fn get_class(server: &CodeIndexServer, name: String) -> String {
 }
 
 pub async fn get_callers(
-    server: &CodeIndexServer,
+    entry: &RepoEntry,
     function_name: String,
     language: Option<String>,
 ) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     match storage.get_callers(&function_name, language.as_deref()) {
         Ok(r) => to_json(&r),
         Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
@@ -132,12 +135,12 @@ pub async fn get_callers(
 }
 
 pub async fn get_callees(
-    server: &CodeIndexServer,
+    entry: &RepoEntry,
     function_name: String,
     language: Option<String>,
 ) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     match storage.get_callees(&function_name, language.as_deref()) {
         Ok(r) => to_json(&r),
         Err(e) => format!("{{\"error\": \"get_callees: {}\"}}", e),
@@ -145,12 +148,12 @@ pub async fn get_callees(
 }
 
 pub async fn find_symbol(
-    server: &CodeIndexServer,
+    entry: &RepoEntry,
     name: String,
     language: Option<String>,
 ) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     match storage.find_symbol(&name, language.as_deref()) {
         Ok(r) => to_json(&r),
         Err(e) => format!("{{\"error\": \"find_symbol: {}\"}}", e),
@@ -158,13 +161,13 @@ pub async fn find_symbol(
 }
 
 pub async fn get_imports(
-    server: &CodeIndexServer,
+    entry: &RepoEntry,
     file_id: Option<i64>,
     module: Option<String>,
     language: Option<String>,
 ) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     if let Some(fid) = file_id {
         return match storage.get_imports_by_file(fid) {
             Ok(r) => to_json(&r),
@@ -180,9 +183,9 @@ pub async fn get_imports(
     "{\"error\": \"Укажите file_id или module\"}".to_string()
 }
 
-pub async fn get_file_summary(server: &CodeIndexServer, path: String) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     match storage.get_file_summary(&path) {
         Ok(Some(s)) => to_json(&s),
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден\"}}", path),
@@ -190,35 +193,58 @@ pub async fn get_file_summary(server: &CodeIndexServer, path: String) -> String 
     }
 }
 
-pub async fn get_stats(server: &CodeIndexServer) -> String {
-    // `get_stats` мы возвращаем даже если папка не Ready — это диагностический
-    // инструмент, агенту полезно знать состояние индекса во время индексации.
-    let path_info = client::path_status_async(&server.root_path).await.ok();
-    let storage = server.storage.lock().await;
-    match storage.get_stats() {
-        Ok(mut stats) => {
-            // Старое поле indexing_status переиспользуем: кладём туда snake_case
-            // статус от демона, чтобы ответ был совместим с прошлым форматом.
-            stats.indexing_status = None; // поле Option, в read-only MCP не заполняем
-            let enriched = serde_json::json!({
-                "db": stats,
-                "path": server.root_path.display().to_string(),
-                "daemon": path_info,
-            });
-            to_json(&enriched)
+/// Статистика по одному или всем репо. get_stats остаётся диагностическим:
+/// возвращает данные даже если папка не Ready.
+pub async fn get_stats(server: &CodeIndexServer, repo: Option<String>) -> String {
+    async fn one(alias: &str, entry: &RepoEntry) -> serde_json::Value {
+        let path_info = client::path_status_async(&entry.root_path).await.ok();
+        let storage = entry.storage.lock().await;
+        match storage.get_stats() {
+            Ok(mut stats) => {
+                stats.indexing_status = None;
+                serde_json::json!({
+                    "repo": alias,
+                    "db": stats,
+                    "path": entry.root_path.display().to_string(),
+                    "daemon": path_info,
+                })
+            }
+            Err(e) => serde_json::json!({
+                "repo": alias,
+                "error": format!("get_stats: {}", e),
+                "path": entry.root_path.display().to_string(),
+            }),
         }
-        Err(e) => format!("{{\"error\": \"get_stats: {}\"}}", e),
+    }
+
+    if let Some(alias) = repo {
+        match server.repos.get(&alias) {
+            Some(entry) => to_json(&one(&alias, entry).await),
+            None => format_unavailable(ToolUnavailable::NotStarted {
+                message: format!(
+                    "Неизвестный repo '{}'. Доступные: {:?}.",
+                    alias,
+                    server.repo_aliases()
+                ),
+            }),
+        }
+    } else {
+        let mut all = Vec::new();
+        for (alias, entry) in server.repos.iter() {
+            all.push(one(alias, entry).await);
+        }
+        to_json(&serde_json::json!({ "repos": all }))
     }
 }
 
 pub async fn search_text(
-    server: &CodeIndexServer,
+    entry: &RepoEntry,
     query: String,
     limit: Option<usize>,
     language: Option<String>,
 ) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     match storage.search_text(&query, limit.unwrap_or(20), language.as_deref()) {
         Ok(results) => {
             let items: Vec<serde_json::Value> = results
@@ -232,14 +258,14 @@ pub async fn search_text(
 }
 
 pub async fn grep_body(
-    server: &CodeIndexServer,
+    entry: &RepoEntry,
     pattern: Option<String>,
     regex: Option<String>,
     language: Option<String>,
     limit: Option<usize>,
 ) -> String {
-    bail_if_not_ready!(server);
-    let storage = server.storage.lock().await;
+    bail_if_not_ready!(entry);
+    let storage = entry.storage.lock().await;
     match storage.grep_body(
         pattern.as_deref(),
         regex.as_deref(),
@@ -251,21 +277,26 @@ pub async fn grep_body(
     }
 }
 
-/// Проверка живости: показывает состояние самого MCP-сервера и дополнительно
-/// проксирует health демона. Использует `cn_ping`/`dbg_health`-подобную логику.
+/// Живость MCP + демон по каждому репо.
 pub async fn health(server: &CodeIndexServer) -> String {
     let daemon_info = client::runtime_info();
+
+    // Сводка по репо: статус каждого пути у демона
+    let mut repos = Vec::new();
+    for (alias, entry) in server.repos.iter() {
+        let path_status = match client::path_status_async(&entry.root_path).await {
+            Ok(s) => serde_json::to_value(s).unwrap_or(serde_json::Value::Null),
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        };
+        repos.push(serde_json::json!({
+            "repo": alias,
+            "root_path": entry.root_path.display().to_string(),
+            "path_status": path_status,
+        }));
+    }
+
     let daemon_health = match daemon_info {
-        Some(_) => match client::path_status_async(&server.root_path).await {
-            Ok(path_status) => serde_json::json!({
-                "status": "online",
-                "path_status": path_status,
-            }),
-            Err(e) => serde_json::json!({
-                "status": "online_but_path_unknown",
-                "error": e.to_string(),
-            }),
-        },
+        Some(_) => serde_json::json!({ "status": "online" }),
         None => serde_json::json!({
             "status": "offline",
             "message": "Демон не запущен (runtime-info отсутствует)",
@@ -276,9 +307,10 @@ pub async fn health(server: &CodeIndexServer) -> String {
         "mcp": {
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
-            "root_path": server.root_path.display().to_string(),
+            "repos": server.repo_aliases(),
         },
         "daemon": daemon_health,
+        "repos": repos,
     });
     to_json(&obj)
 }

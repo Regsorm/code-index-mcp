@@ -3,6 +3,37 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.5.0-rc5] — 2026-04-22
+
+### Добавлено
+
+- **HTTP-транспорт у `code-index serve`** через rmcp `StreamableHttpService`. Один процесс обслуживает все репозитории под `mcp-supervisor`, клиенты подключаются к общему URL без копирования `--path` в каждый `.mcp.json`.
+
+  ```bash
+  # stdio (per-session, как раньше)
+  code-index serve --path ut=C:/RepoUT --path bp=C:/RepoBP
+
+  # http (shared process)
+  code-index serve --transport http --port 8011 --config C:/tools/code-index/daemon.toml
+  ```
+
+  Клиентский `.mcp.json`:
+  ```json
+  "code-index": { "type": "http", "url": "http://127.0.0.1:8011/mcp" }
+  ```
+
+  Реализация — [`src/main.rs`](src/main.rs) `serve_http`: `StreamableHttpService::new(factory, LocalSessionManager, StreamableHttpServerConfig::default())`, монтируется в `axum::Router::nest_service("/mcp", svc)`. Фабрика клонирует уже собранный `CodeIndexServer` (он `Clone`), так что все сессии разделяют общий набор открытых SQLite-баз.
+
+- **Multi-repo в одном serve-процессе**. `--path` теперь принимает `alias=dir` и может указываться многократно — каждый tool-call передаёт параметр `repo=<alias>` для выбора репозитория. Без `=` — старый контракт `alias=default`. Параметры инструментов получили поле `repo: String`, внутренняя структура `RepoEntry` держит открытую read-only `Storage` и `root_path` per-репо.
+
+- **Поле `alias` в `[[paths]]` daemon.toml** — [`src/daemon_core/config.rs`](src/daemon_core/config.rs) `PathEntry::alias: Option<String>`. Если не задан — алиас вычисляется через `PathEntry::effective_alias()` из последнего сегмента пути (нижний регистр, пробелы → `_`). Демон поле игнорирует; использует только `code-index serve --config ...` при сборке списка репо. Старые конфиги без `alias` продолжают работать (`#[serde(default)]`).
+
+- **Флаги `--host`, `--port`, `--config` у `serve`**. `--config` указывает на `daemon.toml` — список репо и алиасов берётся оттуда. CLI `--path` имеет приоритет над конфигом. Порт по умолчанию — 8011 (следующий свободный в диапазоне mcp-supervisor: 8001/8002/8007/8010).
+
+### Зависимости
+
+- Включена фича `rmcp/transport-streamable-http-server` (подтянула `transport-streamable-http-server-session`, `server-side-http`, транзитивно — `uuid`, `sse-stream`). `axum` и `tower` уже были в deps для health-endpoint демона.
+
 ## [0.5.0-rc4] — 2026-04-17
 
 ### Исправлено

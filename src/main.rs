@@ -18,14 +18,38 @@ struct Cli {
 enum Commands {
     /// Запустить MCP-сервер (read-only). Индексацию ведёт отдельный демон;
     /// этот режим используется Claude Code и другими клиентами как MCP-транспорт.
+    ///
+    /// Multi-repo: --path можно указать несколько раз в формате `alias=dir`,
+    /// тогда в каждом tool-call LLM передаёт параметр `repo=<alias>` для выбора репо.
+    /// Без `=` — одиночный репо под alias `default` (старый контракт).
+    ///
+    /// Примеры:
+    ///   code-index serve --path C:\RepoUT                          # single, alias=default
+    ///   code-index serve --path ut=C:\RepoUT --path bp=C:\RepoBP   # multi, alias=ut/bp
     Serve {
-        /// Корневая директория проекта
-        #[arg(short, long, default_value = ".")]
-        path: String,
+        /// Корневые директории проектов. Формат: `alias=dir` или просто `dir` (alias="default").
+        /// Можно указать несколько раз. Если не указан ни `--path`, ни `--config` —
+        /// берётся текущая директория с alias=default.
+        #[arg(short, long, value_name = "ALIAS=DIR")]
+        path: Vec<String>,
 
-        /// Транспорт (пока поддерживается только stdio)
+        /// Транспорт: `stdio` (per-session) или `http` (shared process под mcp-supervisor).
         #[arg(short, long, default_value = "stdio")]
         transport: String,
+
+        /// HTTP: адрес биндинга (используется только при `--transport http`).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// HTTP: порт биндинга (используется только при `--transport http`).
+        /// По умолчанию 8011 — следующий свободный после 8001/8002/8007/8010.
+        #[arg(long, default_value_t = 8011)]
+        port: u16,
+
+        /// Путь к `daemon.toml` — подтянуть список репо и их алиасов из секции `[[paths]]`.
+        /// Если указан и `--path` — CLI-пути имеют приоритет и конфиг игнорируется.
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
     },
 
     /// Проиндексировать директорию (однократно)
@@ -277,6 +301,125 @@ fn get_db_path(project_path: &str) -> PathBuf {
     root.join(".code-index").join("index.db")
 }
 
+/// Собрать список (alias, root, db_path) для MCP-сервера.
+///
+/// Порядок источников:
+/// 1. Если передан `--path` — используем CLI-аргументы (старый контракт).
+/// 2. Иначе если указан `--config` — берём секцию `[[paths]]` из daemon.toml,
+///    алиас вычисляется через [`PathEntry::effective_alias`].
+/// 3. Иначе — текущая директория под alias=default.
+///
+/// Параллельно создаём пустую `.code-index/index.db` со схемой, чтобы MCP-сервер
+/// мог открыть read-only до того, как демон проиндексирует путь.
+fn build_repo_entries(
+    cli_paths: Vec<String>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Vec<(String, PathBuf, PathBuf)>> {
+    // (alias, dir)
+    let pairs: Vec<(String, String)> = if !cli_paths.is_empty() {
+        let mut out = Vec::with_capacity(cli_paths.len());
+        for raw in cli_paths {
+            if let Some(eq_idx) = raw.find('=') {
+                let alias = raw[..eq_idx].trim().to_string();
+                let dir = raw[eq_idx + 1..].to_string();
+                if alias.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "Пустой alias в --path '{}'. Формат: alias=dir.",
+                        raw
+                    ));
+                }
+                out.push((alias, dir));
+            } else {
+                out.push(("default".to_string(), raw));
+            }
+        }
+        out
+    } else if let Some(cfg_path) = config_path {
+        let cfg = code_index_mcp::daemon_core::config::load_from(cfg_path)?;
+        if cfg.paths.is_empty() {
+            return Err(anyhow::anyhow!(
+                "В {} нет ни одной секции [[paths]] — укажите --path или добавьте пути в конфиг.",
+                cfg_path.display()
+            ));
+        }
+        cfg.paths
+            .iter()
+            .map(|p| (p.effective_alias(), p.path.to_string_lossy().into_owned()))
+            .collect()
+    } else {
+        vec![("default".to_string(), ".".to_string())]
+    };
+
+    let mut entries: Vec<(String, PathBuf, PathBuf)> = Vec::with_capacity(pairs.len());
+    let mut seen_aliases = std::collections::HashSet::new();
+    for (alias, dir) in pairs {
+        if !seen_aliases.insert(alias.clone()) {
+            return Err(anyhow::anyhow!(
+                "Алиас репо '{}' указан дважды — алиасы должны быть уникальны.",
+                alias
+            ));
+        }
+
+        let root = Path::new(&dir)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&dir));
+        let db_path = root.join(".code-index").join("index.db");
+
+        // Если БД ещё нет — создаём пустую со схемой, чтобы сервер мог стартовать.
+        // Данные появятся, когда демон проиндексирует путь.
+        if !db_path.exists() {
+            std::fs::create_dir_all(db_path.parent().unwrap())?;
+            let storage = Storage::open_file(&db_path)?;
+            drop(storage);
+        }
+
+        tracing::info!("MCP repo: {} -> {}", alias, root.display());
+        entries.push((alias, root, db_path));
+    }
+
+    Ok(entries)
+}
+
+/// Запуск MCP-сервера по HTTP (Streamable HTTP) на `host:port`.
+///
+/// Роут `/mcp` — это точка подключения клиента (соответствует url'у в .mcp.json).
+/// `LocalSessionManager` держит сессии in-memory. На каждую сессию фабрика
+/// клонирует уже собранный `CodeIndexServer` (он реализует `Clone`), так что
+/// все сессии разделяют общий набор открытых SQLite-баз.
+async fn serve_http(
+    server: code_index_mcp::mcp::CodeIndexServer,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<()> {
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+    use std::sync::Arc;
+
+    let session_manager = Arc::new(LocalSessionManager::default());
+    let svc_server = server.clone();
+    let http_service = StreamableHttpService::new(
+        move || Ok(svc_server.clone()),
+        session_manager,
+        StreamableHttpServerConfig::default(),
+    );
+
+    let app = axum::Router::new().nest_service("/mcp", http_service);
+
+    let addr: std::net::SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Некорректный host:port '{}:{}': {}", host, port, e))?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("Не удалось привязаться к {}: {}", addr, e))?;
+
+    tracing::info!("MCP HTTP слушает http://{}/mcp", addr);
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| anyhow::anyhow!("axum serve error: {}", e))?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Инициализация логирования
@@ -291,44 +434,37 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { path, transport } => {
-            tracing::info!("MCP read-only (path={}, transport={})", path, transport);
-            if transport != "stdio" {
-                return Err(anyhow::anyhow!(
-                    "Транспорт '{}' пока не поддерживается. Используйте 'stdio'.",
-                    transport
-                ));
-            }
+        Commands::Serve { path, transport, host, port, config } => {
+            let entries = build_repo_entries(path, config.as_deref())?;
 
-            let root = Path::new(&path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(&path));
-            let db_path = root.join(".code-index").join("index.db");
+            let aliases: Vec<&str> = entries.iter().map(|(a, _, _)| a.as_str()).collect();
+            tracing::info!("MCP read-only ({}), репо: {:?}", transport, aliases);
 
-            // БД создаёт демон при первом индексировании. Если её ещё нет —
-            // запускаем MCP вхолостую: tools будут возвращать `not_started`.
             use code_index_mcp::mcp::CodeIndexServer;
-            use rmcp::ServiceExt;
+            let server = CodeIndexServer::open_readonly_multi(entries)?;
 
-            let server = if db_path.exists() {
-                CodeIndexServer::open_readonly(root.clone(), &db_path)?
-            } else {
-                // Создаём пустую БД с минимальной схемой, чтобы MCP мог стартовать.
-                // Фактические данные появятся, когда демон её заполнит.
-                std::fs::create_dir_all(db_path.parent().unwrap())?;
-                let storage = Storage::open_file(&db_path)?; // инициализирует схему
-                drop(storage);
-                CodeIndexServer::open_readonly(root.clone(), &db_path)?
-            };
-
-            let service = server
-                .serve(rmcp::transport::io::stdio())
-                .await
-                .map_err(|e| anyhow::anyhow!("MCP serve error: {}", e))?;
-            service
-                .waiting()
-                .await
-                .map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
+            match transport.as_str() {
+                "stdio" => {
+                    use rmcp::ServiceExt;
+                    let service = server
+                        .serve(rmcp::transport::io::stdio())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("MCP serve error: {}", e))?;
+                    service
+                        .waiting()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
+                }
+                "http" => {
+                    serve_http(server, &host, port).await?;
+                }
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Транспорт '{}' не поддерживается. Используйте 'stdio' или 'http'.",
+                        other
+                    ));
+                }
+            }
         }
 
         Commands::Index { path, force } => {

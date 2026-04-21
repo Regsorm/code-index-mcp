@@ -139,9 +139,30 @@ code-index serve --path /path/to/project
 
 This is a thin read-only client of the daemon. It does not index anything itself — the daemon does. If the folder is still being indexed or not in `daemon.toml`, tools return a structured `{status, message, progress}` response instead of failing.
 
+### Transports (stdio vs HTTP)
+
+`serve` supports two transports:
+
+| Transport | Process model | When to use |
+|-----------|---------------|-------------|
+| `stdio` (default) | One `serve` process per MCP session | Simple setups, single client, ad-hoc runs |
+| `http` (streamable) | One shared `serve` process, many clients over `http://host:port/mcp` | Multi-project setups, supervisor-managed services, avoiding per-session CLI duplication |
+
+```bash
+# stdio — per-session, alias set at CLI
+code-index serve --path ut=/repos/ut --path bp=/repos/bp
+
+# HTTP — shared process, aliases come from daemon.toml
+code-index serve --transport http --port 8011 --config /etc/code-index/daemon.toml
+```
+
+`--path` can be repeated in `alias=dir` form (multi-repo mode). Each tool call takes a `repo` parameter to select which repository to query. Without `=`, the single path uses `alias=default` (backward-compatible).
+
+In HTTP mode, if `--config` is provided, aliases are taken from `[[paths]]` entries of `daemon.toml`: explicit `alias = "..."`, or derived from the path's last segment (lowercased, spaces → `_`) when not set. CLI `--path` takes precedence over the config file.
+
 ## Connecting to Claude Code
 
-Add to `.mcp.json` in your project root:
+Add to `.mcp.json` in your project root. For `stdio`:
 
 ```json
 {
@@ -150,6 +171,19 @@ Add to `.mcp.json` in your project root:
       "type": "stdio",
       "command": "/path/to/code-index",
       "args": ["serve", "--path", "."]
+    }
+  }
+}
+```
+
+For a shared HTTP process:
+
+```json
+{
+  "mcpServers": {
+    "code-index": {
+      "type": "http",
+      "url": "http://127.0.0.1:8011/mcp"
     }
   }
 }
