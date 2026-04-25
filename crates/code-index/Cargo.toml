@@ -1,0 +1,33 @@
+[package]
+name = "code-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Публичный CLI и MCP-сервер code-index — универсальный индексатор кода для AI-моделей"
+
+# Бинарник называется `code-index` (как и пакет).
+[[bin]]
+name = "code-index"
+path = "src/main.rs"
+
+[dependencies]
+# Ядро — основная зависимость, всё остальное доступно через re-export.
+code-index-core = { path = "../code-index-core" }
+
+# CLI и runtime — используются прямо в main.rs.
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+# Логирование
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Сериализация (для println!("{}", serde_json::to_string_pretty(...))) в CLI-командах
+serde_json = { workspace = true }
+
+# MCP — нужен для типов транспорта в main.rs (ServiceExt, stdio)
+rmcp = { workspace = true }
+
+# HTTP — для axum::Router::new() в serve_http
+axum = { workspace = true }

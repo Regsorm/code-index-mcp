@@ -61,6 +61,33 @@ impl Storage {
         Ok(Self { conn })
     }
 
+    /// Применить дополнительный DDL (CREATE TABLE/INDEX/...) поверх базовой
+    /// схемы. Используется расширениями (например, `bsl_extension`) для
+    /// добавления специфичных таблиц при первом открытии БД репо с
+    /// `language = "bsl"`.
+    ///
+    /// `extensions` — массив SQL-batch'ей, выполняется последовательно.
+    /// Каждый batch может содержать несколько statement'ов через `;`.
+    /// Все DDL должны быть идемпотентными (`IF NOT EXISTS`) — функция
+    /// безопасно вызывается на каждый open, даже если таблицы уже есть.
+    pub fn apply_schema_extensions(&self, extensions: &[&str]) -> Result<()> {
+        for ddl in extensions {
+            self.conn
+                .execute_batch(ddl)
+                .with_context(|| format!("DDL-расширение схемы упало: {}", ddl))?;
+        }
+        Ok(())
+    }
+
+    /// Прямой доступ к низкоуровневому SQLite-соединению для расширений.
+    /// Используется реализациями `LanguageProcessor::index_extras` —
+    /// каждое расширение работает со своими таблицами и пишет напрямую
+    /// (BEGIN/COMMIT, prepared statement'ы), а не через хелперы Storage.
+    /// Прямые INSERT/UPDATE/DELETE — на ответственности расширения.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Открыть БД только для чтения — не пишет в БД, не блокирует.
     /// Используется CLI-командами для параллельной работы с MCP-демоном.
     pub fn open_file_readonly(path: &Path) -> Result<Self> {

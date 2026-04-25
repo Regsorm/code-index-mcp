@@ -1,0 +1,71 @@
+[package]
+name = "bsl-extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Приватное расширение code-index для индексации конфигураций 1С (BSL/XML)"
+publish = false
+
+[lib]
+name = "bsl_extension"
+path = "src/lib.rs"
+
+# Cargo features. По умолчанию включены только базовые XML-парсеры,
+# schema_extensions, index_extras и MCP-tools. Опциональные фичи —
+# `enrichment` (LLM-обогащение процедур терминами для FTS-поиска)
+# и в будущем `embeddings` (этап 5b) — включаются на сборке
+# `bsl-indexer` под флагом `--features enrichment[,embeddings]`.
+#
+# Без feature `enrichment` сама таблица procedure_enrichment всё равно
+# создаётся (она занимает 0 байт пока пуста) и MCP-tool `search_terms`
+# работает — он просто ничего не находит. Зато бинарник без feature
+# не тащит reqwest, и отсутствует подкоманда `bsl-indexer enrich`.
+[features]
+default = []
+enrichment = ["dep:reqwest"]
+
+[dependencies]
+# Ядро code-index — даёт типы LanguageProcessor / IndexTool / ToolContext.
+code-index-core = { path = "../code-index-core" }
+
+# Парсинг исходников 1С. На Этапе 2 здесь только декларация — реальные
+# парсеры остаются в core::parser до этапа 3, когда они переедут сюда
+# вместе с XML-парсером метаданных.
+tree-sitter = { workspace = true }
+tree-sitter-onescript = { workspace = true }
+quick-xml = { workspace = true }
+
+# Async-инфраструктура для tools.
+tokio = { workspace = true }
+
+# Сериализация результата tools.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Обработка ошибок.
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Логирование.
+tracing = { workspace = true }
+
+# SQLite для специфичных схем 1С (этап 3+).
+rusqlite = { workspace = true }
+
+# Обход дерева репо при index_extras (этап 4c).
+walkdir = { workspace = true }
+
+# CLI-парсинг для подкоманды `bsl-indexer enrich` (этап 5a).
+# Не под feature, потому что вход в подкоманду ловится в bsl-indexer/main.rs
+# через intercept argv[1] до core::cli::run, и это нужно в любой сборке —
+# чтобы без feature пользователь получал явное сообщение «эта команда
+# доступна только при сборке с --features enrichment», а не silent panic.
+clap = { workspace = true }
+
+# HTTP-клиент к chat-completions endpoint (OpenAI-compatible) — только
+# когда включена фича `enrichment`. Базовая сборка bsl-indexer без
+# enrichment эту зависимость не подтягивает.
+reqwest = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

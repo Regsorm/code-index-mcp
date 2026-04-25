@@ -3,6 +3,135 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.6.0] — 2026-04-26
+
+Большой релиз: workspace-рефакторинг, новый бинарник `bsl-indexer` с полной 1С-спецификой, multi-config обработка одного репо с base/ + extensions/, парсинг `ConfigDumpInfo.xml` для UUID-идентификаторов отладки, опциональное LLM-обогащение процедур через cargo feature `enrichment`, защита от рассинхрона моделей через `embedding_signature`. Все наработки сделаны на ветке `workspace-refactor` (24+ коммита, 249 тестов).
+
+### Добавлено
+
+- **Cargo Workspace**. Один моно-крейт превращён в 4 крейта с чёткими зонами ответственности:
+  - `code-index-core` (lib, publish=true) — универсальное ядро: file scanner, tree-sitter-парсеры (Python/Rust/Go/Java/JS/TS/BSL), SQLite-схема, MCP-сервер, federation.
+  - `code-index` (bin, publish=true) — публичный бинарник без 1С-специфики.
+  - `bsl-extension` (lib, publish=false) — 1С-специфика: XML-парсеры выгрузки, граф вызовов BSL, MCP-tools `get_object_structure`/`get_form_handlers`/`get_event_subscriptions`/`find_path`/`search_terms`, опциональный LLM-enrichment.
+  - `bsl-indexer` (bin, publish=false) — приватный бинарник = core + bsl-extension. Используется на VM RAG для индексации конфигураций 1С.
+
+- **Conditional MCP-tool registration**. MCP-сервер на старте читает `daemon.toml`, для каждого `[[paths]]` определяет `language` (явно или auto-detect по корню репо), собирает множество активных языков и регистрирует ТОЛЬКО tools от подходящих `LanguageProcessor`-ов. Если в репо нет ни одного BSL-репозитория — 1С-инструменты вообще не появляются в `tools/list`. Уведомление `notifications/tools/list_changed` отправляется при правке `daemon.toml` (file-watch с debounce 500мс через `notify-debouncer-full`).
+
+- **`bsl-indexer` — новый отдельный бинарник** для конфигураций 1С. Релиз CI собирает его под Windows/Linux/macOS (с feature `enrichment` для прода). Подробная инструкция — в [docs/bsl-indexer.md](docs/bsl-indexer.md), деплой на VM RAG — [docs/deploy-vm-rag.md](docs/deploy-vm-rag.md).
+
+- **Multi-config layout** (`<repo>/base/Configuration.xml` + `<repo>/extensions/<EF_*>/Configuration.xml`). `BslLanguageProcessor::detects()` теперь рекурсивно (глубина ≤ 2) находит любой `Configuration.xml`. `index_metadata_objects` обходит ВСЕ найденные конфигурации в дереве и сводит их объекты в одну таблицу (заимствованные в расширениях объекты пропускаются через `INSERT OR IGNORE`). `extension_name` хранится для каждого модуля — фильтр между base и CFE доступен запросом.
+
+- **Таблица `metadata_modules`** с тройкой UUID для платформенного отладчика 1С (`dbgs-debug` setBreakpoint):
+  - `object_id` — UUID объекта/формы из атрибута `uuid` корневого элемента в его XML.
+  - `property_id` — UUID типа модуля (Module/ManagerModule/FormModule/...) — константа платформы, словарь в `module_constants.rs`.
+  - `config_version` — хеш версии из `ConfigDumpInfo.xml` (отдельный парсер). Меняется при каждом изменении конфигурации.
+
+  Эта тройка позволяет агентам ставить breakpoint'ы по человекочитаемому имени модуля, не дёргая live-ИБ. На УТ-масштаб ~8 тыс модулей, на BP_SS/BP_TDK ~10 тыс.
+
+- **MCP-tool `search_terms`** — третий канал семантического поиска (после `search_function` и будущего `semantic_search`). Использует FTS5 на колонке `procedure_enrichment.terms`, заполняемой LLM-обогащением. Поддерживает FTS-синтаксис (AND, OR, NOT, "точная фраза", префикс*). NULL-записи (необогащённые процедуры) просто не находятся — это progressive enhancement, не баг.
+
+- **Подкоманда `bsl-indexer enrich [--path P] [--limit N] [--reenrich]`** под cargo feature `enrichment`. HTTP-клиент к OpenAI-compatible chat-completions endpoint (OpenRouter / Ollama / любой совместимый). Параллельная обработка через `tokio::task::JoinSet` с настраиваемым `batch_size`. Защита от рассинхрона моделей через `embedding_meta.enrichment_signature` — при смене модели в конфиге выводится warning с предложением `--reenrich`.
+
+- **Секция `[enrichment]` в `daemon.toml`** — провайдер, URL endpoint, имя модели, имя env-переменной API-key, batch-size, шаблон промпта. По умолчанию выключено (фича опциональная).
+
+- **Auto-detect языка с записью обратно в `daemon.toml`** через `toml_edit` (сохраняет комментарии). Алгоритм: `Configuration.xml` → bsl, `pyproject.toml`/`setup.py` → python, `Cargo.toml` → rust, `package.json` → javascript/typescript, иначе по преобладанию расширений. Если эвристика не сработала — warning в лог и пропуск (без молчаливого фолбэка).
+
+- **`Storage::apply_schema_extensions(extensions: &[&str])`** — точка применения дополнительных DDL от LanguageProcessor'ов. Вызывается один раз при первом открытии БД репо для языка, требующего специфичных таблиц.
+
+- **`LanguageProcessor::index_extras(repo_root, &mut storage)`** — hook для специфичных постобработок после основной индексации (например, парсинг XML и заполнение `metadata_*`-таблиц). Дефолтная реализация — no-op.
+
+### Изменено
+
+- **Параллельный прогон 4 репо на VM RAG (8 ядер Intel Xeon)** — суммарное время полной индексации УТ + BP_SS + BP_TDK + ZUP уменьшилось с ~8м30с (последовательно) до **3м11с** (×2.7 выигрыш). Узкое место — single-thread SQLite FTS-rebuild у каждого процесса; диск (NVMe) не блокирует, разница холодный↔горячий кеш всего ~5 сек.
+
+- **Защита от cascade-ошибок транзакций**. В каждой `index_*`-функции и `build_call_graph` добавлен идемпотентный `ROLLBACK` перед `BEGIN` — если предыдущая функция оставила открытую транзакцию, следующая корректно её закроет вместо падения с «cannot start a transaction within a transaction».
+
+- **`config_watch::run_watch` — первичная затравка active_languages при старте**. До правки клиент, подключившийся ДО первого изменения файла, видел только core-tools (потому что в моно-режиме `RepoEntry.language=None` при загрузке через `cli::run`). После правки — первый `tools/list` сразу содержит правильный набор для текущего `daemon.toml`.
+
+- **Настройка CI**. `.github/workflows/release.yml` теперь собирает 6 артефактов на каждый tag: `code-index` × {Windows, Linux, macOS} + `bsl-indexer` × {Windows, Linux, macOS} (с `--features enrichment`). Кеш cargo registry/git/target по `${{ runner.os }}-${{ matrix.target }}-${{ matrix.crate }}`.
+
+### Безопасность
+
+- **`.mcp.json` исключён из tracking** через `.gitignore` + `git rm --cached`. Файл — локальная конфигурация, содержит SSH-пути и URL'ы конкретного хоста; в репо ему не место.
+
+- **Внутренние IP заменены на RFC 5737 doc-IP** (`192.0.2.0/24`) во всех тестах federation, комментариях и примерах конфигов. Конкретные адреса VM RAG в инструкции деплоя — на placeholder `<vm-rag-ip>`.
+
+### Эмпирическая верификация на проде (этап 7-8)
+
+- **Conditional registration на Claude Code 2.1.120** — `tools/list` корректно содержит 18 tools (5 BSL + 13 core) при наличии BSL-репо в `daemon.toml`, 13 tools (только core) без них.
+- **`notifications/tools/list_changed` Claude Code на 2.1.120 ИГНОРИРУЕТ** — баг [anthropics/claude-code#13646](https://github.com/anthropics/claude-code/issues/13646) подтверждён эмпирически. Workaround — ручной `/mcp Reconnect`. Reconnect (issue #33779) на 2.1.120 уже корректно перечитывает `tools/list`.
+- **VM RAG (Linux, 8 ядер, NVMe)** — RepoUT 53.6 с холодным кешем, 57.7 с горячим, разница 5 сек = диск не bottleneck. Параллельная индексация всех 4 репо за 3м11с при 8 ядрах × ~2 ядра rayon на процесс.
+
+### Документация
+
+- **[docs/bsl-indexer.md](docs/bsl-indexer.md)** — пользовательская инструкция по `bsl-indexer`: что умеет, как собрать с/без feature `enrichment`, как настроить enrichment с OpenRouter / Ollama, ограничения MCP-клиентов с workaround'ом.
+- **[docs/bsl-indexer-architecture.md](docs/bsl-indexer-architecture.md)** — полное архитектурное ТЗ workspace-refactor с обоснованиями решений.
+- **[docs/deploy-vm-rag.md](docs/deploy-vm-rag.md)** — пошаговая инструкция деплоя на VM (установка Rust toolchain, копирование исходников, настройка daemon.toml, systemd-unit, A/B-протокол сравнения с pg_indexer).
+- **[deploy/systemd/bsl-indexer-daemon.service](deploy/systemd/bsl-indexer-daemon.service)** — готовый systemd-unit с лимитами ресурсов и защитой от записи вне разрешённых каталогов.
+
+## [0.5.0-rc6] — 2026-04-25
+
+### Добавлено
+
+- **Федеративная архитектура `code-index serve`** (по образцу `1c-router`/`mcp__1c__`). Один процесс serve обслуживает реестр репозиториев из нескольких машин: для каждого tool-call с `repo=X` локальный serve смотрит ip — если совпадает с `[me].ip`, читает локальный SQLite, иначе делает HTTP-вызов к удалённому serve. Источник истины для каждого репо — на одной машине (это прокси, не репликация).
+
+  **Новый конфиг** [`serve.toml`](src/federation/config.rs) — глобальный, одинаковый на всех нодах (раскатывается через общий git-репо `code-index-config`):
+
+  ```toml
+  [me]
+  ip = "192.0.2.10"
+  # token = "..."   # опционально, в rc6 не валидируется (заготовка под rc7)
+
+  [[paths]]
+  alias = "ut"
+  ip = "192.0.2.50"
+
+  [[paths]]
+  alias = "dev"
+  ip = "192.0.2.10"
+  ```
+
+  `daemon.toml` остаётся локальным (только пути этой машины, без изменений в схеме).
+
+- **Внутренний endpoint `POST /federate/<tool_name>`** ([`src/federation/server.rs`](src/federation/server.rs)) — приёмная сторона форвардинга. Тело запроса — JSON, точно соответствующий нашим `*Params`-структурам. Ответ — то же, что вернул бы локальный tool-handler. `/federate` живёт на том же axum-роутере, что `/mcp`, защищён общим whitelist middleware.
+
+- **IP-whitelist middleware** ([`src/federation/whitelist.rs`](src/federation/whitelist.rs)). serve биндится на `[me].ip` (не на `127.0.0.1`, не на `0.0.0.0`) — порт активен только на одном интерфейсе. Допустимые peer-IP — из `{все [[paths]].ip} ∪ {127.0.0.1, ::1}`. Чужой peer → `403 {"error":"forbidden","peer":"..."}`.
+
+- **Параллельный fan-out у `get_stats(repo=None)`** ([`src/mcp/tools.rs`](src/mcp/tools.rs)) через `tokio::task::JoinSet`. Каждый remote-репо опрашивается с таймаутом 5 сек; недоступные возвращаются как `{"repo":"...","status":"unreachable","error":"..."}`, не блокируя остальные.
+
+- **Флаг `--serve-config <FILE>` у `code-index serve`**. Если флаг не задан — ищется `$CODE_INDEX_HOME/serve.toml`. Если файла нет — serve работает как rc5 (моно-режим, bind 127.0.0.1, без whitelist). При `transport=stdio` или явном `--path` федерация не активируется.
+
+  ```bash
+  # Федеративный режим (rc6+):
+  code-index serve --transport http --port 8011
+
+  # Совместимый rc5-режим (моно):
+  code-index serve --transport http --port 8011 --path ut=C:/RepoUT
+  ```
+
+- **Пул переиспользуемых HTTP-клиентов** ([`src/federation/client.rs`](src/federation/client.rs)) — один `reqwest::Client` на удалённый IP, lazy init через `RemoteClientPool::get_or_create`. Таймаут 5 сек; idle pool 60 сек.
+
+### Изменено
+
+- **`RepoEntry` теперь хранит `ip` и `is_local`**, поля `root_path` и `storage` обёрнуты в `Option` (`None` для remote). Старые конструкторы `open_readonly_multi` / `open_readonly` / `with_storage` ставят `is_local=true`, `ip="127.0.0.1"` — обратная совместимость для тестов и моно-режима.
+
+- **`serve_http` принимает опциональные `federate_router` и `whitelist`**. Если переданы — `Router::merge` для `/federate/*` и `axum::middleware::from_fn_with_state` для whitelist. Listener теперь использует `into_make_service_with_connect_info::<SocketAddr>()` — без этого peer-IP в middleware не извлечётся.
+
+- **`--host` стал `Option<String>`**. Если задан — приоритет CLI; иначе при наличии serve.toml — `[me].ip`, иначе `127.0.0.1` (rc5-default).
+
+### Защита от циклов
+
+- **Никаких заголовков** типа `X-Forwarded-Already`. Защита — статически по конфигу: каждая нода знает свой `[me].ip`, форвардит только если `repo.ip != own_ip`. При расхождении конфигов (`A: X→B`, `B: X→A`) запрос упадёт по таймауту 5s с понятной ошибкой.
+- Приёмник `/federate/get_stats` без `repo` ограничивает fan-out только своими local-репо (не делает рекурсивный обход к чужим), чтобы исключить круг между нодами.
+
+### Roadmap (вне rc6)
+
+- Создание git-репо `code-index-config` с шаблоном `serve.toml` — операционная задача.
+- Linux-бинарник + systemd unit для деплоя на VM 200.
+- `[me].token` авторизация — Bearer header в `/federate/*`, проверка в whitelist-middleware. Поле уже парсится в схеме serve.toml.
+- HEAD-ping к удалённым в `health` — низкоприоритетная фича.
+- Hot-reload `serve.toml` без рестарта (`POST /reload` для serve).
+
 ## [0.5.0-rc5] — 2026-04-22
 
 ### Добавлено

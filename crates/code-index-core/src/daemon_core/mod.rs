@@ -8,6 +8,7 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod ipc;
+pub mod language_detect;
 pub mod lock;
 pub mod paths;
 pub mod runner;

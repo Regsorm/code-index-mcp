@@ -1,0 +1,65 @@
+# systemd-unit для запуска bsl-indexer-daemon на VM RAG.
+#
+# Расположение на VM: /etc/systemd/system/bsl-indexer-daemon.service
+# (или, если без root-прав, --user в ~/.config/systemd/user/).
+#
+# Включить и запустить:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bsl-indexer-daemon
+#
+# Логи:
+#   journalctl -u bsl-indexer-daemon -f
+#
+# Health-проверка (порт из daemon.json):
+#   PORT=$(jq -r '.http_port' /home/rag/.code-index/daemon.json)
+#   curl http://127.0.0.1:$PORT/health
+
+[Unit]
+Description=bsl-indexer indexing daemon (Rust, для 1С на VM RAG)
+Documentation=https://github.com/...../code-index/blob/main/docs/bsl-indexer.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rag
+Group=rag
+
+# Бинарник копируется при деплое в этот путь (см. docs/deploy-vm-rag.md).
+ExecStart=/home/rag/.local/bin/bsl-indexer daemon run
+
+# Конфиг с путями к репо лежит в стандартной директории code-index.
+# CODE_INDEX_HOME — переменная, по которой код находит daemon.toml.
+Environment="CODE_INDEX_HOME=/home/rag/.code-index"
+
+# OpenRouter API-ключ для подкоманды `bsl-indexer enrich` (опционально).
+# В проде ключ кладётся в /etc/bsl-indexer/env, читается через EnvironmentFile.
+EnvironmentFile=-/etc/bsl-indexer/env
+
+# Перезапуск при падении (сбой сети с GitLab, временные ошибки SQLite и т.п.).
+Restart=on-failure
+RestartSec=5s
+
+# Не убивать процесс по таймауту при остановке — индексатор может писать
+# большие транзакции в SQLite, обрыв на середине = corrupted WAL.
+TimeoutStopSec=60s
+
+# Защита: запрет писать вне указанных каталогов и эксперементы со sysctl.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/rag/.code-index /home/rag/code-index /tmp /var/tmp
+ReadWritePaths=/srv/repos
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+
+# Лимиты ресурсов. На VM RAG 62 ГБ RAM — индексер потребляет до 1.6 ГБ
+# в in-memory режиме при больших репо (см. карточку 260 о StorageConfig).
+MemoryMax=8G
+CPUQuota=400%
+
+[Install]
+WantedBy=multi-user.target

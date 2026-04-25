@@ -41,10 +41,15 @@ Text files (`.md`, `.json`, `.yaml`, `.toml`, `.xml`, `.sql`, `.env`, etc.) are 
 ```bash
 git clone https://github.com/Regsorm/code-index-mcp.git
 cd code-index-mcp
-cargo build --release
+cargo build --release -p code-index               # public binary for Python/Rust/Go/Java/JS/TS
+cargo build --release -p bsl-indexer --features enrichment   # extra build with 1C support + LLM enrichment
 ```
 
-Binary: `target/release/code-index` (Linux/Mac) or `target/release/code-index.exe` (Windows)
+Binaries:
+* `target/release/code-index[.exe]` — main binary (no 1C support).
+* `target/release/bsl-indexer[.exe]` — full 1C support (XML metadata parsers, BSL call graph, MCP tools `get_object_structure` / `get_form_handlers` / `find_path` / `search_terms`, optional LLM enrichment under cargo feature `enrichment`).
+
+GitHub Releases publish 6 ready artifacts per tag: `code-index` × {Win, Linux, macOS} + `bsl-indexer` × {Win, Linux, macOS}.
 
 ### Set up the background daemon (v0.5+)
 
@@ -205,6 +210,23 @@ For a shared HTTP process:
 | `get_stats` | Index statistics |
 | `search_text` | Full-text search across text files |
 | `grep_body` | Substring or regex search in function/class bodies. Returns `match_lines` (first 3 line numbers) and `match_count` (total, if > 3) |
+| `health` | MCP server health and connected repos |
+
+### Additional tools for 1C repos (only in `bsl-indexer`, v0.6+)
+
+When BSL repos are present in `daemon.toml` (`language = "bsl"`), 5 BSL-specific tools are auto-registered:
+
+| Tool | Description |
+|------|-------------|
+| `get_object_structure` | Structure of a 1C metadata object (Catalog, Document, InformationRegister, ...) by `full_name` like `Document.SalesInvoice` |
+| `get_form_handlers` | Managed-form event handlers by `(owner_full_name, form_name)`. For typical document form returns ~120 `(event, handler)` pairs |
+| `get_event_subscriptions` | All event subscriptions from `EventSubscriptions/*.xml`, optional filter by handler module |
+| `find_path` | Call-chain between two procedures via `proc_call_graph` (recursive CTE, max_depth=3) |
+| `search_terms` | FTS search by business terms enriched per procedure by an LLM (after `bsl-indexer enrich`) |
+
+These tools appear in `tools/list` **only when at least one BSL repo is configured** (conditional registration). When the repo set changes in `daemon.toml`, the server emits `notifications/tools/list_changed`. On Claude Code 2.1.120 this notification is currently [ignored](https://github.com/anthropics/claude-code/issues/13646); workaround — manual `/mcp Reconnect`.
+
+Full instructions: [docs/bsl-indexer.md](docs/bsl-indexer.md).
 
 All tools support a language filter: `search_function(query="X", language="python")`
 

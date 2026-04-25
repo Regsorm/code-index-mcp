@@ -77,6 +77,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -176,6 +185,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "bsl-extension"
+version = "0.5.0-rc6"
+dependencies = [
+ "anyhow",
+ "clap",
+ "code-index-core",
+ "quick-xml",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-onescript",
+ "walkdir",
+]
+
+[[package]]
+name = "bsl-indexer"
+version = "0.5.0-rc6"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bsl-extension",
+ "clap",
+ "code-index-core",
+ "rmcp",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -288,10 +334,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "code-index-mcp"
-version = "0.5.0-rc5"
+name = "code-index"
+version = "0.5.0-rc6"
 dependencies = [
  "anyhow",
+ "axum",
+ "clap",
+ "code-index-core",
+ "rmcp",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "code-index-core"
+version = "0.5.0-rc6"
+dependencies = [
+ "anyhow",
+ "arc-swap",
  "axum",
  "chrono",
  "clap",
@@ -315,6 +377,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "toml_edit",
  "tower",
  "tracing",
  "tracing-subscriber",

@@ -5,3 +5,12 @@ target2/
 *.db-shm
 *.db-wal
 .cargo/config.toml
+
+# Локальная конфигурация MCP-клиента (содержит SSH-пути и URL'ы конкретного хоста).
+# Уже tracked в исторических коммитах main — не удаляем из tracking, но новые
+# изменения в этом файле остаются у разработчика локально.
+.mcp.json
+
+# Локальные настройки Claude Code на стороне разработчика
+# (settings.json/settings.local.json/permissions). Не часть проекта.
+.claude/

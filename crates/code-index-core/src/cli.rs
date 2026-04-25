@@ -1,11 +1,17 @@
-// Точка входа CLI — code-index
+// Точка входа CLI — общая для бинарей `code-index` (публичный) и
+// `bsl-indexer` (приватный, с BSL-расширением). Каждый бинарь зовёт
+// `run(registry)`, передавая свой `ProcessorRegistry`: code-index —
+// только встроенные процессоры, bsl-indexer — те же плюс
+// `BslLanguageProcessor` из crate'а bsl-extension.
+
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use code_index_mcp::indexer::config::IndexConfig;
-use code_index_mcp::indexer::Indexer;
-use code_index_mcp::storage::memory::StorageConfig;
-use code_index_mcp::storage::Storage;
+use crate::extension::ProcessorRegistry;
+use crate::indexer::config::IndexConfig;
+use crate::indexer::Indexer;
+use crate::storage::memory::StorageConfig;
+use crate::storage::Storage;
 
 #[derive(Parser)]
 #[command(name = "code-index", version, about = "Высокопроизводительный индексатор кода с MCP-протоколом")]
@@ -37,9 +43,10 @@ enum Commands {
         #[arg(short, long, default_value = "stdio")]
         transport: String,
 
-        /// HTTP: адрес биндинга (используется только при `--transport http`).
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        /// HTTP: адрес биндинга. Если не задан и есть `serve.toml` —
+        /// берётся `[me].ip`. Иначе по умолчанию `127.0.0.1`.
+        #[arg(long)]
+        host: Option<String>,
 
         /// HTTP: порт биндинга (используется только при `--transport http`).
         /// По умолчанию 8011 — следующий свободный после 8001/8002/8007/8010.
@@ -50,6 +57,13 @@ enum Commands {
         /// Если указан и `--path` — CLI-пути имеют приоритет и конфиг игнорируется.
         #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
+
+        /// Путь к глобальному `serve.toml` (rc6+). Если не задан, ищется
+        /// `$CODE_INDEX_HOME/serve.toml`. Если файл существует — включает
+        /// федеративный режим: bind на `[me].ip`, IP-whitelist, форвард
+        /// tool-call для удалённых репо.
+        #[arg(long, value_name = "FILE")]
+        serve_config: Option<PathBuf>,
     },
 
     /// Проиндексировать директорию (однократно)
@@ -335,7 +349,7 @@ fn build_repo_entries(
         }
         out
     } else if let Some(cfg_path) = config_path {
-        let cfg = code_index_mcp::daemon_core::config::load_from(cfg_path)?;
+        let cfg = crate::daemon_core::config::load_from(cfg_path)?;
         if cfg.paths.is_empty() {
             return Err(anyhow::anyhow!(
                 "В {} нет ни одной секции [[paths]] — укажите --path или добавьте пути в конфиг.",
@@ -382,18 +396,23 @@ fn build_repo_entries(
 
 /// Запуск MCP-сервера по HTTP (Streamable HTTP) на `host:port`.
 ///
-/// Роут `/mcp` — это точка подключения клиента (соответствует url'у в .mcp.json).
+/// Роут `/mcp` — точка подключения MCP-клиента (url из `.mcp.json`).
+/// При федеративном режиме (`federate_router = Some(...)`) добавляется
+/// `/federate/<tool>` и оба роута оборачиваются IP-whitelist middleware.
 /// `LocalSessionManager` держит сессии in-memory. На каждую сессию фабрика
 /// клонирует уже собранный `CodeIndexServer` (он реализует `Clone`), так что
 /// все сессии разделяют общий набор открытых SQLite-баз.
 async fn serve_http(
-    server: code_index_mcp::mcp::CodeIndexServer,
+    server: crate::mcp::CodeIndexServer,
     host: &str,
     port: u16,
+    federate_router: Option<axum::Router>,
+    whitelist: Option<std::sync::Arc<std::collections::HashSet<std::net::IpAddr>>>,
 ) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
     let session_manager = Arc::new(LocalSessionManager::default());
@@ -404,9 +423,20 @@ async fn serve_http(
         StreamableHttpServerConfig::default(),
     );
 
-    let app = axum::Router::new().nest_service("/mcp", http_service);
+    let mut app = axum::Router::new().nest_service("/mcp", http_service);
+    if let Some(fr) = federate_router {
+        app = app.merge(fr);
+    }
+    if let Some(allowed) = whitelist {
+        let count = allowed.len();
+        app = app.layer(axum::middleware::from_fn_with_state(
+            allowed,
+            crate::federation::whitelist::middleware,
+        ));
+        tracing::info!("IP-whitelist активен ({} адресов, включая loopback).", count);
+    }
 
-    let addr: std::net::SocketAddr = format!("{}:{}", host, port)
+    let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| anyhow::anyhow!("Некорректный host:port '{}:{}': {}", host, port, e))?;
     let listener = tokio::net::TcpListener::bind(addr)
@@ -414,34 +444,185 @@ async fn serve_http(
         .map_err(|e| anyhow::anyhow!("Не удалось привязаться к {}: {}", addr, e))?;
 
     tracing::info!("MCP HTTP слушает http://{}/mcp", addr);
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow::anyhow!("axum serve error: {}", e))?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("axum serve error: {}", e))?;
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Инициализация логирования
-    tracing_subscriber::fmt()
+/// Точка входа для бинарных wrapper'ов. Принимает уже собранный реестр
+/// `LanguageProcessor`-ов: каждый bin собирает его сам (`code-index` —
+/// только встроенные, `bsl-indexer` — встроенные + BSL).
+///
+/// Регистрируется логирование, парсятся CLI-аргументы и происходит
+/// выполнение соответствующей подкоманды. Не возвращает Ok пока
+/// демон/сервер живут — это long-running процесс.
+pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
+    // Инициализация логирования. tracing_subscriber idempotent при
+    // повторных вызовах — если bin уже что-то настроил, второй вызов
+    // вернёт ошибку, которую мы игнорируем (для тестов это норма).
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing::Level::INFO.into()),
         )
         .with_writer(std::io::stderr)
-        .init();
+        .try_init();
 
     let cli = Cli::parse();
+    // На текущем этапе registry приходит только в Serve через
+    // `with_repos_and_registry`. Остальные команды (Index/Stats/...) её
+    // не используют. Чтобы не плодить копии, сохраняем в локальной
+    // переменной и тащим в Serve через замыкание ниже.
+    let registry = Some(registry);
 
     match cli.command {
-        Commands::Serve { path, transport, host, port, config } => {
-            let entries = build_repo_entries(path, config.as_deref())?;
+        Commands::Serve { path, transport, host, port, config, serve_config } => {
+            use crate::federation;
+            use crate::mcp::CodeIndexServer;
 
+            // Решаем, активен ли федеративный режим. Условия:
+            //   * transport == http (stdio не имеет адреса для bind/whitelist);
+            //   * --serve-config указан явно ИЛИ существует $CODE_INDEX_HOME/serve.toml;
+            //   * --path не передан (CLI-приоритет — это моно-режим, явный override).
+            let serve_cfg_path: Option<PathBuf> = if transport == "http" && path.is_empty() {
+                if let Some(p) = serve_config.clone() {
+                    if !p.exists() {
+                        return Err(anyhow::anyhow!(
+                            "--serve-config={} не существует.",
+                            p.display()
+                        ));
+                    }
+                    Some(p)
+                } else {
+                    let p = federation::config::default_path()?;
+                    if p.exists() { Some(p) } else { None }
+                }
+            } else {
+                None
+            };
+
+            if let Some(serve_cfg_path) = serve_cfg_path {
+                tracing::info!(
+                    "Федеративный режим: serve.toml={}",
+                    serve_cfg_path.display()
+                );
+                let serve_cfg = federation::config::load_from(&serve_cfg_path)?;
+                let daemon_cfg = match config.as_deref() {
+                    Some(p) => crate::daemon_core::config::load_from(p)?,
+                    None => crate::daemon_core::config::load_or_default()?,
+                };
+
+                // Создать пустые БД для local-репо, чтобы сервер мог открыть
+                // их read-only до индексации демоном.
+                for daemon_entry in &daemon_cfg.paths {
+                    let root = daemon_entry
+                        .path
+                        .canonicalize()
+                        .unwrap_or_else(|_| daemon_entry.path.clone());
+                    let db_path = root.join(".code-index").join("index.db");
+                    if !db_path.exists() {
+                        std::fs::create_dir_all(db_path.parent().unwrap())?;
+                        let storage = Storage::open_file(&db_path)?;
+                        drop(storage);
+                    }
+                }
+
+                let repos = federation::repos::merge(&serve_cfg, &daemon_cfg)?;
+                let aliases: Vec<&str> =
+                    repos.iter().map(|r| r.alias.as_str()).collect();
+                let local_count = repos.iter().filter(|r| r.is_local).count();
+                tracing::info!(
+                    "Реестр федерации: {} репо ({} local, {} remote): {:?}",
+                    repos.len(),
+                    local_count,
+                    repos.len() - local_count,
+                    aliases
+                );
+
+                // На этапе 2 federation-конструктор пока не принимает
+                // ProcessorRegistry — federation-репо могут быть remote
+                // и язык неизвестен на момент сборки. Активные tools
+                // подтягиваются через `reload_extensions` после первого
+                // file-watch-события на daemon.toml (см. этап 1.7).
+                // TODO(этап 2.1): расширить from_federated, чтобы он
+                // принимал registry и сразу учитывал local-репо с
+                // language в TOML.
+                let server = CodeIndexServer::from_federated(repos, serve_cfg.me.ip.clone())?;
+                let federate_router = federation::server::federate_router(server.clone());
+                let allowed = std::sync::Arc::new(federation::whitelist::build(&serve_cfg));
+
+                // File-watch на daemon.toml — реактивно подменяем
+                // active_languages при правке (этап 1.7). config может быть
+                // не задан — тогда watcher не запускаем (active set
+                // задаётся только содержимым serve.toml, который тут не
+                // меняется).
+                let _config_watch = if let Some(cfg_path) = config.as_deref() {
+                    Some(crate::mcp::config_watch::spawn_watch(
+                        server.clone(),
+                        cfg_path.to_path_buf(),
+                    ))
+                } else {
+                    None
+                };
+
+                // Bind: --host имеет приоритет, иначе [me].ip.
+                let bind_host = host.unwrap_or_else(|| serve_cfg.me.ip.clone());
+                serve_http(server, &bind_host, port, Some(federate_router), Some(allowed))
+                    .await?;
+                return Ok(());
+            }
+
+            // Моно-режим (rc5-совместимый): нет serve.toml или явно указан --path.
+            let entries = build_repo_entries(path, config.as_deref())?;
             let aliases: Vec<&str> = entries.iter().map(|(a, _, _)| a.as_str()).collect();
             tracing::info!("MCP read-only ({}), репо: {:?}", transport, aliases);
 
-            use code_index_mcp::mcp::CodeIndexServer;
-            let server = CodeIndexServer::open_readonly_multi(entries)?;
+            // Если передан реестр — собираем сервер сразу с ним. Если конфига
+            // нет (`--path`-режим), language ещё не известен — extension_tools
+            // окажутся пусты, file-watch их не активирует (нечему watch'ить),
+            // но это разумно: в `--path`-режиме оператор обычно знает что
+            // подключает (моно-репо без 1С-специфики).
+            // Если конфиг есть — daemon уже отработал auto-detect и записал
+            // language обратно в TOML; build_repo_entries прочитал свежий
+            // TOML, передал repos с пустым `language` (моно-конструктор не
+            // подцепляет language из конфига), но file-watch в spawn_watch
+            // ниже подхватит и сделает первый rebuild.
+            let server = match registry {
+                Some(reg) => {
+                    let mut map = std::collections::BTreeMap::new();
+                    for (alias, root_path, db_path) in entries {
+                        let storage = Storage::open_file_readonly(&db_path)?;
+                        map.insert(alias, crate::mcp::RepoEntry {
+                            root_path: Some(root_path),
+                            storage: Some(std::sync::Arc::new(tokio::sync::Mutex::new(storage))),
+                            ip: "127.0.0.1".to_string(),
+                            is_local: true,
+                            language: None,
+                        });
+                    }
+                    CodeIndexServer::with_repos_and_registry(map, reg)
+                }
+                None => CodeIndexServer::open_readonly_multi(entries)?,
+            };
+            let bind_host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+
+            // Если запуск с --config — подписываемся на изменения daemon.toml,
+            // чтобы реактивно пересобирать active_languages/extension_tools
+            // при правке оператором (этап 1.7). Без --config нет файла,
+            // за которым наблюдать — режим --path даёт фиксированный набор
+            // репо, в нём перезагрузка не нужна.
+            let _config_watch = if let Some(cfg_path) = config.as_deref() {
+                Some(crate::mcp::config_watch::spawn_watch(
+                    server.clone(),
+                    cfg_path.to_path_buf(),
+                ))
+            } else {
+                None
+            };
 
             match transport.as_str() {
                 "stdio" => {
@@ -456,7 +637,7 @@ async fn main() -> anyhow::Result<()> {
                         .map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
                 }
                 "http" => {
-                    serve_http(server, &host, port).await?;
+                    serve_http(server, &bind_host, port, None, None).await?;
                 }
                 other => {
                     return Err(anyhow::anyhow!(
@@ -491,13 +672,60 @@ async fn main() -> anyhow::Result<()> {
             };
             let mut storage = Storage::open_auto(&db_path, &storage_config)?;
 
+            // 4a. Если язык репо известен и в реестре есть процессор для
+            // него — применить его schema_extensions. Это создаст
+            // специфичные таблицы (для BSL — metadata_objects, metadata_forms,
+            // event_subscriptions). DDL идемпотентен (CREATE IF NOT EXISTS),
+            // повторный вызов безвреден.
+            //
+            // Auto-detect языка по корню репо: используем первый процессор,
+            // у которого `detects(root) == true`. Это даёт работающую
+            // схему даже без явного `language` в daemon.toml.
+            if let Some(reg) = registry.as_ref() {
+                if let Some(proc) = reg.detect(&abs_path) {
+                    let exts = proc.schema_extensions();
+                    if !exts.is_empty() {
+                        storage.apply_schema_extensions(exts)?;
+                        tracing::info!(
+                            "Применены schema_extensions процессора '{}' ({} DDL-statement'ов)",
+                            proc.name(),
+                            exts.len(),
+                        );
+                    }
+                }
+            }
+
             // 5. Создать Indexer с конфигом
             let mut indexer = Indexer::with_config(&mut storage, config);
 
             // 6. Запустить индексацию
             let result = indexer.full_reindex(&abs_path, force)?;
 
-            // 7. Если работаем в in-memory режиме — сохранить результаты на диск
+            // 6a. Hook расширения: для BSL-репо здесь происходит
+            // парсинг XML-метаданных и заполнение специфичных таблиц
+            // (metadata_objects/metadata_forms/event_subscriptions/proc_call_graph).
+            // Для универсальных языков `index_extras` — no-op (default-impl).
+            //
+            // ВАЖНО: вызывается ДО flush_to_disk. В in-memory режиме
+            // flush_to_disk копирует текущее SQLite-соединение в файл —
+            // если бы мы дописали в conn после flush, записи остались бы
+            // только в памяти и пропали бы при выходе.
+            if let Some(reg) = registry.as_ref() {
+                if let Some(proc) = reg.detect(&abs_path) {
+                    if let Err(e) = proc.index_extras(&abs_path, &mut storage) {
+                        tracing::warn!(
+                            "index_extras процессора '{}' завершился с ошибкой: {}. \
+                             Базовая индексация при этом сохранена.",
+                            proc.name(),
+                            e
+                        );
+                    }
+                }
+            }
+
+            // 7. Если работаем в in-memory режиме — сохранить результаты на диск.
+            // Должно идти ПОСЛЕ index_extras, иначе записи расширения
+            // попадут только в in-memory копию.
             storage.flush_to_disk(&db_path)?;
 
             // 8. Вывести результат
@@ -848,7 +1076,7 @@ fn detach_from_console_if_needed() -> anyhow::Result<bool> {
 }
 
 async fn handle_daemon(action: DaemonAction) -> anyhow::Result<()> {
-    use code_index_mcp::daemon_core::{client, runner};
+    use crate::daemon_core::{client, runner};
 
     match action {
         DaemonAction::Run => {
@@ -883,7 +1111,7 @@ async fn handle_daemon(action: DaemonAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_status_text(h: &code_index_mcp::daemon_core::ipc::HealthResponse) {
+fn print_status_text(h: &crate::daemon_core::ipc::HealthResponse) {
     println!("Демон code-index");
     println!("  статус:    {}", h.status);
     println!("  версия:    {}", h.version);

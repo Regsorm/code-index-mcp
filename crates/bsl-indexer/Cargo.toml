@@ -1,0 +1,40 @@
+[package]
+name = "bsl-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Приватный CLI и MCP-сервер code-index с поддержкой 1С (BSL/XML)"
+publish = false
+
+# Бинарник называется `bsl-indexer` (как и пакет). На VM RAG он
+# заменяет `code-index` — те же CLI-команды, тот же MCP-протокол,
+# плюс активные BSL-tools при наличии `[[paths]] language = "bsl"`.
+[[bin]]
+name = "bsl-indexer"
+path = "src/main.rs"
+
+# Cargo features. Прокидываются в bsl-extension. Базовая сборка без
+# features валидна — `bsl-indexer enrich` тогда возвращает понятную
+# ошибку «фича не собрана». CI (этап 7-8) собирает релизный артефакт
+# с `--features enrichment[,embeddings]`.
+[features]
+default = []
+enrichment = ["bsl-extension/enrichment"]
+
+[dependencies]
+# Ядро code-index — даёт CLI-конструкцию, реестры и MCP-сервер.
+code-index-core = { path = "../code-index-core" }
+
+# Расширение для 1С — регистрируется в `main()` и активируется
+# conditional registration'ом при наличии `language = "bsl"` в TOML.
+bsl-extension = { path = "../bsl-extension" }
+
+# Те же runtime-зависимости, что у публичного code-index.
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+rmcp = { workspace = true }
+axum = { workspace = true }

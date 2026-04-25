@@ -1,0 +1,93 @@
+[package]
+name = "code-index-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Универсальное ядро code-index: парсеры, SQLite-хранилище, MCP read-only сервер, фоновый демон"
+
+# Имя crate в Rust-коде — `code_index_core` (Cargo заменяет дефисы на _).
+# В коммитах и логах фигурирует как `code-index-core`.
+[lib]
+name = "code_index_core"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI (используется некоторыми внутренними утилитами тестов; легко выпилится)
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# MCP протокол
+rmcp = { workspace = true }
+
+# Парсинг AST
+tree-sitter = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-java = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-onescript = { workspace = true }
+tree-sitter-go = { workspace = true }
+
+# XML-парсинг (для выгрузок 1С — пока в core, на этапе 2 переедет в bsl-extension)
+quick-xml = { workspace = true }
+
+# База данных
+rusqlite = { workspace = true }
+
+# Сериализация
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+# Файловая система
+walkdir = { workspace = true }
+rayon = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+
+# Хеширование
+sha2 = { workspace = true }
+
+# Регулярные выражения
+regex = { workspace = true }
+
+# Glob-матчинг
+globset = { workspace = true }
+
+# Обработка ошибок
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Логирование
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Системная информация
+sysinfo = { workspace = true }
+
+# Утилиты
+hex = { workspace = true }
+chrono = { workspace = true }
+
+# HTTP
+axum = { workspace = true }
+tower = { workspace = true }
+reqwest = { workspace = true }
+
+# Конфиг и пути
+toml = { workspace = true }
+toml_edit = { workspace = true }
+dirs = { workspace = true }
+
+# Hot reload
+arc-swap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bench]]
+name = "parse_benchmark"
+harness = false
