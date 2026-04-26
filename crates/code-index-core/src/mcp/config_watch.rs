@@ -241,6 +241,7 @@ mod tests {
             root_path: None,
             storage: None,
             ip: LEGACY_OWN_IP.to_string(),
+            port: crate::federation::client::DEFAULT_REMOTE_PORT,
             is_local: false,
             language: None,
         }

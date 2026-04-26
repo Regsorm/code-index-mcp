@@ -600,6 +600,7 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                             root_path: Some(root_path),
                             storage: Some(std::sync::Arc::new(tokio::sync::Mutex::new(storage))),
                             ip: "127.0.0.1".to_string(),
+                            port: crate::federation::client::DEFAULT_REMOTE_PORT,
                             is_local: true,
                             language: None,
                         });

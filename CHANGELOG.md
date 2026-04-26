@@ -3,6 +3,27 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.6.1] — 2026-04-26
+
+Технический долг rc7 закрыт: per-host порт удалённого `code-index serve` для federate-форвардинга. До 0.6.0 включительно порт удалённой ноды был захардкожен в `client.rs::DEFAULT_REMOTE_PORT = 8011`, и две serve-ноды на одной машине неизбежно перекрывали друг друга в connection pool — пара ключевалась только по IP. Изменение полностью обратно совместимое: `serve.toml` без поля `port` работает ровно как раньше (используется дефолт 8011).
+
+### Добавлено
+
+- **Поле `port: Option<u16>`** в `[[paths]]` секции `serve.toml` (`federation::config::ServePathEntry`). Опциональное, default — `DEFAULT_REMOTE_PORT` (8011). Метод `effective_port()` возвращает явное либо дефолт. Валидация запрещает `port = 0` (зарезервирован).
+- **Поле `port: u16`** в `federation::repos::FederatedRepo` и `mcp::RepoEntry` — обязательное, заполняется из `ServePathEntry::effective_port()` при `merge`. Для local-записей значение информационное (форвардинг для них не используется).
+- **Тесты:** `port_field_is_optional_and_defaults_to_remote_port`, `port_field_parses_when_explicit`, `zero_port_fails_validation` (config.rs), `port_defaults_when_not_set_and_propagates_when_set` (repos.rs), `pool_creates_separate_clients_for_different_ports_on_same_ip` (client.rs).
+
+### Изменено
+
+- **`RemoteClientPool` ключует клиентов по `(String, u16)`** вместо `String`. Сигнатура `get_or_create(&self, ip: &str, port: u16)`. Поле `default_port` убрано: пул сам по себе порт не фиксирует, он подаётся per-call из `RepoEntry::port`. `RemoteClientPool::new(timeout)` теперь принимает только таймаут.
+- **`dispatcher::dispatch_remote` и `dispatch_remote_value` принимают `port: u16`** между `ip` и `tool`. Все 13 tool-handler-ов (`mcp/mod.rs`) и `tools::remote_stats` обновлены — пробрасывают `entry.port`.
+
+### Совместимость
+
+- **`serve.toml` без поля `port`** парсится как раньше, для всех записей используется `DEFAULT_REMOTE_PORT`. Никаких миграций не требуется.
+- **Внешний MCP API без изменений** — поле `port` не появляется ни в одном tool-call, ни в одном tool-result. Это деталь конфигурации serve, наружу не уходит.
+- **Кэширующий прокси (планируется)** будет читать `serve.toml` для определения, на какой `port` ходить к каждому репо — теперь это единая точка истины.
+
 ## [0.6.0] — 2026-04-26
 
 Большой релиз: workspace-рефакторинг, новый бинарник `bsl-indexer` с полной 1С-спецификой, multi-config обработка одного репо с base/ + extensions/, парсинг `ConfigDumpInfo.xml` для UUID-идентификаторов отладки, опциональное LLM-обогащение процедур через cargo feature `enrichment`, защита от рассинхрона моделей через `embedding_signature`. Все наработки сделаны на ветке `workspace-refactor` (24+ коммита, 249 тестов).

@@ -19,6 +19,11 @@
 // [[paths]]
 // alias = "dev"
 // ip = "192.0.2.10"
+//
+// [[paths]]
+// alias = "wms"
+// ip = "192.0.2.51"
+// port = 8021    # опционально: per-host port, default = DEFAULT_REMOTE_PORT (8011)
 // ```
 //
 // Локальный путь репозитория живёт в `daemon.toml` (см. daemon_core::config).
@@ -28,6 +33,8 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use super::client::DEFAULT_REMOTE_PORT;
 
 /// Полная конфигурация serve, прочитанная из `serve.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +69,23 @@ pub struct ServePathEntry {
 
     /// IP машины, на которой лежит репозиторий.
     pub ip: String,
+
+    /// Опциональный порт удалённого `code-index serve` для этой записи.
+    /// Если не указан — используется `DEFAULT_REMOTE_PORT` (8011).
+    /// Полезно когда на одной машине поднято несколько serve-нод (разные
+    /// деплои, тестовые окружения), либо когда port в проде смещён от дефолта.
+    /// Для local-записей (ip == me.ip) поле игнорируется — местный serve
+    /// слушает на собственном порту, заданном в daemon.toml/CLI.
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+impl ServePathEntry {
+    /// Эффективный порт для исходящих federate-запросов: явно указанный
+    /// `port` либо `DEFAULT_REMOTE_PORT` если не задан.
+    pub fn effective_port(&self) -> u16 {
+        self.port.unwrap_or(DEFAULT_REMOTE_PORT)
+    }
 }
 
 /// Прочитать `serve.toml` с указанного пути и провалидировать.
@@ -118,6 +142,15 @@ pub fn validate(cfg: &ServeFileConfig) -> anyhow::Result<()> {
                 e
             )
         })?;
+        if let Some(p) = entry.port {
+            if p == 0 {
+                anyhow::bail!(
+                    "[[paths]] #{} (alias='{}'): port = 0 недопустим (зарезервирован).",
+                    idx,
+                    entry.alias
+                );
+            }
+        }
         if !seen.insert(entry.alias.clone()) {
             anyhow::bail!(
                 "Алиас '{}' встречается в [[paths]] более одного раза — алиасы должны быть уникальны.",
@@ -274,6 +307,63 @@ mod tests {
         let cfg = parse_str(text).unwrap();
         let err = validate(&cfg).expect_err("должна быть ошибка");
         assert!(format!("{}", err).contains("ip"));
+    }
+
+    #[test]
+    fn port_field_is_optional_and_defaults_to_remote_port() {
+        // port не указан — effective_port() возвращает DEFAULT_REMOTE_PORT.
+        let text = r#"
+            [me]
+            ip = "127.0.0.1"
+
+            [[paths]]
+            alias = "ut"
+            ip = "192.0.2.50"
+        "#;
+        let cfg = parse_str(text).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.paths[0].port, None);
+        assert_eq!(cfg.paths[0].effective_port(), DEFAULT_REMOTE_PORT);
+    }
+
+    #[test]
+    fn port_field_parses_when_explicit() {
+        let text = r#"
+            [me]
+            ip = "127.0.0.1"
+
+            [[paths]]
+            alias = "ut"
+            ip = "192.0.2.50"
+            port = 8021
+
+            [[paths]]
+            alias = "dev"
+            ip = "192.0.2.10"
+        "#;
+        let cfg = parse_str(text).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.paths[0].port, Some(8021));
+        assert_eq!(cfg.paths[0].effective_port(), 8021);
+        // Соседняя запись без port — дефолт сохраняется независимо.
+        assert_eq!(cfg.paths[1].port, None);
+        assert_eq!(cfg.paths[1].effective_port(), DEFAULT_REMOTE_PORT);
+    }
+
+    #[test]
+    fn zero_port_fails_validation() {
+        let text = r#"
+            [me]
+            ip = "127.0.0.1"
+
+            [[paths]]
+            alias = "ut"
+            ip = "192.0.2.50"
+            port = 0
+        "#;
+        let cfg = parse_str(text).unwrap();
+        let err = validate(&cfg).expect_err("port=0 должен отклоняться");
+        assert!(format!("{}", err).contains("port = 0"));
     }
 
     #[test]

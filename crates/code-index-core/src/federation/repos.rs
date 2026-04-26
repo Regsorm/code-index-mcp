@@ -26,6 +26,11 @@ pub struct FederatedRepo {
     pub alias: String,
     /// IP машины, на которой репо физически находится.
     pub ip: String,
+    /// Порт удалённого `code-index serve` для этого репо. Берётся из
+    /// `ServePathEntry::effective_port()` (явно заданный либо
+    /// `DEFAULT_REMOTE_PORT`). Для local-записей значение информационное —
+    /// форвардинг для них не используется.
+    pub port: u16,
     /// Канонический путь к корню (только для local).
     pub root_path: Option<PathBuf>,
     /// Путь к `.code-index/index.db` (только для local).
@@ -53,6 +58,7 @@ pub fn merge(
     let mut out = Vec::with_capacity(serve.paths.len());
     for entry in &serve.paths {
         let is_local = entry.ip.trim() == me_ip;
+        let port = entry.effective_port();
         if is_local {
             match local_paths.get(&entry.alias) {
                 Some(raw_path) => {
@@ -63,6 +69,7 @@ pub fn merge(
                     out.push(FederatedRepo {
                         alias: entry.alias.clone(),
                         ip: entry.ip.clone(),
+                        port,
                         root_path: Some(root),
                         db_path: Some(db),
                         is_local: true,
@@ -82,6 +89,7 @@ pub fn merge(
             out.push(FederatedRepo {
                 alias: entry.alias.clone(),
                 ip: entry.ip.clone(),
+                port,
                 root_path: None,
                 db_path: None,
                 is_local: false,
@@ -106,6 +114,25 @@ mod tests {
                 .map(|(alias, ip)| ServePathEntry {
                     alias: alias.to_string(),
                     ip: ip.to_string(),
+                    port: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Расширенный builder с явным портом — для тестов per-host port.
+    fn serve_with_ports(
+        me_ip: &str,
+        paths: Vec<(&str, &str, Option<u16>)>,
+    ) -> ServeFileConfig {
+        ServeFileConfig {
+            me: MeSection { ip: me_ip.to_string(), token: None },
+            paths: paths
+                .into_iter()
+                .map(|(alias, ip, port)| ServePathEntry {
+                    alias: alias.to_string(),
+                    ip: ip.to_string(),
+                    port,
                 })
                 .collect(),
         }
@@ -198,5 +225,31 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].alias, "repout");
         assert!(merged[0].is_local);
+    }
+
+    #[test]
+    fn port_defaults_when_not_set_and_propagates_when_set() {
+        use crate::federation::client::DEFAULT_REMOTE_PORT;
+        // ut: явный port 8021; dev: дефолт; local-record тоже получает port
+        // (информационно — для local не используется, но поле всегда заполнено).
+        let s = serve_with_ports(
+            "192.0.2.10",
+            vec![
+                ("ut", "192.0.2.50", Some(8021)),
+                ("dev", "192.0.2.10", None),
+                ("wms", "192.0.2.51", None),
+            ],
+        );
+        let d = daemon(vec![("/tmp/dev_repo", "dev")]);
+        let merged = merge(&s, &d).unwrap();
+
+        assert_eq!(merged.len(), 3);
+        // Порядок merge сохраняет порядок serve.paths
+        let ut = merged.iter().find(|r| r.alias == "ut").unwrap();
+        let dev = merged.iter().find(|r| r.alias == "dev").unwrap();
+        let wms = merged.iter().find(|r| r.alias == "wms").unwrap();
+        assert_eq!(ut.port, 8021, "явно заданный port должен пробрасываться");
+        assert_eq!(dev.port, DEFAULT_REMOTE_PORT, "local получает дефолт");
+        assert_eq!(wms.port, DEFAULT_REMOTE_PORT, "remote без port → дефолт");
     }
 }

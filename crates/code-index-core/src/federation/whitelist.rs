@@ -80,8 +80,8 @@ mod tests {
         let cfg = ServeFileConfig {
             me: MeSection { ip: "192.0.2.10".to_string(), token: None },
             paths: vec![
-                ServePathEntry { alias: "ut".to_string(), ip: "192.0.2.50".to_string() },
-                ServePathEntry { alias: "dev".to_string(), ip: "192.0.2.10".to_string() },
+                ServePathEntry { alias: "ut".to_string(), ip: "192.0.2.50".to_string(), port: None },
+                ServePathEntry { alias: "dev".to_string(), ip: "192.0.2.10".to_string(), port: None },
             ],
         };
         let set = build(&cfg);
@@ -100,7 +100,7 @@ mod tests {
         let cfg = ServeFileConfig {
             me: MeSection { ip: "192.0.2.10".to_string(), token: None },
             paths: vec![
-                ServePathEntry { alias: "ut".to_string(), ip: "not-ip".to_string() },
+                ServePathEntry { alias: "ut".to_string(), ip: "not-ip".to_string(), port: None },
             ],
         };
         let set = build(&cfg);

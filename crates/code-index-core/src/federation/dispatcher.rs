@@ -12,9 +12,13 @@ use super::client::RemoteClientPool;
 /// Сериализовать `params` (наша `*Params` структура) в JSON и форвардить
 /// удалённому serve. Возвращает строку — успех (тот же ответ, что вернул бы
 /// удалённый tool-handler) либо federation-error JSON.
+///
+/// `port` — per-host порт удалённого serve. Берётся из `RepoEntry::port`,
+/// который в свою очередь из `ServePathEntry::effective_port()` в `serve.toml`.
 pub async fn dispatch_remote<P: Serialize>(
     pool: &RemoteClientPool,
     ip: &str,
+    port: u16,
     tool: &str,
     params: &P,
 ) -> String {
@@ -22,7 +26,7 @@ pub async fn dispatch_remote<P: Serialize>(
         Ok(v) => v,
         Err(e) => return federation_error(tool, ip, format!("Сериализация params: {}", e)),
     };
-    dispatch_remote_value(pool, ip, tool, params_json).await
+    dispatch_remote_value(pool, ip, port, tool, params_json).await
 }
 
 /// То же что `dispatch_remote`, но `params` — уже готовый `serde_json::Value`.
@@ -30,10 +34,11 @@ pub async fn dispatch_remote<P: Serialize>(
 pub async fn dispatch_remote_value(
     pool: &RemoteClientPool,
     ip: &str,
+    port: u16,
     tool: &str,
     params: Value,
 ) -> String {
-    let client = match pool.get_or_create(ip).await {
+    let client = match pool.get_or_create(ip, port).await {
         Ok(c) => c,
         Err(e) => return federation_error(tool, ip, format!("Не удалось создать клиент: {}", e)),
     };
@@ -62,11 +67,12 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_remote_returns_federation_error_json() {
-        // Несуществующий порт на 127.0.0.1 — connect быстро упадёт с RST.
-        let pool = super::super::client::RemoteClientPool::new(1, Duration::from_millis(500));
+        // Порт 1 на 127.0.0.1 — connect быстро упадёт с RST.
+        let pool = super::super::client::RemoteClientPool::new(Duration::from_millis(500));
         let body = dispatch_remote(
             &pool,
             "127.0.0.1",
+            1,
             "search_function",
             &serde_json::json!({"repo": "x", "query": "y"}),
         )

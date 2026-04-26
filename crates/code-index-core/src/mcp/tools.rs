@@ -230,6 +230,7 @@ async fn remote_stats(
     let fut = crate::federation::dispatcher::dispatch_remote_value(
         &server.clients,
         &entry.ip,
+        entry.port,
         "get_stats",
         serde_json::json!({ "repo": alias }),
     );

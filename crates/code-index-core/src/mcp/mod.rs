@@ -49,6 +49,12 @@ pub struct RepoEntry {
     pub storage: Option<Arc<Mutex<Storage>>>,
     /// IP машины, на которой лежит репо (для решения local vs remote и логов).
     pub ip: String,
+    /// Порт удалённого `code-index serve` для federate-форвардинга.
+    /// Для remote-репо — обязателен (default `DEFAULT_REMOTE_PORT` из
+    /// `serve.toml::ServePathEntry::effective_port`). Для local-репо —
+    /// заполнен тем же значением, что и у remote (информационно), но не
+    /// используется: tool-handler идёт по local-ветке.
+    pub port: u16,
     /// `true` если репо обслуживается этим процессом (`ip == own_ip`).
     pub is_local: bool,
     /// Преобладающий язык, под который репо классифицирован. Определяется
@@ -252,6 +258,7 @@ impl CodeIndexServer {
                     root_path: repo.root_path,
                     storage: Some(Arc::new(Mutex::new(storage))),
                     ip: repo.ip,
+                    port: repo.port,
                     is_local: true,
                     language: None,
                 }
@@ -260,6 +267,7 @@ impl CodeIndexServer {
                     root_path: None,
                     storage: None,
                     ip: repo.ip,
+                    port: repo.port,
                     is_local: false,
                     language: None,
                 }
@@ -290,6 +298,7 @@ impl CodeIndexServer {
                 root_path: Some(root_path),
                 storage: Some(Arc::new(Mutex::new(storage))),
                 ip: LEGACY_OWN_IP.to_string(),
+                port: crate::federation::client::DEFAULT_REMOTE_PORT,
                 is_local: true,
                 language: None,
             });
@@ -309,6 +318,7 @@ impl CodeIndexServer {
             root_path: Some(root_path),
             storage: Some(Arc::new(Mutex::new(storage))),
             ip: LEGACY_OWN_IP.to_string(),
+            port: crate::federation::client::DEFAULT_REMOTE_PORT,
             is_local: true,
             language: None,
         });
@@ -453,7 +463,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "search_function", &p,
+                &self.clients, &entry.ip, entry.port, "search_function", &p,
             ).await;
         }
         tools::search_function(entry, p.query, p.limit, p.language).await
@@ -464,7 +474,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "search_class", &p,
+                &self.clients, &entry.ip, entry.port, "search_class", &p,
             ).await;
         }
         tools::search_class(entry, p.query, p.limit, p.language).await
@@ -475,7 +485,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "get_function", &p,
+                &self.clients, &entry.ip, entry.port, "get_function", &p,
             ).await;
         }
         tools::get_function(entry, p.name).await
@@ -486,7 +496,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "get_class", &p,
+                &self.clients, &entry.ip, entry.port, "get_class", &p,
             ).await;
         }
         tools::get_class(entry, p.name).await
@@ -497,7 +507,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "get_callers", &p,
+                &self.clients, &entry.ip, entry.port, "get_callers", &p,
             ).await;
         }
         tools::get_callers(entry, p.function_name, p.language).await
@@ -508,7 +518,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "get_callees", &p,
+                &self.clients, &entry.ip, entry.port, "get_callees", &p,
             ).await;
         }
         tools::get_callees(entry, p.function_name, p.language).await
@@ -519,7 +529,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "find_symbol", &p,
+                &self.clients, &entry.ip, entry.port, "find_symbol", &p,
             ).await;
         }
         tools::find_symbol(entry, p.name, p.language).await
@@ -530,7 +540,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "get_imports", &p,
+                &self.clients, &entry.ip, entry.port, "get_imports", &p,
             ).await;
         }
         tools::get_imports(entry, p.file_id, p.module, p.language).await
@@ -541,7 +551,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "get_file_summary", &p,
+                &self.clients, &entry.ip, entry.port, "get_file_summary", &p,
             ).await;
         }
         tools::get_file_summary(entry, p.path).await
@@ -554,7 +564,7 @@ impl CodeIndexServer {
             if let Some(entry) = self.repos.get(alias) {
                 if !entry.is_local {
                     return crate::federation::dispatcher::dispatch_remote(
-                        &self.clients, &entry.ip, "get_stats", &p,
+                        &self.clients, &entry.ip, entry.port, "get_stats", &p,
                     ).await;
                 }
             }
@@ -568,7 +578,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "search_text", &p,
+                &self.clients, &entry.ip, entry.port, "search_text", &p,
             ).await;
         }
         tools::search_text(entry, p.query, p.limit, p.language).await
@@ -579,7 +589,7 @@ impl CodeIndexServer {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, "grep_body", &p,
+                &self.clients, &entry.ip, entry.port, "grep_body", &p,
             ).await;
         }
         tools::grep_body(entry, p.pattern, p.regex, p.language, p.limit).await
@@ -804,6 +814,7 @@ mod conditional_registration_tests {
             root_path: None,
             storage: None,
             ip: LEGACY_OWN_IP.to_string(),
+            port: crate::federation::client::DEFAULT_REMOTE_PORT,
             is_local: false,
             language: language.map(String::from),
         }
