@@ -1,3 +1,11 @@
+<a href="https://infostart.ru/1c/tools/2677918/" title="Публикация на Инфостарте">
+  <img src="https://infostart.ru/bitrix/templates/sandbox_empty/assets/tpl/abo/img/logo.svg" alt="Infostart" height="32">
+</a>
+
+Опубликовано на Инфостарте: [Code Index — структурный поиск по выгрузке кода 1С через MCP](https://infostart.ru/1c/tools/2677918/)
+
+---
+
 # Code Index MCP
 
 [English version](README.md)
@@ -98,7 +106,7 @@ cargo build --release -p bsl-indexer --features enrichment   # дополнит�
    path = "C:\\RepoUT"
 
    [[paths]]
-   path = "C:\\RepoBP_SS"
+   path = "C:\\RepoBP_1"
    debounce_ms = 500              # per-папка переопределение: быстрее чем дефолт 1500 мс
    batch_ms    = 1000
    ```
@@ -411,7 +419,7 @@ code-index get-file-summary "src/auth/login.py" --path /my/project
 1. **Переопределение per-папка в `daemon.toml`:**
    ```toml
    [[paths]]
-   path = "C:/RepoBP_SS"
+   path = "C:/RepoBP_1"
    debounce_ms = 500      # реакция ~0.6 с вместо ~1.6 с
    batch_ms    = 1000
    ```

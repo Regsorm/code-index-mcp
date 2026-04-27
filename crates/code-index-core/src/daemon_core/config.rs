@@ -12,7 +12,7 @@
 // path = "C:\\RepoUT"
 //
 // [[paths]]
-// path = "C:\\RepoBP_SS"
+// path = "C:\\RepoBP_1"
 // debounce_ms = 2000         # опциональное переопределение per-папка
 // ```
 

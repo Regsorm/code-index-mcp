@@ -1,3 +1,11 @@
+<a href="https://infostart.ru/1c/tools/2677918/" title="Published on Infostart">
+  <img src="https://infostart.ru/bitrix/templates/sandbox_empty/assets/tpl/abo/img/logo.svg" alt="Infostart" height="32">
+</a>
+
+Published on Infostart: [Code Index — структурный поиск по выгрузке кода 1С через MCP](https://infostart.ru/1c/tools/2677918/)
+
+---
+
 # Code Index MCP
 
 [Русская версия](README_RU.md)
@@ -96,7 +104,7 @@ Portable layout: one folder for everything (binary + config + runtime files). Po
    path = "C:\\RepoUT"
 
    [[paths]]
-   path = "C:\\RepoBP_SS"
+   path = "C:\\RepoBP_1"
    debounce_ms = 500              # per-folder override: react faster than the default 1500 ms
    batch_ms    = 1000
    ```
@@ -407,7 +415,7 @@ The daemon resolves these values in this order (first match wins):
 1. **Per-folder override in `daemon.toml`:**
    ```toml
    [[paths]]
-   path = "C:/RepoBP_SS"
+   path = "C:/RepoBP_1"
    debounce_ms = 500      # react in ~0.6 s instead of ~1.6 s
    batch_ms    = 1000
    ```

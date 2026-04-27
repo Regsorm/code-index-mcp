@@ -80,13 +80,13 @@ alias = "ut"
 language = "bsl"
 
 [[paths]]
-path = "/home/rag/data/bsl_local/RepoBP_SS"
-alias = "bp-ss"
+path = "/home/rag/data/bsl_local/RepoBP_1"
+alias = "bp-1"
 language = "bsl"
 
 [[paths]]
-path = "/home/rag/data/bsl_local/RepoBP_TDK"
-alias = "bp-tdk"
+path = "/home/rag/data/bsl_local/RepoBP_2"
+alias = "bp-2"
 language = "bsl"
 
 [[paths]]
@@ -123,12 +123,12 @@ sudo chown rag:rag /etc/bsl-indexer/env
 
 ```bash
 bsl-indexer index /home/rag/data/bsl_local/RepoUT
-bsl-indexer index /home/rag/data/bsl_local/RepoBP_SS
-bsl-indexer index /home/rag/data/bsl_local/RepoBP_TDK
+bsl-indexer index /home/rag/data/bsl_local/RepoBP_1
+bsl-indexer index /home/rag/data/bsl_local/RepoBP_2
 bsl-indexer index /home/rag/data/bsl_local/RepoZUP
 ```
 
-Ожидаемое время (с холодным кешем диска): УТ ~1 мин, БП SS ~1.5 мин, БП ТДК ~1 мин, ЗУП ~1.5-2 мин. Итого 5-7 минут на полный набор.
+Ожидаемое время (с холодным кешем диска): УТ ~1 мин, БП #1 ~1.5 мин, БП #2 ~1 мин, ЗУП ~1.5-2 мин. Итого 5-7 минут на полный набор.
 
 После завершения — проверка таблиц:
 
