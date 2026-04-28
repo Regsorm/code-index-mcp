@@ -126,6 +126,79 @@ pub struct GrepBodyMatch {
     /// Общее количество совпадений (только если > 3)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_count: Option<usize>,
+    /// Контекст вокруг каждого совпадения (если запрошен через context_lines).
+    /// Ключ — номер строки в файле, значение — текст. Пуст когда context_lines=0.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub context: Vec<ContextLine>,
+}
+
+/// Одна строка контекста для grep_body / grep_text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextLine {
+    pub line: usize,
+    pub content: String,
+}
+
+/// Результат `read_file` — содержимое (целиком или по диапазону строк) +
+/// метаданные индекса.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadFileResult {
+    /// Содержимое (плоский текст с переносами строк).
+    pub content: String,
+    /// Сколько строк реально вернулось.
+    pub lines_returned: usize,
+    /// Всего строк в файле.
+    pub lines_total: usize,
+    /// Пришлось ли усечь по soft-cap.
+    pub truncated: bool,
+    /// ISO-время последней индексации (для контроля свежести).
+    pub indexed_at: String,
+    /// Категория файла: "text" — содержимое из БД доступно;
+    /// "code" — содержимое не хранится в Phase 1 (вернётся пустая строка).
+    pub category: String,
+}
+
+/// Запись из `list_files` — метаданные файла без полей хеша.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListedFile {
+    pub path: String,
+    pub language: String,
+    pub lines_total: usize,
+    pub size: Option<i64>,
+    pub mtime: Option<i64>,
+}
+
+/// Результат `stat_file` — метаданные одного файла + флаг наличия content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatFileResult {
+    pub exists: bool,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_at: Option<String>,
+    /// Доступен ли content через `read_file` ("text" — да, "code" — нет в Phase 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+}
+
+/// Один матч `grep_text` — строка в text-файле, удовлетворяющая regex.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepTextMatch {
+    pub path: String,
+    pub line: usize,
+    pub content: String,
+    /// Контекст до/после матча, если запрошен. Пуст когда context_lines=0.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub context: Vec<ContextLine>,
 }
 
 /// Статус фоновой индексации

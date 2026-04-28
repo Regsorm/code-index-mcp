@@ -4,7 +4,7 @@ pub mod models;
 pub mod schema;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 use models::*;
@@ -226,6 +226,21 @@ impl Storage {
             |row| row.get(0),
         )?;
         Ok(id)
+    }
+
+    /// Получить только путь файла по id. Используется в post-filter
+    /// (mcp/tools.rs) для применения path_glob к результатам search_*/get_*.
+    pub fn get_path_by_file_id(&self, id: i64) -> Result<Option<String>> {
+        let r: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT path FROM files WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("get_path_by_file_id")?;
+        Ok(r)
     }
 
     /// Получить запись файла по пути
@@ -660,6 +675,7 @@ impl Storage {
                     line_end: raw.line_end,
                     match_lines,
                     match_count,
+                    context: Vec::new(),
                 }
             })
             .collect();
@@ -919,6 +935,465 @@ impl Storage {
         })
     }
 
+    // ── Phase 1: file listing, stat, read, grep_text ────────────────────────
+    //
+    // Новые read-only инструменты, добавленные в v0.7.0. Все работают только
+    // с тем, что уже есть в индексе:
+    //   * `stat_file` / `list_files`        — таблица `files`.
+    //   * `read_file_text` / `grep_text`    — таблица `text_files` (FTS-индексируемые
+    //                                          расширения: yaml, md, json, toml, xml,
+    //                                          shell-скрипты и т.д.).
+    //
+    // Чтение содержимого code-файлов (.py/.bsl/.rs/...) откладывается до Phase 2
+    // (миграция v4 с таблицей `file_contents`).
+
+    /// stat_file: метаданные одного файла из таблицы `files`.
+    /// Возвращает `exists=false` если файл не индексирован.
+    pub fn stat_file_meta(&self, path: &str) -> Result<StatFileResult> {
+        let row: Option<(String, String, i64, String, Option<i64>, Option<i64>, String)> = self
+            .conn
+            .query_row(
+                "SELECT language, content_hash, lines_total, indexed_at, mtime, file_size, path
+                 FROM files WHERE path = ?1",
+                params![path],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,        // language
+                        r.get::<_, String>(1)?,        // content_hash
+                        r.get::<_, i64>(2)?,           // lines_total
+                        r.get::<_, String>(3)?,        // indexed_at
+                        r.get::<_, Option<i64>>(4)?,   // mtime
+                        r.get::<_, Option<i64>>(5)?,   // file_size
+                        r.get::<_, String>(6)?,        // path
+                    ))
+                },
+            )
+            .optional()
+            .context("stat_file_meta: ошибка SELECT files")?;
+
+        match row {
+            None => Ok(StatFileResult {
+                exists: false,
+                path: path.to_string(),
+                language: None,
+                size: None,
+                mtime: None,
+                lines_total: None,
+                content_hash: None,
+                indexed_at: None,
+                category: None,
+            }),
+            Some((language, hash, lines_total, indexed_at, mtime, size, path_db)) => {
+                // Категория: text — content есть в text_files, code — нет (Phase 1)
+                let has_text: i64 = self
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM text_files tf
+                         JOIN files fi ON fi.id = tf.file_id
+                         WHERE fi.path = ?1",
+                        params![path_db],
+                        |r| r.get(0),
+                    )
+                    .context("stat_file_meta: проверка text_files")?;
+                let category = if has_text > 0 { "text" } else { "code" };
+                Ok(StatFileResult {
+                    exists: true,
+                    path: path_db,
+                    language: Some(language),
+                    size,
+                    mtime,
+                    lines_total: Some(lines_total as usize),
+                    content_hash: Some(hash),
+                    indexed_at: Some(indexed_at),
+                    category: Some(category.to_string()),
+                })
+            }
+        }
+    }
+
+    /// list_files: список файлов с опциональными фильтрами (glob по пути,
+    /// префикс пути, язык). Возвращает `Vec<ListedFile>` с метаданными.
+    ///
+    /// `pattern` использует SQLite GLOB (`*` матчит любой символ, включая `/`,
+    /// поэтому `*.py` рекурсивно). `**` нормализуется в `*` для совместимости
+    /// с привычным glob-синтаксисом.
+    pub fn list_files_filtered(
+        &self,
+        pattern: Option<&str>,
+        path_prefix: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ListedFile>> {
+        let mut conds: Vec<String> = Vec::new();
+        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(g) = pattern {
+            conds.push("path GLOB ?".to_string());
+            params_dyn.push(Box::new(normalize_glob(g)));
+        }
+        if let Some(p) = path_prefix {
+            conds.push("path LIKE ?".to_string());
+            // Экранируем спецсимволы LIKE (%, _) — пользователь может передать `path/with_underscore`.
+            let escaped = p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            params_dyn.push(Box::new(format!("{}%", escaped)));
+        }
+        if let Some(l) = language {
+            conds.push("language = ?".to_string());
+            params_dyn.push(Box::new(l.to_string()));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT path, language, lines_total, file_size, mtime
+             FROM files {} ORDER BY path LIMIT ?",
+            where_clause
+        );
+        params_dyn.push(Box::new(limit as i64));
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok(ListedFile {
+                path: row.get::<_, String>(0)?,
+                language: row.get::<_, String>(1)?,
+                lines_total: row.get::<_, i64>(2)? as usize,
+                size: row.get::<_, Option<i64>>(3)?,
+                mtime: row.get::<_, Option<i64>>(4)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// read_file_text: прочитать содержимое text-файла.
+    /// Для code-файлов (Phase 1) — content в БД нет, возвращается результат
+    /// с `category="code"` и пустой строкой; вызывающая сторона должна
+    /// сообщить пользователю, что для code-файлов нужно дождаться Phase 2.
+    ///
+    /// `line_start`/`line_end` — 1-based, оба inclusive. Если оба None —
+    /// возвращается весь файл (с применением soft-cap).
+    pub fn read_file_text(
+        &self,
+        path: &str,
+        line_start: Option<usize>,
+        line_end: Option<usize>,
+        soft_cap_lines: usize,
+        soft_cap_bytes: usize,
+        hard_cap_bytes: usize,
+    ) -> Result<Option<ReadFileResult>> {
+        // Сначала ищем файл в files
+        let meta: Option<(i64, i64, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, lines_total, indexed_at, language FROM files WHERE path = ?1",
+                params![path],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("read_file_text: ошибка SELECT files")?;
+
+        let Some((file_id, lines_total_i, indexed_at, _language)) = meta else {
+            return Ok(None);
+        };
+        let lines_total = lines_total_i as usize;
+
+        // Пытаемся прочитать содержимое из text_files
+        let content_opt: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT content FROM text_files WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .context("read_file_text: ошибка SELECT text_files")?;
+
+        let Some(content) = content_opt else {
+            // Code-файл — content не хранится в Phase 1
+            return Ok(Some(ReadFileResult {
+                content: String::new(),
+                lines_returned: 0,
+                lines_total,
+                truncated: false,
+                indexed_at,
+                category: "code".to_string(),
+            }));
+        };
+
+        // Слайсим по диапазону строк, потом применяем soft/hard cap
+        let (sliced, lines_returned, truncated) = slice_with_caps(
+            &content,
+            line_start,
+            line_end,
+            soft_cap_lines,
+            soft_cap_bytes,
+            hard_cap_bytes,
+        )?;
+
+        Ok(Some(ReadFileResult {
+            content: sliced,
+            lines_returned,
+            lines_total,
+            truncated,
+            indexed_at,
+            category: "text".to_string(),
+        }))
+    }
+
+    /// grep_text: regex-поиск по содержимому text-файлов.
+    /// Pre-filter через REGEXP в SQL, post-process на номера строк и контекст.
+    pub fn grep_text_filtered(
+        &self,
+        regex_pattern: &str,
+        path_glob: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+        context_lines: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<GrepTextMatch>> {
+        let compiled = regex::Regex::new(regex_pattern)
+            .context("grep_text: невалидный regex")?;
+
+        // SQL: pre-filter по REGEXP (ускоряет, отсекает файлы без матча).
+        let mut conds: Vec<String> = vec!["tf.content REGEXP ?".to_string()];
+        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(regex_pattern.to_string())];
+        if let Some(g) = path_glob {
+            conds.push("fi.path GLOB ?".to_string());
+            params_dyn.push(Box::new(normalize_glob(g)));
+        }
+        if let Some(l) = language {
+            conds.push("fi.language = ?".to_string());
+            params_dyn.push(Box::new(l.to_string()));
+        }
+        let sql = format!(
+            "SELECT fi.path, tf.content
+             FROM text_files tf JOIN files fi ON fi.id = tf.file_id
+             WHERE {}
+             ORDER BY fi.path",
+            conds.join(" AND ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let candidate_rows: Vec<(String, String)> = stmt
+            .query_map(params_refs.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Post-process: построчный поиск, контекст, ограничение по limit и байтам
+        let mut results: Vec<GrepTextMatch> = Vec::new();
+        let mut total_bytes: usize = 0;
+        for (path, content) in candidate_rows {
+            let lines: Vec<&str> = content.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !compiled.is_match(line) {
+                    continue;
+                }
+                let line_no = i + 1;
+                let context = if context_lines > 0 {
+                    let from = i.saturating_sub(context_lines);
+                    let to = (i + context_lines + 1).min(lines.len());
+                    (from..to)
+                        .map(|j| ContextLine {
+                            line: j + 1,
+                            content: lines[j].to_string(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let row_bytes = line.len()
+                    + context.iter().map(|c| c.content.len()).sum::<usize>()
+                    + path.len();
+                total_bytes = total_bytes.saturating_add(row_bytes);
+                if total_bytes > max_total_bytes {
+                    return Ok(results);
+                }
+                results.push(GrepTextMatch {
+                    path: path.clone(),
+                    line: line_no,
+                    content: line.to_string(),
+                    context,
+                });
+                if results.len() >= limit {
+                    return Ok(results);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// grep_body с поддержкой context_lines. Существующий `grep_body` без
+    /// контекста остаётся для обратной совместимости (вызовы из cli.rs/тестов).
+    /// Этот метод дополнительно набирает строки контекста вокруг каждой
+    /// первой партии совпадений (до 3, как у `match_lines`).
+    pub fn grep_body_with_options(
+        &self,
+        pattern: Option<&str>,
+        regex_pattern: Option<&str>,
+        language: Option<&str>,
+        path_glob: Option<&str>,
+        limit: usize,
+        context_lines: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<GrepBodyMatch>> {
+        // Базовое условие body
+        let (body_condition, body_param) = match (pattern, regex_pattern) {
+            (Some(p), _) => ("body LIKE ?".to_string(), format!("%{}%", p)),
+            (_, Some(r)) => ("body REGEXP ?".to_string(), r.to_string()),
+            _ => anyhow::bail!("Необходимо указать pattern или regex"),
+        };
+
+        // Доп. условия для общей секции (применяются и к functions, и к classes)
+        let mut extra_conds: Vec<String> = Vec::new();
+        if language.is_some() {
+            extra_conds.push("fi.language = ?".to_string());
+        }
+        if path_glob.is_some() {
+            extra_conds.push("fi.path GLOB ?".to_string());
+        }
+        let extra_clause_str = if extra_conds.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", extra_conds.join(" AND "))
+        };
+
+        // Параметры дублируются на functions и classes секции UNION'а.
+        // Собираем сразу финальный вектор без хитрых клонов Box<dyn ToSql>.
+        let lang_norm: Option<String> = language.map(|s| s.to_string());
+        let glob_norm: Option<String> = path_glob.map(normalize_glob);
+        let mut full_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for _ in 0..2 {
+            full_params.push(Box::new(body_param.clone()));
+            if let Some(ref l) = lang_norm {
+                full_params.push(Box::new(l.clone()));
+            }
+            if let Some(ref g) = glob_norm {
+                full_params.push(Box::new(g.clone()));
+            }
+        }
+        full_params.push(Box::new(limit as i64));
+
+        let sql = format!(
+            "SELECT fi.path, fn.name, 'function' as kind, fn.line_start, fn.line_end, fn.body
+             FROM functions fn JOIN files fi ON fi.id = fn.file_id
+             WHERE fn.{cond}{extra}
+             UNION ALL
+             SELECT fi.path, c.name, 'class' as kind, c.line_start, c.line_end, c.body
+             FROM classes c JOIN files fi ON fi.id = c.file_id
+             WHERE c.{cond}{extra}
+             ORDER BY 1, 4
+             LIMIT ?",
+            cond = body_condition,
+            extra = extra_clause_str
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            full_params.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let raw: Vec<(String, String, String, i64, i64, String)> = stmt
+            .query_map(params_refs.as_slice(), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let compiled_re = regex_pattern
+            .map(regex::Regex::new)
+            .transpose()
+            .context("grep_body_with_options: невалидный regex")?;
+
+        let mut total_bytes: usize = 0;
+        let mut out: Vec<GrepBodyMatch> = Vec::new();
+        for (file_path, name, kind, ls, le, body) in raw.into_iter() {
+            let line_start = ls as usize;
+            let line_end = le as usize;
+            let body_lines: Vec<&str> = body.lines().collect();
+            let mut all_matches: Vec<usize> = Vec::new(); // индексы строк в body (0-based)
+            for (i, line) in body_lines.iter().enumerate() {
+                let matched = if let Some(ref re) = compiled_re {
+                    re.is_match(line)
+                } else if let Some(p) = pattern {
+                    line.to_lowercase().contains(&p.to_lowercase())
+                } else {
+                    false
+                };
+                if matched {
+                    all_matches.push(i);
+                }
+            }
+            let total = all_matches.len();
+            let match_lines: Vec<usize> = all_matches
+                .iter()
+                .take(3)
+                .map(|i| line_start + i)
+                .collect();
+            let match_count = if total > 3 { Some(total) } else { None };
+            // Контекст: первые до 3 матчей, по context_lines строк до/после;
+            // строки склеиваются в общий список без дублей.
+            let context = if context_lines > 0 {
+                let mut included: std::collections::BTreeSet<usize> = Default::default();
+                for &mi in all_matches.iter().take(3) {
+                    let from = mi.saturating_sub(context_lines);
+                    let to = (mi + context_lines + 1).min(body_lines.len());
+                    for j in from..to {
+                        included.insert(j);
+                    }
+                }
+                included
+                    .into_iter()
+                    .map(|j| ContextLine {
+                        line: line_start + j,
+                        content: body_lines[j].to_string(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let row_bytes = file_path.len()
+                + name.len()
+                + kind.len()
+                + match_lines.len() * 8
+                + context.iter().map(|c| c.content.len()).sum::<usize>();
+            total_bytes = total_bytes.saturating_add(row_bytes);
+            if total_bytes > max_total_bytes {
+                return Ok(out);
+            }
+            out.push(GrepBodyMatch {
+                file_path,
+                name,
+                kind,
+                line_start,
+                line_end,
+                match_lines,
+                match_count,
+                context,
+            });
+            if out.len() >= limit {
+                return Ok(out);
+            }
+        }
+        Ok(out)
+    }
+
     // ── Bulk-load ────────────────────────────────────────────────────────────
 
     /// Инициализировать БД для массовой первичной загрузки: только таблицы, без индексов.
@@ -1004,6 +1479,96 @@ fn sanitize_fts_query(query: &str) -> String {
     } else {
         query.to_string()
     }
+}
+
+/// Нормализация glob-паттерна для SQLite GLOB.
+///
+/// SQLite GLOB интерпретирует `*` как «любая последовательность символов»,
+/// включая `/`. Поэтому `*.py` уже работает рекурсивно.
+/// `**` (привычный из shell-glob и .gitignore) — синоним `*` в данном движке,
+/// поэтому просто схлопываем все вхождения `**` в `*` для совместимости
+/// с привычным синтаксисом, не меняя семантику.
+pub(crate) fn normalize_glob(pattern: &str) -> String {
+    // Многократная замена для последовательностей `***` и т.п.
+    let mut s = pattern.to_string();
+    while s.contains("**") {
+        s = s.replace("**", "*");
+    }
+    s
+}
+
+/// Слайс контента по диапазону строк (1-based, inclusive) + применение
+/// soft-cap по числу строк / байтам и hard-cap (отказ).
+///
+/// * `line_start`/`line_end` — `Some(_)` — диапазон, `None` — весь файл
+/// * `soft_cap_lines` — если итог > этого, обрезается и `truncated=true`
+/// * `soft_cap_bytes` — то же по байтам
+/// * `hard_cap_bytes` — если результирующий контент превысит этот предел
+///   ДАЖЕ после диапазона — функция возвращает Err.
+///
+/// Возвращает `(content, lines_returned, truncated)`.
+pub(crate) fn slice_with_caps(
+    content: &str,
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+    soft_cap_lines: usize,
+    soft_cap_bytes: usize,
+    hard_cap_bytes: usize,
+) -> Result<(String, usize, bool)> {
+    // `lines()` теряет трейлинг-newline; для read_file семантически достаточно
+    // вернуть строки через '\n' — UI-различие незначимо.
+    let all_lines: Vec<&str> = content.lines().collect();
+    let total = all_lines.len();
+    let (start_idx, end_idx) = match (line_start, line_end) {
+        (None, None) => (0, total),
+        (Some(s), None) => (s.saturating_sub(1).min(total), total),
+        (None, Some(e)) => (0, e.min(total)),
+        (Some(s), Some(e)) => (
+            s.saturating_sub(1).min(total),
+            e.min(total),
+        ),
+    };
+    if start_idx > end_idx {
+        // Пустой диапазон — возвращаем пусто без ошибки.
+        return Ok((String::new(), 0, false));
+    }
+    let slice_len = end_idx - start_idx;
+
+    // Hard-cap: если запрошенный диапазон по байтам превышает hard_cap — отказ.
+    // Считаем байты конкатенированных строк + переносы.
+    let est_bytes: usize = all_lines[start_idx..end_idx]
+        .iter()
+        .map(|l| l.len() + 1)
+        .sum();
+    if est_bytes > hard_cap_bytes {
+        anyhow::bail!(
+            "read_file: запрошенный диапазон ~{} байт превышает hard-cap {} байт. \
+             Уточните line_start/line_end.",
+            est_bytes,
+            hard_cap_bytes
+        );
+    }
+
+    // Soft-cap: применяем меньшее из двух (по строкам / по байтам).
+    let mut take_n = slice_len.min(soft_cap_lines);
+    // По байтам: укорачиваем до тех пор, пока не вписываемся.
+    let mut acc_bytes: usize = 0;
+    let mut byte_take_n: usize = 0;
+    for line in all_lines[start_idx..start_idx + take_n].iter() {
+        let next = acc_bytes + line.len() + 1;
+        if next > soft_cap_bytes {
+            break;
+        }
+        acc_bytes = next;
+        byte_take_n += 1;
+    }
+    if byte_take_n < take_n {
+        take_n = byte_take_n;
+    }
+    let truncated = take_n < slice_len;
+
+    let body: String = all_lines[start_idx..start_idx + take_n].join("\n");
+    Ok((body, take_n, truncated))
 }
 
 // ── Вспомогательные функции маппинга строк ───────────────────────────────────
@@ -1448,5 +2013,270 @@ mod tests {
         let storage = Storage::open_auto(&db_path, &config).unwrap();
         let found = storage.get_file_by_path("/existing.py").unwrap();
         assert!(found.is_some(), "данные из файла должны быть доступны в in-memory БД");
+    }
+
+    // ── Phase 1 (v0.7.0) тесты ─────────────────────────────────────────────
+
+    /// Создать FileRecord с произвольным путём и языком (mtime/file_size заполнены).
+    fn make_file_full(path: &str, language: &str, lines: usize) -> FileRecord {
+        FileRecord {
+            id: None,
+            path: path.to_string(),
+            content_hash: format!("hash_{}", path),
+            ast_hash: None,
+            language: language.to_string(),
+            lines_total: lines,
+            indexed_at: "2026-04-28T12:00:00".to_string(),
+            mtime: Some(1714305600),
+            file_size: Some((lines * 50) as i64),
+        }
+    }
+
+    #[test]
+    fn test_normalize_glob_replaces_double_star() {
+        assert_eq!(normalize_glob("**/*.py"), "*/*.py");
+        assert_eq!(normalize_glob("src/**/file.rs"), "src/*/file.rs");
+        assert_eq!(normalize_glob("***/foo"), "*/foo");
+        assert_eq!(normalize_glob("*.py"), "*.py");
+    }
+
+    #[test]
+    fn test_slice_with_caps_full_file() {
+        let content = "line1\nline2\nline3\nline4\nline5";
+        let (body, n, truncated) = slice_with_caps(content, None, None, 100, 1000, 10_000).unwrap();
+        assert_eq!(n, 5);
+        assert!(!truncated);
+        assert_eq!(body, "line1\nline2\nline3\nline4\nline5");
+    }
+
+    #[test]
+    fn test_slice_with_caps_range() {
+        let content = "a\nb\nc\nd\ne";
+        let (body, n, truncated) = slice_with_caps(content, Some(2), Some(4), 100, 1000, 10_000).unwrap();
+        assert_eq!(n, 3);
+        assert!(!truncated);
+        assert_eq!(body, "b\nc\nd");
+    }
+
+    #[test]
+    fn test_slice_with_caps_soft_cap_lines() {
+        let content = (1..=10).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let (body, n, truncated) = slice_with_caps(&content, None, None, 3, 1000, 10_000).unwrap();
+        assert_eq!(n, 3);
+        assert!(truncated);
+        assert_eq!(body, "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn test_slice_with_caps_hard_cap() {
+        let content: String = "x".repeat(1000);
+        let res = slice_with_caps(&content, None, None, 10_000, 100_000, 100);
+        assert!(res.is_err(), "превышение hard-cap должно дать Err");
+    }
+
+    #[test]
+    fn test_stat_file_meta_existing_text() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/cfg.yaml", "yaml", 50)).unwrap();
+        // upsert_file пока не пишет mtime/file_size — это делает отдельный update_file_metadata.
+        storage.update_file_metadata("/cfg.yaml", 1714305600, 2500).unwrap();
+        // Помечаем как text-файл (есть запись в text_files).
+        storage.insert_text_file(&TextFileRecord {
+            id: None,
+            file_id: id,
+            content: "key: value\n".repeat(50),
+        }).unwrap();
+
+        let r = storage.stat_file_meta("/cfg.yaml").unwrap();
+        assert!(r.exists);
+        assert_eq!(r.path, "/cfg.yaml");
+        assert_eq!(r.language.as_deref(), Some("yaml"));
+        assert_eq!(r.lines_total, Some(50));
+        assert_eq!(r.mtime, Some(1714305600));
+        assert_eq!(r.size, Some(2500));
+        assert_eq!(r.category.as_deref(), Some("text"));
+    }
+
+    #[test]
+    fn test_stat_file_meta_existing_code() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_file(&make_file_full("/lib.py", "python", 30)).unwrap();
+        // Без insert_text_file — это code-файл
+        let r = storage.stat_file_meta("/lib.py").unwrap();
+        assert!(r.exists);
+        assert_eq!(r.category.as_deref(), Some("code"));
+    }
+
+    #[test]
+    fn test_stat_file_meta_missing() {
+        let storage = Storage::open_in_memory().unwrap();
+        let r = storage.stat_file_meta("/nonexistent").unwrap();
+        assert!(!r.exists);
+        assert!(r.language.is_none());
+    }
+
+    #[test]
+    fn test_list_files_pattern_glob() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_file(&make_file_full("/src/auth/login.py", "python", 10)).unwrap();
+        storage.upsert_file(&make_file_full("/src/utils/helpers.py", "python", 20)).unwrap();
+        storage.upsert_file(&make_file_full("/docs/readme.md", "markdown", 30)).unwrap();
+
+        let py = storage.list_files_filtered(Some("**/*.py"), None, None, 100).unwrap();
+        assert_eq!(py.len(), 2);
+        for f in &py { assert!(f.path.ends_with(".py")); }
+
+        let auth = storage.list_files_filtered(Some("/src/auth/*"), None, None, 100).unwrap();
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth[0].path, "/src/auth/login.py");
+    }
+
+    #[test]
+    fn test_list_files_path_prefix() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_file(&make_file_full("/src/a.py", "python", 1)).unwrap();
+        storage.upsert_file(&make_file_full("/src/b.py", "python", 1)).unwrap();
+        storage.upsert_file(&make_file_full("/test/c.py", "python", 1)).unwrap();
+
+        let r = storage.list_files_filtered(None, Some("/src/"), None, 100).unwrap();
+        assert_eq!(r.len(), 2);
+        for f in &r { assert!(f.path.starts_with("/src/")); }
+    }
+
+    #[test]
+    fn test_list_files_language_filter() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_file(&make_file_full("/a.py", "python", 1)).unwrap();
+        storage.upsert_file(&make_file_full("/b.rs", "rust", 1)).unwrap();
+        storage.upsert_file(&make_file_full("/c.py", "python", 1)).unwrap();
+
+        let r = storage.list_files_filtered(None, None, Some("rust"), 100).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].language, "rust");
+    }
+
+    #[test]
+    fn test_read_file_text_full() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/r.txt", "text", 3)).unwrap();
+        storage.insert_text_file(&TextFileRecord {
+            id: None,
+            file_id: id,
+            content: "alpha\nbeta\ngamma".to_string(),
+        }).unwrap();
+        let r = storage.read_file_text("/r.txt", None, None, 100, 10_000, 100_000).unwrap().unwrap();
+        assert_eq!(r.category, "text");
+        assert_eq!(r.lines_returned, 3);
+        assert_eq!(r.lines_total, 3);
+        assert!(!r.truncated);
+        assert_eq!(r.content, "alpha\nbeta\ngamma");
+    }
+
+    #[test]
+    fn test_read_file_text_range() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/r.txt", "text", 5)).unwrap();
+        storage.insert_text_file(&TextFileRecord {
+            id: None,
+            file_id: id,
+            content: "1\n2\n3\n4\n5".to_string(),
+        }).unwrap();
+        let r = storage.read_file_text("/r.txt", Some(2), Some(4), 100, 10_000, 100_000)
+            .unwrap().unwrap();
+        assert_eq!(r.lines_returned, 3);
+        assert_eq!(r.content, "2\n3\n4");
+    }
+
+    #[test]
+    fn test_read_file_text_code_returns_empty_category_code() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_file(&make_file_full("/lib.py", "python", 10)).unwrap();
+        // text_files не заполнен — это code-файл
+        let r = storage.read_file_text("/lib.py", None, None, 100, 10_000, 100_000).unwrap().unwrap();
+        assert_eq!(r.category, "code");
+        assert!(r.content.is_empty());
+    }
+
+    #[test]
+    fn test_read_file_text_missing() {
+        let storage = Storage::open_in_memory().unwrap();
+        let r = storage.read_file_text("/nope", None, None, 100, 10_000, 100_000).unwrap();
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn test_grep_text_basic_match() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/cfg.yaml", "yaml", 5)).unwrap();
+        storage.insert_text_file(&TextFileRecord {
+            id: None,
+            file_id: id,
+            content: "host: 10.0.0.1\nport: 8080\nname: example\n".to_string(),
+        }).unwrap();
+        let m = storage.grep_text_filtered(r"port:\s*\d+", None, None, 100, 0, 1_000_000).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].path, "/cfg.yaml");
+        assert_eq!(m[0].line, 2);
+        assert!(m[0].content.contains("port: 8080"));
+        assert!(m[0].context.is_empty());
+    }
+
+    #[test]
+    fn test_grep_text_with_context() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/log.txt", "text", 5)).unwrap();
+        storage.insert_text_file(&TextFileRecord {
+            id: None,
+            file_id: id,
+            content: "a\nb\nFOUND\nd\ne".to_string(),
+        }).unwrap();
+        let m = storage.grep_text_filtered(r"FOUND", None, None, 100, 1, 1_000_000).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].context.len(), 3); // строки 2, 3, 4
+        assert_eq!(m[0].context[0].line, 2);
+        assert_eq!(m[0].context[0].content, "b");
+        assert_eq!(m[0].context[1].line, 3);
+        assert_eq!(m[0].context[2].line, 4);
+    }
+
+    #[test]
+    fn test_grep_text_path_glob_filters() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id1 = storage.upsert_file(&make_file_full("/a.yaml", "yaml", 1)).unwrap();
+        let id2 = storage.upsert_file(&make_file_full("/b.json", "json", 1)).unwrap();
+        storage.insert_text_file(&TextFileRecord { id: None, file_id: id1, content: "key: 42".into() }).unwrap();
+        storage.insert_text_file(&TextFileRecord { id: None, file_id: id2, content: "{\"key\": 42}".into() }).unwrap();
+        let m = storage.grep_text_filtered(r"42", Some("*.yaml"), None, 100, 0, 1_000_000).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].path, "/a.yaml");
+    }
+
+    #[test]
+    fn test_grep_body_with_options_context() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file_full("/code.py", "python", 30)).unwrap();
+        let mut fr = make_function(file_id, "do_thing");
+        fr.line_start = 10;
+        fr.line_end = 14;
+        fr.body = "def do_thing():\n    target = 1\n    other = 2\n    return target".to_string();
+        storage.insert_functions(&[fr]).unwrap();
+
+        let m = storage.grep_body_with_options(
+            Some("target"), None, None, None, 50, 1, 1_000_000,
+        ).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].name, "do_thing");
+        assert!(!m[0].match_lines.is_empty());
+        assert!(!m[0].context.is_empty(), "context_lines=1 должен дать контекст");
+    }
+
+    #[test]
+    fn test_get_path_by_file_id() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/some/path.py", "python", 1)).unwrap();
+        let p = storage.get_path_by_file_id(id).unwrap();
+        assert_eq!(p, Some("/some/path.py".to_string()));
+        let none = storage.get_path_by_file_id(99999).unwrap();
+        assert_eq!(none, None);
     }
 }
