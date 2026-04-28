@@ -3,6 +3,37 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.7.0] — 2026-04-28
+
+**Phase 1 «read-only tools»** — закрытие пробелов code-index, чтобы удалённый репо через federation работал «как локальный» для большинства задач разведки и чтения. Релиз read-only: схема БД не трогается, переиндексация не нужна, обратная совместимость сохранена.
+
+### Добавлено
+
+- **`stat_file(repo, path)`** — метаданные одного файла из таблицы `files`. Возвращает `{exists, path, language, size, mtime, lines_total, content_hash, indexed_at, category}`. `category` — `"text"` (содержимое доступно через `read_file`) или `"code"` (Phase 1 не хранит content для AST-языков).
+- **`list_files(repo, pattern?, path_prefix?, language?, limit?)`** — плоский список файлов с фильтрацией. `pattern` — glob (`**/*.py`), `path_prefix` — префикс (`src/auth/`). Возвращает `[{path, language, lines_total, size, mtime}]`. Без отдельного `tree`-эндпоинта — структура восстанавливается по path-строкам.
+- **`read_file(repo, path, line_start?, line_end?)`** — содержимое **text-файла** (yaml/md/json/toml/xml/sh/INI/CSV/SQL и др.) через таблицу `text_files`. `line_start`/`line_end` — 1-based, inclusive. Soft-cap **5000 строк ИЛИ 500 КБ** (что наступит раньше) с флагом `truncated=true`. Hard-cap **2 МБ** даже с диапазоном (отказ). Для code-файлов — `category="code"` и пустой `content` (закроется в Phase 2). Возвращает `{content, lines_returned, lines_total, truncated, indexed_at, category}`.
+- **`grep_text(repo, regex, path_glob?, language?, limit?, context_lines?)`** — regex-поиск по содержимому text-файлов через REGEXP. Закрывает дыру FTS5 со спецсимволами (точки, скобки, экраны). `path_glob` или `language` желателен — иначе full-scan, default-limit занижен до 100. `context_lines` — N строк до/после совпадения. Hard-cap на суммарный размер выдачи (1 МБ).
+- **`path_glob`-параметр** в `search_function`, `search_class`, `get_function`, `get_class`, `find_symbol`, `search_text`, `grep_body`. Сужает выдачу по пути файла. Реализация — post-filter через crate `globset` после SQL-выборки. SQL-LIMIT увеличивается до 5× (но не больше 500), чтобы фильтр не оставил пустую выдачу.
+- **`context_lines`-параметр** в `grep_body` — N строк контекста вокруг первых до 3 совпадений. Через новый `Storage::grep_body_with_options`. Существующий `grep_body` без context-параметра работает как раньше (обратная совместимость для cli.rs/тестов).
+- **Hard-cap на суммарный размер ответа** в `grep_body` (с context_lines) и `grep_text` — 1 МБ. Защита от переполнения контекста модели на широком regex с большим context_lines.
+- **`Storage::get_path_by_file_id`** — публичный метод для post-filter в MCP-слое.
+- **`storage::normalize_glob`** (pub(crate)) — `**` → `*` для совместимости с привычным glob-синтаксисом (SQLite GLOB и `globset` уже понимают `*` как multi-char + `/`).
+- **Federation routes:** `/federate/stat_file`, `/federate/list_files`, `/federate/read_file`, `/federate/grep_text`. Существующие routes расширены новыми параметрами в Params-структурах.
+- **20 новых unit-тестов** для Phase 1: `normalize_glob`, `slice_with_caps` (4 кейса), `stat_file_meta` (3 кейса), `list_files_filtered` (3 кейса), `read_file_text` (4 кейса), `grep_text_filtered` (3 кейса), `grep_body_with_options`, `get_path_by_file_id`.
+
+### Совместимость
+
+- **MCP API без breaking-changes.** Все новые параметры — `Option<...>`, опциональные. Старые клиенты, не знающие о `path_glob`/`context_lines`, работают как раньше.
+- **Storage API без breaking-changes.** Все существующие методы (`search_functions`, `search_classes`, `search_text`, `grep_body`, `find_symbol`) сохранили сигнатуру. Новая функциональность — в новых методах (`grep_body_with_options`) и в post-filter в MCP-слое.
+- **Schema БД без изменений.** Никаких миграций, переиндексации не требуется.
+- **Federation без breaking-changes.** Новые routes аддитивны. **Важно:** обе ноды federation (Windows и VM) должны быть обновлены до 0.7.0 одновременно — иначе при вызове новых tool-ов на старой ноде будет 404.
+
+### Известные ограничения Phase 1
+
+- **`read_file` для code-файлов** (.py/.rs/.bsl/.ts/...) возвращает `category="code"` и пустой `content`. Закроется в Phase 2 миграцией v4 + zstd-compressed blob в новой таблице `file_contents`.
+- **Файлы без расширения** (Dockerfile, Makefile, Jenkinsfile, .gitignore, LICENSE) не индексируются walker-ом — слепая зона DevOps-репо. Сознательное ограничение.
+- **Бинарные форматы 1С** (.epf, .erf, .cfe, .cf) не индексируются. Распаковка во внешнем pipeline.
+
 ## [0.6.1] — 2026-04-26
 
 Технический долг rc7 закрыт: per-host порт удалённого `code-index serve` для federate-форвардинга. До 0.6.0 включительно порт удалённой ноды был захардкожен в `client.rs::DEFAULT_REMOTE_PORT = 8011`, и две serve-ноды на одной машине неизбежно перекрывали друг друга в connection pool — пара ключевалась только по IP. Изменение полностью обратно совместимое: `serve.toml` без поля `port` работает ровно как раньше (используется дефолт 8011).
