@@ -20,8 +20,9 @@ use axum::{
 };
 
 use crate::mcp::{
-    tools, CodeIndexServer, FilePathParams, FunctionNameParams, GrepBodyParams, ImportParams,
-    NameParams, RepoEntry, SearchParams, StatsParams,
+    tools, CodeIndexServer, FilePathParams, FunctionNameParams, GrepBodyParams, GrepTextParams,
+    ImportParams, ListFilesParams, NameParams, ReadFileParams, RepoEntry, SearchParams,
+    StatFileParams, StatsParams,
 };
 
 use super::dispatcher::federation_error;
@@ -44,6 +45,11 @@ pub fn federate_router(server: CodeIndexServer) -> Router {
         .route("/federate/get_stats", post(handle_get_stats))
         .route("/federate/search_text", post(handle_search_text))
         .route("/federate/grep_body", post(handle_grep_body))
+        // Phase 1 (v0.7.0)
+        .route("/federate/stat_file", post(handle_stat_file))
+        .route("/federate/list_files", post(handle_list_files))
+        .route("/federate/read_file", post(handle_read_file))
+        .route("/federate/grep_text", post(handle_grep_text))
         .with_state(Arc::new(server))
 }
 
@@ -95,7 +101,7 @@ async fn handle_search_function(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::search_function(entry, p.query, p.limit, p.language).await)
+    ok_json(tools::search_function(entry, p.query, p.limit, p.language, p.path_glob).await)
 }
 
 async fn handle_search_class(
@@ -106,7 +112,7 @@ async fn handle_search_class(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::search_class(entry, p.query, p.limit, p.language).await)
+    ok_json(tools::search_class(entry, p.query, p.limit, p.language, p.path_glob).await)
 }
 
 async fn handle_get_function(
@@ -117,7 +123,7 @@ async fn handle_get_function(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_function(entry, p.name).await)
+    ok_json(tools::get_function(entry, p.name, p.path_glob).await)
 }
 
 async fn handle_get_class(
@@ -128,7 +134,7 @@ async fn handle_get_class(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_class(entry, p.name).await)
+    ok_json(tools::get_class(entry, p.name, p.path_glob).await)
 }
 
 async fn handle_get_callers(
@@ -161,7 +167,7 @@ async fn handle_find_symbol(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::find_symbol(entry, p.name, p.language).await)
+    ok_json(tools::find_symbol(entry, p.name, p.language, p.path_glob).await)
 }
 
 async fn handle_get_imports(
@@ -247,7 +253,7 @@ async fn handle_search_text(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::search_text(entry, p.query, p.limit, p.language).await)
+    ok_json(tools::search_text(entry, p.query, p.limit, p.language, p.path_glob).await)
 }
 
 async fn handle_grep_body(
@@ -258,5 +264,72 @@ async fn handle_grep_body(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::grep_body(entry, p.pattern, p.regex, p.language, p.limit).await)
+    ok_json(
+        tools::grep_body(
+            entry,
+            p.pattern,
+            p.regex,
+            p.language,
+            p.limit,
+            p.path_glob,
+            p.context_lines,
+        )
+        .await,
+    )
+}
+
+// ── Phase 1 federation handlers ─────────────────────────────────────────────
+
+async fn handle_stat_file(
+    State(server): State<Server>,
+    Json(p): Json<StatFileParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "stat_file") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(tools::stat_file(entry, p.path).await)
+}
+
+async fn handle_list_files(
+    State(server): State<Server>,
+    Json(p): Json<ListFilesParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "list_files") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(tools::list_files(entry, p.pattern, p.path_prefix, p.language, p.limit).await)
+}
+
+async fn handle_read_file(
+    State(server): State<Server>,
+    Json(p): Json<ReadFileParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "read_file") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(tools::read_file(entry, p.path, p.line_start, p.line_end).await)
+}
+
+async fn handle_grep_text(
+    State(server): State<Server>,
+    Json(p): Json<GrepTextParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "grep_text") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(
+        tools::grep_text(
+            entry,
+            p.regex,
+            p.path_glob,
+            p.language,
+            p.limit,
+            p.context_lines,
+        )
+        .await,
+    )
 }
