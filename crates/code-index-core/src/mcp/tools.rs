@@ -13,6 +13,17 @@ use super::{CodeIndexServer, RepoEntry};
 use crate::daemon_core::client;
 use crate::daemon_core::ipc::{PathStatus, ToolUnavailable};
 
+/// Soft-cap: число строк в одном `read_file` (по умолчанию).
+pub(crate) const READ_FILE_SOFT_CAP_LINES: usize = 5_000;
+/// Soft-cap: размер ответа `read_file` в байтах (по умолчанию).
+pub(crate) const READ_FILE_SOFT_CAP_BYTES: usize = 500 * 1024;
+/// Hard-cap: абсолютный максимум для `read_file`, даже с line_start/line_end.
+pub(crate) const READ_FILE_HARD_CAP_BYTES: usize = 2 * 1024 * 1024;
+/// Hard-cap: суммарный размер ответа grep_text/grep_body.
+pub(crate) const GREP_TOTAL_BYTES_CAP: usize = 1 * 1024 * 1024;
+/// Default-limit grep_text если path_glob и language не заданы.
+pub(crate) const GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT: usize = 100;
+
 /// Сериализовать `ToolUnavailable` в JSON-строку.
 pub fn format_unavailable(value: ToolUnavailable) -> String {
     match serde_json::to_string_pretty(&value) {
@@ -74,6 +85,39 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
     }
 }
 
+// ── Phase 1 helpers ─────────────────────────────────────────────────────────
+
+/// Скомпилировать glob → matcher через `globset`. Применяется к результатам
+/// после SQL-выборки в search_*/get_*. Использует `storage::normalize_glob`
+/// для приведения `**` к `*` (см. SQLite GLOB-семантику).
+pub(crate) fn build_path_matcher(glob: &str) -> Result<globset::GlobMatcher, String> {
+    let normalized = crate::storage::normalize_glob(glob);
+    globset::Glob::new(&normalized)
+        .map(|g| g.compile_matcher())
+        .map_err(|e| format!("невалидный glob '{}': {}", glob, e))
+}
+
+/// Lookup пути по file_id через storage. Любая ошибка/отсутствие → пустая строка
+/// (она не пройдёт ни один matcher, так что результат честно отбросится).
+/// Storage уже заблокирован вызывающей стороной (передаётся через `&MutexGuard`).
+pub(crate) fn lookup_path(
+    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
+    file_id: i64,
+) -> String {
+    storage
+        .get_path_by_file_id(file_id)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+pub(crate) fn matches_with(matcher: &globset::GlobMatcher, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    matcher.is_match(path)
+}
+
 // ── Реализации инструментов ─────────────────────────────────────────────────
 
 pub async fn search_function(
@@ -81,11 +125,30 @@ pub async fn search_function(
     query: String,
     limit: Option<usize>,
     language: Option<String>,
+    path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
-    match storage.search_functions(&query, limit.unwrap_or(20), language.as_deref()) {
-        Ok(r) => to_json(&r),
+    let want = limit.unwrap_or(20);
+    // Если path_glob задан — берём с запасом (5×, до 500), потом фильтруем по пути,
+    // потом обрезаем до want. Это компромисс между точностью и нагрузкой.
+    let sql_limit = if path_glob.is_some() {
+        (want.saturating_mul(5)).min(500)
+    } else {
+        want
+    };
+    match storage.search_functions(&query, sql_limit, language.as_deref()) {
+        Ok(mut r) => {
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                r.retain(|fr| matches_with(&matcher, &lookup_path(&storage, fr.file_id)));
+                r.truncate(want);
+            }
+            to_json(&r)
+        }
         Err(e) => format!("{{\"error\": \"search_function: {}\"}}", e),
     }
 }
@@ -95,29 +158,72 @@ pub async fn search_class(
     query: String,
     limit: Option<usize>,
     language: Option<String>,
+    path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
-    match storage.search_classes(&query, limit.unwrap_or(20), language.as_deref()) {
-        Ok(r) => to_json(&r),
+    let want = limit.unwrap_or(20);
+    let sql_limit = if path_glob.is_some() {
+        (want.saturating_mul(5)).min(500)
+    } else {
+        want
+    };
+    match storage.search_classes(&query, sql_limit, language.as_deref()) {
+        Ok(mut r) => {
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                r.retain(|cr| matches_with(&matcher, &lookup_path(&storage, cr.file_id)));
+                r.truncate(want);
+            }
+            to_json(&r)
+        }
         Err(e) => format!("{{\"error\": \"search_class: {}\"}}", e),
     }
 }
 
-pub async fn get_function(entry: &RepoEntry, name: String) -> String {
+pub async fn get_function(
+    entry: &RepoEntry,
+    name: String,
+    path_glob: Option<String>,
+) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     match storage.get_function_by_name(&name) {
-        Ok(r) => to_json(&r),
+        Ok(mut r) => {
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                r.retain(|fr| matches_with(&matcher, &lookup_path(&storage, fr.file_id)));
+            }
+            to_json(&r)
+        }
         Err(e) => format!("{{\"error\": \"get_function: {}\"}}", e),
     }
 }
 
-pub async fn get_class(entry: &RepoEntry, name: String) -> String {
+pub async fn get_class(
+    entry: &RepoEntry,
+    name: String,
+    path_glob: Option<String>,
+) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     match storage.get_class_by_name(&name) {
-        Ok(r) => to_json(&r),
+        Ok(mut r) => {
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                r.retain(|cr| matches_with(&matcher, &lookup_path(&storage, cr.file_id)));
+            }
+            to_json(&r)
+        }
         Err(e) => format!("{{\"error\": \"get_class: {}\"}}", e),
     }
 }
@@ -152,11 +258,28 @@ pub async fn find_symbol(
     entry: &RepoEntry,
     name: String,
     language: Option<String>,
+    path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     match storage.find_symbol(&name, language.as_deref()) {
-        Ok(r) => to_json(&r),
+        Ok(mut r) => {
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                r.functions
+                    .retain(|fr| matches_with(&matcher, &lookup_path(&storage, fr.file_id)));
+                r.classes
+                    .retain(|cr| matches_with(&matcher, &lookup_path(&storage, cr.file_id)));
+                r.variables
+                    .retain(|vr| matches_with(&matcher, &lookup_path(&storage, vr.file_id)));
+                r.imports
+                    .retain(|ir| matches_with(&matcher, &lookup_path(&storage, ir.file_id)));
+            }
+            to_json(&r)
+        }
         Err(e) => format!("{{\"error\": \"find_symbol: {}\"}}", e),
     }
 }
@@ -323,11 +446,26 @@ pub async fn search_text(
     query: String,
     limit: Option<usize>,
     language: Option<String>,
+    path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
-    match storage.search_text(&query, limit.unwrap_or(20), language.as_deref()) {
-        Ok(results) => {
+    let want = limit.unwrap_or(20);
+    let sql_limit = if path_glob.is_some() {
+        (want.saturating_mul(5)).min(500)
+    } else {
+        want
+    };
+    match storage.search_text(&query, sql_limit, language.as_deref()) {
+        Ok(mut results) => {
+            if let Some(ref g) = path_glob {
+                let matcher = match build_path_matcher(g) {
+                    Ok(m) => m,
+                    Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
+                };
+                results.retain(|(p, _)| matches_with(&matcher, p));
+                results.truncate(want);
+            }
             let items: Vec<serde_json::Value> = results
                 .into_iter()
                 .map(|(path, snippet)| serde_json::json!({ "path": path, "snippet": snippet }))
@@ -344,17 +482,121 @@ pub async fn grep_body(
     regex: Option<String>,
     language: Option<String>,
     limit: Option<usize>,
+    path_glob: Option<String>,
+    context_lines: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
-    match storage.grep_body(
+    // Если есть либо path_glob, либо context_lines — идём через grep_body_with_options.
+    // Иначе старый grep_body для обратной совместимости с CHANGELOG / тестами.
+    let ctx = context_lines.unwrap_or(0);
+    if path_glob.is_some() || ctx > 0 {
+        match storage.grep_body_with_options(
+            pattern.as_deref(),
+            regex.as_deref(),
+            language.as_deref(),
+            path_glob.as_deref(),
+            limit.unwrap_or(100),
+            ctx,
+            GREP_TOTAL_BYTES_CAP,
+        ) {
+            Ok(r) => to_json(&r),
+            Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
+        }
+    } else {
+        match storage.grep_body(
+            pattern.as_deref(),
+            regex.as_deref(),
+            language.as_deref(),
+            limit.unwrap_or(100),
+        ) {
+            Ok(r) => to_json(&r),
+            Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
+        }
+    }
+}
+
+// ── Phase 1 tool-handlers ───────────────────────────────────────────────────
+
+pub async fn stat_file(entry: &RepoEntry, path: String) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.local_storage().lock().await;
+    match storage.stat_file_meta(&path) {
+        Ok(r) => to_json(&r),
+        Err(e) => format!("{{\"error\": \"stat_file: {}\"}}", e),
+    }
+}
+
+pub async fn list_files(
+    entry: &RepoEntry,
+    pattern: Option<String>,
+    path_prefix: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.local_storage().lock().await;
+    match storage.list_files_filtered(
         pattern.as_deref(),
-        regex.as_deref(),
+        path_prefix.as_deref(),
         language.as_deref(),
-        limit.unwrap_or(100),
+        limit.unwrap_or(500),
     ) {
         Ok(r) => to_json(&r),
-        Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
+        Err(e) => format!("{{\"error\": \"list_files: {}\"}}", e),
+    }
+}
+
+pub async fn read_file(
+    entry: &RepoEntry,
+    path: String,
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.local_storage().lock().await;
+    match storage.read_file_text(
+        &path,
+        line_start,
+        line_end,
+        READ_FILE_SOFT_CAP_LINES,
+        READ_FILE_SOFT_CAP_BYTES,
+        READ_FILE_HARD_CAP_BYTES,
+    ) {
+        Ok(Some(r)) => to_json(&r),
+        Ok(None) => format!("{{\"error\": \"Файл '{}' не найден в индексе\"}}", path),
+        Err(e) => format!("{{\"error\": \"read_file: {}\"}}", e),
+    }
+}
+
+pub async fn grep_text(
+    entry: &RepoEntry,
+    regex: String,
+    path_glob: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+    context_lines: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.local_storage().lock().await;
+    let want = limit.unwrap_or_else(|| {
+        // Без path_glob и language full-scan может быть тяжёлым — занижаем default.
+        if path_glob.is_none() && language.is_none() {
+            GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT
+        } else {
+            500
+        }
+    });
+    match storage.grep_text_filtered(
+        &regex,
+        path_glob.as_deref(),
+        language.as_deref(),
+        want,
+        context_lines.unwrap_or(0),
+        GREP_TOTAL_BYTES_CAP,
+    ) {
+        Ok(r) => to_json(&r),
+        Err(e) => format!("{{\"error\": \"grep_text: {}\"}}", e),
     }
 }
 

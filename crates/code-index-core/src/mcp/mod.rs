@@ -98,6 +98,9 @@ pub struct SearchParams {
     pub query: String,
     pub limit: Option<usize>,
     pub language: Option<String>,
+    /// Glob по path для сужения поиска (Phase 1, post-filter в MCP-слое).
+    /// Например `src/**/*.py` или `Documents/**`.
+    pub path_glob: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -106,6 +109,8 @@ pub struct NameParams {
     pub repo: String,
     pub name: String,
     pub language: Option<String>,
+    /// Glob по path (Phase 1, post-filter).
+    pub path_glob: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -140,12 +145,60 @@ pub struct GrepBodyParams {
     pub regex: Option<String>,
     pub language: Option<String>,
     pub limit: Option<usize>,
+    /// Glob по path для сужения поиска. SQL-pushdown.
+    pub path_glob: Option<String>,
+    /// Сколько строк до/после совпадения возвращать в `context`.
+    /// 0 (по умолчанию) — без контекста, как раньше.
+    pub context_lines: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct StatsParams {
     /// Алиас репозитория. Если не указан — возвращается статистика по всем подключённым репо.
     pub repo: Option<String>,
+}
+
+// ── Phase 1 параметры (v0.7.0) ──
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct StatFileParams {
+    pub repo: String,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListFilesParams {
+    pub repo: String,
+    /// Glob по path (`**/*.py`, `Documents/**/*.bsl`). Опционально.
+    pub pattern: Option<String>,
+    /// Префикс по path (`src/auth/`). Опционально.
+    pub path_prefix: Option<String>,
+    pub language: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReadFileParams {
+    pub repo: String,
+    pub path: String,
+    /// 1-based, inclusive. None — с начала.
+    pub line_start: Option<usize>,
+    /// 1-based, inclusive. None — до конца.
+    pub line_end: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GrepTextParams {
+    pub repo: String,
+    /// Регулярное выражение (синтаксис crate `regex`).
+    pub regex: String,
+    /// Glob по path. Хотя бы один из {path_glob, language} желателен —
+    /// иначе работает full-scan по всем text-файлам.
+    pub path_glob: Option<String>,
+    pub language: Option<String>,
+    pub limit: Option<usize>,
+    /// Сколько строк до/после совпадения возвращать в `context`. 0 — без контекста.
+    pub context_lines: Option<usize>,
 }
 
 // ── Сервер ───────────────────────────────────────────────────────────────────
@@ -458,7 +511,7 @@ fn collect_extension_tools(
 
 #[tool_router]
 impl CodeIndexServer {
-    #[tool(description = "FTS поиск функций по указанному репо: по имени, docstring, телу. Возвращает JSON-массив FunctionRecord.")]
+    #[tool(description = "FTS поиск функций по указанному репо: по имени, docstring, телу. path_glob — опциональный фильтр по пути (`src/**/*.py`). Возвращает JSON-массив FunctionRecord.")]
     async fn search_function(&self, Parameters(p): Parameters<SearchParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -466,10 +519,10 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "search_function", &p,
             ).await;
         }
-        tools::search_function(entry, p.query, p.limit, p.language).await
+        tools::search_function(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "FTS поиск классов по указанному репо: по имени, docstring, телу. Возвращает JSON-массив ClassRecord.")]
+    #[tool(description = "FTS поиск классов по указанному репо: по имени, docstring, телу. path_glob — опциональный фильтр по пути. Возвращает JSON-массив ClassRecord.")]
     async fn search_class(&self, Parameters(p): Parameters<SearchParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -477,10 +530,10 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "search_class", &p,
             ).await;
         }
-        tools::search_class(entry, p.query, p.limit, p.language).await
+        tools::search_class(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "Найти функцию по точному имени в указанном репо. Возвращает JSON-массив FunctionRecord.")]
+    #[tool(description = "Найти функцию по точному имени в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-массив FunctionRecord.")]
     async fn get_function(&self, Parameters(p): Parameters<NameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -488,10 +541,10 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_function", &p,
             ).await;
         }
-        tools::get_function(entry, p.name).await
+        tools::get_function(entry, p.name, p.path_glob).await
     }
 
-    #[tool(description = "Найти класс по точному имени в указанном репо. Возвращает JSON-массив ClassRecord.")]
+    #[tool(description = "Найти класс по точному имени в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-массив ClassRecord.")]
     async fn get_class(&self, Parameters(p): Parameters<NameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -499,7 +552,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_class", &p,
             ).await;
         }
-        tools::get_class(entry, p.name).await
+        tools::get_class(entry, p.name, p.path_glob).await
     }
 
     #[tool(description = "Найти вызывателей функции (callers) в указанном репо. Возвращает JSON-массив CallRecord.")]
@@ -524,7 +577,7 @@ impl CodeIndexServer {
         tools::get_callees(entry, p.function_name, p.language).await
     }
 
-    #[tool(description = "Универсальный поиск символа по точному имени в указанном репо. Возвращает JSON-объект {functions, classes, variables, imports}.")]
+    #[tool(description = "Универсальный поиск символа по точному имени в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-объект {functions, classes, variables, imports}.")]
     async fn find_symbol(&self, Parameters(p): Parameters<NameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -532,7 +585,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "find_symbol", &p,
             ).await;
         }
-        tools::find_symbol(entry, p.name, p.language).await
+        tools::find_symbol(entry, p.name, p.language, p.path_glob).await
     }
 
     #[tool(description = "Импорты файла (file_id) или модуля (module) в указанном репо. Возвращает JSON-массив ImportRecord.")]
@@ -573,7 +626,7 @@ impl CodeIndexServer {
         tools::get_stats(self, p.repo).await
     }
 
-    #[tool(description = "FTS поиск по текстовым файлам (md, txt, yaml, toml) в указанном репо. Возвращает JSON-массив [{path, snippet}].")]
+    #[tool(description = "FTS поиск по текстовым файлам (md, txt, yaml, toml) в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-массив [{path, snippet}].")]
     async fn search_text(&self, Parameters(p): Parameters<SearchParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -581,10 +634,10 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "search_text", &p,
             ).await;
         }
-        tools::search_text(entry, p.query, p.limit, p.language).await
+        tools::search_text(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "Поиск по телам функций и классов в указанном репо. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP). Возвращает [{file_path, name, kind, line_start, line_end, match_lines, match_count?}].")]
+    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP). path_glob — фильтр по пути (SQL pushdown). context_lines — N строк до/после совпадения.")]
     async fn grep_body(&self, Parameters(p): Parameters<GrepBodyParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -592,7 +645,54 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "grep_body", &p,
             ).await;
         }
-        tools::grep_body(entry, p.pattern, p.regex, p.language, p.limit).await
+        tools::grep_body(
+            entry, p.pattern, p.regex, p.language, p.limit, p.path_glob, p.context_lines,
+        )
+        .await
+    }
+
+    #[tool(description = "Метаданные файла из индекса: existence, размер, mtime, lines_total, language, content_hash, indexed_at, category. Чистая выборка из таблицы files (быстро).")]
+    async fn stat_file(&self, Parameters(p): Parameters<StatFileParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "stat_file", &p,
+            ).await;
+        }
+        tools::stat_file(entry, p.path).await
+    }
+
+    #[tool(description = "Список файлов в индексе с фильтрами. pattern — glob по пути (`**/*.py`), path_prefix — префикс (`src/auth/`), language — язык. Возвращает JSON-массив [{path, language, lines_total, size, mtime}].")]
+    async fn list_files(&self, Parameters(p): Parameters<ListFilesParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "list_files", &p,
+            ).await;
+        }
+        tools::list_files(entry, p.pattern, p.path_prefix, p.language, p.limit).await
+    }
+
+    #[tool(description = "Прочитать содержимое файла из индекса. Phase 1: только text-файлы (yaml/md/json/toml/xml/sh и др.). Для code-файлов вернётся category=\"code\" с пустым content. line_start/line_end — 1-based, inclusive. Soft-cap 5000 строк / 500 КБ, hard-cap 2 МБ.")]
+    async fn read_file(&self, Parameters(p): Parameters<ReadFileParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "read_file", &p,
+            ).await;
+        }
+        tools::read_file(entry, p.path, p.line_start, p.line_end).await
+    }
+
+    #[tool(description = "Regex-поиск по содержимому text-файлов. path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого). context_lines — N строк до/после. Возвращает JSON-массив [{path, line, content, context}].")]
+    async fn grep_text(&self, Parameters(p): Parameters<GrepTextParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "grep_text", &p,
+            ).await;
+        }
+        tools::grep_text(entry, p.regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
     #[tool(description = "Проверка живости MCP-сервера и демона индексации по всем подключённым репо. Возвращает JSON.")]
