@@ -217,8 +217,14 @@ For a shared HTTP process:
 | `get_file_summary` | Complete file map without reading source |
 | `get_stats` | Index statistics |
 | `search_text` | Full-text search across text files |
-| `grep_body` | Substring or regex search in function/class bodies. Returns `match_lines` (first 3 line numbers) and `match_count` (total, if > 3) |
+| `grep_body` | Substring or regex search in function/class bodies. Returns `match_lines` (first 3 line numbers) and `match_count` (total, if > 3). v0.7.0: optional `path_glob`, `context_lines` |
+| `stat_file` | **(v0.7.0)** Metadata of a single file: exists, size, mtime, language, lines_total, content_hash, indexed_at, category (`text`/`code`) |
+| `list_files` | **(v0.7.0)** Flat file listing with optional `pattern` (glob like `**/*.py`), `path_prefix`, `language`, `limit` |
+| `read_file` | **(v0.7.0)** Read content of a **text** file. Optional `line_start`/`line_end` (1-based, inclusive). Soft-cap 5000 lines or 500 KB, hard-cap 2 MB. For code files returns `category="code"` with empty content (Phase 2 ETA) |
+| `grep_text` | **(v0.7.0)** Regex search over text-file content (REGEXP). Closes the FTS5 special-character gap. Optional `path_glob`, `language`, `context_lines`. Hard-cap 1 MB on response size |
 | `health` | MCP server health and connected repos |
+
+All search tools (`search_function`, `search_class`, `get_function`, `get_class`, `find_symbol`, `search_text`, `grep_body`) accept an optional **`path_glob`** parameter (v0.7.0) to scope results to a subtree (e.g., `src/auth/**`, `Documents/**/*.bsl`). Implementation: post-filter via the `globset` crate after the SQL query.
 
 ### Additional tools for 1C repos (only in `bsl-indexer`, v0.6+)
 

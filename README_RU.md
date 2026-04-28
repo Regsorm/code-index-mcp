@@ -219,8 +219,14 @@ code-index serve --transport http --port 8011 --config /etc/code-index/daemon.to
 | `get_file_summary` | Полная карта файла без чтения исходника |
 | `get_stats` | Статистика индекса |
 | `search_text` | Полнотекстовый поиск по текстовым файлам |
-| `grep_body` | Поиск подстроки или regex в телах функций и классов. Возвращает `match_lines` (первые 3 номера строк) и `match_count` (всего, если > 3) |
+| `grep_body` | Поиск подстроки или regex в телах функций и классов. Возвращает `match_lines` (первые 3 номера строк) и `match_count` (всего, если > 3). v0.7.0: опциональные `path_glob`, `context_lines` |
+| `stat_file` | **(v0.7.0)** Метаданные одного файла: exists, size, mtime, language, lines_total, content_hash, indexed_at, category (`text`/`code`) |
+| `list_files` | **(v0.7.0)** Плоский список файлов с опциональными `pattern` (glob `**/*.py`), `path_prefix`, `language`, `limit` |
+| `read_file` | **(v0.7.0)** Чтение содержимого **text-файла**. Опциональные `line_start`/`line_end` (1-based, inclusive). Soft-cap 5000 строк или 500 КБ, hard-cap 2 МБ. Для code-файлов вернётся `category="code"` с пустым content (Phase 2 в работе) |
+| `grep_text` | **(v0.7.0)** Regex-поиск по содержимому text-файлов через REGEXP. Закрывает дыру FTS5 со спецсимволами (точки, скобки, экраны). Опциональные `path_glob`, `language`, `context_lines`. Hard-cap 1 МБ на размер ответа |
 | `health` | Статус MCP-сервера и подключённых репо |
+
+Все поисковые инструменты (`search_function`, `search_class`, `get_function`, `get_class`, `find_symbol`, `search_text`, `grep_body`) принимают опциональный параметр **`path_glob`** (v0.7.0) для сужения выдачи по подкаталогу (например, `src/auth/**`, `Documents/**/*.bsl`). Реализация — post-filter через crate `globset` после SQL-выборки.
 
 ### Дополнительно для 1С-репо (только в `bsl-indexer`, v0.6+)
 
