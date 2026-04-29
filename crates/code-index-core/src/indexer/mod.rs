@@ -48,6 +48,10 @@ pub enum ParsedFile {
         parse_result: ParseResult,
         mtime: i64,
         file_size: i64,
+        /// Для языков с двойной индексацией (html в v0.7.1) — raw-content
+        /// для дополнительной записи в text_files (FTS+regex+read_file).
+        /// Для остальных языков — None.
+        text_for_fts: Option<String>,
     },
     /// Текстовый файл (без AST)
     Text {
@@ -186,6 +190,11 @@ impl<'a> Indexer<'a> {
                                         parse_result: pr,
                                         mtime: *mtime,
                                         file_size: *file_size,
+                                        text_for_fts: if super::indexer::file_types::is_dual_indexed_language(language) {
+                                            Some(content.clone())
+                                        } else {
+                                            None
+                                        },
                                     },
                                     Err(e) => ParsedFile::Error {
                                         rel_path: rel_path.clone(),
@@ -221,6 +230,7 @@ impl<'a> Indexer<'a> {
                                         parse_result: pr,
                                         mtime: *mtime,
                                         file_size: *file_size,
+                                        text_for_fts: None,
                                     };
                                 }
                             }
@@ -275,6 +285,7 @@ impl<'a> Indexer<'a> {
                     parse_result,
                     mtime,
                     file_size,
+                    text_for_fts,
                 } => {
                     match self.write_code_to_db(
                         rel_path,
@@ -286,6 +297,7 @@ impl<'a> Indexer<'a> {
                         is_fresh_db,
                         Some(*mtime),
                         Some(*file_size),
+                        text_for_fts.as_deref(),
                     ) {
                         Ok(_) => {
                             result.files_indexed += 1;
@@ -387,6 +399,9 @@ impl<'a> Indexer<'a> {
         skip_delete: bool,
         mtime: Option<i64>,
         file_size: Option<i64>,
+        // Для языков с двойной индексацией (html в v0.7.1) — raw-content,
+        // который дополнительно записывается в text_files. Для остальных — None.
+        text_for_fts: Option<&str>,
     ) -> Result<()> {
         // Сохраняем запись о файле
         let file_record = FileRecord {
@@ -412,6 +427,11 @@ impl<'a> Indexer<'a> {
             self.storage.delete_imports_by_file(file_id)?;
             self.storage.delete_calls_by_file(file_id)?;
             self.storage.delete_variables_by_file(file_id)?;
+            // Для языков с двойной индексацией убираем старую запись text_files,
+            // чтобы не дублировать при upsert.
+            if text_for_fts.is_some() {
+                self.storage.delete_text_file_by_file(file_id)?;
+            }
         }
 
         // Конвертируем и сохраняем функции
@@ -499,6 +519,17 @@ impl<'a> Indexer<'a> {
             })
             .collect();
         self.storage.insert_variables(&variables)?;
+
+        // Двойная индексация: для html (и других языков из is_dual_indexed_language)
+        // дополнительно сохраняем сырой контент в text_files, чтобы продолжали
+        // работать search_text/grep_text/read_file как раньше.
+        if let Some(content) = text_for_fts {
+            self.storage.insert_text_file(&crate::storage::models::TextFileRecord {
+                id: None,
+                file_id,
+                content: content.to_string(),
+            })?;
+        }
 
         Ok(())
     }

@@ -369,6 +369,14 @@ fn apply_event(
                         match parser.parse(&content, &rel_path) {
                             Ok(pr) => {
                                 let indexer = Indexer::new(storage);
+                                // v0.7.1: для html (и других dual-indexed языков) дополнительно пишем
+                                // raw-content в text_files — чтобы search_text/grep_text/read_file
+                                // продолжали работать как для обычного text-файла.
+                                let text_for_fts = if crate::indexer::file_types::is_dual_indexed_language(&language) {
+                                    Some(content.as_str())
+                                } else {
+                                    None
+                                };
                                 if let Err(e) = indexer.write_code_to_db(
                                     &rel_path,
                                     &hash,
@@ -379,6 +387,7 @@ fn apply_event(
                                     false,
                                     mtime,
                                     file_size,
+                                    text_for_fts,
                                 ) {
                                     eprintln!("[worker:{}] write_code {}: {}",
                                         root.display(), rel_path, e);
@@ -414,6 +423,7 @@ fn apply_event(
                                         false,
                                         mtime,
                                         file_size,
+                                        None,
                                     )
                                     .is_ok()
                             } else {
