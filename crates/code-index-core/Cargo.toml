@@ -30,6 +30,7 @@ tree-sitter-java = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-onescript = { workspace = true }
 tree-sitter-go = { workspace = true }
+tree-sitter-html = { workspace = true }
 
 # XML-парсинг (для выгрузок 1С — пока в core, на этапе 2 переедет в bsl-extension)
 quick-xml = { workspace = true }

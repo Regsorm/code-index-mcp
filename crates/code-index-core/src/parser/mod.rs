@@ -7,6 +7,7 @@ pub mod rust_lang;
 pub mod go;
 pub mod text;
 pub mod bsl;
+pub mod html;
 /// Парсер XML-выгрузок 1С (quick-xml, не tree-sitter)
 /// Не регистрируется в ParserRegistry — вызывается напрямую из indexer
 pub mod xml_1c;
@@ -46,6 +47,7 @@ impl ParserRegistry {
         registry.register(Arc::new(rust_lang::RustParser::new()));
         registry.register(Arc::new(go::GoParser::new()));
         registry.register(Arc::new(bsl::BslParser::new()));
+        registry.register(Arc::new(html::HtmlParser::new()));
         registry
     }
 
@@ -67,6 +69,7 @@ impl ParserRegistry {
                 "rust" => registry.register(Arc::new(rust_lang::RustParser::new())),
                 "go" => registry.register(Arc::new(go::GoParser::new())),
                 "bsl" => registry.register(Arc::new(bsl::BslParser::new())),
+                "html" => registry.register(Arc::new(html::HtmlParser::new())),
                 _ => {} // Неизвестный язык — пропускаем без ошибки
             }
         }
@@ -102,6 +105,7 @@ pub fn get_parser_for_extension(ext: &str) -> Option<Box<dyn LanguageParser>> {
         "rs" => Some(Box::new(rust_lang::RustParser::new())),
         "go" => Some(Box::new(go::GoParser::new())),
         "bsl" | "os" => Some(Box::new(bsl::BslParser::new())),
+        "html" | "htm" => Some(Box::new(html::HtmlParser::new())),
         _ => None,
     }
 }

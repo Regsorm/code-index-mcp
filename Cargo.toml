@@ -9,7 +9,7 @@ members = [
 
 # Общие метаданные пакетов воркспейса. Каждый крейт может переопределить.
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT"
 description = "Высокопроизводительный индексатор кода с MCP-протоколом для AI-моделей"
@@ -37,6 +37,7 @@ tree-sitter-java = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-onescript = "0.1"
 tree-sitter-go = "0.23"
+tree-sitter-html = "0.23"
 
 # XML-парсинг (для выгрузок 1С)
 quick-xml = "0.37"
