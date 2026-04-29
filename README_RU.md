@@ -45,7 +45,7 @@ AI-модели тратят десятки вызовов `grep`/`find` для 
 
 Текстовые файлы (`.md`, `.json`, `.yaml`, `.toml`, `.xml`, `.sql`, `.env` и др.) индексируются для полнотекстового поиска.
 
-### HTML — маппинг сущностей (v0.7.1)
+### HTML — маппинг сущностей (v0.7.2)
 
 У HTML нет родного понятия «функция»/«класс», поэтому маппинг — конвенциональный. **Двойная индексация**: html-файлы проходят И через AST-парсер, И через `text_files`, чтобы `search_text` / `grep_text` / `read_file` продолжали работать наравне с новыми structured queries.
 
@@ -63,18 +63,39 @@ AI-модели тратят десятки вызовов `grep`/`find` для 
 | `<style>…inline CSS…</style>` | → | `functions` | `inline_style_<line>` (body=содержимое) |
 | Атрибут `class="foo bar baz"` | → | `variables` | `class:foo`, `class:bar`, `class:baz` (по одной записи на каждый) |
 
-Что заработает после индексации:
+Все MCP-инструменты, которые работают с HTML после переиндексации:
 
 ```
-get_class(repo="dev", name="cart")          # outerHTML элемента id="cart"
-get_class(repo="dev", name="form_login")    # форма целиком
-search_function(repo="dev", query="inline_script")
-get_imports(repo="dev", module="bootstrap.css")
-find_symbol(repo="dev", name="submitOrder") # ищет id, имя формы, css-класс, и т.п.
-grep_body(repo="dev", regex="fetch\\(", language="html")  # в inline-скриптах
-search_text(repo="dev", query="…")          # продолжает работать на содержимом
-read_file(repo="dev", path="…/template.html")  # продолжает работать
+# === Discovery / метаданные ===
+list_files(repo="X", pattern="**/*.html")                # все html (вернёт language="html")
+list_files(repo="X", path_prefix="src/templates/")
+stat_file(repo="X", path="src/templates/base.html")      # language="html", category="text"
+get_stats(repo="X")                                       # сводные счётчики
+
+# === Структурные (AST) — новинка 0.7.x ===
+# id-элементы, формы, css-классы, ссылки, inline-блоки → AST-таблицы
+get_class(repo="X", name="cart")                          # outerHTML <... id="cart">
+get_class(repo="X", name="form_login")                    # форма <form id="login"> целиком
+search_class(repo="X", query="container", language="html")
+get_function(repo="X", name="inline_script_42")           # body <script> на строке 42
+search_function(repo="X", query="inline_script", language="html")
+find_symbol(repo="X", name="form_login")                  # точный поиск по всем 4 таблицам
+find_symbol(repo="X", name="class:htmx-indicator")        # использования CSS-класса
+get_imports(repo="X", module="https://unpkg.com/htmx.org@1.9.12")  # кто зависит от CDN
+get_file_summary(repo="X", path="src/templates/base.html")         # полная карта файла
+
+# === Body-level grep (работает по inline_script body) ===
+grep_body(repo="X", regex="fetch\\(", language="html")    # в <script>-блоках
+grep_body(repo="X", pattern="color:", language="html")    # в <style>-блоках
+grep_body(repo="X", regex="hx-target", language="html", path_glob="src/templates/**", context_lines=2)
+
+# === Text-level (продолжают работать через двойную индексацию) ===
+read_file(repo="X", path="src/templates/base.html", line_start=1, line_end=20)
+search_text(repo="X", query="DOCTYPE", language="html")
+grep_text(repo="X", regex="\\{%\\s*include", path_glob="**/*.html", context_lines=1)  # Jinja-includes
 ```
+
+`get_callers` / `get_callees` для HTML не наполняются (парсер не извлекает рёбра вызовов между скриптами).
 
 Шаблонизаторы (Jinja/Django/EJS): `{{ … }}` и `{% … %}` парсер пропускает как text-content без падения; элементы вокруг них извлекаются нормально.
 

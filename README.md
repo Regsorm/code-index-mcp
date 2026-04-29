@@ -43,7 +43,7 @@ A compiled Rust binary with **one-writer / many-readers** architecture:
 
 Text files (`.md`, `.json`, `.yaml`, `.toml`, `.xml`, `.sql`, `.env`, etc.) are also indexed for full-text search.
 
-### HTML — entity mapping (v0.7.1)
+### HTML — entity mapping (v0.7.2)
 
 HTML has no native concept of "function" or "class", so the mapping is conventional. **Dual-indexing**: html files go through both AST parser AND `text_files` (so `search_text` / `grep_text` / `read_file` keep working alongside the new structural queries).
 
@@ -61,18 +61,39 @@ HTML has no native concept of "function" or "class", so the mapping is conventio
 | `<style>…inline CSS…</style>` | → | `functions` | `inline_style_<line>` (body=content) |
 | Attribute `class="foo bar baz"` | → | `variables` | `class:foo`, `class:bar`, `class:baz` (one record per class) |
 
-Examples that work after this:
+All MCP tools that work for HTML files after re-indexing:
 
 ```
-get_class(repo="dev", name="cart")          # outerHTML of element with id="cart"
-get_class(repo="dev", name="form_login")    # full form
-search_function(repo="dev", query="inline_script")
-get_imports(repo="dev", module="bootstrap.css")
-find_symbol(repo="dev", name="submitOrder") # finds id, form name, css class etc.
-grep_body(repo="dev", regex="fetch\\(", language="html")  # in inline scripts
-search_text(repo="dev", query="…")          # still works on full content
-read_file(repo="dev", path="…/template.html")  # still works
+# === Discovery & metadata ===
+list_files(repo="X", pattern="**/*.html")                # all html (returns language="html")
+list_files(repo="X", path_prefix="src/templates/")
+stat_file(repo="X", path="src/templates/base.html")      # returns language="html", category="text"
+get_stats(repo="X")                                       # totals
+
+# === Structural (AST) — new in 0.7.x ===
+# Elements with id, forms, css-classes, links, inline blocks → AST tables
+get_class(repo="X", name="cart")                          # outerHTML of <... id="cart">
+get_class(repo="X", name="form_login")                    # full <form id="login">
+search_class(repo="X", query="container", language="html")
+get_function(repo="X", name="inline_script_42")           # body of <script> at line 42
+search_function(repo="X", query="inline_script", language="html")
+find_symbol(repo="X", name="form_login")                  # exact-name lookup across all 4 tables
+find_symbol(repo="X", name="class:htmx-indicator")        # CSS class usage
+get_imports(repo="X", module="https://unpkg.com/htmx.org@1.9.12")  # who depends on this CDN
+get_file_summary(repo="X", path="src/templates/base.html")         # full map (functions/classes/imports/variables)
+
+# === Body-level grep (works on inline_script bodies) ===
+grep_body(repo="X", regex="fetch\\(", language="html")    # in <script> blocks
+grep_body(repo="X", pattern="color:", language="html")    # in <style> blocks
+grep_body(repo="X", regex="hx-target", language="html", path_glob="src/templates/**", context_lines=2)
+
+# === Text-level (still works via dual-indexing) ===
+read_file(repo="X", path="src/templates/base.html", line_start=1, line_end=20)
+search_text(repo="X", query="DOCTYPE", language="html")
+grep_text(repo="X", regex="\\{%\\s*include", path_glob="**/*.html", context_lines=1)  # Jinja includes
 ```
+
+`get_callers` / `get_callees` are not populated for HTML (the parser does not extract call edges between scripts).
 
 Template engines (Jinja/Django/EJS): `{{ … }}` and `{% … %}` are tolerated as text content; surrounding HTML elements are still parsed normally.
 
