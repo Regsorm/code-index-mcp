@@ -41,8 +41,42 @@ AI-модели тратят десятки вызовов `grep`/`find` для 
 | Go | tree-sitter-go | `.go` |
 | 1С (BSL) | tree-sitter-onescript | `.bsl`, `.os` |
 | XML (1С) | quick-xml | `.xml` (метаданные конфигураций) |
+| HTML | tree-sitter-html | `.html`, `.htm` (v0.7.1, по запросу пользователя — см. маппинг ниже) |
 
 Текстовые файлы (`.md`, `.json`, `.yaml`, `.toml`, `.xml`, `.sql`, `.env` и др.) индексируются для полнотекстового поиска.
+
+### HTML — маппинг сущностей (v0.7.1)
+
+У HTML нет родного понятия «функция»/«класс», поэтому маппинг — конвенциональный. **Двойная индексация**: html-файлы проходят И через AST-парсер, И через `text_files`, чтобы `search_text` / `grep_text` / `read_file` продолжали работать наравне с новыми structured queries.
+
+| HTML | → | Таблица code-index | Имя |
+|------|---|--------------------|-----|
+| `<element id="X">…</element>` | → | `classes` | `X` (body=outerHTML, bases=tag_name) |
+| `<form id|name="X">` | → | `classes` | `form_X` (bases=`form`) |
+| `<form>` без id/name | → | `classes` | `form_<line>` |
+| `<input/select/textarea name="Y">` | → | `variables` | `Y` |
+| `<a href="URL">` | → | `imports` | `module=URL`, `kind="link"` |
+| `<link href="URL" rel="X">` | → | `imports` | `module=URL`, `kind=X` (или `"stylesheet"`) |
+| `<script src="URL">` | → | `imports` | `module=URL`, `kind="script"` |
+| `<img/iframe/video/audio/source/embed src="URL">` | → | `imports` | `module=URL`, `kind=tag` |
+| `<script>…inline JS…</script>` | → | `functions` | `inline_script_<line>` (body=содержимое) |
+| `<style>…inline CSS…</style>` | → | `functions` | `inline_style_<line>` (body=содержимое) |
+| Атрибут `class="foo bar baz"` | → | `variables` | `class:foo`, `class:bar`, `class:baz` (по одной записи на каждый) |
+
+Что заработает после индексации:
+
+```
+get_class(repo="dev", name="cart")          # outerHTML элемента id="cart"
+get_class(repo="dev", name="form_login")    # форма целиком
+search_function(repo="dev", query="inline_script")
+get_imports(repo="dev", module="bootstrap.css")
+find_symbol(repo="dev", name="submitOrder") # ищет id, имя формы, css-класс, и т.п.
+grep_body(repo="dev", regex="fetch\\(", language="html")  # в inline-скриптах
+search_text(repo="dev", query="…")          # продолжает работать на содержимом
+read_file(repo="dev", path="…/template.html")  # продолжает работать
+```
+
+Шаблонизаторы (Jinja/Django/EJS): `{{ … }}` и `{% … %}` парсер пропускает как text-content без падения; элементы вокруг них извлекаются нормально.
 
 ## Быстрый старт
 

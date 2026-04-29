@@ -39,8 +39,42 @@ A compiled Rust binary with **one-writer / many-readers** architecture:
 | Go | tree-sitter-go | `.go` |
 | 1C (BSL) | tree-sitter-onescript | `.bsl`, `.os` |
 | XML (1C) | quick-xml | `.xml` (configuration metadata) |
+| HTML | tree-sitter-html | `.html`, `.htm` (v0.7.1, by user request — see HTML-specific mapping below) |
 
 Text files (`.md`, `.json`, `.yaml`, `.toml`, `.xml`, `.sql`, `.env`, etc.) are also indexed for full-text search.
+
+### HTML — entity mapping (v0.7.1)
+
+HTML has no native concept of "function" or "class", so the mapping is conventional. **Dual-indexing**: html files go through both AST parser AND `text_files` (so `search_text` / `grep_text` / `read_file` keep working alongside the new structural queries).
+
+| HTML | → | code-index table | Name |
+|------|---|------------------|------|
+| `<element id="X">…</element>` | → | `classes` | `X` (body=outerHTML, bases=tag_name) |
+| `<form id|name="X">` | → | `classes` | `form_X` (bases=`form`) |
+| `<form>` without id/name | → | `classes` | `form_<line>` |
+| `<input/select/textarea name="Y">` | → | `variables` | `Y` |
+| `<a href="URL">` | → | `imports` | `module=URL`, `kind="link"` |
+| `<link href="URL" rel="X">` | → | `imports` | `module=URL`, `kind=X` (or `"stylesheet"`) |
+| `<script src="URL">` | → | `imports` | `module=URL`, `kind="script"` |
+| `<img/iframe/video/audio/source/embed src="URL">` | → | `imports` | `module=URL`, `kind=tag` |
+| `<script>…inline JS…</script>` | → | `functions` | `inline_script_<line>` (body=content) |
+| `<style>…inline CSS…</style>` | → | `functions` | `inline_style_<line>` (body=content) |
+| Attribute `class="foo bar baz"` | → | `variables` | `class:foo`, `class:bar`, `class:baz` (one record per class) |
+
+Examples that work after this:
+
+```
+get_class(repo="dev", name="cart")          # outerHTML of element with id="cart"
+get_class(repo="dev", name="form_login")    # full form
+search_function(repo="dev", query="inline_script")
+get_imports(repo="dev", module="bootstrap.css")
+find_symbol(repo="dev", name="submitOrder") # finds id, form name, css class etc.
+grep_body(repo="dev", regex="fetch\\(", language="html")  # in inline scripts
+search_text(repo="dev", query="…")          # still works on full content
+read_file(repo="dev", path="…/template.html")  # still works
+```
+
+Template engines (Jinja/Django/EJS): `{{ … }}` and `{% … %}` are tolerated as text content; surrounding HTML elements are still parsed normally.
 
 ## Quick Start
 
