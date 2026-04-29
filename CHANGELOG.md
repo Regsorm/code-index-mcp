@@ -3,6 +3,45 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.7.1] — 2026-04-28
+
+**HTML-парсер** через tree-sitter — добавлен **по запросу пользователя**. До 0.7.1 `.html` индексировался только как text-файл (FTS+regex+read_file). Теперь — полноценный AST с извлечением структурных сущностей: элементы с id, формы, поля ввода, ссылки, inline-скрипты/стили, CSS-классы. Сохранена обратная совместимость: search_text/grep_text/read_file для html продолжают работать через **двойную индексацию** (text_files + AST).
+
+### Добавлено
+
+- **Новый парсер** `crates/code-index-core/src/parser/html.rs` (~430 строк) на основе `tree-sitter-html` 0.23. Поддерживает `.html` и `.htm`. Зарегистрирован в `ParserRegistry::new_all()` и `from_languages()`.
+- **Маппинг семантики HTML → таблицы code-index:**
+
+  | HTML-конструкция | → | Таблица | Имя |
+  |---|---|---|---|
+  | `<element id="X">…</element>` | `classes` | `X` (body=outerHTML, bases=tag_name) |
+  | `<form id|name="X">` | `classes` | `form_X` (bases="form") |
+  | `<form>` без id/name | `classes` | `form_<line>` |
+  | `<input/select/textarea name="Y">` | `variables` | `Y` (value=type/value-атрибут) |
+  | `<a href="URL">` | `imports` | `module=URL`, `kind="link"` |
+  | `<link href="URL" rel="X">` | `imports` | `module=URL`, `kind=X` (или "stylesheet") |
+  | `<script src="URL">` | `imports` | `module=URL`, `kind="script"` |
+  | `<img/iframe/video/audio/source/embed src="URL">` | `imports` | `module=URL`, `kind=tag_name` |
+  | `<script>…inline JS…</script>` | `functions` | `inline_script_<line>` (body=содержимое) |
+  | `<style>…inline CSS…</style>` | `functions` | `inline_style_<line>` (body=содержимое) |
+  | Атрибут `class="foo bar baz"` | `variables` | `class:foo`, `class:bar`, `class:baz` (по одной записи на каждый) |
+
+- **Двойная индексация**: для языков из `is_dual_indexed_language()` (на 0.7.1 — только `html`) при индексации параллельно создаётся запись в `text_files`. Это сохраняет работоспособность `search_text`/`grep_text`/`read_file` для HTML-файлов наряду с новыми structured queries (`get_class("cart")`, `find_symbol("submitOrder")`, `get_imports(module="bootstrap.css")` и т.п.). Реализовано через новое поле `text_for_fts: Option<String>` в `ParsedFile::Code` + дополнительный параметр `text_for_fts: Option<&str>` в `Indexer::write_code_to_db`.
+- **Расширения файлов**: `("html", "html")` и `("htm", "html")` перенесены из TEXT_EXTENSIONS в CODE_EXTENSIONS (`indexer/file_types.rs`). Добавлена публичная функция `is_dual_indexed_language(language: &str) -> bool`.
+- **13 unit-тестов** для парсера html (`parser/html.rs::tests`): id-элемент, форма с id/name/без обоих, input/select/textarea, link/script/img imports, inline-скрипт, inline-стиль, classes-атрибут, толерантность к Jinja-шаблонам, пустой HTML, вложенные элементы. Plus `file_types::html_is_code_with_dual_indexing` для проверки категоризации.
+- **Tolerance к шаблонизаторам**: `{{ … }}` и `{% … %}` парсятся как text-content без падения. Структурные элементы вокруг них извлекаются нормально.
+
+### Изменено
+
+- **Сигнатура `Indexer::write_code_to_db`**: добавлен последний параметр `text_for_fts: Option<&str>`. Внутренний API, не MCP-видимый. Все известные callers (worker.rs:380 для html, worker.rs:416 для xml_1c) обновлены.
+
+### Совместимость
+
+- **MCP API без изменений** — никаких новых tool-ов, никаких новых параметров. После переиндексации html-файлы автоматически становятся доступны для существующих tool-ов: `get_class`, `find_symbol`, `search_function`, `get_imports`, `grep_body` + продолжают работать `search_text`, `grep_text`, `read_file`, `list_files`, `stat_file`.
+- **Schema БД без миграций.** Используются существующие таблицы files / functions / classes / imports / variables / text_files. Двойная вставка для html — через прежний `insert_text_file`.
+- **Federation без новых routes.** Внутренний механизм; обе ноды должны быть одной версии (требование 0.7.0 продолжает действовать).
+- **Переиндексация:** при первом запуске v0.7.1 daemon найдёт mtime html-файлов неизменным относительно прошлой индексации и **не будет** их переиндексировать (mtime pre-filter из v0.4.0). Чтобы получить новые structured-записи для уже индексированных html, нужен либо явный re-index (`code-index index <repo>`), либо изменение mtime файла. Рекомендуется при первом обновлении на 0.7.1 — однократный полный re-index репо с html-файлами.
+
 ## [0.7.0] — 2026-04-28
 
 **Phase 1 «read-only tools»** — закрытие пробелов code-index, чтобы удалённый репо через federation работал «как локальный» для большинства задач разведки и чтения. Релиз read-only: схема БД не трогается, переиндексация не нужна, обратная совместимость сохранена.
