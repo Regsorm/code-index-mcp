@@ -23,17 +23,33 @@ const CODE_EXTENSIONS: &[(&str, &str)] = &[
     ("go", "go"),
     ("bsl", "bsl"),
     ("os", "bsl"),
+    ("html", "html"),
+    ("htm", "html"),
 ];
 
-/// Расширения текстовых файлов для полнотекстового поиска
+/// Расширения текстовых файлов для полнотекстового поиска.
+/// Внимание: `html`/`htm` ушли в CODE_EXTENSIONS (v0.7.1) — для них применяется
+/// AST-парсинг + дополнительная text-индексация (см. `is_dual_indexed_language`).
 const TEXT_EXTENSIONS: &[&str] = &[
     "md", "txt", "rst",
     "json", "yaml", "yml", "toml",
-    "xml", "html", "css",
+    "xml", "css",
     "c", "h", "cpp", "hpp", "cs", "rb", "php", "swift", "kt",
     "csv", "env", "ini", "cfg",
     "sql", "sh", "bat", "ps1",
 ];
+
+/// Языки, для которых при индексации делается «двойная вставка»: и
+/// AST-парсинг (functions/classes/imports/variables), и сохранение
+/// raw-content в `text_files` для FTS+regex+read_file.
+///
+/// Введено для HTML в v0.7.1: пользователи привыкли искать
+/// `search_text("...")` и `grep_text(...)` по html-файлам, новые
+/// structured queries (`get_class("cart")`, `find_symbol("submitOrder")`,
+/// `get_imports(module=...)`) добавляются сверху без регрессии.
+pub fn is_dual_indexed_language(language: &str) -> bool {
+    matches!(language, "html")
+}
 
 /// Директории, которые следует исключать при обходе
 pub const EXCLUDE_DIRS: &[&str] = &[
@@ -89,6 +105,22 @@ mod tests {
         assert_eq!(categorize_file(Path::new("config.toml")), FileCategory::Text);
         assert_eq!(categorize_file(Path::new("data.json")), FileCategory::Text);
         assert_eq!(categorize_file(Path::new("setup.cfg")), FileCategory::Text);
+    }
+
+    #[test]
+    fn html_is_code_with_dual_indexing() {
+        // v0.7.1: .html и .htm — code-категория с language=html, плюс
+        // отдельная пометка про дополнительную FTS-индексацию.
+        assert_eq!(
+            categorize_file(Path::new("index.html")),
+            FileCategory::Code("html".to_string())
+        );
+        assert_eq!(
+            categorize_file(Path::new("legacy.htm")),
+            FileCategory::Code("html".to_string())
+        );
+        assert!(is_dual_indexed_language("html"));
+        assert!(!is_dual_indexed_language("python"));
     }
 
     #[test]
