@@ -51,7 +51,12 @@ impl ParserRegistry {
         registry
     }
 
-    /// Создать реестр только с указанными языками
+    /// Создать реестр только с указанными языками.
+    ///
+    /// HTML регистрируется **всегда** дополнительно к указанному `language`
+    /// (HTML встречается в любом репо как шаблоны/ассеты — templates, generated
+    /// docs, sphinx-output, vue/svelte single-file-components и т.п. — но
+    /// никогда не указывается как «основной язык» репо в daemon.toml).
     pub fn from_languages(languages: &[String]) -> Self {
         let mut registry = Self { parsers: HashMap::new() };
         for lang in languages {
@@ -69,10 +74,12 @@ impl ParserRegistry {
                 "rust" => registry.register(Arc::new(rust_lang::RustParser::new())),
                 "go" => registry.register(Arc::new(go::GoParser::new())),
                 "bsl" => registry.register(Arc::new(bsl::BslParser::new())),
-                "html" => registry.register(Arc::new(html::HtmlParser::new())),
+                "html" => {} // ниже регистрируется безусловно
                 _ => {} // Неизвестный язык — пропускаем без ошибки
             }
         }
+        // HTML — универсальный ассет; всегда подгружаем (даже если не упомянут).
+        registry.register(Arc::new(html::HtmlParser::new()));
         registry
     }
 
