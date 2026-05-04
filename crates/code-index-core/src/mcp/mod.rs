@@ -289,12 +289,19 @@ impl CodeIndexServer {
         }
     }
 
-    /// Федеративный конструктор: принимает реестр из `federation::repos::merge`
-    /// и собственный IP. Для local-записей открывает SQLite read-only,
-    /// для remote-записей создаёт RepoEntry без storage/root_path.
+    /// Федеративный конструктор: принимает реестр из `federation::repos::merge`,
+    /// собственный IP, опциональный реестр процессоров и мапу local-aliases →
+    /// language (из daemon.toml). Для local-записей открывает SQLite read-only
+    /// и проставляет `RepoEntry.language` из `local_languages`, чтобы
+    /// `collect_active_languages` нашёл нужные языки и conditional registration
+    /// зарегистрировал extension-tools (`get_object_structure` и др.) в
+    /// `tools/list`. Для remote-записей storage/root_path/language=None —
+    /// они приходят через federation, активный язык по ним неизвестен.
     pub fn from_federated(
         repos: Vec<FederatedRepo>,
         own_ip: String,
+        registry: Option<ProcessorRegistry>,
+        local_languages: BTreeMap<String, String>,
     ) -> anyhow::Result<Self> {
         let mut map = BTreeMap::new();
         for repo in repos {
@@ -313,7 +320,7 @@ impl CodeIndexServer {
                     ip: repo.ip,
                     port: repo.port,
                     is_local: true,
-                    language: None,
+                    language: local_languages.get(&repo.alias).cloned(),
                 }
             } else {
                 RepoEntry {
@@ -328,14 +335,18 @@ impl CodeIndexServer {
             map.insert(repo.alias, entry);
         }
         let active_languages = collect_active_languages(&map);
+        let extension_tools = match registry.as_ref() {
+            Some(reg) => collect_extension_tools(&active_languages, reg),
+            None => Vec::new(),
+        };
         Ok(Self {
             repos: Arc::new(map),
             own_ip: Arc::new(own_ip),
             clients: Arc::new(RemoteClientPool::with_defaults()),
             tool_router: Self::tool_router(),
             active_languages: Arc::new(ArcSwap::from_pointee(active_languages)),
-            extension_tools: Arc::new(ArcSwap::from_pointee(Vec::new())),
-            registry: Arc::new(None),
+            extension_tools: Arc::new(ArcSwap::from_pointee(extension_tools)),
+            registry: Arc::new(registry),
             peer: Arc::new(Mutex::new(None)),
         })
     }

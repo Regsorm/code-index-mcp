@@ -474,10 +474,12 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     // На текущем этапе registry приходит только в Serve через
-    // `with_repos_and_registry`. Остальные команды (Index/Stats/...) её
-    // не используют. Чтобы не плодить копии, сохраняем в локальной
-    // переменной и тащим в Serve через замыкание ниже.
-    let registry = Some(registry);
+    // `with_repos_and_registry` или `from_federated`. Остальные команды
+    // (Index/Stats/...) её не используют. Чтобы не плодить копии,
+    // сохраняем в локальной переменной и тащим в Serve. `mut` нужен,
+    // чтобы федеративная ветка могла забрать registry через `take()`,
+    // не ломая компиляцию `match registry` в моно-ветке.
+    let mut registry = Some(registry);
 
     match cli.command {
         Commands::Serve { path, transport, host, port, config, serve_config } => {
@@ -543,15 +545,30 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                     aliases
                 );
 
-                // На этапе 2 federation-конструктор пока не принимает
-                // ProcessorRegistry — federation-репо могут быть remote
-                // и язык неизвестен на момент сборки. Активные tools
-                // подтягиваются через `reload_extensions` после первого
-                // file-watch-события на daemon.toml (см. этап 1.7).
-                // TODO(этап 2.1): расширить from_federated, чтобы он
-                // принимал registry и сразу учитывал local-репо с
-                // language в TOML.
-                let server = CodeIndexServer::from_federated(repos, serve_cfg.me.ip.clone())?;
+                // Этап 2.1: federation-конструктор принимает registry и
+                // мапу alias → language для local-репо из daemon.toml,
+                // чтобы extension-tools (`get_object_structure` и др.)
+                // регистрировались в `tools/list` сразу при старте,
+                // а не только после первого file-watch-события.
+                // remote-репо приходят без языка — для них tools
+                // зарегистрированы только если такой же язык уже активен
+                // у local-репо на этой ноде (что естественно для
+                // 1С-конфигураций, где BSL-репо есть и тут, и там).
+                let local_languages: std::collections::BTreeMap<String, String> = daemon_cfg
+                    .paths
+                    .iter()
+                    .filter_map(|p| {
+                        p.language
+                            .as_ref()
+                            .map(|lang| (p.effective_alias(), lang.clone()))
+                    })
+                    .collect();
+                let server = CodeIndexServer::from_federated(
+                    repos,
+                    serve_cfg.me.ip.clone(),
+                    registry.take(),
+                    local_languages,
+                )?;
                 let federate_router = federation::server::federate_router(server.clone());
                 let allowed = std::sync::Arc::new(federation::whitelist::build(&serve_cfg));
 
