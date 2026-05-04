@@ -3,6 +3,23 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.7.3] — 2026-05-04
+
+**Bug-fix**: extension-tools (`get_object_structure`, `get_form_handlers` и другие, поставляемые через `LanguageProcessor::additional_tools()`) **не регистрировались в `tools/list`** при работе сервера в федеративном режиме (`serve.toml` присутствует). У пользователей в моно-режиме всё было корректно.
+
+### Исправлено
+
+- **`CodeIndexServer::from_federated`** теперь принимает два дополнительных параметра: `registry: Option<ProcessorRegistry>` и `local_languages: BTreeMap<String, String>`. Реестр процессоров сохраняется в `Self.registry`, и сразу после построения карты репо вычисляется `extension_tools = collect_extension_tools(&active_languages, &reg)`. Раньше федеративный конструктор всегда инициализировал `extension_tools = Vec::new()` и `registry = None`, что обнуляло conditional registration на старте serve и при последующих `reload_extensions` (`registry_opt = None` → `new_tools = Vec::new()`).
+- **`local_languages` для federation**: мапа `alias → language` собирается из локального `daemon.toml` (`PathEntry::effective_alias()` + `PathEntry.language`) и проставляется в `RepoEntry.language` для **local-репо**. Без этого `collect_active_languages` не находил bsl/python/rust в federation-сценарии (federation::repos::merge возвращает FederatedRepo без поля language). Remote-репо через federation продолжают приходить без языка — для них extension-tools регистрируются только если такой же язык активен у local-репо на этой ноде.
+- **Поведенческое следствие**: на сборке `bsl-indexer` в federation-режиме `tools/list` теперь возвращает 22 инструмента вместо 17 — добавляются `find_path`, `get_event_subscriptions`, `get_form_handlers`, `get_object_structure`, `search_terms` (5 BSL-tools из `bsl-extension`).
+
+### Совместимость
+
+- **MCP API без изменений** — список tool-ов меняется только в federation-режиме сборки `bsl-indexer` при наличии хотя бы одного local-репо с `language = "bsl"` в `daemon.toml`. Клиенту это видно как штатный `notifications/tools/list_changed`.
+- **Schema БД без миграций.**
+- **Federation требует синхронного апгрейда обеих нод** — общий принцип v0.7.0+ остаётся (cross-node API не менялся, но полезный эффект достигается, только когда обе ноды собраны на 0.7.3).
+- Сигнатура `from_federated` изменена несовместимо. Внешних вызовов в публичном API code-index нет (использовалось только из `cli::run`), но если у вас есть приватный код с прямым вызовом — обновите его.
+
 ## [0.7.2] — 2026-04-29
 
 **Bug-fix к v0.7.1**: HTML-парсер не подхватывался в репо, у которых в `daemon.toml` явно указан `language="..."` (python/rust/bsl и т.п.). При попытке индексации `.html` файлов выдавалась ошибка `Нет парсера для расширения: html`.
