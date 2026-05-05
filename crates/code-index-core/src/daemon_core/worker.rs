@@ -21,7 +21,7 @@ use crate::storage::memory::StorageConfig;
 use crate::storage::Storage;
 use crate::watcher::{create_watcher, poll_batch, FileEvent, WatcherConfig};
 
-use super::config::PathEntry;
+use super::config::{IndexerSection, PathEntry};
 use super::ipc::{PathStatus, Progress};
 use super::state::DaemonState;
 
@@ -34,6 +34,7 @@ pub fn run_worker(
     state: DaemonState,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     initial_limiter: Option<Arc<Semaphore>>,
+    indexer_section: IndexerSection,
 ) {
     let path = match entry.path.canonicalize() {
         Ok(p) => p,
@@ -60,7 +61,7 @@ pub fn run_worker(
     let db_path = db_dir.join("index.db");
 
     // 2. Загрузить конфигурацию проекта (для exclude_dirs, debounce и т.п.)
-    let index_config = match IndexConfig::load(&path) {
+    let mut index_config = match IndexConfig::load(&path) {
         Ok(c) => c,
         Err(e) => {
             tokio_block_on(async {
@@ -71,6 +72,11 @@ pub fn run_worker(
             return;
         }
     };
+    // Phase 2 (v0.8.0): эффективный лимит для file_contents.
+    // Приоритет: per-path (`[[paths]].max_code_file_size_bytes`) →
+    // глобальный `[indexer].max_code_file_size_bytes` → hardcoded 5 МБ.
+    // Перетираем дефолт IndexConfig — переоформленные правила сильнее JSON-конфига проекта.
+    index_config.max_code_file_size_bytes = entry.effective_max_code_file_size(&indexer_section);
     let storage_config = StorageConfig {
         mode: index_config.storage_mode.clone(),
         memory_max_percent: index_config.memory_max_percent,
@@ -225,6 +231,9 @@ pub fn run_worker(
         path.display(), debounce_ms, batch_ms);
 
     let registry = ParserRegistry::from_languages(&index_config.languages);
+    // Эффективный лимит для file_contents — пробросим в apply_event,
+    // чтобы Indexer::with_config не пересоздавался на каждое событие.
+    let max_code_file_size = index_config.max_code_file_size_bytes;
 
     // Основной цикл обработки батчей. Idle-таймаут 500 мс даёт шанс проверить
     // shutdown-сигнал даже если файлов давно не меняли.
@@ -264,7 +273,7 @@ pub fn run_worker(
         let mut done = 0usize;
         let batch_len = batch.len();
         for event in &batch {
-            apply_event(&mut storage, &path, event, &registry);
+            apply_event(&mut storage, &path, event, &registry, max_code_file_size);
             done += 1;
             if done % 50 == 0 || done == batch_len {
                 tokio_block_on(async {
@@ -325,6 +334,7 @@ fn apply_event(
     root: &PathBuf,
     event: &FileEvent,
     registry: &ParserRegistry,
+    max_code_file_size: usize,
 ) {
     match event {
         FileEvent::Modified(abs) | FileEvent::Created(abs) => {
@@ -368,7 +378,13 @@ fn apply_event(
                     if let Some(parser) = registry.get_parser(&ext) {
                         match parser.parse(&content, &rel_path) {
                             Ok(pr) => {
-                                let indexer = Indexer::new(storage);
+                                let indexer = Indexer::with_config(
+                                    storage,
+                                    IndexConfig {
+                                        max_code_file_size_bytes: max_code_file_size,
+                                        ..IndexConfig::default()
+                                    },
+                                );
                                 // v0.7.1: для html (и других dual-indexed языков) дополнительно пишем
                                 // raw-content в text_files — чтобы search_text/grep_text/read_file
                                 // продолжали работать как для обычного text-файла.
@@ -388,6 +404,7 @@ fn apply_event(
                                     mtime,
                                     file_size,
                                     text_for_fts,
+                                    Some(content.as_str()),
                                 ) {
                                     eprintln!("[worker:{}] write_code {}: {}",
                                         root.display(), rel_path, e);
@@ -411,7 +428,13 @@ fn apply_event(
                                 || !pr.classes.is_empty()
                                 || !pr.variables.is_empty()
                             {
-                                let indexer = Indexer::new(storage);
+                                let indexer = Indexer::with_config(
+                                    storage,
+                                    IndexConfig {
+                                        max_code_file_size_bytes: max_code_file_size,
+                                        ..IndexConfig::default()
+                                    },
+                                );
                                 indexer
                                     .write_code_to_db(
                                         &rel_path,
@@ -424,6 +447,7 @@ fn apply_event(
                                         mtime,
                                         file_size,
                                         None,
+                                        Some(content.as_str()),
                                     )
                                     .is_ok()
                             } else {

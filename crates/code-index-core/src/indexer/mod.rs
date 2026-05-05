@@ -52,6 +52,10 @@ pub enum ParsedFile {
         /// для дополнительной записи в text_files (FTS+regex+read_file).
         /// Для остальных языков — None.
         text_for_fts: Option<String>,
+        /// Phase 2 (v0.8.0): исходный content для записи в `file_contents`
+        /// с zstd-сжатием. Хранится здесь, а не вычисляется на лету, потому
+        /// что после parse-этапа исходный буфер `candidate_files` теряется.
+        raw_content: String,
     },
     /// Текстовый файл (без AST)
     Text {
@@ -195,6 +199,7 @@ impl<'a> Indexer<'a> {
                                         } else {
                                             None
                                         },
+                                        raw_content: content.clone(),
                                     },
                                     Err(e) => ParsedFile::Error {
                                         rel_path: rel_path.clone(),
@@ -231,6 +236,7 @@ impl<'a> Indexer<'a> {
                                         mtime: *mtime,
                                         file_size: *file_size,
                                         text_for_fts: None,
+                                        raw_content: content.clone(),
                                     };
                                 }
                             }
@@ -286,6 +292,7 @@ impl<'a> Indexer<'a> {
                     mtime,
                     file_size,
                     text_for_fts,
+                    raw_content,
                 } => {
                     match self.write_code_to_db(
                         rel_path,
@@ -298,6 +305,7 @@ impl<'a> Indexer<'a> {
                         Some(*mtime),
                         Some(*file_size),
                         text_for_fts.as_deref(),
+                        Some(raw_content.as_str()),
                     ) {
                         Ok(_) => {
                             result.files_indexed += 1;
@@ -344,7 +352,7 @@ impl<'a> Indexer<'a> {
         let write_ms = write_start.elapsed().as_millis();
         eprintln!("[timing] Запись в БД: {} мс ({} файлов)", write_ms, result.files_indexed);
 
-        // Обновляем mtime/file_size для файлов с неизменённым содержимым
+        // Обновляем mtime/file_size для файлов с неизменённым содержимым.
         if !metadata_updates.is_empty() {
             self.storage.begin_batch()?;
             for (path, mtime, file_size) in &metadata_updates {
@@ -381,6 +389,63 @@ impl<'a> Indexer<'a> {
             eprintln!("[timing] Удаление устаревших: {} мс ({} файлов)", cleanup_ms, result.files_deleted);
         }
 
+        // ── Этап 6: Phase 2 backfill для file_contents ──────────────────────
+        // Отдельная фаза от write-step — она работает только для файлов,
+        // у которых hash изменился (write_code_to_db уже вызвал upsert_file_content).
+        // Здесь же добиваем все остальные code-файлы (mtime+hash тот же, в files
+        // запись есть, но file_contents для них пуст). Это типичная ситуация
+        // первого запуска v0.8.0 на БД от v0.7.x: файлы стабильны, никто не
+        // зашёл в write_code_to_db, и backfill делает однократный обход.
+        //
+        // Промежуточные commit'ы каждые batch_size строк — иначе на 90K-репо
+        // WAL раздуется до многих ГБ.
+        let backfill_candidates = self.storage.list_code_files_without_content()?;
+        if !backfill_candidates.is_empty() {
+            let backfill_start = std::time::Instant::now();
+            let mut backfilled = 0usize;
+            let mut backfill_errors = 0usize;
+            let mut in_batch = 0usize;
+            let backfill_batch_size = self.config.batch_size.max(500);
+            self.storage.begin_batch()?;
+            for (file_id, path) in &backfill_candidates {
+                let abs = root.join(path);
+                match std::fs::read_to_string(&abs) {
+                    Ok(content) => {
+                        match self.storage.upsert_file_content(
+                            *file_id,
+                            &content,
+                            self.config.max_code_file_size_bytes,
+                        ) {
+                            Ok(_) => backfilled += 1,
+                            Err(e) => {
+                                eprintln!("[backfill] upsert_file_content {}: {}", path, e);
+                                backfill_errors += 1;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Файл нечитаемый — пропускаем тихо.
+                        backfill_errors += 1;
+                    }
+                }
+                in_batch += 1;
+                if in_batch >= backfill_batch_size {
+                    self.storage.commit_batch()?;
+                    self.storage.begin_batch()?;
+                    in_batch = 0;
+                }
+            }
+            self.storage.commit_batch()?;
+            let backfill_ms = backfill_start.elapsed().as_millis();
+            eprintln!(
+                "[timing] file_contents backfill: {} мс ({} наполнено из {} кандидатов, {} ошибок)",
+                backfill_ms,
+                backfilled,
+                backfill_candidates.len(),
+                backfill_errors
+            );
+        }
+
         result.elapsed_ms = start.elapsed().as_millis() as u64;
         eprintln!("[timing] Итого: {} мс", result.elapsed_ms);
         Ok(result)
@@ -388,6 +453,10 @@ impl<'a> Indexer<'a> {
 
     /// Записать код-файл в БД: метаданные + символы (функции, классы, импорты и т.д.)
     /// skip_delete: при первичной индексации пропускать DELETE (БД пуста, удалять нечего)
+    /// raw_content: Phase 2 (v0.8.0). Если задан — content сохраняется в `file_contents`
+    /// с zstd-сжатием. Файлы крупнее `config.max_code_file_size_bytes` получают
+    /// «oversize»-запись (см. `Storage::upsert_file_content`). `None` отключает
+    /// сохранение (используется в тестах и местах, где content недоступен).
     pub fn write_code_to_db(
         &self,
         rel_path: &str,
@@ -402,6 +471,8 @@ impl<'a> Indexer<'a> {
         // Для языков с двойной индексацией (html в v0.7.1) — raw-content,
         // который дополнительно записывается в text_files. Для остальных — None.
         text_for_fts: Option<&str>,
+        // Phase 2: исходный content для записи в `file_contents` (zstd).
+        raw_content: Option<&str>,
     ) -> Result<()> {
         // Сохраняем запись о файле
         let file_record = FileRecord {
@@ -529,6 +600,13 @@ impl<'a> Indexer<'a> {
                 file_id,
                 content: content.to_string(),
             })?;
+        }
+
+        // Phase 2: сохраняем исходный content в `file_contents` (zstd).
+        // Файлы крупнее `max_code_file_size_bytes` получают oversize-запись (без blob).
+        if let Some(raw) = raw_content {
+            self.storage
+                .upsert_file_content(file_id, raw, self.config.max_code_file_size_bytes)?;
         }
 
         Ok(())

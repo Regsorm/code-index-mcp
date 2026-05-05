@@ -201,6 +201,20 @@ pub struct GrepTextParams {
     pub context_lines: Option<usize>,
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GrepCodeParams {
+    pub repo: String,
+    /// Регулярное выражение (синтаксис crate `regex`).
+    pub regex: String,
+    /// Glob по path. Хотя бы один из {path_glob, language} желателен —
+    /// иначе full-scan по всем code-файлам репо (zstd-decode каждого) дорогой.
+    pub path_glob: Option<String>,
+    pub language: Option<String>,
+    pub limit: Option<usize>,
+    /// Сколько строк до/после совпадения возвращать в `context`. 0 — без контекста.
+    pub context_lines: Option<usize>,
+}
+
 // ── Сервер ───────────────────────────────────────────────────────────────────
 
 /// Read-only MCP-сервер индексатора. Держит N открытых репозиториев
@@ -704,6 +718,17 @@ impl CodeIndexServer {
             ).await;
         }
         tools::grep_text(entry, p.regex, p.path_glob, p.language, p.limit, p.context_lines).await
+    }
+
+    #[tool(description = "Regex-поиск по содержимому **code-файлов** (Phase 2, v0.8.0): module-level код, идентификаторы, комментарии вне тел, макросы, use-импорты — всё что не ловит grep_body. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла). Файлы oversize=true пропускаются. Возвращает JSON-массив [{path, line, content, context}].")]
+    async fn grep_code(&self, Parameters(p): Parameters<GrepCodeParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "grep_code", &p,
+            ).await;
+        }
+        tools::grep_code(entry, p.regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
     #[tool(description = "Проверка живости MCP-сервера и демона индексации по всем подключённым репо. Возвращает JSON.")]

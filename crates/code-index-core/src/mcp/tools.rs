@@ -562,6 +562,10 @@ pub async fn read_file(
         READ_FILE_SOFT_CAP_LINES,
         READ_FILE_SOFT_CAP_BYTES,
         READ_FILE_HARD_CAP_BYTES,
+        // size_limit_bytes для hint в oversize-ответе. MCP-слой не знает per-repo
+        // лимит daemon'а — передаём None, hint будет короткий «файл превышает лимит».
+        // file_size в ответе всё равно показывается, оператор может сравнить.
+        None,
     ) {
         Ok(Some(r)) => to_json(&r),
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден в индексе\"}}", path),
@@ -597,6 +601,45 @@ pub async fn grep_text(
     ) {
         Ok(r) => to_json(&r),
         Err(e) => format!("{{\"error\": \"grep_text: {}\"}}", e),
+    }
+}
+
+/// grep_code (Phase 2, v0.8.0): regex-поиск по содержимому **code-файлов** через
+/// `file_contents` (zstd). Закрывает слепые зоны `grep_body` (ищет только в телах
+/// функций/классов): module-level код, имена символов как идентификаторы,
+/// комментарии вне тел, макросы, use-импорты. Файлы с `oversize=true` пропускаются —
+/// для них нет content в индексе, нужно увеличить `max_code_file_size_bytes` либо
+/// читать с диска.
+pub async fn grep_code(
+    entry: &RepoEntry,
+    regex: String,
+    path_glob: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+    context_lines: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = entry.local_storage().lock().await;
+    let want = limit.unwrap_or_else(|| {
+        // Без path_glob/language full-scan по всему репо может быть тяжёлым:
+        // distinct от grep_text здесь сильнее, потому что zstd-decode на каждый
+        // файл — full-scan на 100K файлов реально дорогой. Занижаем default.
+        if path_glob.is_none() && language.is_none() {
+            GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT
+        } else {
+            500
+        }
+    });
+    match storage.grep_code_filtered(
+        &regex,
+        path_glob.as_deref(),
+        language.as_deref(),
+        want,
+        context_lines.unwrap_or(0),
+        GREP_TOTAL_BYTES_CAP,
+    ) {
+        Ok(r) => to_json(&r),
+        Err(e) => format!("{{\"error\": \"grep_code: {}\"}}", e),
     }
 }
 

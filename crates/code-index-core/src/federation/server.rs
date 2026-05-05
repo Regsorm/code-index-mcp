@@ -20,9 +20,9 @@ use axum::{
 };
 
 use crate::mcp::{
-    tools, CodeIndexServer, FilePathParams, FunctionNameParams, GrepBodyParams, GrepTextParams,
-    ImportParams, ListFilesParams, NameParams, ReadFileParams, RepoEntry, SearchParams,
-    StatFileParams, StatsParams,
+    tools, CodeIndexServer, FilePathParams, FunctionNameParams, GrepBodyParams, GrepCodeParams,
+    GrepTextParams, ImportParams, ListFilesParams, NameParams, ReadFileParams, RepoEntry,
+    SearchParams, StatFileParams, StatsParams,
 };
 
 use super::dispatcher::federation_error;
@@ -50,6 +50,8 @@ pub fn federate_router(server: CodeIndexServer) -> Router {
         .route("/federate/list_files", post(handle_list_files))
         .route("/federate/read_file", post(handle_read_file))
         .route("/federate/grep_text", post(handle_grep_text))
+        // Phase 2 (v0.8.0)
+        .route("/federate/grep_code", post(handle_grep_code))
         .with_state(Arc::new(server))
 }
 
@@ -323,6 +325,27 @@ async fn handle_grep_text(
     };
     ok_json(
         tools::grep_text(
+            entry,
+            p.regex,
+            p.path_glob,
+            p.language,
+            p.limit,
+            p.context_lines,
+        )
+        .await,
+    )
+}
+
+async fn handle_grep_code(
+    State(server): State<Server>,
+    Json(p): Json<GrepCodeParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "grep_code") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(
+        tools::grep_code(
             entry,
             p.regex,
             p.path_glob,

@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Semaphore};
 
 use super::commands::{self, DaemonCommand};
-use super::config::{self, PathEntry};
+use super::config::{self, IndexerSection, PathEntry};
 use super::ipc::{ReloadResponse, RuntimeInfo, StopResponse};
 use super::language_detect;
 use super::lock;
@@ -99,6 +99,7 @@ pub async fn run() -> Result<()> {
     daemon_state.apply_config(&wanted_canon).await;
 
     let mut workers: HashMap<PathBuf, tokio::task::JoinHandle<()>> = HashMap::new();
+    let indexer_section = cfg.indexer.clone();
     for entry in cfg.paths.into_iter() {
         let canonical = entry
             .path
@@ -109,6 +110,7 @@ pub async fn run() -> Result<()> {
             daemon_state.clone(),
             shutdown_tx.subscribe(),
             initial_limiter.clone(),
+            indexer_section.clone(),
         );
         workers.insert(canonical, handle);
     }
@@ -161,9 +163,10 @@ fn spawn_worker(
     state: DaemonState,
     shutdown_rx: broadcast::Receiver<()>,
     initial_limiter: Option<Arc<Semaphore>>,
+    indexer_section: IndexerSection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        worker::run_worker(entry, state, shutdown_rx, initial_limiter);
+        worker::run_worker(entry, state, shutdown_rx, initial_limiter, indexer_section);
     })
 }
 
@@ -202,6 +205,7 @@ async fn handle_reload(
     } else {
         Some(Arc::new(Semaphore::new(cfg.daemon.max_concurrent_initial)))
     };
+    let indexer_section = cfg.indexer.clone();
     for entry in cfg.paths.into_iter() {
         let canonical = entry
             .path
@@ -213,6 +217,7 @@ async fn handle_reload(
                 state.clone(),
                 shutdown_tx.subscribe(),
                 limiter.clone(),
+                indexer_section.clone(),
             );
             workers.insert(canonical, handle);
         }
