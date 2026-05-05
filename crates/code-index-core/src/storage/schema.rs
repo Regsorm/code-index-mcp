@@ -205,6 +205,7 @@ pub fn initialize_tables_only(conn: &rusqlite::Connection) -> rusqlite::Result<(
     conn.execute_batch(SQL_SCHEMA)?;
     migrate_v2(conn)?;
     migrate_v3(conn)?;
+    migrate_v4(conn)?;
     Ok(())
 }
 
@@ -230,6 +231,7 @@ pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SQL_SCHEMA)?;
     migrate_v2(conn)?;
     migrate_v3(conn)?;
+    migrate_v4(conn)?;
     // Создаём триггеры
     conn.execute_batch(TRIGGERS_SQL)?;
     // Создаём индексы
@@ -273,6 +275,28 @@ pub fn migrate_v3(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
              ALTER TABLE files ADD COLUMN file_size INTEGER;",
         )?;
     }
+    Ok(())
+}
+
+/// Миграция v4 (Phase 2): таблица `file_contents` для хранения сжатого content
+/// code-файлов (.py/.bsl/.rs/.ts и т.п.). Text-файлы продолжают жить в `text_files`.
+///
+/// Структура:
+///   * `file_id`      — PK, FK на `files(id)` с каскадным удалением.
+///   * `content_blob` — содержимое, сжатое zstd. NULL для oversize-файлов.
+///   * `oversize`     — 0/1 флаг: файл превышает `max_code_file_size_bytes` и не сохранён.
+///
+/// Зачем oversize-флаг отдельно: позволяет отличить «backfill ещё не дошёл до этого
+/// файла» (записи нет) от «файл больше лимита, content намеренно не сохранён»
+/// (запись есть, oversize=1, blob=NULL).
+pub fn migrate_v4(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_contents (
+            file_id      INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            content_blob BLOB,
+            oversize     INTEGER NOT NULL DEFAULT 0
+         );",
+    )?;
     Ok(())
 }
 

@@ -144,6 +144,7 @@ pub struct ContextLine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFileResult {
     /// Содержимое (плоский текст с переносами строк).
+    /// Для oversize-файлов — пустая строка (см. `oversize`).
     pub content: String,
     /// Сколько строк реально вернулось.
     pub lines_returned: usize,
@@ -154,9 +155,33 @@ pub struct ReadFileResult {
     /// ISO-время последней индексации (для контроля свежести).
     pub indexed_at: String,
     /// Категория файла: "text" — содержимое из БД доступно;
-    /// "code" — содержимое не хранится в Phase 1 (вернётся пустая строка).
+    /// "code" — content из `file_contents` (Phase 2). Если v0.8.0 ещё не
+    /// успел сделать backfill для этого файла — content пуст и `oversize=false`.
     pub category: String,
+    /// `true` — файл превышает `max_code_file_size_bytes`, content
+    /// намеренно не сохранён в индексе. Используйте `get_function`/
+    /// `get_class`/`grep_body` для целевого чтения, либо читайте файл
+    /// напрямую с диска.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub oversize: bool,
+    /// Размер файла в байтах (если известен из таблицы `files`).
+    /// Полезно вместе с `oversize=true` для понимания насколько файл велик.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<i64>,
+    /// Эффективный лимит, по которому был принят `oversize` для этого репо
+    /// (per-path > [indexer] > hardcoded 5 МБ). Помогает оператору быстро
+    /// понять, нужно ли увеличивать лимит в `daemon.toml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_limit: Option<i64>,
+    /// Человекочитаемая подсказка вызывающей стороне. Заполняется только
+    /// для `oversize=true` либо когда content code-файла ещё не наполнен
+    /// (backfill в процессе).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
+
+#[inline]
+fn is_false(b: &bool) -> bool { !*b }
 
 /// Запись из `list_files` — метаданные файла без полей хеша.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,9 +210,15 @@ pub struct StatFileResult {
     pub content_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexed_at: Option<String>,
-    /// Доступен ли content через `read_file` ("text" — да, "code" — нет в Phase 1).
+    /// Доступен ли content через `read_file`:
+    ///   * `"text"` — да, из `text_files`.
+    ///   * `"code"` — да, из `file_contents` (Phase 2). См. `oversize`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// `true` — файл превышает лимит и content не сохранён в индексе.
+    /// Поле появляется только для code-файлов (Phase 2) — для text всегда отсутствует.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oversize: Option<bool>,
 }
 
 /// Один матч `grep_text` — строка в text-файле, удовлетворяющая regex.

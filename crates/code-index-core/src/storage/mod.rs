@@ -451,6 +451,292 @@ impl Storage {
         Ok(())
     }
 
+    // ── file_contents (Phase 2): хранение content code-файлов с zstd-сжатием ──
+    //
+    // Для text-файлов content живёт в `text_files.content` (без сжатия — нужен
+    // для FTS5). Для code-файлов (.py/.bsl/.rs/...) — в `file_contents.content_blob`
+    // с zstd-сжатием. Файлы крупнее лимита получают `oversize=1`, `content_blob=NULL`.
+    //
+    // Различие "записи нет" vs "запись с oversize=1" важно:
+    //   * нет записи → backfill ещё не дошёл (переходное состояние v0.7.x → 0.8.0)
+    //   * запись с oversize=1 → файл намеренно пропущен из-за лимита
+
+    /// zstd-уровень сжатия для file_contents. 3 — стандартный баланс
+    /// скорости и коэффициента (~5× для текстового кода).
+    const FILE_CONTENTS_ZSTD_LEVEL: i32 = 3;
+
+    /// Максимальный размер разжатого buffer'а из `file_contents.content_blob`.
+    /// Защита от zstd-bomb: вредоносный или повреждённый blob не сможет
+    /// аллоцировать произвольно много RAM. 256 МБ — заведомо больше любого
+    /// валидного code-файла (lim_max = 5 МБ default × 5× компрессия = 25 МБ;
+    /// даже если оператор поднял `max_code_file_size_bytes` до 50 МБ,
+    /// 256 МБ остаётся комфортным запасом).
+    const FILE_CONTENTS_MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+
+    /// Безопасный zstd-decode с лимитом на размер выходного буфера.
+    /// Использует stream-decoder с `io::Read::take(limit)` — если разжатый
+    /// размер превысит лимит, `read_to_end` остановится; затем мы сверяем
+    /// фактический размер с лимитом и возвращаем ошибку, если совпало
+    /// (значит decode был усечён — потенциальная zstd-bomb).
+    fn decode_zstd_safe(blob: &[u8]) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let mut decoder = zstd::stream::read::Decoder::new(blob)
+            .context("decode_zstd_safe: открыть zstd-decoder")?;
+        let mut out = Vec::new();
+        let limit = Self::FILE_CONTENTS_MAX_DECOMPRESSED_BYTES as u64;
+        // take(limit + 1) — читаем на 1 байт больше, чтобы отличить
+        // «разжалось ровно в limit» (валидно) от «разжалось больше limit»
+        // (zstd-bomb: данные ещё были, но мы остановились).
+        let read = (&mut decoder).take(limit + 1).read_to_end(&mut out)
+            .context("decode_zstd_safe: чтение разжатого потока")?;
+        if read as u64 > limit {
+            anyhow::bail!(
+                "decode_zstd_safe: разжатый размер превысил лимит {} байт (zstd-bomb?)",
+                Self::FILE_CONTENTS_MAX_DECOMPRESSED_BYTES
+            );
+        }
+        Ok(out)
+    }
+
+    /// Сохранить content code-файла в `file_contents` с zstd-сжатием.
+    /// Если `content.len() > max_size_bytes` — записывается «oversize»-запись
+    /// с `content_blob=NULL`. Idempotent через `INSERT OR REPLACE`.
+    pub fn upsert_file_content(
+        &self,
+        file_id: i64,
+        content: &str,
+        max_size_bytes: usize,
+    ) -> Result<()> {
+        if content.len() > max_size_bytes {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO file_contents (file_id, content_blob, oversize)
+                     VALUES (?1, NULL, 1)",
+                    params![file_id],
+                )
+                .context("upsert_file_content: INSERT oversize")?;
+            return Ok(());
+        }
+        let blob = zstd::encode_all(content.as_bytes(), Self::FILE_CONTENTS_ZSTD_LEVEL)
+            .context("upsert_file_content: zstd encode")?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO file_contents (file_id, content_blob, oversize)
+                 VALUES (?1, ?2, 0)",
+                params![file_id, blob],
+            )
+            .context("upsert_file_content: INSERT blob")?;
+        Ok(())
+    }
+
+    /// Получить только id файла по пути. Лёгкая альтернатива `get_file_by_path`,
+    /// когда нужен только PK (например, в backfill `file_contents`).
+    pub fn get_file_id_by_path(&self, path: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM files WHERE path = ?1",
+                params![path],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .context("get_file_id_by_path")
+    }
+
+    /// Список code-файлов, у которых нет записи в `file_contents` И нет записи
+    /// в `text_files` (т.е. это code-файлы, которым нужен backfill после
+    /// миграции v0.7.x → v0.8.0). Возвращает `(file_id, path)`-пары, отсортированные
+    /// по пути. Используется отдельной фазой backfill в `full_reindex` —
+    /// независимо от того, изменился ли mtime файла.
+    pub fn list_code_files_without_content(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT fi.id, fi.path
+             FROM files fi
+             WHERE fi.id NOT IN (SELECT file_id FROM file_contents)
+               AND fi.id NOT IN (SELECT file_id FROM text_files)
+             ORDER BY fi.path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Есть ли запись в `text_files` для file_id. Используется backfill'ом
+    /// `file_contents`, чтобы пропускать text-файлы (их content уже в text_files).
+    pub fn has_text_file(&self, file_id: i64) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM text_files WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get(0),
+            )
+            .context("has_text_file")?;
+        Ok(n > 0)
+    }
+
+    /// Удалить запись `file_contents` (на случай удаления файла без CASCADE).
+    /// При штатной работе срабатывает `ON DELETE CASCADE` — этот метод нужен
+    /// только для явного контроля.
+    pub fn delete_file_content(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM file_contents WHERE file_id = ?1", params![file_id])
+            .context("delete_file_content")?;
+        Ok(())
+    }
+
+    /// Есть ли запись в `file_contents` для file_id (любого вида — содержательная
+    /// или oversize). Используется backfill'ом, чтобы пропускать уже обработанные.
+    pub fn has_file_content(&self, file_id: i64) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_contents WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get(0),
+            )
+            .context("has_file_content")?;
+        Ok(n > 0)
+    }
+
+    /// Прочитать content code-файла и oversize-флаг.
+    /// Возвращает:
+    ///   * `None` — записи нет (backfill ещё не дошёл, переходное состояние).
+    ///   * `Some((Some(content), false))` — нормальная запись, content разжат из zstd.
+    ///   * `Some((None, true))` — файл oversize, content намеренно не сохранён.
+    pub fn read_file_content(&self, file_id: i64) -> Result<Option<(Option<String>, bool)>> {
+        let row: Option<(Option<Vec<u8>>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT content_blob, oversize FROM file_contents WHERE file_id = ?1",
+                params![file_id],
+                |r| Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .context("read_file_content: SELECT")?;
+        let Some((blob_opt, oversize_int)) = row else {
+            return Ok(None);
+        };
+        let oversize = oversize_int != 0;
+        let content_opt = match blob_opt {
+            None => None, // oversize-запись или повреждённая (oversize=0, blob=NULL — не должно случаться)
+            Some(blob) => {
+                let bytes = Self::decode_zstd_safe(&blob)
+                    .context("read_file_content: zstd decode")?;
+                let text = String::from_utf8(bytes)
+                    .context("read_file_content: UTF-8 из zstd-blob")?;
+                Some(text)
+            }
+        };
+        Ok(Some((content_opt, oversize)))
+    }
+
+    /// grep_code: regex-поиск по содержимому **code-файлов** через `file_contents`.
+    /// Содержимое хранится сжатым zstd, поэтому SQL делает только pre-filter
+    /// по path_glob/language; сам regex применяется к разжатому тексту в Rust.
+    /// Файлы oversize=1 (без content) пропускаются.
+    ///
+    /// Параметры идентичны `grep_text_filtered` для совместимости в MCP-слое.
+    pub fn grep_code_filtered(
+        &self,
+        regex_pattern: &str,
+        path_glob: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+        context_lines: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<GrepTextMatch>> {
+        let compiled = regex::Regex::new(regex_pattern)
+            .context("grep_code: невалидный regex")?;
+
+        let mut conds: Vec<String> = vec![
+            "fc.oversize = 0".to_string(),
+            "fc.content_blob IS NOT NULL".to_string(),
+        ];
+        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(g) = path_glob {
+            conds.push("fi.path GLOB ?".to_string());
+            params_dyn.push(Box::new(normalize_glob(g)));
+        }
+        if let Some(l) = language {
+            conds.push("fi.language = ?".to_string());
+            params_dyn.push(Box::new(l.to_string()));
+        }
+        let sql = format!(
+            "SELECT fi.path, fc.content_blob
+             FROM file_contents fc
+             JOIN files fi ON fi.id = fc.file_id
+             WHERE {}
+             ORDER BY fi.path",
+            conds.join(" AND ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+
+        let candidate_rows: Vec<(String, Vec<u8>)> = stmt
+            .query_map(params_refs.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut results: Vec<GrepTextMatch> = Vec::new();
+        let mut total_bytes: usize = 0;
+        for (path, blob) in candidate_rows {
+            // Безопасный decode zstd с лимитом размера (защита от zstd-bomb).
+            // Битые blob'ы или превышение лимита пропускаем — не валим весь поиск.
+            let bytes = match Self::decode_zstd_safe(&blob) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let content = match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Быстрый отказ: если в файле нет ни одного совпадения — не
+            // тратим время на построчный обход.
+            if !compiled.is_match(&content) {
+                continue;
+            }
+            let lines: Vec<&str> = content.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !compiled.is_match(line) {
+                    continue;
+                }
+                let line_no = i + 1;
+                let context = if context_lines > 0 {
+                    let from = i.saturating_sub(context_lines);
+                    let to = (i + context_lines + 1).min(lines.len());
+                    (from..to)
+                        .map(|j| ContextLine {
+                            line: j + 1,
+                            content: lines[j].to_string(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let row_bytes = line.len()
+                    + context.iter().map(|c| c.content.len()).sum::<usize>()
+                    + path.len();
+                total_bytes = total_bytes.saturating_add(row_bytes);
+                if total_bytes > max_total_bytes {
+                    return Ok(results);
+                }
+                results.push(GrepTextMatch {
+                    path: path.clone(),
+                    line: line_no,
+                    content: line.to_string(),
+                    context,
+                });
+                if results.len() >= limit {
+                    return Ok(results);
+                }
+            }
+        }
+        Ok(results)
+    }
+
     // ── Поисковые запросы ────────────────────────────────────────────────────
 
     /// Полнотекстовый поиск функций через FTS5
@@ -982,9 +1268,11 @@ impl Storage {
                 content_hash: None,
                 indexed_at: None,
                 category: None,
+                oversize: None,
             }),
             Some((language, hash, lines_total, indexed_at, mtime, size, path_db)) => {
-                // Категория: text — content есть в text_files, code — нет (Phase 1)
+                // Категория: text — content есть в text_files, code — content в file_contents
+                // (Phase 2). Для code дополнительно вытаскиваем oversize-флаг из file_contents.
                 let has_text: i64 = self
                     .conn
                     .query_row(
@@ -996,6 +1284,25 @@ impl Storage {
                     )
                     .context("stat_file_meta: проверка text_files")?;
                 let category = if has_text > 0 { "text" } else { "code" };
+
+                // oversize актуален только для code-файлов (для text всегда None).
+                let oversize_opt = if category == "code" {
+                    let oversize_int: Option<i64> = self
+                        .conn
+                        .query_row(
+                            "SELECT oversize FROM file_contents fc
+                             JOIN files fi ON fi.id = fc.file_id
+                             WHERE fi.path = ?1",
+                            params![path_db],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .context("stat_file_meta: проверка file_contents")?;
+                    oversize_int.map(|i| i != 0)
+                } else {
+                    None
+                };
+
                 Ok(StatFileResult {
                     exists: true,
                     path: path_db,
@@ -1006,6 +1313,7 @@ impl Storage {
                     content_hash: Some(hash),
                     indexed_at: Some(indexed_at),
                     category: Some(category.to_string()),
+                    oversize: oversize_opt,
                 })
             }
         }
@@ -1082,31 +1390,35 @@ impl Storage {
         soft_cap_lines: usize,
         soft_cap_bytes: usize,
         hard_cap_bytes: usize,
+        // Эффективный лимит размера code-файла для этого репо (per-path > [indexer] > 5 МБ).
+        // Используется только для заполнения `size_limit` и `hint` в oversize-ответе.
+        // None — поля останутся пустыми (например, в тестах или для text-файлов).
+        size_limit_bytes: Option<i64>,
     ) -> Result<Option<ReadFileResult>> {
-        // Сначала ищем файл в files
-        let meta: Option<(i64, i64, String, String)> = self
+        // Сначала ищем файл в files (берём id, lines_total, indexed_at, file_size)
+        let meta: Option<(i64, i64, String, Option<i64>)> = self
             .conn
             .query_row(
-                "SELECT id, lines_total, indexed_at, language FROM files WHERE path = ?1",
+                "SELECT id, lines_total, indexed_at, file_size FROM files WHERE path = ?1",
                 params![path],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
                         r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<i64>>(3)?,
                     ))
                 },
             )
             .optional()
             .context("read_file_text: ошибка SELECT files")?;
 
-        let Some((file_id, lines_total_i, indexed_at, _language)) = meta else {
+        let Some((file_id, lines_total_i, indexed_at, file_size)) = meta else {
             return Ok(None);
         };
         let lines_total = lines_total_i as usize;
 
-        // Пытаемся прочитать содержимое из text_files
+        // Пытаемся прочитать содержимое из text_files (для yaml/md/xml/sh и т.п.)
         let content_opt: Option<String> = self
             .conn
             .query_row(
@@ -1117,36 +1429,127 @@ impl Storage {
             .optional()
             .context("read_file_text: ошибка SELECT text_files")?;
 
-        let Some(content) = content_opt else {
-            // Code-файл — content не хранится в Phase 1
+        if let Some(content) = content_opt {
+            let (sliced, lines_returned, truncated) = slice_with_caps(
+                &content,
+                line_start,
+                line_end,
+                soft_cap_lines,
+                soft_cap_bytes,
+                hard_cap_bytes,
+            )?;
             return Ok(Some(ReadFileResult {
-                content: String::new(),
-                lines_returned: 0,
+                content: sliced,
+                lines_returned,
                 lines_total,
-                truncated: false,
+                truncated,
                 indexed_at,
-                category: "code".to_string(),
+                category: "text".to_string(),
+                oversize: false,
+                file_size,
+                size_limit: None,
+                hint: None,
             }));
-        };
+        }
 
-        // Слайсим по диапазону строк, потом применяем soft/hard cap
-        let (sliced, lines_returned, truncated) = slice_with_caps(
-            &content,
-            line_start,
-            line_end,
-            soft_cap_lines,
-            soft_cap_bytes,
-            hard_cap_bytes,
-        )?;
-
-        Ok(Some(ReadFileResult {
-            content: sliced,
-            lines_returned,
-            lines_total,
-            truncated,
-            indexed_at,
-            category: "text".to_string(),
-        }))
+        // Code-файл (Phase 2): пробуем `file_contents`. Три ветки:
+        //   1. Нет записи           → переходное состояние, backfill ещё не дошёл.
+        //   2. Запись oversize=1    → файл крупнее лимита, content не сохранён.
+        //   3. Запись с blob        → decode zstd, slice, отдать.
+        let fc_row = self.read_file_content(file_id)?;
+        match fc_row {
+            None => {
+                // Переходное состояние — пустой content + hint, что backfill ещё в работе.
+                Ok(Some(ReadFileResult {
+                    content: String::new(),
+                    lines_returned: 0,
+                    lines_total,
+                    truncated: false,
+                    indexed_at,
+                    category: "code".to_string(),
+                    oversize: false,
+                    file_size,
+                    size_limit: None,
+                    hint: Some(
+                        "Content code-файла ещё не наполнен (backfill в процессе после v0.8.0). \
+                         Перезапустите запрос через несколько секунд или используйте \
+                         get_function/get_class/grep_body для целевого чтения."
+                            .to_string(),
+                    ),
+                }))
+            }
+            Some((None, true)) => {
+                // Файл крупнее лимита — намеренно без content.
+                let hint = match (file_size, size_limit_bytes) {
+                    (Some(fs), Some(lim)) => format!(
+                        "Файл превышает лимит сохранения content ({} байт > {} байт). \
+                         Используйте get_function/get_class/grep_body для целевого чтения, \
+                         либо увеличьте `[indexer].max_code_file_size_bytes` или \
+                         `[[paths]].max_code_file_size_bytes` в daemon.toml.",
+                        fs, lim
+                    ),
+                    _ => "Файл oversize: content не сохранён в индексе. \
+                          Используйте get_function/get_class/grep_body."
+                        .to_string(),
+                };
+                Ok(Some(ReadFileResult {
+                    content: String::new(),
+                    lines_returned: 0,
+                    lines_total,
+                    truncated: false,
+                    indexed_at,
+                    category: "code".to_string(),
+                    oversize: true,
+                    file_size,
+                    size_limit: size_limit_bytes,
+                    hint: Some(hint),
+                }))
+            }
+            Some((Some(content), _)) => {
+                // Нормальный case: разжатый content code-файла.
+                let (sliced, lines_returned, truncated) = slice_with_caps(
+                    &content,
+                    line_start,
+                    line_end,
+                    soft_cap_lines,
+                    soft_cap_bytes,
+                    hard_cap_bytes,
+                )?;
+                Ok(Some(ReadFileResult {
+                    content: sliced,
+                    lines_returned,
+                    lines_total,
+                    truncated,
+                    indexed_at,
+                    category: "code".to_string(),
+                    oversize: false,
+                    file_size,
+                    size_limit: None,
+                    hint: None,
+                }))
+            }
+            Some((None, false)) => {
+                // Невалидное состояние: blob=NULL, oversize=0. По логике записи
+                // такого быть не должно — только oversize-запись имеет blob=NULL.
+                // Трактуем как переходное состояние (как будто записи нет вовсе).
+                Ok(Some(ReadFileResult {
+                    content: String::new(),
+                    lines_returned: 0,
+                    lines_total,
+                    truncated: false,
+                    indexed_at,
+                    category: "code".to_string(),
+                    oversize: false,
+                    file_size,
+                    size_limit: None,
+                    hint: Some(
+                        "Битая запись file_contents (blob=NULL без oversize). \
+                         Перезапустите индексацию репо."
+                            .to_string(),
+                    ),
+                }))
+            }
+        }
     }
 
     /// grep_text: regex-поиск по содержимому text-файлов.
@@ -2164,7 +2567,7 @@ mod tests {
             file_id: id,
             content: "alpha\nbeta\ngamma".to_string(),
         }).unwrap();
-        let r = storage.read_file_text("/r.txt", None, None, 100, 10_000, 100_000).unwrap().unwrap();
+        let r = storage.read_file_text("/r.txt", None, None, 100, 10_000, 100_000, None).unwrap().unwrap();
         assert_eq!(r.category, "text");
         assert_eq!(r.lines_returned, 3);
         assert_eq!(r.lines_total, 3);
@@ -2181,7 +2584,7 @@ mod tests {
             file_id: id,
             content: "1\n2\n3\n4\n5".to_string(),
         }).unwrap();
-        let r = storage.read_file_text("/r.txt", Some(2), Some(4), 100, 10_000, 100_000)
+        let r = storage.read_file_text("/r.txt", Some(2), Some(4), 100, 10_000, 100_000, None)
             .unwrap().unwrap();
         assert_eq!(r.lines_returned, 3);
         assert_eq!(r.content, "2\n3\n4");
@@ -2192,7 +2595,7 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         storage.upsert_file(&make_file_full("/lib.py", "python", 10)).unwrap();
         // text_files не заполнен — это code-файл
-        let r = storage.read_file_text("/lib.py", None, None, 100, 10_000, 100_000).unwrap().unwrap();
+        let r = storage.read_file_text("/lib.py", None, None, 100, 10_000, 100_000, None).unwrap().unwrap();
         assert_eq!(r.category, "code");
         assert!(r.content.is_empty());
     }
@@ -2200,7 +2603,7 @@ mod tests {
     #[test]
     fn test_read_file_text_missing() {
         let storage = Storage::open_in_memory().unwrap();
-        let r = storage.read_file_text("/nope", None, None, 100, 10_000, 100_000).unwrap();
+        let r = storage.read_file_text("/nope", None, None, 100, 10_000, 100_000, None).unwrap();
         assert!(r.is_none());
     }
 
@@ -2278,5 +2681,460 @@ mod tests {
         assert_eq!(p, Some("/some/path.py".to_string()));
         let none = storage.get_path_by_file_id(99999).unwrap();
         assert_eq!(none, None);
+    }
+
+    // ── Phase 2 (v0.8.0) тесты: file_contents + zstd ──────────────────────────
+
+    // ── upsert / read / has ────────────────────────────────────────────────────
+
+    /// Базовый round-trip: запись → zstd-сжатие → чтение → распаковка.
+    /// Содержимое должно вернуться без изменений.
+    #[test]
+    fn test_upsert_file_content_round_trip() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file_full("/src/app.py", "python", 5)).unwrap();
+
+        storage.upsert_file_content(file_id, "hello world", 1024).unwrap();
+
+        let result = storage.read_file_content(file_id).unwrap();
+        assert_eq!(
+            result,
+            Some((Some("hello world".to_string()), false)),
+            "ожидается нормальная запись с разжатым content"
+        );
+        assert!(
+            storage.has_file_content(file_id).unwrap(),
+            "has_file_content должен вернуть true"
+        );
+    }
+
+    /// Если content длиннее max_size_bytes — должна создаться oversize-запись.
+    #[test]
+    fn test_upsert_file_content_oversize() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file_full("/big.py", "python", 1000)).unwrap();
+
+        // 100 байт > 50 байт лимита → oversize
+        let big_content: String = "x".repeat(100);
+        storage.upsert_file_content(file_id, &big_content, 50).unwrap();
+
+        let result = storage.read_file_content(file_id).unwrap();
+        assert_eq!(
+            result,
+            Some((None, true)),
+            "ожидается oversize-запись: (None, true)"
+        );
+        assert!(
+            storage.has_file_content(file_id).unwrap(),
+            "has_file_content должен быть true даже для oversize"
+        );
+    }
+
+    /// Повторный upsert на тот же file_id должен заменить предыдущую запись
+    /// (INSERT OR REPLACE). read_file_content отдаёт второй content.
+    #[test]
+    fn test_upsert_file_content_idempotent_replace() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file_full("/mod.py", "python", 10)).unwrap();
+
+        storage.upsert_file_content(file_id, "first content", 4096).unwrap();
+        storage.upsert_file_content(file_id, "second content", 4096).unwrap();
+
+        let result = storage.read_file_content(file_id).unwrap();
+        assert_eq!(
+            result,
+            Some((Some("second content".to_string()), false)),
+            "второй upsert должен заменить первый"
+        );
+    }
+
+    /// Для file_id, у которого нет записи в file_contents, read_file_content
+    /// должен вернуть None (переходное состояние — backfill ещё не дошёл).
+    #[test]
+    fn test_read_file_content_missing_returns_none() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file_full("/norecord.py", "python", 5)).unwrap();
+
+        // Запись в files есть, но file_contents — нет
+        let result = storage.read_file_content(file_id).unwrap();
+        assert!(result.is_none(), "нет записи в file_contents → None");
+
+        assert!(
+            !storage.has_file_content(file_id).unwrap(),
+            "has_file_content должен быть false"
+        );
+    }
+
+    // ── delete ─────────────────────────────────────────────────────────────────
+
+    /// После delete_file_content запись исчезает — read возвращает None, has = false.
+    #[test]
+    fn test_delete_file_content_removes_entry() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file_full("/del.py", "python", 3)).unwrap();
+        storage.upsert_file_content(file_id, "some code", 4096).unwrap();
+        assert!(storage.has_file_content(file_id).unwrap());
+
+        storage.delete_file_content(file_id).unwrap();
+
+        assert!(
+            storage.read_file_content(file_id).unwrap().is_none(),
+            "после delete read_file_content должен вернуть None"
+        );
+        assert!(
+            !storage.has_file_content(file_id).unwrap(),
+            "после delete has_file_content должен быть false"
+        );
+    }
+
+    // ── get_file_id_by_path ────────────────────────────────────────────────────
+
+    /// get_file_id_by_path: путь есть → Some(id), нет → None.
+    #[test]
+    fn test_get_file_id_by_path_found_and_missing() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/exists.py", "python", 1)).unwrap();
+
+        let found = storage.get_file_id_by_path("/exists.py").unwrap();
+        assert_eq!(found, Some(id), "путь есть — должен вернуть правильный id");
+
+        let missing = storage.get_file_id_by_path("/missing.py").unwrap();
+        assert!(missing.is_none(), "пути нет — должен вернуть None");
+    }
+
+    // ── has_text_file ─────────────────────────────────────────────────────────
+
+    /// has_text_file: true для файлов с записью в text_files, false без неё.
+    #[test]
+    fn test_has_text_file_true_for_text_files() {
+        let storage = Storage::open_in_memory().unwrap();
+        let text_id = storage.upsert_file(&make_file_full("/readme.md", "markdown", 10)).unwrap();
+        let code_id = storage.upsert_file(&make_file_full("/lib.rs", "rust", 20)).unwrap();
+
+        storage.insert_text_file(&TextFileRecord {
+            id: None,
+            file_id: text_id,
+            content: "# README\n".to_string(),
+        }).unwrap();
+
+        assert!(
+            storage.has_text_file(text_id).unwrap(),
+            "text-файл с записью в text_files → true"
+        );
+        assert!(
+            !storage.has_text_file(code_id).unwrap(),
+            "code-файл без записи в text_files → false"
+        );
+    }
+
+    // ── read_file_text для code-файлов (Phase 2) ───────────────────────────────
+
+    /// Нормальный case: code-файл с записью в file_contents → category="code",
+    /// content правильно разжат, oversize=false.
+    #[test]
+    fn test_read_file_text_for_code_returns_decoded() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/src/utils.py", "python", 3))
+            .unwrap();
+        let source = "def hello():\n    pass\n# конец";
+        storage.upsert_file_content(file_id, source, 4096).unwrap();
+
+        let r = storage
+            .read_file_text("/src/utils.py", None, None, 1000, 1_000_000, 10_000_000, None)
+            .unwrap()
+            .expect("файл должен существовать");
+
+        assert_eq!(r.category, "code");
+        assert_eq!(r.content, source);
+        assert!(!r.oversize, "нормальная запись → oversize=false");
+        assert!(r.hint.is_none(), "нормальная запись → hint отсутствует");
+    }
+
+    /// Oversize case: уведомление через oversize=true и заполненный hint.
+    /// При указанном size_limit_bytes hint содержит числовые размеры.
+    #[test]
+    fn test_read_file_text_for_code_oversize_returns_hint() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/huge.bsl", "bsl", 500))
+            .unwrap();
+        // Устанавливаем file_size = 200 через update_file_metadata, чтобы hint мог показать размер
+        storage.update_file_metadata("/huge.bsl", 1714305600, 200).unwrap();
+
+        // content 100 байт > лимит 50
+        let big: String = "a".repeat(100);
+        storage.upsert_file_content(file_id, &big, 50).unwrap();
+
+        // С явным size_limit_bytes — hint должен содержать оба числа
+        let r = storage
+            .read_file_text("/huge.bsl", None, None, 1000, 1_000_000, 10_000_000, Some(50))
+            .unwrap()
+            .expect("файл должен существовать");
+
+        assert_eq!(r.category, "code");
+        assert!(r.content.is_empty(), "oversize — content пустой");
+        assert!(r.oversize, "oversize → true");
+        let hint = r.hint.expect("hint должен быть заполнен");
+        assert!(
+            hint.contains("200") && hint.contains("50"),
+            "hint должен содержать file_size=200 и size_limit=50, получили: {hint}"
+        );
+
+        // Без size_limit_bytes — hint всё равно Some (общая формулировка)
+        let r2 = storage
+            .read_file_text("/huge.bsl", None, None, 1000, 1_000_000, 10_000_000, None)
+            .unwrap()
+            .expect("файл должен существовать");
+        assert!(r2.oversize);
+        assert!(r2.hint.is_some(), "hint должен быть и без size_limit_bytes");
+    }
+
+    /// Переходное состояние v0.7.x→v0.8.0: файл в files есть, но в file_contents
+    /// записи нет (backfill ещё не дошёл). read_file_text → category="code",
+    /// content пустой, oversize=false, hint содержит слово "backfill".
+    #[test]
+    fn test_read_file_text_for_code_no_record_returns_transitional_hint() {
+        let storage = Storage::open_in_memory().unwrap();
+        // Файл только в files — file_contents пустой
+        storage
+            .upsert_file(&make_file_full("/old.py", "python", 20))
+            .unwrap();
+
+        let r = storage
+            .read_file_text("/old.py", None, None, 1000, 1_000_000, 10_000_000, None)
+            .unwrap()
+            .expect("файл должен существовать");
+
+        assert_eq!(r.category, "code");
+        assert!(r.content.is_empty(), "нет записи → content пустой");
+        assert!(!r.oversize, "нет записи ≠ oversize");
+        let hint = r.hint.expect("переходное состояние должно давать hint");
+        assert!(
+            hint.to_lowercase().contains("backfill"),
+            "hint должен упоминать backfill, получили: {hint}"
+        );
+    }
+
+    // ── stat_file_meta с oversize (Phase 2) ───────────────────────────────────
+
+    /// stat_file для code-файла с oversize → category="code", oversize=Some(true).
+    #[test]
+    fn test_stat_file_for_code_with_oversize() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/heavy.rs", "rust", 200))
+            .unwrap();
+        // Запись oversize: content 100 байт > лимит 10
+        let big: String = "r".repeat(100);
+        storage.upsert_file_content(file_id, &big, 10).unwrap();
+
+        let r = storage.stat_file_meta("/heavy.rs").unwrap();
+        assert!(r.exists);
+        assert_eq!(r.category.as_deref(), Some("code"));
+        assert_eq!(r.oversize, Some(true), "oversize-запись → oversize=Some(true)");
+    }
+
+    /// stat_file для обычного code-файла (нормальная запись) → oversize=Some(false).
+    #[test]
+    fn test_stat_file_for_code_normal_oversize_false() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/small.rs", "rust", 10))
+            .unwrap();
+        storage.upsert_file_content(file_id, "fn main() {}", 4096).unwrap();
+
+        let r = storage.stat_file_meta("/small.rs").unwrap();
+        assert!(r.exists);
+        assert_eq!(r.category.as_deref(), Some("code"));
+        assert_eq!(r.oversize, Some(false), "нормальная запись → oversize=Some(false)");
+    }
+
+    /// stat_file для text-файла → category="text", oversize=None (поле не заполняется).
+    #[test]
+    fn test_stat_file_for_text_no_oversize() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/config.yaml", "yaml", 20))
+            .unwrap();
+        storage.insert_text_file(&TextFileRecord {
+            id: None,
+            file_id,
+            content: "key: value\n".to_string(),
+        }).unwrap();
+
+        let r = storage.stat_file_meta("/config.yaml").unwrap();
+        assert!(r.exists);
+        assert_eq!(r.category.as_deref(), Some("text"));
+        assert!(
+            r.oversize.is_none(),
+            "для text-файлов oversize не заполняется: {:?}",
+            r.oversize
+        );
+    }
+
+    // ── grep_code_filtered ────────────────────────────────────────────────────
+
+    /// Базовый поиск: паттерн есть в одном из двух файлов → один матч.
+    #[test]
+    fn test_grep_code_finds_pattern() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id1 = storage
+            .upsert_file(&make_file_full("/a.py", "python", 3))
+            .unwrap();
+        let id2 = storage
+            .upsert_file(&make_file_full("/b.py", "python", 3))
+            .unwrap();
+
+        storage
+            .upsert_file_content(id1, "def foo():\n    specific_word\n", 4096)
+            .unwrap();
+        storage
+            .upsert_file_content(id2, "def bar():\n    nothing_here\n", 4096)
+            .unwrap();
+
+        let m = storage
+            .grep_code_filtered("specific_word", None, None, 100, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(m.len(), 1, "только один файл должен совпасть");
+        assert_eq!(m[0].path, "/a.py");
+    }
+
+    /// Oversize-файлы должны пропускаться — content у них не сохранён.
+    #[test]
+    fn test_grep_code_skips_oversize() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id1 = storage
+            .upsert_file(&make_file_full("/normal.py", "python", 3))
+            .unwrap();
+        let id2 = storage
+            .upsert_file(&make_file_full("/giant.py", "python", 10000))
+            .unwrap();
+
+        // Нормальный файл содержит паттерн
+        storage
+            .upsert_file_content(id1, "TARGET_PATTERN in normal file", 4096)
+            .unwrap();
+        // Oversize-запись: content не сохранён (лимит 1 байт)
+        storage
+            .upsert_file_content(id2, "TARGET_PATTERN in oversize", 1)
+            .unwrap();
+
+        let m = storage
+            .grep_code_filtered("TARGET_PATTERN", None, None, 100, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(m.len(), 1, "oversize-файл должен быть пропущен");
+        assert_eq!(m[0].path, "/normal.py");
+    }
+
+    /// path_glob сужает поиск до подходящих путей.
+    #[test]
+    fn test_grep_code_path_glob_filter() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id1 = storage
+            .upsert_file(&make_file_full("/src/match.py", "python", 2))
+            .unwrap();
+        let id2 = storage
+            .upsert_file(&make_file_full("/test/no_match.py", "python", 2))
+            .unwrap();
+
+        storage
+            .upsert_file_content(id1, "NEEDLE found here", 4096)
+            .unwrap();
+        storage
+            .upsert_file_content(id2, "NEEDLE found here too", 4096)
+            .unwrap();
+
+        // Ищем только в /src/
+        let m = storage
+            .grep_code_filtered("NEEDLE", Some("/src/*"), None, 100, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(m.len(), 1, "glob должен ограничить поиск до /src/");
+        assert_eq!(m[0].path, "/src/match.py");
+    }
+
+    /// context_lines возвращает строки до и после совпадения.
+    #[test]
+    fn test_grep_code_context_lines() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/ctx.py", "python", 5))
+            .unwrap();
+        // Совпадение на 3-й строке из 5
+        storage
+            .upsert_file_content(file_id, "before1\nbefore2\nMATCH\nafter1\nafter2", 4096)
+            .unwrap();
+
+        let m = storage
+            .grep_code_filtered("MATCH", None, None, 100, 1, 1_000_000)
+            .unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].line, 3, "MATCH на строке 3");
+        // context_lines=1: строки 2, 3, 4
+        assert_eq!(m[0].context.len(), 3, "должно быть 3 строки контекста (до, матч, после)");
+        let lines: Vec<usize> = m[0].context.iter().map(|c| c.line).collect();
+        assert!(lines.contains(&2), "должна быть строка 2");
+        assert!(lines.contains(&3), "должна быть строка 3");
+        assert!(lines.contains(&4), "должна быть строка 4");
+    }
+
+    /// limit ограничивает количество возвращаемых результатов.
+    #[test]
+    fn test_grep_code_respects_limit() {
+        let storage = Storage::open_in_memory().unwrap();
+        // Создаём 5 файлов с паттерном
+        for i in 0..5 {
+            let path = format!("/file{}.py", i);
+            let file_id = storage
+                .upsert_file(&make_file_full(&path, "python", 1))
+                .unwrap();
+            storage
+                .upsert_file_content(file_id, &format!("COMMON_PATTERN in file {}", i), 4096)
+                .unwrap();
+        }
+
+        let m = storage
+            .grep_code_filtered("COMMON_PATTERN", None, None, 2, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(m.len(), 2, "limit=2 должен вернуть ровно 2 результата");
+    }
+
+    // ── migrate_v4 идемпотентность ────────────────────────────────────────────
+
+    /// migrate_v4 должна быть идемпотентной: второй вызов не должен давать ошибку,
+    /// и в таблицу можно писать после любого количества вызовов.
+    #[test]
+    fn test_migrate_v4_idempotent() {
+        use crate::storage::schema;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+
+        // Создаём полную схему (включает migrate_v4 внутри)
+        schema::initialize(&conn).unwrap();
+
+        // Повторный вызов не должен ломаться (CREATE TABLE IF NOT EXISTS)
+        schema::migrate_v4(&conn).unwrap();
+
+        // Убеждаемся что таблица рабочая после повторного вызова
+        conn.execute(
+            "INSERT INTO files (path, content_hash, language) VALUES ('/t.py', 'h', 'python')",
+            [],
+        ).unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path = '/t.py'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO file_contents (file_id, content_blob, oversize) VALUES (?1, NULL, 1)",
+            rusqlite::params![file_id],
+        ).unwrap();
+
+        let oversize: i64 = conn
+            .query_row(
+                "SELECT oversize FROM file_contents WHERE file_id = ?1",
+                rusqlite::params![file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(oversize, 1, "после идемпотентных вызовов таблица должна работать");
     }
 }
