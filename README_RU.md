@@ -12,7 +12,7 @@
 
 Мгновенный поиск по коду для AI-моделей. Заменяет grep на запросы за миллисекунды.
 
-> **Ключевые метрики:** 93K файлов перепроверяются за 4 сек (mtime fast-path) · 282K функций за <1 мс · 8 языков · 12 MCP-инструментов
+> **Ключевые метрики:** 93K файлов перепроверяются за 4 сек (mtime fast-path) · 282K функций за <1 мс · 9 языков · 18 MCP-инструментов
 
 ## Проблема
 
@@ -275,13 +275,29 @@ code-index serve --transport http --port 8011 --config /etc/code-index/daemon.to
 | `get_stats` | Статистика индекса |
 | `search_text` | Полнотекстовый поиск по текстовым файлам |
 | `grep_body` | Поиск подстроки или regex в телах функций и классов. Возвращает `match_lines` (первые 3 номера строк) и `match_count` (всего, если > 3). v0.7.0: опциональные `path_glob`, `context_lines` |
-| `stat_file` | **(v0.7.0)** Метаданные одного файла: exists, size, mtime, language, lines_total, content_hash, indexed_at, category (`text`/`code`) |
+| `stat_file` | **(v0.7.0)** Метаданные одного файла: exists, size, mtime, language, lines_total, content_hash, indexed_at, category (`text`/`code`). **(v0.8.0)** добавляет `oversize: bool` для code-файлов |
 | `list_files` | **(v0.7.0)** Плоский список файлов с опциональными `pattern` (glob `**/*.py`), `path_prefix`, `language`, `limit` |
-| `read_file` | **(v0.7.0)** Чтение содержимого **text-файла**. Опциональные `line_start`/`line_end` (1-based, inclusive). Soft-cap 5000 строк или 500 КБ, hard-cap 2 МБ. Для code-файлов вернётся `category="code"` с пустым content (Phase 2 в работе) |
+| `read_file` | **(v0.7.0)** Чтение содержимого файла. Опциональные `line_start`/`line_end` (1-based, inclusive). Soft-cap 5000 строк или 500 КБ, hard-cap 2 МБ. **(v0.8.0)** работает для **code-файлов** (`.py`, `.bsl`, `.rs`, `.ts` и др.) — content хранится в таблице `file_contents` (zstd). Файлы-oversize (дефолт > 5 МБ) возвращают `oversize: true` с пустым `content` и подсказкой |
 | `grep_text` | **(v0.7.0)** Regex-поиск по содержимому text-файлов через REGEXP. Закрывает дыру FTS5 со спецсимволами (точки, скобки, экраны). Опциональные `path_glob`, `language`, `context_lines`. Hard-cap 1 МБ на размер ответа |
+| `grep_code` | **(v0.8.0)** Regex-поиск по содержимому **code-файлов** (`.py`, `.bsl`, `.rs`, `.ts` и др.) через таблицу `file_contents` (zstd-decode в Rust). Параметры аналогичны `grep_text`: `regex`, `path_glob?`, `language?`, `limit?`, `context_lines?`. Дополняет `grep_body` (тот ищет только в телах функций/классов). Oversize-файлы пропускаются |
 | `health` | Статус MCP-сервера и подключённых репо |
 
 Все поисковые инструменты (`search_function`, `search_class`, `get_function`, `get_class`, `find_symbol`, `search_text`, `grep_body`) принимают опциональный параметр **`path_glob`** (v0.7.0) для сужения выдачи по подкаталогу (например, `src/auth/**`, `Documents/**/*.bsl`). Реализация — post-filter через crate `globset` после SQL-выборки.
+
+### Хранение содержимого code-файлов (v0.8.0)
+
+С v0.8.0 содержимое code-файлов хранится в таблице `file_contents` (zstd-сжатие) и возвращается `read_file`, а также доступно для поиска через `grep_code`. Крупные файлы можно исключить из хранения через `max_code_file_size_bytes` (дефолт **5 МБ**):
+
+```toml
+[indexer]
+max_code_file_size_bytes = 5242880   # 5 МБ, глобальный override
+
+[[paths]]
+path = "C:/RepoUT"
+max_code_file_size_bytes = 10485760  # только для этого репо — 10 МБ
+```
+
+Приоритет: per-path → секция `[indexer]` → дефолт 5 МБ. Файлы сверх лимита сохраняются с `oversize=1` и `content_blob=NULL`; AST-парсинг, FTS и граф вызовов для них работают в полном объёме. `read_file` и `grep_code` возвращают подсказку как искать такие файлы через `get_function`/`get_class`/`grep_body`.
 
 ### Дополнительно для 1С-репо (только в `bsl-indexer`, v0.6+)
 

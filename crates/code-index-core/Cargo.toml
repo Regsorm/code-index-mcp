@@ -38,6 +38,9 @@ quick-xml = { workspace = true }
 # База данных
 rusqlite = { workspace = true }
 
+# Сжатие content code-файлов (Phase 2: file_contents)
+zstd = { workspace = true }
+
 # Сериализация
 serde = { workspace = true }
 serde_json = { workspace = true }

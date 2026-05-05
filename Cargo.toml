@@ -9,7 +9,7 @@ members = [
 
 # Общие метаданные пакетов воркспейса. Каждый крейт может переопределить.
 [workspace.package]
-version = "0.7.3"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 description = "Высокопроизводительный индексатор кода с MCP-протоколом для AI-моделей"
@@ -44,6 +44,9 @@ quick-xml = "0.37"
 
 # База данных
 rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
+
+# Сжатие content code-файлов (Phase 2: file_contents)
+zstd = "0.13"
 
 # Сериализация
 serde = { version = "1", features = ["derive"] }

@@ -3,6 +3,70 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.8.0] — 2026-05-05
+
+**Phase 2 «content для code-файлов»** — закрытие главного ограничения Phase 1. До v0.8.0 `read_file` для `.py`/`.bsl`/`.rs`/`.ts` и других code-файлов возвращал `category="code"` с пустым `content`. Теперь содержимое хранится в новой таблице `file_contents` (zstd-сжатие, миграция v4) и отдаётся при каждом вызове. Дополнительно: новый инструмент `grep_code` для regex-поиска непосредственно по содержимому code-файлов, oversize-механика для файлов крупнее настраиваемого лимита.
+
+### Добавлено
+
+- **Таблица `file_contents` (миграция v4).** DDL: `file_contents(file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE, content_blob BLOB, oversize INTEGER NOT NULL DEFAULT 0)`. Backfill автоматический — выполняется в составе `full_reindex` при первом запуске v0.8.0 на существующей БД. Идемпотентна: повторный вызов безопасен (`INSERT OR REPLACE`). Оценка для УТ (~15 665 `.bsl`, ~620 МБ исходников): ~120 МБ blob после zstd (~5×), однократное время backfill ~1-2 минуты (чистый I/O + zstd encode).
+
+- **`read_file` для code-файлов работает в полном объёме.** Для `.py`, `.bsl`, `.rs`, `.ts` и других AST-языков возвращается разжатый content из `file_contents`. `category="code"`. Старая логика чтения text-файлов через `text_files` не меняется.
+
+- **Oversize-механика.** Файлы крупнее `max_code_file_size_bytes` (дефолт **5 МБ**) сохраняются с `oversize=1, content_blob=NULL`. AST-парсинг, FTS и граф вызовов для них работают в полном объёме. `read_file` для oversize-файла возвращает специальный ответ:
+  ```json
+  {
+    "category": "code",
+    "content": "",
+    "oversize": true,
+    "file_size": 8650240,
+    "size_limit": null,
+    "hint": "Файл oversize: content не сохранён в индексе. Используйте get_function/get_class/grep_body."
+  }
+  ```
+
+- **`stat_file` показывает `oversize`** для code-файлов: поле `Option<bool>` добавлено в ответ. Для text-файлов — всегда `null`.
+
+- **Конфигурация лимита `max_code_file_size_bytes`.** Hardcoded дефолт — 5 МБ (`DEFAULT_MAX_CODE_FILE_SIZE_BYTES` в `crate::daemon_core::config`). Переопределяется в `daemon.toml`:
+  ```toml
+  [indexer]
+  max_code_file_size_bytes = 5242880   # глобальный override (5 МБ)
+
+  [[paths]]
+  path = "C:/RepoUT"
+  max_code_file_size_bytes = 10485760  # для этого репо — 10 МБ
+  ```
+  Приоритет: per-path → секция `[indexer]` → дефолт 5 МБ. Логика выбора — хелпер `PathEntry::effective_max_code_file_size(&IndexerSection)`.
+
+- **Новый MCP-инструмент `grep_code` (Phase 2 bonus).** Regex-поиск по содержимому code-файлов — закрывает слепую зону `grep_body` (тот ищет только в телах функций/классов). Источник данных — таблица `file_contents` (zstd-decode на лету в Rust; SQL делает pre-filter по path/language). Параметры идентичны `grep_text`: `regex`, `path_glob?`, `language?`, `limit?`, `context_lines?`. Файлы с `oversize=1` пропускаются. Storage-метод: `Storage::grep_code_filtered(regex, path_glob, language, limit, context_lines, max_total_bytes) -> Vec<GrepTextMatch>`. Сигнатура pub-функции: `pub async fn grep_code(entry, regex, path_glob, language, limit, context_lines)`.
+
+- **Federation route `/federate/grep_code`** — аддитивный, не ломает существующие клиенты. При обращении к старой ноде (< 0.8.0) вернётся `404` — ожидаемое поведение; обе ноды нужно обновлять синхронно для использования `grep_code` в федерации.
+
+### Изменено
+
+- **`Indexer::write_code_to_db`** — добавлен последний параметр `raw_content: Option<&str>`. Если задан — content сохраняется в `file_contents` (zstd encode). Внутренний API.
+- **`Storage::read_file_text`** — добавлен последний параметр `size_limit_bytes: Option<i64>`. Используется для заполнения поля `size_limit` в oversize-ответе. MCP-слой передаёт `None`.
+- **`ParsedFile::Code` enum-вариант** — добавлено поле `raw_content: String`.
+- **`worker::run_worker`** — добавлен параметр `IndexerSection` (последний). Внутри вычисляется effective лимит и записывается в `IndexConfig.max_code_file_size_bytes`.
+- **`runner::spawn_worker`** — добавлен параметр `IndexerSection`, пробрасывается в `run_worker`.
+
+### Безопасность
+
+- **Защита от zstd-bomb.** Все вызовы декомпрессии в `read_file_content` и `grep_code_filtered` идут через приватный helper `Storage::decode_zstd_safe(blob) -> Result<Vec<u8>>`. Использует stream-decoder с `io::Read::take(limit + 1)` — если разжатый размер превысит `FILE_CONTENTS_MAX_DECOMPRESSED_BYTES` (256 МБ), возвращает ошибку, не аллоцирует RAM дальше. 256 МБ заведомо больше любого валидного code-файла (5 МБ default × ~5× zstd = ~25 МБ; запас на случай поднятого `max_code_file_size_bytes` оператором).
+
+### Исправлено
+
+- **Backfill теперь работает для всех code-файлов на стабильной БД (фикс бага первой превью-сборки).** Раньше backfill был встроен в обработку `metadata_updates` в `full_reindex` — это контейнер файлов с изменившимся mtime/file_size, но прежним content_hash. На «стабильной» БД (никто не трогал файлы с прошлой индексации) `metadata_updates` пустой, поэтому backfill **не запускался для UT/BP_SS/ZUP** — наполнялись только репо с реально изменившимися файлами (BP_TDK получал ~15 файлов из 90K). Фикс: вынесено в **отдельную фазу** `Этап 6` после удаления устаревших, через новый Storage-метод `list_code_files_without_content() -> Vec<(file_id, path)>`. Теперь backfill бьёт по всем code-файлам, у которых нет записи в `file_contents` И нет записи в `text_files`, независимо от того менялся ли mtime. Реальные показатели на VM rag после фикса: UT 32599/32599 за 31.7 сек, BP_SS 37535/37535 за 37.9 сек, ZUP 19066/19066 за 17.5 сек, BP_TDK аналогично.
+- **Backfill в батчах вместо одной мега-транзакции.** Для 90K-репо вся фаза в `BEGIN TRANSACTION` без commit раздула бы WAL до многих ГБ. Промежуточный `commit_batch + begin_batch` каждые `batch_size.max(500)` файлов держит WAL в разумных пределах.
+
+### Совместимость
+
+- **MCP API без breaking-changes.** Все новые поля в response — `Option<...>` или `default false`; старые клиенты не сломаются. Изменение `read_file` для code-файлов (возвращает реальный content вместо пустого) — улучшение, не breaking.
+- **Schema БД** — миграция v4 идемпотентна, безопасна на существующей БД v0.7.x. Откат на v0.7.x просто игнорирует новую таблицу — обе версии совместимы по чтению старых данных.
+- **Storage API изменён несовместимо** для прямых пользователей крейта `code-index-core`: `Indexer::write_code_to_db`, `Storage::read_file_text`, `worker::run_worker`, `runner::spawn_worker` — новые параметры. Также добавлены публичные методы: `Storage::upsert_file_content`, `read_file_content`, `has_file_content`, `delete_file_content`, `get_file_id_by_path`, `has_text_file`, `list_code_files_without_content`, `grep_code_filtered`. Внешних callers в публичном API нет, но если есть приватный код с прямыми вызовами — обновить.
+- **Federation** — новый route `/federate/grep_code` аддитивный. **Обе ноды federation должны быть обновлены синхронно** для использования `grep_code` в федерации (иначе старая нода вернёт 404 на этот route). Общий принцип `v0.7.0+` остаётся.
+- **`grep_code` пропускает oversize-файлы** — это задокументированное ограничение, не баг. Для таких файлов по-прежнему работают `get_function`/`get_class`/`grep_body` по AST-данным.
+
 ## [0.7.3] — 2026-05-04
 
 **Bug-fix**: extension-tools (`get_object_structure`, `get_form_handlers` и другие, поставляемые через `LanguageProcessor::additional_tools()`) **не регистрировались в `tools/list`** при работе сервера в федеративном режиме (`serve.toml` присутствует). У пользователей в моно-режиме всё было корректно.
