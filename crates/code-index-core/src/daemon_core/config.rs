@@ -8,12 +8,16 @@
 // http_port = 0              # 0 = автовыбор свободного порта
 // log_level = "info"
 //
+// [indexer]
+// max_code_file_size_bytes = 5242880   # глобальный лимит content для code (5 МБ default)
+//
 // [[paths]]
 // path = "C:\\RepoUT"
 //
 // [[paths]]
 // path = "C:\\RepoBP_1"
-// debounce_ms = 2000         # опциональное переопределение per-папка
+// debounce_ms = 2000                   # опциональное переопределение per-папка
+// max_code_file_size_bytes = 10485760  # этой папке — мягче (10 МБ)
 // ```
 
 use std::path::{Path, PathBuf};
@@ -38,6 +42,37 @@ pub struct DaemonFileConfig {
     /// feature `enrichment`.
     #[serde(default)]
     pub enrichment: Option<EnrichmentConfig>,
+
+    /// Опциональная глобальная секция `[indexer]` (Phase 2, v0.8.0).
+    /// Сейчас содержит один параметр — `max_code_file_size_bytes`. Может расти.
+    #[serde(default)]
+    pub indexer: IndexerSection,
+}
+
+/// Дефолтный hardcoded-лимит размера code-файла, content которого сохраняется
+/// в `file_contents` с zstd-сжатием. Файлы крупнее не получают content, но
+/// продолжают индексироваться по AST/FTS. Подробности — в `IndexerSection`.
+pub const DEFAULT_MAX_CODE_FILE_SIZE_BYTES: usize = 5 * 1024 * 1024; // 5 МБ
+
+/// Секция `[indexer]` из конфига демона (Phase 2, v0.8.0).
+///
+/// Сейчас содержит только лимит на размер code-файла, content которого
+/// будет сохранён в БД. Файлы крупнее лимита остаются полностью
+/// проиндексированными по AST/FTS, но `read_file` для них вернёт
+/// `oversize=true` без content; читать такие файлы — через
+/// `get_function`/`get_class`/`grep_body` (тела функций/классов
+/// хранятся отдельно и не подпадают под лимит).
+///
+/// Приоритет значения для конкретной папки:
+///   1. `paths[i].max_code_file_size_bytes` — per-path override (если задано);
+///   2. `[indexer].max_code_file_size_bytes` — глобальный override (если задано);
+///   3. `DEFAULT_MAX_CODE_FILE_SIZE_BYTES` — hardcoded дефолт 5 МБ.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IndexerSection {
+    /// Глобальный лимит размера code-файла для сохранения content.
+    /// `None` → используется hardcoded дефолт 5 МБ.
+    #[serde(default)]
+    pub max_code_file_size_bytes: Option<usize>,
 }
 
 /// Секция `[enrichment]` из конфига демона.
@@ -222,6 +257,12 @@ pub struct PathEntry {
     /// `python`, `rust`, `go`, `java`, `javascript`, `typescript`, `bsl`.
     #[serde(default)]
     pub language: Option<String>,
+
+    /// Per-path override лимита размера code-файла для сохранения content
+    /// в `file_contents` (Phase 2). `None` → использовать глобальный
+    /// `[indexer].max_code_file_size_bytes` либо hardcoded дефолт 5 МБ.
+    #[serde(default)]
+    pub max_code_file_size_bytes: Option<usize>,
 }
 
 impl PathEntry {
@@ -237,6 +278,14 @@ impl PathEntry {
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase().replace(' ', "_"))
             .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Эффективный лимит на размер code-файла для сохранения content.
+    /// Приоритет: per-path → глобальный `[indexer]` → hardcoded дефолт 5 МБ.
+    pub fn effective_max_code_file_size(&self, indexer: &IndexerSection) -> usize {
+        self.max_code_file_size_bytes
+            .or(indexer.max_code_file_size_bytes)
+            .unwrap_or(DEFAULT_MAX_CODE_FILE_SIZE_BYTES)
     }
 }
 
@@ -327,6 +376,7 @@ mod tests {
             batch_ms: None,
             alias: None,
             language: None,
+            max_code_file_size_bytes: None,
         };
         assert_eq!(entry.effective_alias(), "some_folder_name");
     }
@@ -376,6 +426,83 @@ mod tests {
             e.signature(),
             "openai_compatible:anthropic/claude-haiku-4.5"
         );
+    }
+
+    #[test]
+    fn indexer_section_default_when_missing() {
+        let cfg: DaemonFileConfig = parse_str("").unwrap();
+        // Секция [indexer] отсутствует → дефолтная (поле = None).
+        assert!(cfg.indexer.max_code_file_size_bytes.is_none());
+    }
+
+    #[test]
+    fn indexer_section_parses_global_limit() {
+        let text = r#"
+            [indexer]
+            max_code_file_size_bytes = 10485760
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(cfg.indexer.max_code_file_size_bytes, Some(10_485_760));
+    }
+
+    #[test]
+    fn path_entry_max_code_file_size_optional() {
+        let text = r#"
+            [[paths]]
+            path = "/tmp/a"
+
+            [[paths]]
+            path = "/tmp/b"
+            max_code_file_size_bytes = 2097152
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(cfg.paths[0].max_code_file_size_bytes, None);
+        assert_eq!(cfg.paths[1].max_code_file_size_bytes, Some(2_097_152));
+    }
+
+    #[test]
+    fn effective_max_code_file_size_priority() {
+        // 1. Если задан per-path — он побеждает.
+        let entry_with_override = PathEntry {
+            path: PathBuf::from("/x"),
+            debounce_ms: None,
+            batch_ms: None,
+            alias: None,
+            language: None,
+            max_code_file_size_bytes: Some(1024),
+        };
+        let indexer_with_global = IndexerSection {
+            max_code_file_size_bytes: Some(2048),
+        };
+        assert_eq!(
+            entry_with_override.effective_max_code_file_size(&indexer_with_global),
+            1024,
+            "per-path должен перекрывать глобальный"
+        );
+
+        // 2. Per-path не задан — берётся глобальный.
+        let entry_no_override = PathEntry {
+            path: PathBuf::from("/x"),
+            debounce_ms: None,
+            batch_ms: None,
+            alias: None,
+            language: None,
+            max_code_file_size_bytes: None,
+        };
+        assert_eq!(
+            entry_no_override.effective_max_code_file_size(&indexer_with_global),
+            2048,
+            "без per-path должен браться глобальный"
+        );
+
+        // 3. Ни один не задан — hardcoded дефолт 5 МБ.
+        let indexer_empty = IndexerSection::default();
+        assert_eq!(
+            entry_no_override.effective_max_code_file_size(&indexer_empty),
+            DEFAULT_MAX_CODE_FILE_SIZE_BYTES,
+            "без override должен браться hardcoded дефолт"
+        );
+        assert_eq!(DEFAULT_MAX_CODE_FILE_SIZE_BYTES, 5 * 1024 * 1024);
     }
 
     #[test]

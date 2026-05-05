@@ -149,9 +149,11 @@ mod tests {
                     batch_ms: None,
                     alias: if alias.is_empty() { None } else { Some(alias.to_string()) },
                     language: None,
+                    max_code_file_size_bytes: None,
                 })
                 .collect(),
             enrichment: None,
+            indexer: Default::default(),
         }
     }
 

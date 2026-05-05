@@ -24,6 +24,16 @@ pub struct IndexConfig {
     #[serde(default = "default_max_file_size")]
     pub max_file_size: usize,
 
+    /// Phase 2 (v0.8.0): максимальный размер code-файла, content которого
+    /// сохраняется в `file_contents` с zstd-сжатием. Файлы крупнее
+    /// продолжают индексироваться по AST/FTS, но `read_file` для них
+    /// вернёт `oversize=true` без content. Дефолт 5 МБ. Можно переопределить
+    /// в `daemon.toml` (`[indexer].max_code_file_size_bytes` или
+    /// `[[paths]].max_code_file_size_bytes`); worker присваивает эффективное
+    /// значение этому полю перед запуском Indexer'а.
+    #[serde(default = "default_max_code_file_size")]
+    pub max_code_file_size_bytes: usize,
+
     /// Максимальное количество файлов для индексации (0 = без лимита)
     #[serde(default)]
     pub max_files: usize,
@@ -105,6 +115,10 @@ fn default_max_file_size() -> usize {
     1_048_576 // 1 МБ
 }
 
+fn default_max_code_file_size() -> usize {
+    5 * 1_048_576 // 5 МБ — Phase 2 (см. также DEFAULT_MAX_CODE_FILE_SIZE_BYTES в daemon_core::config)
+}
+
 fn default_batch_size() -> usize {
     2000
 }
@@ -133,6 +147,7 @@ impl Default for IndexConfig {
             exclude_file_patterns: vec![],
             extra_text_extensions: vec![],
             max_file_size: default_max_file_size(),
+            max_code_file_size_bytes: default_max_code_file_size(),
             max_files: 0,
             bulk_threshold: default_bulk_threshold(),
             languages: default_languages(),
