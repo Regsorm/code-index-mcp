@@ -20,9 +20,9 @@ use axum::{
 };
 
 use crate::mcp::{
-    tools, CodeIndexServer, FilePathParams, FunctionNameParams, GrepBodyParams, GrepCodeParams,
-    GrepTextParams, ImportParams, ListFilesParams, NameParams, ReadFileParams, RepoEntry,
-    SearchParams, StatFileParams, StatsParams,
+    tools, CodeIndexServer, ExtensionToolParams, FilePathParams, FunctionNameParams,
+    GrepBodyParams, GrepCodeParams, GrepTextParams, ImportParams, ListFilesParams, NameParams,
+    ReadFileParams, RepoEntry, SearchParams, StatFileParams, StatsParams,
 };
 
 use super::dispatcher::federation_error;
@@ -52,6 +52,10 @@ pub fn federate_router(server: CodeIndexServer) -> Router {
         .route("/federate/grep_text", post(handle_grep_text))
         // Phase 2 (v0.8.0)
         .route("/federate/grep_code", post(handle_grep_code))
+        // v0.8.1: универсальный route для extension-tools (BSL и любых
+        // будущих расширений). Один route на все extension-tools, чтобы
+        // не плодить per-tool маршруты при добавлении нового language-процессора.
+        .route("/federate/extension", post(handle_extension_tool))
         .with_state(Arc::new(server))
 }
 
@@ -355,4 +359,71 @@ async fn handle_grep_code(
         )
         .await,
     )
+}
+
+/// Универсальный handler для extension-tools (v0.8.1).
+///
+/// Принимает `{tool_name, args}`. `repo` извлекается из `args` (как и в
+/// штатном MCP call_tool). Находит tool в `extension_tools` снимке сервера,
+/// строит `ToolContext` для local repo и вызывает `IndexTool::execute`.
+///
+/// Если на этой ноде такого tool нет (например, target-узел не bsl-indexer
+/// сборка) — возвращаем federation_error с понятным текстом, чтобы caller
+/// мог отличить «tool не найден на target» от «target недоступен».
+async fn handle_extension_tool(
+    State(server): State<Server>,
+    Json(p): Json<ExtensionToolParams>,
+) -> axum::response::Response {
+    // Извлечь repo из args — стандартный контракт: у extension-tools repo
+    // обязателен.
+    let repo = match p.args.get("repo").and_then(|v| v.as_str()) {
+        Some(r) => r.to_string(),
+        None => {
+            return ok_json(federation_error(
+                &p.tool_name,
+                &server.own_ip,
+                "extension-tool вызван без обязательного 'repo' в args".to_string(),
+            ));
+        }
+    };
+
+    let entry = match resolve_local(&server, &repo, &p.tool_name) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+
+    // Найти tool в snapshot — extension_tools меняется на reload, но мы
+    // работаем со стабильным snapshot текущего вызова.
+    let snapshot = server.extension_tools.load();
+    let ext = match snapshot.iter().find(|t| t.name() == p.tool_name) {
+        Some(t) => t.clone(),
+        None => {
+            return ok_json(federation_error(
+                &p.tool_name,
+                &server.own_ip,
+                format!(
+                    "extension-tool '{}' не зарегистрирован на этой ноде \
+                     (возможно, сборка собрана без bsl-extension)",
+                    p.tool_name
+                ),
+            ));
+        }
+    };
+
+    let storage = entry.local_storage();
+    let root_path: Option<&std::path::Path> = entry.root_path.as_deref();
+    let language: Option<&str> = entry.language.as_deref();
+    let ctx = crate::extension::ToolContext {
+        repo: &repo,
+        root_path,
+        language,
+        storage,
+    };
+
+    let value = ext.execute(p.args, ctx).await;
+    // Сериализуем результат — он уже валидный JSON.
+    let body = serde_json::to_string(&value).unwrap_or_else(|e| {
+        federation_error(&p.tool_name, &server.own_ip, format!("serialize: {}", e))
+    });
+    ok_json(body)
 }

@@ -215,6 +215,22 @@ pub struct GrepCodeParams {
     pub context_lines: Option<usize>,
 }
 
+/// Универсальные параметры для federation-форварда extension-tools
+/// (`get_object_structure`, `get_form_handlers`, `find_path` и т.д.).
+///
+/// Введён в v0.8.1 как замена per-tool routes: extension-tools меняются
+/// чаще, чем core, и заводить отдельный route на каждый — лишний шум.
+/// `tool_name` — имя tool (например, `"get_object_structure"`),
+/// `args` — оригинальные arguments вызова MCP (включая `repo`).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExtensionToolParams {
+    /// Имя extension-tool как он зарегистрирован в `IndexTool::name()`.
+    pub tool_name: String,
+    /// Полный набор arguments в формате MCP (произвольный JSON-объект).
+    /// `repo` извлекается из этого поля на target-стороне.
+    pub args: serde_json::Value,
+}
+
 // ── Сервер ───────────────────────────────────────────────────────────────────
 
 /// Read-only MCP-сервер индексатора. Держит N открытых репозиториев
@@ -829,14 +845,32 @@ impl ServerHandler for CodeIndexServer {
             )
         })?;
 
-        // Local-only: extension-tools не форвардятся в federation на этапе 1.6.
-        // (При необходимости федеративный форвард можно добавить позже —
-        // сейчас 1С-инструменты работают только с local SQLite.)
+        // v0.8.1: federation для extension-tools.
+        //
+        // Если репо remote — форвардим вызов на удалённую ноду через
+        // универсальный route /federate/extension. Удалённый сервер
+        // получит {tool_name, args} и сам найдёт tool в своём
+        // extension_tools snapshot, выполнит и вернёт результат.
+        //
+        // Раньше (до 0.8.1) здесь стоял жёсткий Err «supports only local
+        // repos» — это делало BSL-tools (`get_object_structure` и т.д.)
+        // нерабочими для federation-репо (UT/BP_SS/BP_TDK/ZUP на VM rag).
         if !entry.is_local {
-            return Err(ErrorData::invalid_params(
-                format!("extension tool '{}' currently supports only local repos", tool_name),
-                None,
-            ));
+            let payload = serde_json::json!({
+                "tool_name": tool_name,
+                "args": args,
+            });
+            let body = crate::federation::dispatcher::dispatch_remote_value(
+                &self.clients,
+                &entry.ip,
+                entry.port,
+                "extension",
+                payload,
+            )
+            .await;
+            let value: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"raw": body}));
+            return Ok(CallToolResult::structured(value));
         }
         let storage = entry.local_storage();
         let root_path: Option<&Path> = entry.root_path.as_deref();
