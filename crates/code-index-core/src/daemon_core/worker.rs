@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
+use crate::extension::ProcessorRegistry;
 use crate::indexer::config::IndexConfig;
 use crate::indexer::file_types::{categorize_file, FileCategory};
 use crate::indexer::hasher;
@@ -29,12 +30,19 @@ use super::state::DaemonState;
 ///
 /// Функция блокирующая. Runner вызывает её через `spawn_blocking`. По завершении
 /// (включая ошибку) статус папки уже записан в `DaemonState`.
+///
+/// `processor_registry` — список зарегистрированных `LanguageProcessor`-ов.
+/// `None` означает «universal-only сборка» (`code-index.exe` без BSL); в этом
+/// случае пропускаем `apply_schema_extensions` / `index_extras`. В сборке
+/// `bsl-indexer.exe` сюда приходит registry с `BslLanguageProcessor`,
+/// благодаря чему создаются специфичные таблицы (metadata_objects/...).
 pub fn run_worker(
     entry: PathEntry,
     state: DaemonState,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     initial_limiter: Option<Arc<Semaphore>>,
     indexer_section: IndexerSection,
+    processor_registry: Option<Arc<ProcessorRegistry>>,
 ) {
     let path = match entry.path.canonicalize() {
         Ok(p) => p,
@@ -131,6 +139,35 @@ pub fn run_worker(
         }
     };
 
+    // 5a. Применить schema_extensions процессора, соответствующего этому репо.
+    //     Двухступенчатый resolve: явный `language` из daemon.toml → fallback
+    //     на auto-detect по маркерам корня. DDL идемпотентен (`IF NOT EXISTS`),
+    //     повторный вызов на каждом старте безопасен.
+    //
+    //     Без этого вызова в сборке `bsl-indexer.exe` BSL-tools падают с
+    //     `no such table: metadata_objects` (см. v0.8.0 регрессия —
+    //     apply_schema_extensions раньше вызывался только в CLI-команде Index).
+    let resolved_processor = processor_registry
+        .as_ref()
+        .and_then(|reg| reg.resolve(entry.language.as_deref(), &path).cloned());
+    if let Some(proc) = resolved_processor.as_ref() {
+        let exts = proc.schema_extensions();
+        if !exts.is_empty() {
+            if let Err(e) = storage.apply_schema_extensions(exts) {
+                eprintln!(
+                    "[worker:{}] apply_schema_extensions ('{}') упал: {}. \
+                     Базовая индексация продолжится, но extension-tools могут не работать.",
+                    path.display(), proc.name(), e
+                );
+            } else {
+                eprintln!(
+                    "[worker:{}] schema_extensions процессора '{}' применены ({} DDL)",
+                    path.display(), proc.name(), exts.len()
+                );
+            }
+        }
+    }
+
     eprintln!("[worker:{}] initial reindex", path.display());
 
     // 6. Полная переиндексация (fast-path по mtime, если БД уже есть)
@@ -155,6 +192,32 @@ pub fn run_worker(
                 state.set_error(&path, format!("full_reindex: {}", e)).await;
             });
             return;
+        }
+    }
+
+    // 6a. index_extras процессора — для BSL это парсинг Configuration.xml /
+    //     Forms / EventSubscriptions и заполнение metadata_*-таблиц.
+    //
+    //     ВАЖНО: вызывается ДО flush_to_disk. Если БД была новой и открыта
+    //     in-memory — записи extras должны попасть в snapshot до сброса на
+    //     диск, иначе исчезнут при reopen. Для disk-режима порядок не важен,
+    //     но единый код проще.
+    //
+    //     Ошибка не фатальна: базовая индексация уже сохранена. Логируем и
+    //     продолжаем — например, для репо без Configuration.xml (старая
+    //     выгрузка обработок) парсер может ничего не найти и это нормально.
+    if let Some(proc) = resolved_processor.as_ref() {
+        if let Err(e) = proc.index_extras(&path, &mut storage) {
+            eprintln!(
+                "[worker:{}] index_extras процессора '{}' упал: {}. \
+                 Базовая индексация при этом сохранена.",
+                path.display(), proc.name(), e
+            );
+        } else {
+            eprintln!(
+                "[worker:{}] index_extras процессора '{}' выполнен",
+                path.display(), proc.name()
+            );
         }
     }
 

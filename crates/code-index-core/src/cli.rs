@@ -6,6 +6,7 @@
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::extension::ProcessorRegistry;
 use crate::indexer::config::IndexConfig;
@@ -696,11 +697,13 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             // event_subscriptions). DDL идемпотентен (CREATE IF NOT EXISTS),
             // повторный вызов безвреден.
             //
-            // Auto-detect языка по корню репо: используем первый процессор,
-            // у которого `detects(root) == true`. Это даёт работающую
-            // схему даже без явного `language` в daemon.toml.
+            // Resolve через `ProcessorRegistry::resolve(None, root)` —
+            // CLI-команда `index` не знает явный `language` из daemon.toml
+            // (это standalone разовая индексация), поэтому работает только
+            // auto-detect по маркерам. Логика идентична daemon-режиму, что
+            // даёт единый контракт «индексация» независимо от запуска.
             if let Some(reg) = registry.as_ref() {
-                if let Some(proc) = reg.detect(&abs_path) {
+                if let Some(proc) = reg.resolve(None, &abs_path) {
                     let exts = proc.schema_extensions();
                     if !exts.is_empty() {
                         storage.apply_schema_extensions(exts)?;
@@ -729,7 +732,7 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             // если бы мы дописали в conn после flush, записи остались бы
             // только в памяти и пропали бы при выходе.
             if let Some(reg) = registry.as_ref() {
-                if let Some(proc) = reg.detect(&abs_path) {
+                if let Some(proc) = reg.resolve(None, &abs_path) {
                     if let Err(e) = proc.index_extras(&abs_path, &mut storage) {
                         tracing::warn!(
                             "index_extras процессора '{}' завершился с ошибкой: {}. \
@@ -1049,7 +1052,14 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
-        Commands::Daemon { action } => handle_daemon(action).await?,
+        Commands::Daemon { action } => {
+            // Передаём registry в handle_daemon, чтобы daemon-режим мог
+            // применять schema_extensions / index_extras для BSL и других
+            // языков-расширений. registry.take() — чтобы не клонировать
+            // и сохранить совместимость с веткой Serve выше.
+            let reg = registry.take().map(Arc::new);
+            handle_daemon(action, reg).await?;
+        }
     }
 
     Ok(())
@@ -1093,7 +1103,10 @@ fn detach_from_console_if_needed() -> anyhow::Result<bool> {
     Ok(false)
 }
 
-async fn handle_daemon(action: DaemonAction) -> anyhow::Result<()> {
+async fn handle_daemon(
+    action: DaemonAction,
+    processor_registry: Option<Arc<ProcessorRegistry>>,
+) -> anyhow::Result<()> {
     use crate::daemon_core::{client, runner};
 
     match action {
@@ -1102,7 +1115,7 @@ async fn handle_daemon(action: DaemonAction) -> anyhow::Result<()> {
                 return Ok(());
             }
             tracing::info!("Запуск фонового демона code-index");
-            runner::run().await?;
+            runner::run(processor_registry).await?;
         }
         DaemonAction::Status { json } => match client::health().await {
             Ok(h) => {

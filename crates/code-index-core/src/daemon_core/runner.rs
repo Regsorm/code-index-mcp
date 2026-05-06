@@ -25,10 +25,16 @@ use super::paths;
 use super::server::{build_router, AppState};
 use super::state::DaemonState;
 use super::worker;
+use crate::extension::ProcessorRegistry;
 
 /// Запустить демона в foreground-режиме. Возврат происходит только после
 /// полной остановки (сигнал stop или Ctrl-C).
-pub async fn run() -> Result<()> {
+///
+/// `processor_registry` — реестр `LanguageProcessor`-ов от bin'а
+/// (`code-index` или `bsl-indexer`). Пробрасывается до worker'ов, чтобы
+/// они могли применить `schema_extensions()` и `index_extras()` для
+/// своих репо. `None` — universal-only сборка без BSL.
+pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<()> {
     let _pid_lock = lock::acquire()?;
     let started_at = std::time::Instant::now();
     let version = env!("CARGO_PKG_VERSION").to_string();
@@ -111,6 +117,7 @@ pub async fn run() -> Result<()> {
             shutdown_tx.subscribe(),
             initial_limiter.clone(),
             indexer_section.clone(),
+            processor_registry.clone(),
         );
         workers.insert(canonical, handle);
     }
@@ -121,7 +128,12 @@ pub async fn run() -> Result<()> {
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     DaemonCommand::Reload { respond_to } => {
-                        let resp = handle_reload(&daemon_state, &mut workers, &shutdown_tx).await;
+                        let resp = handle_reload(
+                            &daemon_state,
+                            &mut workers,
+                            &shutdown_tx,
+                            processor_registry.clone(),
+                        ).await;
                         let _ = respond_to.send(resp);
                     }
                     DaemonCommand::Stop { respond_to } => {
@@ -164,9 +176,17 @@ fn spawn_worker(
     shutdown_rx: broadcast::Receiver<()>,
     initial_limiter: Option<Arc<Semaphore>>,
     indexer_section: IndexerSection,
+    processor_registry: Option<Arc<ProcessorRegistry>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        worker::run_worker(entry, state, shutdown_rx, initial_limiter, indexer_section);
+        worker::run_worker(
+            entry,
+            state,
+            shutdown_rx,
+            initial_limiter,
+            indexer_section,
+            processor_registry,
+        );
     })
 }
 
@@ -177,6 +197,7 @@ async fn handle_reload(
     state: &DaemonState,
     workers: &mut HashMap<PathBuf, tokio::task::JoinHandle<()>>,
     shutdown_tx: &broadcast::Sender<()>,
+    processor_registry: Option<Arc<ProcessorRegistry>>,
 ) -> ReloadResponse {
     let cfg = match config::load_or_default() {
         Ok(c) => c,
@@ -218,6 +239,7 @@ async fn handle_reload(
                 shutdown_tx.subscribe(),
                 limiter.clone(),
                 indexer_section.clone(),
+                processor_registry.clone(),
             );
             workers.insert(canonical, handle);
         }
