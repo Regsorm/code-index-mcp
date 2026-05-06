@@ -3,6 +3,34 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.8.1] — 2026-05-06
+
+**Patch-релиз: BSL extension-tools в daemon-режиме и через federation.** Закрывает две публичные регрессии v0.8.0, из-за которых пять BSL-инструментов (`get_object_structure`, `get_form_handlers`, `get_event_subscriptions`, `find_path`, `search_terms`) были нерабочими в штатном production-сценарии (репо обслуживаются демоном, federation-репо на удалённой ноде).
+
+### Исправлено
+
+- **Daemon теперь применяет `schema_extensions` и `index_extras` процессоров.** В v0.8.0 эти вызовы были только в CLI-команде `index <path>`, а worker даемона их не делал. Результат: на любом BSL-репо, проиндексированном через `bsl-indexer.exe daemon run`, BSL-tools падали с `database error: no such table: metadata_objects`. Теперь worker `daemon_core/worker.rs` сам resolve'ит процессор по правилу «явный `language` из `daemon.toml` → fallback `detect()`», применяет `apply_schema_extensions` ДО `full_reindex` (создаёт пустые таблицы — DDL идемпотентен) и вызывает `index_extras` ДО `flush_to_disk` (наполняет таблицы из `Configuration.xml`). Для репо без `Configuration.xml` (например, старые выгрузки обработок) таблицы создаются пустыми — tools отвечают `[]` без exception.
+- **Federation теперь форвардит extension-tools на удалённые ноды.** Раньше любой вызов BSL-tool на remote-репо (UT/BP_SS/BP_TDK/ZUP на VM rag) возвращал `extension tool '...' currently supports only local repos`. Введён универсальный route `POST /federate/extension` с payload `{tool_name, args}` — один маршрут на все extension-tools, расширяемо при добавлении новых LanguageProcessor'ов. На source-стороне `mcp::call_tool` форвардит вызов через `dispatcher::dispatch_remote_value`. Обе ноды federation должны быть обновлены до 0.8.1 синхронно — старая нода вернёт 404 на новый route.
+
+### Добавлено
+
+- **`ProcessorRegistry::resolve(explicit_language, repo_root)`** — двухступенчатый resolve процессора: сначала по явному `language` из конфига, потом fallback на `detect()` по маркерам корня. Используется в daemon-worker и в CLI-команде `index`. Унифицирует поведение «индексация» независимо от способа запуска.
+- **Структура `mcp::ExtensionToolParams { tool_name, args }`** — payload для federation-форварда extension-tools.
+- **Universal handler `handle_extension_tool` в `federation::server`** — находит tool в `extension_tools` snapshot, строит `ToolContext` для local repo и вызывает `IndexTool::execute`. Если на target-ноде такого tool нет (например, она запущена не с bsl-extension) — возвращает `federation_error` с понятным сообщением.
+
+### Изменено
+
+- **`run_worker` принимает `processor_registry: Option<Arc<ProcessorRegistry>>`** (последний параметр). `None` = universal-only сборка (`code-index.exe`); `Some(reg)` = `bsl-indexer.exe`. Используется для resolve процессора текущего репо.
+- **`runner::run` принимает `processor_registry`** и пробрасывает в `spawn_worker` (initial loop + `handle_reload`).
+- **`cli::handle_daemon` принимает `processor_registry`** — передаётся в `runner::run` при запуске даемона.
+- **`Commands::Index` использует `resolve(None, root)`** вместо прямого `detect(root)` — поведение идентично, но единый кодпуть.
+
+### Совместимость
+
+Изменения сигнатур публичных API в `daemon_core::worker`/`runner`/`cli` — additive (новые параметры в конце). Сборка `bsl-indexer` 0.8.1 совместима с конфигом `daemon.toml` 0.8.0 — миграции БД не требуется (DDL `apply_schema_extensions` идемпотентен).
+
+**Federation:** обе ноды нужно обновлять одновременно. До-0.8.1 нода вернёт `404 Not Found` на `POST /federate/extension`, и new-нода покажет это как `federation_error`.
+
 ## [0.8.0] — 2026-05-05
 
 **Phase 2 «content для code-файлов»** — закрытие главного ограничения Phase 1. До v0.8.0 `read_file` для `.py`/`.bsl`/`.rs`/`.ts` и других code-файлов возвращал `category="code"` с пустым `content`. Теперь содержимое хранится в новой таблице `file_contents` (zstd-сжатие, миграция v4) и отдаётся при каждом вызове. Дополнительно: новый инструмент `grep_code` для regex-поиска непосредственно по содержимому code-файлов, oversize-механика для файлов крупнее настраиваемого лимита.
