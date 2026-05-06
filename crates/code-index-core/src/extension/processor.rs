@@ -112,6 +112,28 @@ impl ProcessorRegistry {
         self.processors.iter().find(|p| p.detects(repo_root))
     }
 
+    /// Двухступенчатый resolve: сначала пробуем явное имя (если задано
+    /// в `daemon.toml` через `language = "..."`), потом fallback на
+    /// auto-detect по маркерам корня.
+    ///
+    /// Зачем: для репо вида «выгрузка обработок без Configuration.xml в
+    /// корне» (`wms`, кастомные сборки) auto-detect не сработает, но
+    /// пользователь явно указал `language = "bsl"` — мы должны это
+    /// уважать и применить bsl-специфичные schema_extensions, иначе
+    /// BSL-tools падают с `no such table: metadata_objects`.
+    pub fn resolve(
+        &self,
+        explicit_language: Option<&str>,
+        repo_root: &Path,
+    ) -> Option<&Arc<dyn LanguageProcessor>> {
+        if let Some(name) = explicit_language {
+            if let Some(p) = self.get(name) {
+                return Some(p);
+            }
+        }
+        self.detect(repo_root)
+    }
+
     /// Все имена зарегистрированных языков — для логов и диагностики.
     pub fn names(&self) -> Vec<&str> {
         self.processors.iter().map(|p| p.name()).collect()
@@ -316,5 +338,48 @@ mod tests {
         let p = StandardLanguageProcessor::rust();
         assert!(p.additional_tools().is_empty());
         assert!(p.schema_extensions().is_empty());
+    }
+
+    #[test]
+    fn resolve_prefers_explicit_language_even_without_marker() {
+        // Конфиг говорит «bsl», но Configuration.xml в корне нет —
+        // resolve всё равно должен вернуть BSL-процессор.
+        let mut reg = ProcessorRegistry::new();
+        reg.register(Arc::new(StandardLanguageProcessor::rust()));
+        reg.register(Arc::new(StandardLanguageProcessor::bsl()));
+        let tmp = TempDir::new().unwrap();
+        let resolved = reg.resolve(Some("bsl"), tmp.path()).map(|p| p.name());
+        assert_eq!(resolved, Some("bsl"));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_detect_when_no_explicit_language() {
+        let mut reg = ProcessorRegistry::new();
+        reg.register(Arc::new(StandardLanguageProcessor::rust()));
+        reg.register(Arc::new(StandardLanguageProcessor::python()));
+        let tmp = TempDir::new().unwrap();
+        touch(tmp.path(), "Cargo.toml");
+        let resolved = reg.resolve(None, tmp.path()).map(|p| p.name());
+        assert_eq!(resolved, Some("rust"));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_detect_when_explicit_unknown() {
+        // Имя процессора не зарегистрировано — берём fallback на маркеры.
+        let mut reg = ProcessorRegistry::new();
+        reg.register(Arc::new(StandardLanguageProcessor::python()));
+        let tmp = TempDir::new().unwrap();
+        touch(tmp.path(), "pyproject.toml");
+        let resolved = reg.resolve(Some("brainfuck"), tmp.path()).map(|p| p.name());
+        assert_eq!(resolved, Some("python"));
+    }
+
+    #[test]
+    fn resolve_returns_none_when_nothing_matches() {
+        let mut reg = ProcessorRegistry::new();
+        reg.register(Arc::new(StandardLanguageProcessor::python()));
+        let tmp = TempDir::new().unwrap();
+        // Нет ни маркера, ни явного language → None.
+        assert!(reg.resolve(None, tmp.path()).is_none());
     }
 }
