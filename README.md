@@ -311,6 +311,12 @@ When BSL repos are present in `daemon.toml` (`language = "bsl"`), 5 BSL-specific
 
 These tools appear in `tools/list` **only when at least one BSL repo is configured** (conditional registration). When the repo set changes in `daemon.toml`, the server emits `notifications/tools/list_changed`. On Claude Code 2.1.120 this notification is currently [ignored](https://github.com/anthropics/claude-code/issues/13646); workaround — manual `/mcp Reconnect`.
 
+**Since v0.8.1**, these BSL-tools work in **all** scenarios (was broken in v0.8.0, see CHANGELOG):
+
+* via `bsl-indexer.exe daemon run` — daemon now applies `schema_extensions` and `index_extras` for each BSL repo on startup (creates `metadata_objects` / `metadata_forms` / `event_subscriptions` / `proc_call_graph` and fills them from `Configuration.xml`).
+* via federation — extension-tools are forwarded over the universal `POST /federate/extension` route. Both peers must be on **≥ 0.8.1**; older peers will return 404 on the new route.
+* on repos without `Configuration.xml` (e.g. partial dumps containing only forms/processors) — the tables are created empty and the tools return `[]` instead of throwing `no such table: metadata_objects`.
+
 Full instructions: [docs/bsl-indexer.md](docs/bsl-indexer.md).
 
 All tools support a language filter: `search_function(query="X", language="python")`

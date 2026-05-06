@@ -7,6 +7,10 @@
 
 **Patch-релиз: BSL extension-tools в daemon-режиме и через federation.** Закрывает две публичные регрессии v0.8.0, из-за которых пять BSL-инструментов (`get_object_structure`, `get_form_handlers`, `get_event_subscriptions`, `find_path`, `search_terms`) были нерабочими в штатном production-сценарии (репо обслуживаются демоном, federation-репо на удалённой ноде).
 
+### Как нашли и почему починили сами
+
+Регрессия обнаружена нами **в ходе эксплуатации v0.8.0** (2026-05-06): попытка вызвать `get_object_structure` на любом BSL-репо приводила к `database error: no such table: metadata_objects`, а на federation-репо — к `extension tool '...' currently supports only local repos`. До нас ошибки никто не сообщал — внешние пользователи v0.8.0 могли не дойти до 1С-ветки. Локализовано до двух точек в `code-index-core`: вызовы `apply_schema_extensions` / `index_extras` существовали только в CLI-команде `index` (`cli.rs`), а в `daemon_core/worker.rs` отсутствовали; в `mcp::call_tool` стоял жёсткий отказ для `is_local == false`. После полного цикла проверки (235 unit-тестов + smoke на 4 BSL-репо локально и через federation на VM) — фикс вкатан патчем v0.8.1 без участия внешнего сообщества.
+
 ### Исправлено
 
 - **Daemon теперь применяет `schema_extensions` и `index_extras` процессоров.** В v0.8.0 эти вызовы были только в CLI-команде `index <path>`, а worker даемона их не делал. Результат: на любом BSL-репо, проиндексированном через `bsl-indexer.exe daemon run`, BSL-tools падали с `database error: no such table: metadata_objects`. Теперь worker `daemon_core/worker.rs` сам resolve'ит процессор по правилу «явный `language` из `daemon.toml` → fallback `detect()`», применяет `apply_schema_extensions` ДО `full_reindex` (создаёт пустые таблицы — DDL идемпотентен) и вызывает `index_extras` ДО `flush_to_disk` (наполняет таблицы из `Configuration.xml`). Для репо без `Configuration.xml` (например, старые выгрузки обработок) таблицы создаются пустыми — tools отвечают `[]` без exception.
