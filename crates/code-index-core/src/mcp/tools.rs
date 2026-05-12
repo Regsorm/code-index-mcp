@@ -85,6 +85,60 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
     }
 }
 
+// ── Event-based invalidation helpers (Phase 2) ──────────────────────────────
+
+/// Завернуть результат tool'а в `{result, _meta: {dependent_files: [...]}}`.
+///
+/// Целевой потребитель — `mcp-cache-ci`: при cache-fill он парсит payload и
+/// регистрирует связи `cache_key → file_path` в `reverse_index`. По
+/// последующему `POST /invalidate {file_paths: [...]}` от daemon после
+/// `transaction.commit()` SQLite (этап 3) cache-ci мгновенно сносит ровно те
+/// entries, что зависят от изменённых файлов — не задевая соседних.
+///
+/// `dependent_files` пустой → entry попадёт в кэш без file-зависимостей и будет
+/// чиститься только по TTL (как раньше). Это нормально для tools без явной
+/// привязки к файлам (часть BSL-инструментов).
+///
+/// Дубликаты в `dependent_files` дедуплицируются (HashSet → Vec, без гарантии
+/// порядка — cache-ci порядок не использует).
+pub(crate) fn wrap_with_meta<T: serde::Serialize>(
+    result: &T,
+    dependent_files: Vec<String>,
+) -> String {
+    use std::collections::HashSet;
+    let deps: Vec<String> = dependent_files
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let result_value = match serde_json::to_value(result) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\": \"Сериализация result: {}\"}}", e),
+    };
+    let wrapped = serde_json::json!({
+        "result": result_value,
+        "_meta": { "dependent_files": deps },
+    });
+    serde_json::to_string_pretty(&wrapped)
+        .unwrap_or_else(|e| format!("{{\"error\": \"Сериализация wrap: {}\"}}", e))
+}
+
+/// Собрать `dependent_files` из vec'а записей через extractor file_id.
+/// Применяется к Vec<FunctionRecord>, Vec<ClassRecord>, Vec<CallRecord> и т.п.
+/// Дубликаты не нужно дедуплицировать здесь — `wrap_with_meta` сам сделает.
+pub(crate) fn collect_paths_via<R>(
+    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
+    records: &[R],
+    extract: impl Fn(&R) -> i64,
+) -> Vec<String> {
+    records
+        .iter()
+        .map(|r| lookup_path(storage, extract(r)))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 // ── Phase 1 helpers ─────────────────────────────────────────────────────────
 
 /// Скомпилировать glob → matcher через `globset`. Применяется к результатам
@@ -147,7 +201,8 @@ pub async fn search_function(
                 r.retain(|fr| matches_with(&matcher, &lookup_path(&storage, fr.file_id)));
                 r.truncate(want);
             }
-            to_json(&r)
+            let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
+            wrap_with_meta(&r, deps)
         }
         Err(e) => format!("{{\"error\": \"search_function: {}\"}}", e),
     }
@@ -178,7 +233,8 @@ pub async fn search_class(
                 r.retain(|cr| matches_with(&matcher, &lookup_path(&storage, cr.file_id)));
                 r.truncate(want);
             }
-            to_json(&r)
+            let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            wrap_with_meta(&r, deps)
         }
         Err(e) => format!("{{\"error\": \"search_class: {}\"}}", e),
     }
@@ -200,7 +256,8 @@ pub async fn get_function(
                 };
                 r.retain(|fr| matches_with(&matcher, &lookup_path(&storage, fr.file_id)));
             }
-            to_json(&r)
+            let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
+            wrap_with_meta(&r, deps)
         }
         Err(e) => format!("{{\"error\": \"get_function: {}\"}}", e),
     }
@@ -222,7 +279,8 @@ pub async fn get_class(
                 };
                 r.retain(|cr| matches_with(&matcher, &lookup_path(&storage, cr.file_id)));
             }
-            to_json(&r)
+            let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            wrap_with_meta(&r, deps)
         }
         Err(e) => format!("{{\"error\": \"get_class: {}\"}}", e),
     }
@@ -236,7 +294,10 @@ pub async fn get_callers(
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     match storage.get_callers(&function_name, language.as_deref()) {
-        Ok(r) => to_json(&r),
+        Ok(r) => {
+            let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            wrap_with_meta(&r, deps)
+        }
         Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
     }
 }
@@ -249,7 +310,10 @@ pub async fn get_callees(
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     match storage.get_callees(&function_name, language.as_deref()) {
-        Ok(r) => to_json(&r),
+        Ok(r) => {
+            let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            wrap_with_meta(&r, deps)
+        }
         Err(e) => format!("{{\"error\": \"get_callees: {}\"}}", e),
     }
 }
@@ -278,7 +342,11 @@ pub async fn find_symbol(
                 r.imports
                     .retain(|ir| matches_with(&matcher, &lookup_path(&storage, ir.file_id)));
             }
-            to_json(&r)
+            let mut deps = collect_paths_via(&storage, &r.functions, |fr| fr.file_id);
+            deps.extend(collect_paths_via(&storage, &r.classes, |cr| cr.file_id));
+            deps.extend(collect_paths_via(&storage, &r.variables, |vr| vr.file_id));
+            deps.extend(collect_paths_via(&storage, &r.imports, |ir| ir.file_id));
+            wrap_with_meta(&r, deps)
         }
         Err(e) => format!("{{\"error\": \"find_symbol: {}\"}}", e),
     }
@@ -294,13 +362,19 @@ pub async fn get_imports(
     let storage = entry.local_storage().lock().await;
     if let Some(fid) = file_id {
         return match storage.get_imports_by_file(fid) {
-            Ok(r) => to_json(&r),
+            Ok(r) => {
+                let deps = collect_paths_via(&storage, &r, |ir| ir.file_id);
+                wrap_with_meta(&r, deps)
+            }
             Err(e) => format!("{{\"error\": \"get_imports_by_file: {}\"}}", e),
         };
     }
     if let Some(ref m) = module {
         return match storage.get_imports_by_module(m, language.as_deref()) {
-            Ok(r) => to_json(&r),
+            Ok(r) => {
+                let deps = collect_paths_via(&storage, &r, |ir| ir.file_id);
+                wrap_with_meta(&r, deps)
+            }
             Err(e) => format!("{{\"error\": \"get_imports_by_module: {}\"}}", e),
         };
     }
@@ -311,7 +385,13 @@ pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
     match storage.get_file_summary(&path) {
-        Ok(Some(s)) => to_json(&s),
+        Ok(Some(s)) => {
+            // Зависимость одна и явная — путь из args, который daemon только что
+            // запросил из таблицы files. Если результат пустой — entry всё равно
+            // помечается как зависящий от этого path (туда придёт invalidate при
+            // изменении).
+            wrap_with_meta(&s, vec![path.clone()])
+        }
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден\"}}", path),
         Err(e) => format!("{{\"error\": \"get_file_summary: {}\"}}", e),
     }
@@ -466,11 +546,12 @@ pub async fn search_text(
                 results.retain(|(p, _)| matches_with(&matcher, p));
                 results.truncate(want);
             }
+            let deps: Vec<String> = results.iter().map(|(p, _)| p.clone()).collect();
             let items: Vec<serde_json::Value> = results
                 .into_iter()
                 .map(|(path, snippet)| serde_json::json!({ "path": path, "snippet": snippet }))
                 .collect();
-            to_json(&items)
+            wrap_with_meta(&items, deps)
         }
         Err(e) => format!("{{\"error\": \"search_text: {}\"}}", e),
     }
@@ -500,7 +581,10 @@ pub async fn grep_body(
             ctx,
             GREP_TOTAL_BYTES_CAP,
         ) {
-            Ok(r) => to_json(&r),
+            Ok(r) => {
+                let deps: Vec<String> = r.iter().map(|m| m.file_path.clone()).collect();
+                wrap_with_meta(&r, deps)
+            }
             Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
         }
     } else {
@@ -510,7 +594,10 @@ pub async fn grep_body(
             language.as_deref(),
             limit.unwrap_or(100),
         ) {
-            Ok(r) => to_json(&r),
+            Ok(r) => {
+                let deps: Vec<String> = r.iter().map(|m| m.file_path.clone()).collect();
+                wrap_with_meta(&r, deps)
+            }
             Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
         }
     }
@@ -521,6 +608,10 @@ pub async fn grep_body(
 pub async fn stat_file(entry: &RepoEntry, path: String) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
+    // stat_file намеренно НЕ заворачиваем в `_meta` — он non-cacheable по
+    // policy (всегда быстрая прямая выборка, к тому же быстро меняется на
+    // тонких операциях типа `oversize` после реиндексации). Прокси даже не
+    // увидит этот ответ в кэше.
     match storage.stat_file_meta(&path) {
         Ok(r) => to_json(&r),
         Err(e) => format!("{{\"error\": \"stat_file: {}\"}}", e),
@@ -542,7 +633,10 @@ pub async fn list_files(
         language.as_deref(),
         limit.unwrap_or(500),
     ) {
-        Ok(r) => to_json(&r),
+        Ok(r) => {
+            let deps: Vec<String> = r.iter().map(|lf| lf.path.clone()).collect();
+            wrap_with_meta(&r, deps)
+        }
         Err(e) => format!("{{\"error\": \"list_files: {}\"}}", e),
     }
 }
@@ -567,7 +661,7 @@ pub async fn read_file(
         // file_size в ответе всё равно показывается, оператор может сравнить.
         None,
     ) {
-        Ok(Some(r)) => to_json(&r),
+        Ok(Some(r)) => wrap_with_meta(&r, vec![path.clone()]),
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден в индексе\"}}", path),
         Err(e) => format!("{{\"error\": \"read_file: {}\"}}", e),
     }
@@ -599,7 +693,10 @@ pub async fn grep_text(
         context_lines.unwrap_or(0),
         GREP_TOTAL_BYTES_CAP,
     ) {
-        Ok(r) => to_json(&r),
+        Ok(r) => {
+            let deps: Vec<String> = r.iter().map(|m| m.path.clone()).collect();
+            wrap_with_meta(&r, deps)
+        }
         Err(e) => format!("{{\"error\": \"grep_text: {}\"}}", e),
     }
 }
@@ -638,7 +735,10 @@ pub async fn grep_code(
         context_lines.unwrap_or(0),
         GREP_TOTAL_BYTES_CAP,
     ) {
-        Ok(r) => to_json(&r),
+        Ok(r) => {
+            let deps: Vec<String> = r.iter().map(|m| m.path.clone()).collect();
+            wrap_with_meta(&r, deps)
+        }
         Err(e) => format!("{{\"error\": \"grep_code: {}\"}}", e),
     }
 }
