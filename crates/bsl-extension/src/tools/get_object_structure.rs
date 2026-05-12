@@ -60,9 +60,9 @@ impl IndexTool for GetObjectStructureTool {
             let full_name = match args.get("full_name").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => {
-                    return json!({
+                    return crate::tools::wrap_error(json!({
                         "error": "missing required parameter 'full_name' (string)"
-                    });
+                    }));
                 }
             };
 
@@ -82,7 +82,7 @@ impl IndexTool for GetObjectStructureTool {
                 },
             );
 
-            match row {
+            let result_value = match row {
                 Ok((meta_type, name, synonym, attrs)) => {
                     let attrs_value = attrs
                         .as_deref()
@@ -102,7 +102,8 @@ impl IndexTool for GetObjectStructureTool {
                 Err(e) => json!({
                     "error": format!("database error: {}", e)
                 }),
-            }
+            };
+            crate::tools::wrap_with_meta(result_value, Vec::new())
         })
     }
 }

@@ -90,7 +90,11 @@ impl IndexTool for GetEventSubscriptionsTool {
 
             let mut stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
-                Err(e) => return json!({"error": format!("prepare failed: {}", e)}),
+                Err(e) => {
+                    return crate::tools::wrap_error(json!({
+                        "error": format!("prepare failed: {}", e)
+                    }))
+                }
             };
             let rows = stmt.query_map(params_vec.as_slice(), |r| {
                 Ok((
@@ -120,13 +124,25 @@ impl IndexTool for GetEventSubscriptionsTool {
                                     "sources": sources_v,
                                 }));
                             }
-                            Err(e) => return json!({"error": format!("row error: {}", e)}),
+                            Err(e) => {
+                                return crate::tools::wrap_error(json!({
+                                    "error": format!("row error: {}", e)
+                                }))
+                            }
                         }
                     }
                 }
-                Err(e) => return json!({"error": format!("query failed: {}", e)}),
+                Err(e) => {
+                    return crate::tools::wrap_error(json!({
+                        "error": format!("query failed: {}", e)
+                    }))
+                }
             }
-            json!({"subscriptions": out, "count": out.len()})
+            let count = out.len();
+            crate::tools::wrap_with_meta(
+                json!({"subscriptions": out, "count": count}),
+                Vec::new(),
+            )
         })
     }
 }

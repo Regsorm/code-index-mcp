@@ -38,6 +38,12 @@ fn fresh_storage() -> (TempDir, Arc<Mutex<Storage>>) {
     (tmp, Arc::new(Mutex::new(storage)))
 }
 
+/// Запустить tool и вернуть **распакованное** значение `result` из ответа.
+///
+/// С 0.9.0 все extension-tools возвращают `{result, _meta: {dependent_files: [...]}}`
+/// для event-based cache invalidation. Тесты проверяют поле `_meta` отдельно
+/// (must exist и быть массивом), а основной result отдают наружу как раньше —
+/// чтобы сохранить совместимость существующих assert'ов по `res["..."]`.
 async fn run_tool(
     tool: &dyn IndexTool,
     storage: &Arc<Mutex<Storage>>,
@@ -49,7 +55,12 @@ async fn run_tool(
         language: Some("bsl"),
         storage,
     };
-    tool.execute(args, ctx).await
+    let raw = tool.execute(args, ctx).await;
+    assert!(
+        raw["_meta"]["dependent_files"].is_array(),
+        "tool обязан возвращать _meta.dependent_files (массив, возможно пустой). Получили: {raw}"
+    );
+    raw["result"].clone()
 }
 
 // ── get_object_structure ──────────────────────────────────────────────────

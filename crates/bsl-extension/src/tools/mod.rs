@@ -27,3 +27,24 @@ pub use get_event_subscriptions::GetEventSubscriptionsTool;
 pub use get_form_handlers::GetFormHandlersTool;
 pub use get_object_structure::GetObjectStructureTool;
 pub use search_terms::SearchTermsTool;
+
+use serde_json::{json, Value};
+
+/// Завернуть результат BSL-tool'а в `{result, _meta: {dependent_files: [...]}}`
+/// для cache-ci event-based invalidation (Phase 2). BSL-tools пока не вычисляют
+/// dependent_files (XML-парсер метаданных хранит данные о объектах конфигурации
+/// не как файлы а как records в SQLite) — отдаём пустой массив. Entry попадёт
+/// в кэш без file-зависимостей и будет чиститься только по TTL (как раньше).
+/// Включение реальных dependent_files для BSL — задача следующей итерации.
+pub(crate) fn wrap_with_meta(result: Value, dependent_files: Vec<String>) -> Value {
+    json!({
+        "result": result,
+        "_meta": { "dependent_files": dependent_files },
+    })
+}
+
+/// Сохранить _meta даже на ошибке, чтобы клиенты всегда получали единый формат
+/// `{result, _meta}`. Tool сам помещает в `result` что нужно (включая `{error: ...}`).
+pub(crate) fn wrap_error(error_value: Value) -> Value {
+    wrap_with_meta(error_value, Vec::new())
+}

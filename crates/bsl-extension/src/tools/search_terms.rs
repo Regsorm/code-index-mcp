@@ -76,7 +76,9 @@ impl IndexTool for SearchTermsTool {
             let query = match args.get("query").and_then(|v| v.as_str()) {
                 Some(s) if !s.trim().is_empty() => s.to_string(),
                 _ => {
-                    return json!({"error": "missing or empty parameter 'query' (string)"});
+                    return crate::tools::wrap_error(json!({
+                        "error": "missing or empty parameter 'query' (string)"
+                    }));
                 }
             };
             let limit: i64 = args
@@ -107,7 +109,11 @@ impl IndexTool for SearchTermsTool {
 
             let mut stmt = match conn.prepare(sql) {
                 Ok(s) => s,
-                Err(e) => return json!({"error": format!("prepare: {}", e)}),
+                Err(e) => {
+                    return crate::tools::wrap_error(json!({
+                        "error": format!("prepare: {}", e)
+                    }))
+                }
             };
             let rows_iter = stmt.query_map(params![ctx.repo, &query, limit], |r| {
                 Ok(json!({
@@ -126,16 +132,19 @@ impl IndexTool for SearchTermsTool {
                     // Типичная причина — невалидный FTS5 синтаксис в query.
                     // Возвращаем структурированную ошибку, чтобы LLM
                     // подкорректировала запрос.
-                    return json!({
+                    return crate::tools::wrap_error(json!({
                         "error": format!("FTS-запрос '{}' отвергнут: {}", query, e)
-                    });
+                    }));
                 }
             };
 
-            json!({
-                "query": query,
-                "results": rows,
-            })
+            crate::tools::wrap_with_meta(
+                json!({
+                    "query": query,
+                    "results": rows,
+                }),
+                Vec::new(),
+            )
         })
     }
 }

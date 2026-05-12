@@ -73,13 +73,17 @@ impl IndexTool for FindPathTool {
             let from = match args.get("from").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => {
-                    return json!({"error": "missing required parameter 'from' (string)"});
+                    return crate::tools::wrap_error(json!({
+                        "error": "missing required parameter 'from' (string)"
+                    }));
                 }
             };
             let to = match args.get("to").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => {
-                    return json!({"error": "missing required parameter 'to' (string)"});
+                    return crate::tools::wrap_error(json!({
+                        "error": "missing required parameter 'to' (string)"
+                    }));
                 }
             };
             let max_depth: i64 = args
@@ -140,7 +144,7 @@ impl IndexTool for FindPathTool {
                 |r| r.get::<_, String>(0),
             );
 
-            match row {
+            let result_value = match row {
                 Ok(path_json) => {
                     let path: Value = serde_json::from_str(&path_json)
                         .unwrap_or_else(|_| Value::Array(Vec::new()));
@@ -159,7 +163,8 @@ impl IndexTool for FindPathTool {
                     "max_depth": max_depth,
                 }),
                 Err(e) => json!({"error": format!("database error: {}", e)}),
-            }
+            };
+            crate::tools::wrap_with_meta(result_value, Vec::new())
         })
     }
 }

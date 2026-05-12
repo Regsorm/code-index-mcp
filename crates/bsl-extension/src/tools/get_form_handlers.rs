@@ -59,17 +59,17 @@ impl IndexTool for GetFormHandlersTool {
             let owner = match args.get("owner_full_name").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => {
-                    return json!({
+                    return crate::tools::wrap_error(json!({
                         "error": "missing required parameter 'owner_full_name' (string)"
-                    });
+                    }));
                 }
             };
             let form_name = match args.get("form_name").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => {
-                    return json!({
+                    return crate::tools::wrap_error(json!({
                         "error": "missing required parameter 'form_name' (string)"
-                    });
+                    }));
                 }
             };
 
@@ -83,7 +83,7 @@ impl IndexTool for GetFormHandlersTool {
                 |r| r.get::<_, Option<String>>(0),
             );
 
-            match row {
+            let result_value = match row {
                 Ok(handlers_json) => {
                     let handlers = handlers_json
                         .as_deref()
@@ -102,7 +102,8 @@ impl IndexTool for GetFormHandlersTool {
                     )
                 }),
                 Err(e) => json!({"error": format!("database error: {}", e)}),
-            }
+            };
+            crate::tools::wrap_with_meta(result_value, Vec::new())
         })
     }
 }
