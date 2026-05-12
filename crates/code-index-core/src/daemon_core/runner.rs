@@ -16,6 +16,7 @@ use anyhow::Result;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Semaphore};
 
+use super::cache_client::CacheClient;
 use super::commands::{self, DaemonCommand};
 use super::config::{self, IndexerSection, PathEntry};
 use super::ipc::{ReloadResponse, RuntimeInfo, StopResponse};
@@ -106,6 +107,23 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
 
     let mut workers: HashMap<PathBuf, tokio::task::JoinHandle<()>> = HashMap::new();
     let indexer_section = cfg.indexer.clone();
+
+    // Event-based cache invalidation (этап 3, v0.9.1+): создаём один общий
+    // CacheClient на все workers, передаём как `Option<Arc<_>>`. Пустой
+    // `cache_targets` → None (внутренний путь invalidate отключён).
+    let cache_target_urls: Vec<String> =
+        cfg.cache_targets.iter().map(|t| t.url.clone()).collect();
+    let cache_client = if cache_target_urls.is_empty() {
+        None
+    } else {
+        let cc = Arc::new(CacheClient::new(cache_target_urls));
+        eprintln!(
+            "[daemon] cache invalidation: {} target(s) настроено",
+            cc.target_count()
+        );
+        Some(cc)
+    };
+
     for entry in cfg.paths.into_iter() {
         let canonical = entry
             .path
@@ -118,6 +136,7 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
             initial_limiter.clone(),
             indexer_section.clone(),
             processor_registry.clone(),
+            cache_client.clone(),
         );
         workers.insert(canonical, handle);
     }
@@ -177,6 +196,7 @@ fn spawn_worker(
     initial_limiter: Option<Arc<Semaphore>>,
     indexer_section: IndexerSection,
     processor_registry: Option<Arc<ProcessorRegistry>>,
+    cache_client: Option<Arc<CacheClient>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         worker::run_worker(
@@ -186,6 +206,7 @@ fn spawn_worker(
             initial_limiter,
             indexer_section,
             processor_registry,
+            cache_client,
         );
     })
 }
@@ -227,6 +248,20 @@ async fn handle_reload(
         Some(Arc::new(Semaphore::new(cfg.daemon.max_concurrent_initial)))
     };
     let indexer_section = cfg.indexer.clone();
+
+    // На reload пересоздаём CacheClient — оператор мог добавить/удалить
+    // cache_targets в daemon.toml. Существующие workers продолжают
+    // использовать свой (захваченный при старте) client, новые получают
+    // обновлённый. После полного рестарта demon все workers будут на
+    // одной актуальной версии.
+    let cache_target_urls: Vec<String> =
+        cfg.cache_targets.iter().map(|t| t.url.clone()).collect();
+    let reload_cache_client = if cache_target_urls.is_empty() {
+        None
+    } else {
+        Some(Arc::new(CacheClient::new(cache_target_urls)))
+    };
+
     for entry in cfg.paths.into_iter() {
         let canonical = entry
             .path
@@ -240,6 +275,7 @@ async fn handle_reload(
                 limiter.clone(),
                 indexer_section.clone(),
                 processor_registry.clone(),
+                reload_cache_client.clone(),
             );
             workers.insert(canonical, handle);
         }

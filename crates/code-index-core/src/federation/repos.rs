@@ -154,6 +154,7 @@ mod tests {
                 .collect(),
             enrichment: None,
             indexer: Default::default(),
+            cache_targets: Vec::new(),
         }
     }
 

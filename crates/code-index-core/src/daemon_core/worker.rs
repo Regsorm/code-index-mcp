@@ -22,6 +22,7 @@ use crate::storage::memory::StorageConfig;
 use crate::storage::Storage;
 use crate::watcher::{create_watcher, poll_batch, FileEvent, WatcherConfig};
 
+use super::cache_client::CacheClient;
 use super::config::{IndexerSection, PathEntry};
 use super::ipc::{PathStatus, Progress};
 use super::state::DaemonState;
@@ -36,6 +37,12 @@ use super::state::DaemonState;
 /// случае пропускаем `apply_schema_extensions` / `index_extras`. В сборке
 /// `bsl-indexer.exe` сюда приходит registry с `BslLanguageProcessor`,
 /// благодаря чему создаются специфичные таблицы (metadata_objects/...).
+///
+/// `cache_client` — клиент `mcp-cache-ci` для event-based invalidation
+/// (этап 3, v0.9.1+). Если `None` или `is_empty()` — событийный канал не
+/// используется, cache-ci работает только по TTL fallback. Если задан — после
+/// каждого успешного `commit_batch()` worker асинхронно шлёт
+/// `POST /invalidate {file_paths: [...]}` со списком файлов batch'а.
 pub fn run_worker(
     entry: PathEntry,
     state: DaemonState,
@@ -43,6 +50,7 @@ pub fn run_worker(
     initial_limiter: Option<Arc<Semaphore>>,
     indexer_section: IndexerSection,
     processor_registry: Option<Arc<ProcessorRegistry>>,
+    cache_client: Option<Arc<CacheClient>>,
 ) {
     let path = match entry.path.canonicalize() {
         Ok(p) => p,
@@ -347,14 +355,36 @@ pub fn run_worker(
             }
         }
 
-        if let Err(e) = storage.commit_batch() {
-            eprintln!("[worker:{}] commit_batch: {}", path.display(), e);
-        }
+        let commit_ok = match storage.commit_batch() {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("[worker:{}] commit_batch: {}", path.display(), e);
+                false
+            }
+        };
         // В disk-режиме (а worker сюда попадает всегда в disk после reopen на шаге 7)
         // flush_to_disk через Connection::backup() — бесполезное копирование БД самой
         // в себя, WAL не уменьшает. checkpoint_truncate реально схлопывает WAL.
         if let Err(e) = storage.checkpoint_truncate() {
             eprintln!("[worker:{}] checkpoint_truncate: {}", path.display(), e);
+        }
+
+        // Event-based cache invalidation (v0.9.1+): после успешного commit
+        // отправляем cache-ci список затронутых относительных путей. Если
+        // commit упал — invalidate не шлём (новых данных в индексе нет;
+        // cache-ci пусть отдаёт что было, TTL подстрахует).
+        if commit_ok {
+            if let Some(cc) = &cache_client {
+                if !cc.is_empty() {
+                    let paths_to_invalidate = collect_invalidate_paths(&path, &batch);
+                    if !paths_to_invalidate.is_empty() {
+                        let cc_clone = cc.clone();
+                        tokio_block_on(async move {
+                            cc_clone.invalidate_files(&paths_to_invalidate).await;
+                        });
+                    }
+                }
+            }
         }
 
         tokio_block_on(async {
@@ -370,6 +400,33 @@ pub fn run_worker(
 
 fn shutdown_received(rx: &mut tokio::sync::broadcast::Receiver<()>) -> bool {
     matches!(rx.try_recv(), Ok(()))
+}
+
+/// Собрать список относительных file_path из batch'а FS-событий для отправки
+/// в `cache-ci` через `POST /invalidate {file_paths}`.
+///
+/// Используются ВСЕ типы событий — Modified/Created/Deleted: cache_entries,
+/// зависящие от удалённого файла, также должны быть снесены. Дубликаты
+/// (несколько событий по одному файлу в одном batch) дедуплицируются.
+/// Пути приводятся к forward-slash формату (совпадает с тем, что daemon
+/// записал в SQLite через `rel_path.replace('\\', "/")`).
+fn collect_invalidate_paths(root: &PathBuf, batch: &[FileEvent]) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut set: HashSet<String> = HashSet::new();
+    for event in batch {
+        let abs = match event {
+            FileEvent::Modified(p) | FileEvent::Created(p) | FileEvent::Deleted(p) => p,
+        };
+        let rel = abs
+            .strip_prefix(root)
+            .unwrap_or(abs)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !rel.is_empty() {
+            set.insert(rel);
+        }
+    }
+    set.into_iter().collect()
 }
 
 fn tokio_block_on<F: std::future::Future<Output = ()>>(fut: F) {

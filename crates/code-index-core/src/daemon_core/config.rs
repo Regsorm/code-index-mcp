@@ -47,6 +47,19 @@ pub struct DaemonFileConfig {
     /// Сейчас содержит один параметр — `max_code_file_size_bytes`. Может расти.
     #[serde(default)]
     pub indexer: IndexerSection,
+
+    /// Список cache-ci эндпоинтов, которые надо уведомлять о переиндексации
+    /// файлов (этап 3 event-based cache invalidation, v0.9.1+).
+    /// Пустой список (или отсутствие секции) → событийный канал выключен,
+    /// cache-ci работает только по TTL fallback (как до v0.9.1).
+    ///
+    /// Пример:
+    /// ```toml
+    /// [[cache_targets]]
+    /// url = "http://127.0.0.1:8011"
+    /// ```
+    #[serde(default, rename = "cache_targets")]
+    pub cache_targets: Vec<CacheTargetEntry>,
 }
 
 /// Дефолтный hardcoded-лимит размера code-файла, content которого сохраняется
@@ -73,6 +86,23 @@ pub struct IndexerSection {
     /// `None` → используется hardcoded дефолт 5 МБ.
     #[serde(default)]
     pub max_code_file_size_bytes: Option<usize>,
+}
+
+/// Запись в секции `[[cache_targets]]`. Описывает один cache-ci endpoint,
+/// которому daemon шлёт `POST /invalidate {file_paths: [...]}` после
+/// успешного commit'а batch'а FS-событий.
+///
+/// Пример:
+/// ```toml
+/// [[cache_targets]]
+/// url = "http://127.0.0.1:8011"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheTargetEntry {
+    /// Корневой URL cache-ci. `/invalidate` дописывается клиентом, поэтому
+    /// здесь — только схема + host + port (опционально с path-prefix, но
+    /// без `/invalidate`).
+    pub url: String,
 }
 
 /// Секция `[enrichment]` из конфига демона.
@@ -517,5 +547,28 @@ mod tests {
         let e = cfg.enrichment.expect("секция [enrichment] разобралась");
         assert!(!e.enabled);
         assert_eq!(e.signature(), "openai_compatible:qwen2.5:7b");
+    }
+
+    #[test]
+    fn cache_targets_default_empty() {
+        // Старые конфиги без `[[cache_targets]]` — пустой список,
+        // событийный канал invalidate выключен.
+        let cfg: DaemonFileConfig = parse_str("").unwrap();
+        assert!(cfg.cache_targets.is_empty());
+    }
+
+    #[test]
+    fn parses_cache_targets_list() {
+        let text = r#"
+            [[cache_targets]]
+            url = "http://127.0.0.1:8011"
+
+            [[cache_targets]]
+            url = "http://192.0.2.5:8011"
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(cfg.cache_targets.len(), 2);
+        assert_eq!(cfg.cache_targets[0].url, "http://127.0.0.1:8011");
+        assert_eq!(cfg.cache_targets[1].url, "http://192.0.2.5:8011");
     }
 }

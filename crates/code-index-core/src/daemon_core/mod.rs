@@ -4,6 +4,7 @@
 // отслеживаемых папок, кроссплатформенные пути. HTTP-сервер демона и MCP-клиент
 // подключаются к этим примитивам и реализуют соответствующие роли.
 
+pub mod cache_client;
 pub mod client;
 pub mod commands;
 pub mod config;
