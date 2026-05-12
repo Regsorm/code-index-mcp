@@ -605,6 +605,21 @@ This makes Code Index suitable as an offline search layer over full 1C configura
 - **Disk**: index size is approximately 1-2 GB for projects with 60K+ files
 - **Build**: Rust 1.77 or later — install from [rustup.rs](https://rustup.rs)
 
+## MCP tool response format (v0.9.0+)
+
+All data tools return a unified JSON envelope:
+
+```json
+{
+  "result": <previous plain payload>,
+  "_meta": { "dependent_files": ["src/X.bsl", "src/Y.bsl"] }
+}
+```
+
+`_meta.dependent_files` lists files the response depends on. Consumed by the caching proxy (`mcp-cache-ci` 0.2.0+) for point invalidation when a file changes on disk. Clients that don't use this field just read `result` as before.
+
+Diagnostic tools (`health`, `get_stats`, `stat_file`) are not wrapped — their format is unchanged.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
