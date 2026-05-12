@@ -3,6 +3,109 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.9.1] — 2026-05-12
+
+**Этап 3 миграции на event-based cache invalidation: уведомление `mcp-cache-ci` после переиндексации.**
+
+Замыкает цепочку: сохранили файл → daemon (watcher) обнаружил → переиндексировал в SQLite → **отправил `POST /invalidate {file_paths: [...]}` в cache-ci**. Cache-ci по reverse_index (заполненному в этапе 2 через `_meta.dependent_files`) точечно сносит только зависимые entries, остальные cache hits сохраняются.
+
+### Добавлено
+
+- **`crates/code-index-core/src/daemon_core/cache_client.rs`** — `CacheClient` с пулом `reqwest::Client` (timeout 2s, keep-alive 60s) и списком target URL-ов. Метод `invalidate_files(&[String])` шлёт POST параллельно всем targets, на failure (сеть, 5xx, timeout) — `eprintln!` warning и продолжаем; падать не должны, TTL на стороне cache-ci подстрахует.
+- **Секция `[[cache_targets]]` в `daemon.toml`** + структура `CacheTargetEntry { url: String }` в `daemon_core/config.rs`. Пример:
+
+  ```toml
+  [[cache_targets]]
+  url = "http://127.0.0.1:8011"
+  ```
+
+  Несколько entries разрешено (multi-cache-ci топологии: локальный Windows + удалённый rag-VM). Отсутствие секции (или пустой список) → событийный канал выключен, поведение как до v0.9.1.
+- **Хелпер `worker::collect_invalidate_paths(root, batch)`** — собирает дедуплицированный список relative file_path'ей из batch'а FS-событий. Учитывает все типы (Modified/Created/Deleted) — удаление файла тоже должно сносить связанные cache_entries.
+- **Параметр `cache_client: Option<Arc<CacheClient>>`** в `worker::run_worker` и `runner::spawn_worker`. Пробрасывается из `runner::run` и `runner::handle_reload` (reload пересоздаёт `CacheClient` по новому конфигу для added-папок; existing workers сохраняют свой client до рестарта demon).
+- **Юнит-тесты** для `cache_client.rs`: пустые targets → `is_empty()`; trailing slashes стрипуются; невалидный target не паникует (connection refused → 0 успехов). Тесты для config.rs `cache_targets_default_empty` и `parses_cache_targets_list`.
+
+### Изменено
+
+- **Сигнатура `worker::run_worker`** — новый последний параметр `cache_client`.
+- **Сигнатура `runner::spawn_worker`** — то же.
+- **`commit_batch()` теперь возвращает результат проверки** — если commit упал, invalidate не отправляется (новых данных в индексе всё равно нет; cache-ci пусть отдаёт старое — будет corrected либо при следующем успешном batch'е, либо через TTL).
+- **Workspace version** 0.9.0 → 0.9.1.
+
+### Совместимость
+
+- `daemon.toml` без `[[cache_targets]]` — полностью работающий (поведение как до v0.9.1, без сетевого трафика к cache-ci).
+- `daemon.toml` с `[[cache_targets]]` — событийный канал активируется автоматически на старте.
+- API `run_worker` / `spawn_worker` — изменилась сигнатура (additive last param). Внешние клиенты крейта `code-index-core` (если есть) должны передать `None` для совместимости.
+
+### Архитектура (final state цепочки)
+
+После v0.9.1 + cache-ci 0.2.0:
+
+1. **Read-tools daemon'а** возвращают `{result, _meta: {dependent_files: [...]}}` (v0.9.0).
+2. **`mcp-cache-ci`** при cache-fill пишет `cache_key → file_paths` в reverse_index (cache-ci 0.2.0).
+3. **Daemon watcher** на FS event → reindex → `commit_batch` → `cache_client.invalidate_files(...)` → cache-ci по reverse_index сносит точечно (v0.9.1).
+4. **TTL fallback** — третий эшелон safety net: если событие потерялось (сеть, daemon упал, ReadDirectoryChangesW buffer overflow), entry протухнет за 600s/3600s сам.
+
+## [0.9.0] — 2026-05-12
+
+**Phase 2 (этап миграции на event-based cache invalidation): `_meta.dependent_files` в read-ответах.**
+
+Все data-инструменты MCP теперь возвращают единый JSON-формат:
+
+```json
+{
+  "result": <prev plain payload>,
+  "_meta": { "dependent_files": ["src/X.bsl", "src/Y.bsl"] }
+}
+```
+
+`dependent_files` — список path'ей файлов, из которых построен этот ответ. Целевой потребитель — `mcp-cache-ci`: при cache-fill он регистрирует связи `cache_key → file_path` в `reverse_index` и затем сносит точечно затронутые entries по сигналу от daemon после переиндексации файла (этап 3, готовится).
+
+### Совместимость (BREAKING CHANGE формата ответа)
+
+Все клиенты read-tools должны быть готовы к новой структуре `{result, _meta}`:
+
+- Раньше: `search_function` возвращал плоский массив `[FunctionRecord, ...]`.
+- Сейчас: `{"result": [FunctionRecord, ...], "_meta": {"dependent_files": [...]}}`.
+
+Для существующего потребителя (`mcp-cache-ci` 0.2.0+) поведение обратно-совместимое: cache-ci парсит `_meta.dependent_files` если есть, иначе работает как раньше (insert без зависимостей, TTL fallback).
+
+Tools **без** обёртки (формат ответа не изменён):
+
+- `health` — non-cacheable.
+- `get_stats` — диагностический, формат расширяется по федерации, обёртка ломала бы агрегацию.
+- `stat_file` — single-file тривиальный.
+
+### Добавлено
+
+- **Wrapper-хелперы в `crates/code-index-core/src/mcp/tools.rs`:**
+  - `wrap_with_meta<T: Serialize>(result, dependent_files)` — финальная сериализация в `{result, _meta}` с дедупликацией file_paths.
+  - `collect_paths_via<R>(storage, records, extract: fn(&R) -> file_id)` — собрать пути из vec'а records через extractor.
+- **Wrapper-хелперы в `crates/bsl-extension/src/tools/mod.rs`:**
+  - `wrap_with_meta(result: Value, dependent_files: Vec<String>) -> Value` для BSL extension-tools.
+  - `wrap_error(error_value: Value) -> Value` — даже на ошибке формат единый.
+- **Поддержка `_meta.dependent_files` в data-tools core:**
+  - `search_function`, `search_class` — DISTINCT file_paths из Vec'а records.
+  - `get_function`, `get_class` — то же.
+  - `find_symbol` — объединение path'ей из functions+classes+variables+imports.
+  - `get_imports` (by file и by module).
+  - `get_file_summary` — path из args.
+  - `get_callers`, `get_callees` — file_ids из CallRecord.
+  - `grep_body` — file_path напрямую из GrepBodyMatch.
+  - `grep_code`, `grep_text`, `search_text` — path напрямую из match-структур.
+  - `read_file` — path из args.
+  - `list_files` — paths из ListedFile.
+- **Поддержка `_meta.dependent_files` в BSL extension-tools** (пока пустой массив — XML-парсер метаданных не привязан к file_path, реальные зависимости — задача следующей итерации):
+  - `get_object_structure`, `get_form_handlers`, `get_event_subscriptions`, `find_path`, `search_terms`.
+
+### Изменено
+
+- **Workspace version** bumped 0.8.1 → 0.9.0 (minor — обратно-совместимое расширение формата для cache-ci-клиента, breaking для клиентов, парсивших плоский payload).
+
+### Следующие шаги
+
+- Этап 3: `POST /invalidate {file_paths}` от daemon к cache-ci после `transaction.commit()` SQLite по batch'у FS-событий. На стороне cache-ci 0.2.0 уже готово принимать.
+
 ## [0.8.1] — 2026-05-06
 
 **Patch-релиз: BSL extension-tools в daemon-режиме и через federation.** Закрывает две публичные регрессии v0.8.0, из-за которых пять BSL-инструментов (`get_object_structure`, `get_form_handlers`, `get_event_subscriptions`, `find_path`, `search_terms`) были нерабочими в штатном production-сценарии (репо обслуживаются демоном, federation-репо на удалённой ноде).
