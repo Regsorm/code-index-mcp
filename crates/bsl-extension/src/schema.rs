@@ -273,6 +273,57 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
         updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
     );
     ",
+
+    // ── data_links ────────────────────────────────────────────────────────
+    // Граф связей ДАННЫХ конфигурации 1С: ребро «объект → объект» по
+    // ссылочному типу реквизита/измерения. Дополняет `proc_call_graph`
+    // (граф вызовов кода) — это про структуру данных, а не про поток
+    // управления. Источник — XML отдельных объектов (Catalogs/<X>.xml,
+    // Documents/<Y>.xml и т.д.), которые парсит `xml::object_attributes`.
+    //
+    // Ребро: `from_object` --[from_path]--> `to_object`.
+    //   * `from_object` — владелец, канонический `<MetaType>.<Name>`
+    //     (например `Document.РеализацияТоваровУслуг`).
+    //   * `from_path`   — путь к реквизиту: имя реквизита шапки
+    //     (`Контрагент`) либо `<ТабЧасть>.<Реквизит>` (`Товары.Номенклатура`),
+    //     для измерения регистра — имя измерения.
+    //   * `to_object`   — цель. Для конкретного типа — `<MetaType>.<Name>`
+    //     (`Catalog.Контрагенты`). Для обобщённого («вся категория») —
+    //     служебный *-узел: `*CatalogRef` / `*DocumentRef` / `*AnyRef`.
+    //
+    // `link_kind`:
+    //   * `attr`          — ссылочный реквизит шапки.
+    //   * `tabular_attr`  — ссылочный реквизит табличной части.
+    //   * `register_dim`  — измерение регистра.
+    //   * `recorder`      — движение: документ → регистр (этап 2).
+    //   * `owner`         — подчинённый справочник → владелец (этап 2).
+    //
+    // `is_composite` — ребро из составного типа (перечислено несколько
+    // конкретных типов). `is_universal` — обобщённый тип, схлопнут в
+    // *-узел (терминал обхода; защита от fan-out 2000+ и зашумления).
+    //
+    // Граница конкретный/обобщённый — КАЧЕСТВЕННАЯ, по форме типа в XML:
+    // есть имя после `Ref.` → конкретное ребро (хоть 20 в составном);
+    // имени нет (`cfg:CatalogRef`, `cfg:AnyRef`) → один *-узел.
+    //
+    // UNIQUE предотвращает дубликаты при повторном `index_extras`.
+    "
+    CREATE TABLE IF NOT EXISTS data_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        from_object TEXT NOT NULL,
+        from_path TEXT NOT NULL,
+        to_object TEXT NOT NULL,
+        link_kind TEXT NOT NULL,
+        is_composite INTEGER NOT NULL DEFAULT 0,
+        is_universal INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(repo, from_object, from_path, to_object)
+    );
+    ",
+    // idx_dl_from — прямой обход «на что ссылается X» (get_data_links out).
+    "CREATE INDEX IF NOT EXISTS idx_dl_from ON data_links(repo, from_object);",
+    // idx_dl_to — обратный обход «кто ссылается на X» (get_data_links in).
+    "CREATE INDEX IF NOT EXISTS idx_dl_to ON data_links(repo, to_object);",
 ];
 
 #[cfg(test)]
