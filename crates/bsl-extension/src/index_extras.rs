@@ -26,7 +26,27 @@ use crate::xml::config_dump_info::parse_config_dump_info;
 use crate::xml::configuration::parse_configuration_file;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
 use crate::xml::forms::parse_form_file;
+use crate::xml::object_attributes::parse_object_attributes_file;
 use crate::xml::object_uuid::{extract_form_uuid_from_file, extract_object_uuid_from_file};
+
+/// Папки выгрузки → singular meta_type. Объектные XML лежат прямо в этих
+/// папках (`Catalogs/<Имя>.xml`). Перечислены только типы со ссылочными
+/// реквизитами/измерениями — для остальных (CommonModule, Enum, Constant…)
+/// открывать XML смысла нет.
+const OBJECT_FOLDERS: &[(&str, &str)] = &[
+    ("Catalogs", "Catalog"),
+    ("Documents", "Document"),
+    ("InformationRegisters", "InformationRegister"),
+    ("AccumulationRegisters", "AccumulationRegister"),
+    ("AccountingRegisters", "AccountingRegister"),
+    ("CalculationRegisters", "CalculationRegister"),
+    ("ChartsOfCharacteristicTypes", "ChartOfCharacteristicTypes"),
+    ("ChartsOfAccounts", "ChartOfAccounts"),
+    ("ChartsOfCalculationTypes", "ChartOfCalculationTypes"),
+    ("ExchangePlans", "ExchangePlan"),
+    ("BusinessProcesses", "BusinessProcess"),
+    ("Tasks", "Task"),
+];
 
 /// Repo-key для оффлайн-индексации (через `bsl-indexer index .`).
 /// В реальном демоне используется alias из daemon.toml; пока этой
@@ -42,6 +62,11 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // дальше; одна сломанная подписка не должна валить весь процесс.
     if let Err(e) = index_metadata_objects(repo_root, conn) {
         tracing::warn!("metadata_objects: {}", e);
+    }
+    // Граф связей данных: ссылочные реквизиты/измерения → рёбра data_links.
+    // Открывает XML отдельных объектов (которые остальные проходы не читают).
+    if let Err(e) = index_data_links(repo_root, conn) {
+        tracing::warn!("data_links: {}", e);
     }
     if let Err(e) = index_metadata_forms(repo_root, conn) {
         tracing::warn!("metadata_forms: {}", e);
@@ -255,6 +280,103 @@ fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connection) -> Resu
     for (src, n) in sources {
         tracing::debug!("  {} → {} объектов", src, n);
     }
+    Ok(())
+}
+
+/// Заполнить `data_links` — граф связей данных конфигурации.
+///
+/// Для каждой sub-config обходит папки объектов со ссылочными реквизитами
+/// (`OBJECT_FOLDERS`), открывает корневой XML каждого объекта
+/// (`Catalogs/<Имя>.xml`) и через `parse_object_attributes_file` извлекает
+/// рёбра «объект → объект» по ссылочным типам реквизитов/измерений.
+///
+/// Полный пересбор (DELETE+INSERT всего репо) — идемпотентно, как остальной
+/// `index_extras`. Объём IO невелик (для УТ ~1900 XML / ~68 МБ, ~1-3 сек),
+/// поэтому инкрементальность здесь не нужна.
+fn index_data_links(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    // Корни sub-config — родители найденных Configuration.xml.
+    let mut sub_roots: Vec<std::path::PathBuf> = Vec::new();
+    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file()
+            && entry.file_name().to_str() == Some("Configuration.xml")
+        {
+            if let Some(parent) = entry.path().parent() {
+                sub_roots.push(parent.to_path_buf());
+            }
+        }
+    }
+    if sub_roots.is_empty() {
+        return Ok(());
+    }
+
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    conn.execute("DELETE FROM data_links WHERE repo = ?", params![REPO_DEFAULT])?;
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO data_links \
+         (repo, from_object, from_path, to_object, link_kind, is_composite, is_universal) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )?;
+
+    let mut total: usize = 0;
+    let mut objects: usize = 0;
+    for sub_root in &sub_roots {
+        for (folder, meta_type) in OBJECT_FOLDERS {
+            let dir = sub_root.join(folder);
+            if !dir.is_dir() {
+                continue;
+            }
+            // Только файлы верхнего уровня (Catalogs/<Имя>.xml), не подпапки
+            // (Catalogs/<Имя>/Forms/... — это формы, не структура объекта).
+            let read = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("data_links: read_dir({}): {}", dir.display(), e);
+                    continue;
+                }
+            };
+            for entry in read.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if !path.is_file() || path.extension().and_then(|x| x.to_str()) != Some("xml") {
+                    continue;
+                }
+                let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let owner_full = format!("{}.{}", meta_type, stem);
+                let edges = match parse_object_attributes_file(&path, &owner_full) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!("data_links: {}: {}", path.display(), e);
+                        continue;
+                    }
+                };
+                objects += 1;
+                for edge in edges {
+                    stmt.execute(params![
+                        REPO_DEFAULT,
+                        &owner_full,
+                        &edge.from_path,
+                        &edge.to_object,
+                        edge.link_kind,
+                        edge.is_composite as i64,
+                        edge.is_universal as i64,
+                    ])?;
+                    total += 1;
+                }
+            }
+        }
+    }
+    drop(stmt);
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!(
+        "data_links: {} рёбер из {} объектов ({} sub-config)",
+        total,
+        objects,
+        sub_roots.len()
+    );
     Ok(())
 }
 
@@ -900,5 +1022,113 @@ mod tests {
         assert_eq!(row.0, "Documents.Реализация");
         assert_eq!(row.1, "ФормаДокумента");
         assert!(row.2.contains("ПриОткрытии"));
+    }
+
+    #[test]
+    fn fills_data_links_from_object_xml() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        // Configuration.xml нужен, чтобы index_data_links нашёл sub-root.
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Document>РеализацияТоваровУслуг</Document>
+</ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        // Объектный XML документа: реквизит шапки + ТЧ + примитив.
+        write(
+            &repo.join("Documents").join("РеализацияТоваровУслуг.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Document uuid="root">
+    <Properties><Name>РеализацияТоваровУслуг</Name></Properties>
+    <ChildObjects>
+      <Attribute uuid="a1"><Properties><Name>Контрагент</Name>
+        <Type><v8:Type>cfg:CatalogRef.Контрагенты</v8:Type></Type>
+      </Properties></Attribute>
+      <Attribute uuid="a2"><Properties><Name>Сумма</Name>
+        <Type><v8:Type>xs:decimal</v8:Type></Type>
+      </Properties></Attribute>
+      <TabularSection uuid="ts1"><Properties><Name>Товары</Name></Properties>
+        <ChildObjects>
+          <Attribute uuid="a3"><Properties><Name>Номенклатура</Name>
+            <Type><v8:Type>cfg:CatalogRef.Номенклатура</v8:Type></Type>
+          </Properties></Attribute>
+        </ChildObjects>
+      </TabularSection>
+    </ChildObjects>
+  </Document>
+</MetaDataObject>"#,
+        );
+
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        let conn = storage.conn();
+
+        // Контрагент (attr) + Товары.Номенклатура (tabular_attr) = 2 ребра.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM data_links WHERE repo = ?", params![REPO_DEFAULT], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "ожидаем 2 ссылочных ребра (примитив Сумма пропущен)");
+
+        let (from_path, to_object, kind): (String, String, String) = conn
+            .query_row(
+                "SELECT from_path, to_object, link_kind FROM data_links \
+                 WHERE repo = ? AND from_object = 'Document.РеализацияТоваровУслуг' AND from_path = 'Контрагент'",
+                params![REPO_DEFAULT],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(from_path, "Контрагент");
+        assert_eq!(to_object, "Catalog.Контрагенты");
+        assert_eq!(kind, "attr");
+
+        // Реквизит табличной части.
+        let tab_to: String = conn
+            .query_row(
+                "SELECT to_object FROM data_links WHERE repo = ? AND from_path = 'Товары.Номенклатура'",
+                params![REPO_DEFAULT],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tab_to, "Catalog.Номенклатура");
+    }
+
+    #[test]
+    fn data_links_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Catalog>Тест</Catalog>
+</ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("Catalogs").join("Тест.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Catalog uuid="root"><ChildObjects>
+    <Attribute uuid="a1"><Properties><Name>Владелец</Name>
+      <Type><v8:Type>cfg:CatalogRef.Организации</v8:Type></Type>
+    </Properties></Attribute>
+  </ChildObjects></Catalog>
+</MetaDataObject>"#,
+        );
+
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        run_index_extras(&repo, &mut storage).unwrap();
+        run_index_extras(&repo, &mut storage).unwrap();
+
+        let count: i64 = storage
+            .conn()
+            .query_row("SELECT COUNT(*) FROM data_links WHERE repo = ?", params![REPO_DEFAULT], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "повторный run не должен плодить дубликаты рёбер");
     }
 }
