@@ -1,20 +1,18 @@
 name: Publish to MCP Registry
 
-# Запускается ПОСЛЕ успешного завершения workflow "Release" (на тег v*).
-# Порядок важен: npm-пакет тянет бинарник из GitHub Releases на postinstall,
-# поэтому публиковать его в npm можно только когда релиз с бинарниками готов.
+# Триггер — push тега v* (как у Release). Не workflow_run: тот срабатывает
+# только если файл есть в default-ветке (main), а релизы тегируются из рабочей
+# ветки. push:tags работает из любой ветки/тега.
+#
+# Запускается параллельно с Release, поэтому ПЕРВЫМ делом ждём, пока Release
+# выложит бинарники в GitHub Release (npm-пакет тянет их на postinstall).
 on:
-  workflow_run:
-    workflows: ["Release"]
-    types:
-      - completed
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   publish:
-    # Только при успешном релизе и только для пушей тегов (head_branch = тег).
-    if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: ubuntu-latest
 
     permissions:
@@ -22,16 +20,31 @@ jobs:
       id-token: write   # нужно для аутентификации mcp-publisher через GitHub OIDC
 
     env:
-      TAG: ${{ github.event.workflow_run.head_branch }}
+      TAG: ${{ github.ref_name }}
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Compute version from tag
         id: ver
         run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Ждём, пока Release-workflow создаст релиз и выложит архивы code-index.
+      - name: Wait for GitHub Release assets
+        run: |
+          for i in $(seq 1 60); do
+            if gh release view "$TAG" --repo "$REPO" --json assets \
+                 -q '.assets[].name' 2>/dev/null | grep -q '^code-index-linux-x64.tar.gz$'; then
+              echo "Release-ассеты готовы."
+              exit 0
+            fi
+            echo "Жду ассеты релиза $TAG... попытка $i"
+            sleep 15
+          done
+          echo "Ассеты релиза $TAG не появились за отведённое время."
+          exit 1
 
       # Подставляем версию из тега в server.json и npm/package.json,
       # чтобы единственным источником истины был сам тег релиза.
@@ -59,11 +72,9 @@ jobs:
       # --- Публикация визитки в официальный MCP-реестр ---
       # mcp-publisher тянем из релизов реестра (linux amd64).
       - name: Install mcp-publisher
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           gh release download --repo modelcontextprotocol/registry \
-            --pattern '*linux_amd64.tar.gz' --output mcp-publisher.tar.gz
+            --pattern 'mcp-publisher_linux_amd64.tar.gz' --output mcp-publisher.tar.gz
           tar xzf mcp-publisher.tar.gz mcp-publisher
           chmod +x mcp-publisher
 

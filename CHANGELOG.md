@@ -3,6 +3,22 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.10.2] — 2026-05-22
+
+**Фикс автопубликации: рабочий триггер workflow.**
+
+В 0.10.1 публикация не сработала — `publish-registry.yml` был на триггере `workflow_run`, который GitHub запускает только при наличии файла в default-ветке (`main`); релизы же тегируются из рабочей ветки. Плюс паттерн скачивания `mcp-publisher` цеплял лишний ассет.
+
+### Исправлено
+
+- **Триггер `publish-registry.yml`** переведён с `workflow_run` на `push: tags: ['v*']` — работает из любой ветки. Добавлен шаг ожидания готовности GitHub Release (архивов code-index) перед `npm publish`, чтобы исключить гонку.
+- **Скачивание `mcp-publisher`** — точный паттерн ассета `mcp-publisher_linux_amd64.tar.gz` (раньше `*linux_amd64.tar.gz` цеплял и `registry_linux_amd64.tar.gz`).
+- Команды `mcp-publisher login github-oidc` и `publish` сверены с реальным CLI (v1.7.9).
+
+### Изменено
+
+- **Workspace version** 0.10.1 → 0.10.2.
+
 ## [0.10.1] — 2026-05-22
 
 **Публикация в npm и официальный MCP-реестр.**

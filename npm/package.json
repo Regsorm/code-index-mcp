@@ -1,6 +1,6 @@
 {
   "name": "@regsorm/code-index-mcp",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "Высокопроизводительный индексатор кода с MCP-протоколом для AI-моделей. Rust + tree-sitter + SQLite. Поиск по 62K файлов за 43 сек.",
   "mcpName": "io.github.regsorm/code-index",
   "keywords": [
