@@ -113,7 +113,7 @@ npm install -g @regsorm/code-index-mcp
 npx @regsorm/code-index-mcp serve --path /путь/к/репозиторию
 ```
 
-Опубликован также в [официальном MCP-реестре](https://registry.modelcontextprotocol.io/) как `io.github.regsorm/code-index`. Обёртка содержит только публичный бинарник `code-index` (без поддержки 1С); для `bsl-indexer` собирайте из исходников.
+Опубликован также в [официальном MCP-реестре](https://registry.modelcontextprotocol.io/) как `io.github.Regsorm/code-index`. Обёртка содержит только публичный бинарник `code-index` (без поддержки 1С); для `bsl-indexer` собирайте из исходников.
 
 ### Сборка из исходников
 

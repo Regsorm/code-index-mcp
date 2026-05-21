@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.regsorm/code-index",
+  "name": "io.github.Regsorm/code-index",
   "title": "code-index",
   "description": "Быстрый индексатор кода для AI-моделей. Rust + tree-sitter + SQLite. Мгновенный поиск по символам.",
-  "version": "0.10.3",
+  "version": "0.10.4",
   "repository": {
     "url": "https://github.com/Regsorm/code-index-mcp",
     "source": "github"
@@ -13,7 +13,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@regsorm/code-index-mcp",
-      "version": "0.10.3",
+      "version": "0.10.4",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

@@ -111,7 +111,7 @@ The `postinstall` step downloads the prebuilt native binary for your platform (W
 npx @regsorm/code-index-mcp serve --path /path/to/your/repo
 ```
 
-Also published to the [official MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.regsorm/code-index`. This wrapper ships only the public `code-index` binary (no 1C support); for `bsl-indexer` build from source.
+Also published to the [official MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.Regsorm/code-index`. This wrapper ships only the public `code-index` binary (no 1C support); for `bsl-indexer` build from source.
 
 ### Build from source
 

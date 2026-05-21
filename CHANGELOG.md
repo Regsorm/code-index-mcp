@@ -3,6 +3,20 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.10.4] — 2026-05-22
+
+**Фикс публикации в MCP-реестр: регистр namespace.**
+
+Реестр отклонял `server.json` с 403 — namespace был указан строчными (`io.github.regsorm`), а OIDC выдаёт права на namespace, точно совпадающий с GitHub-логином (`io.github.Regsorm`). Исправлен регистр в `name`/`mcpName`. npm-публикация в 0.10.2/0.10.3 уже прошла; этот патч доводит регистрацию визитки в официальном реестре.
+
+### Исправлено
+
+- **`server.json` `name` и `package.json` `mcpName`** — регистр namespace `io.github.Regsorm/code-index` (точно как GitHub-логин).
+
+### Изменено
+
+- **Workspace version** 0.10.3 → 0.10.4.
+
 ## [0.10.3] — 2026-05-22
 
 **Фикс публикации в MCP-реестр: длина описания.**
