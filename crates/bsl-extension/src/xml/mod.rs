@@ -11,9 +11,13 @@
 //   для `metadata_forms`.
 // - `event_subscriptions` — *.xml в EventSubscriptions/: связь
 //   «событие → модуль.процедура». Источник для `event_subscriptions`.
+// - `object_attributes` — XML отдельных объектов (Catalogs/<X>.xml и т.д.):
+//   ссылочные типы реквизитов/измерений → рёбра графа связей данных.
+//   Источник для `data_links`.
 
 pub mod config_dump_info;
 pub mod configuration;
 pub mod event_subscriptions;
 pub mod forms;
+pub mod object_attributes;
 pub mod object_uuid;
