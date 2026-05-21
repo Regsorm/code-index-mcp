@@ -95,6 +95,10 @@ impl LanguageProcessor for BslLanguageProcessor {
             Arc::new(crate::tools::GetFormHandlersTool),
             Arc::new(crate::tools::GetEventSubscriptionsTool),
             Arc::new(crate::tools::FindPathTool),
+            // Граф связей данных (этап 1): окрестность объекта и путь между
+            // объектами по ссылочным реквизитам/измерениям (data_links).
+            Arc::new(crate::tools::GetDataLinksTool),
+            Arc::new(crate::tools::FindDataPathTool),
             // search_terms — поиск по обогащённым termам (этап 5a).
             // Регистрируется всегда, даже без feature `enrichment`:
             // tool сам по себе read-only, не требует HTTP-клиента.
@@ -200,7 +204,7 @@ mod tests {
 
     #[test]
     fn additional_tools_registered() {
-        // Этап 6 + 5a: пять 1С-tool'ов (4 от метаданных + search_terms).
+        // 7 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных.
         let p = BslLanguageProcessor::new();
         let tools = p.additional_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -209,7 +213,9 @@ mod tests {
         assert!(names.contains(&"get_event_subscriptions"));
         assert!(names.contains(&"find_path"));
         assert!(names.contains(&"search_terms"));
-        assert_eq!(tools.len(), 5);
+        assert!(names.contains(&"get_data_links"));
+        assert!(names.contains(&"find_data_path"));
+        assert_eq!(tools.len(), 7);
     }
 
     #[test]
