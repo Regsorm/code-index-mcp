@@ -3,6 +3,29 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.10.0] — 2026-05-21
+
+**Граф связей данных 1С (data-graph): новые BSL-tools `get_data_links` и `find_data_path`.**
+
+Дополняет граф ВЫЗОВОВ (`proc_call_graph`) графом СВЯЗЕЙ ДАННЫХ — рёбра «объект → объект» по ссылочным типам реквизитов, измерений регистров и реквизитов табличных частей. Закрывает частый паттерн «блуждания по структуре»: вместо серии `get_object_structure`/`get_metadata_structure` для трассировки связей вручную — один обход графа. (На реальном кейсе «схлопнуть остатки по ГТД» это было 37 запросов структуры → теперь один `get_data_links`.)
+
+### Добавлено
+
+- **Таблица `data_links`** в `bsl-extension` schema (`SCHEMA_EXTENSIONS`, аддитивно через `CREATE TABLE IF NOT EXISTS` — миграция не требуется): `from_object`, `from_path` (реквизит / `ТЧ.реквизит` / измерение), `to_object`, `link_kind` (`attr`/`tabular_attr`/`register_dim`), `is_composite`, `is_universal`. Индексы `idx_dl_from` (прямой обход) и `idx_dl_to` (обратный — «кто ссылается на X»).
+- **`crates/bsl-extension/src/xml/object_attributes.rs`** — парсер ссылочных типов из XML отдельных объектов (`Catalogs/<X>.xml`, `Documents/<Y>.xml`, регистры). Классификация типа: конкретный `cfg:CatalogRef.Контрагенты` → ребро `Catalog.Контрагенты`; составной (несколько `<v8:Type>`) → несколько рёбер (`is_composite`); обобщённый (`cfg:CatalogRef` без имени, `cfg:AnyRef`, `cfg:DefinedType.X`) → терминальный `*`-узел (`is_universal`, не разворачивается при обходе — защита от fan-out и шума); примитивы (`xs:`/`v8:`) отбрасываются. Страховочный cap на патологические перечни (>30 конкретных типов → `*Multiple`).
+- **`index_data_links`** в `index_extras::run_index_extras` — обход объектных XML и наполнение `data_links` полным пересбором (как остальной `index_extras`). На крупной конфигурации (~1900 объектных XML / ~68 МБ) — ~1.3–1.9 сек, инкрементальность не нужна.
+- **MCP-tool `get_data_links(repo, object, direction=out|in|both, depth=1..4)`** — окрестность объекта в графе связей данных через recursive CTE. `out` — на что ссылается; `in` — кто ссылается; терминальные `*`-узлы при обходе не разворачиваются.
+- **MCP-tool `find_data_path(repo, from, to, max_depth=4)`** — путь (цепочка ссылочных связей) между двумя объектами (BFS по `data_links`, аналог `find_path` для графа вызовов).
+- Оба tool зарегистрированы в `BslLanguageProcessor::additional_tools` (теперь **7 BSL-tools**, итого **25** в сборке `bsl-indexer`), доступны и через federation (`POST /federate/extension`). Юнит-тесты парсера (3 случая типов, ТЧ, измерения, cap) и наполнения.
+
+### Изменено
+
+- **Workspace version** 0.9.1 → 0.10.0.
+
+### Совместимость
+
+- Полностью обратно совместимо. Новая таблица создаётся идемпотентно при старте; существующие индексы и tools не затронуты. Публичный бинарник `code-index` не меняется — фича только в `bsl-indexer` (`bsl-extension`).
+
 ## [0.9.1] — 2026-05-12
 
 **Этап 3 миграции на event-based cache invalidation: уведомление `mcp-cache-ci` после переиндексации.**

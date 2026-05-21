@@ -110,7 +110,7 @@ cargo build --release -p bsl-indexer --features enrichment   # extra build with 
 
 Binaries:
 * `target/release/code-index[.exe]` — main binary (no 1C support).
-* `target/release/bsl-indexer[.exe]` — full 1C support (XML metadata parsers, BSL call graph, MCP tools `get_object_structure` / `get_form_handlers` / `find_path` / `search_terms`, optional LLM enrichment under cargo feature `enrichment`).
+* `target/release/bsl-indexer[.exe]` — full 1C support (XML metadata parsers, BSL call graph, data-links graph, MCP tools `get_object_structure` / `get_form_handlers` / `find_path` / `search_terms` / `get_data_links` / `find_data_path`, optional LLM enrichment under cargo feature `enrichment`).
 
 GitHub Releases publish 6 ready artifacts per tag: `code-index` × {Win, Linux, macOS} + `bsl-indexer` × {Win, Linux, macOS}.
 
@@ -308,6 +308,8 @@ When BSL repos are present in `daemon.toml` (`language = "bsl"`), 5 BSL-specific
 | `get_event_subscriptions` | All event subscriptions from `EventSubscriptions/*.xml`, optional filter by handler module |
 | `find_path` | Call-chain between two procedures via `proc_call_graph` (recursive CTE, max_depth=3) |
 | `search_terms` | FTS search by business terms enriched per procedure by an LLM (after `bsl-indexer enrich`) |
+| `get_data_links` | **Data-links graph (v0.10.0):** what an object references / what references it, via reference-typed attributes, register dimensions and tabular-section attributes (`data_links` table). `direction=out\|in\|both`, `depth=1..4`. Replaces a series of `get_object_structure` calls when tracing relations. Targets like `*CatalogRef`/`*AnyRef`/`*DefinedType.X` are generalized refs (terminal, not expanded) |
+| `find_data_path` | **Data-links graph (v0.10.0):** chain of reference links from one object to another (BFS over `data_links`, like `find_path` but for data, not calls) |
 
 These tools appear in `tools/list` **only when at least one BSL repo is configured** (conditional registration). When the repo set changes in `daemon.toml`, the server emits `notifications/tools/list_changed`. On Claude Code 2.1.120 this notification is currently [ignored](https://github.com/anthropics/claude-code/issues/13646); workaround — manual `/mcp Reconnect`.
 
