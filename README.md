@@ -99,6 +99,20 @@ Template engines (Jinja/Django/EJS): `{{ … }}` and `{% … %}` are tolerated a
 
 ## Quick Start
 
+### Install via npm (easiest)
+
+```bash
+npm install -g @regsorm/code-index-mcp
+```
+
+The `postinstall` step downloads the prebuilt native binary for your platform (Windows x64, Linux x64, macOS arm64) from GitHub Releases — nothing is compiled. Then run it as an MCP server:
+
+```bash
+npx @regsorm/code-index-mcp serve --path /path/to/your/repo
+```
+
+Also published to the [official MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.regsorm/code-index`. This wrapper ships only the public `code-index` binary (no 1C support); for `bsl-indexer` build from source.
+
 ### Build from source
 
 ```bash

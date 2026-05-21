@@ -3,6 +3,26 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.10.1] — 2026-05-22
+
+**Публикация в npm и официальный MCP-реестр.**
+
+Публичный `code-index` теперь ставится через `npx`/`npm` и регистрируется в [официальном MCP-реестре](https://registry.modelcontextprotocol.io/) (`io.github.regsorm/code-index`). Бинарник на Rust по-прежнему распространяется через GitHub Releases — npm-пакет лишь тонкая обёртка, которая на установке скачивает архив под текущую платформу. `bsl-indexer` остаётся приватным, в реестр не публикуется.
+
+### Добавлено
+
+- **npm-обёртка `@regsorm/code-index-mcp`** (каталог `npm/`): `package.json` с `mcpName`, `bin/cli.js` (прозрачно проксирует аргументы и stdio в нативный бинарник), `scripts/postinstall.js` (скачивает архив `code-index-<platform>` из GitHub Releases и распаковывает системным `tar`/bsdtar). Поддержка Windows x64, Linux x64, macOS arm64.
+- **`server.json`** — визитка для официального MCP-реестра (npm-пакет, транспорт stdio, подкоманда `serve`).
+- **`.github/workflows/publish-registry.yml`** — после успешного `Release` на тег `v*`: `npm publish` + `mcp-publisher publish`. Версия подставляется из тега. Требует секрет `NPM_TOKEN`.
+
+### Изменено
+
+- **Workspace version** 0.10.0 → 0.10.1.
+
+### Совместимость
+
+- Полностью обратно совместимо. Изменений в коде индексатора нет — только инфраструктура распространения.
+
 ## [0.10.0] — 2026-05-21
 
 **Граф связей данных 1С (data-graph): новые BSL-tools `get_data_links` и `find_data_path`.**

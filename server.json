@@ -1,0 +1,38 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.regsorm/code-index",
+  "title": "code-index",
+  "description": "Высокопроизводительный индексатор кода с MCP-протоколом для AI-моделей. Rust + tree-sitter + SQLite. Поиск по 62K файлов за 43 сек, 282K функций, ответ < 1 мс.",
+  "version": "0.10.1",
+  "repository": {
+    "url": "https://github.com/Regsorm/code-index-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@regsorm/code-index-mcp",
+      "version": "0.10.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve",
+          "valueHint": "serve",
+          "description": "Подкоманда запуска MCP-сервера (read-only)."
+        },
+        {
+          "type": "named",
+          "name": "--path",
+          "description": "Корневая директория проекта для индексации (формат `alias=dir` или просто `dir`). Можно указать несколько раз.",
+          "isRequired": true,
+          "isRepeated": true
+        }
+      ]
+    }
+  ]
+}

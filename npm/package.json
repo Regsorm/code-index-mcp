@@ -1,0 +1,47 @@
+{
+  "name": "@regsorm/code-index-mcp",
+  "version": "0.10.1",
+  "description": "Высокопроизводительный индексатор кода с MCP-протоколом для AI-моделей. Rust + tree-sitter + SQLite. Поиск по 62K файлов за 43 сек.",
+  "mcpName": "io.github.regsorm/code-index",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "code-index",
+    "code-search",
+    "tree-sitter",
+    "claude",
+    "ai"
+  ],
+  "homepage": "https://github.com/Regsorm/code-index-mcp",
+  "bugs": {
+    "url": "https://github.com/Regsorm/code-index-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Regsorm/code-index-mcp.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "code-index-mcp": "bin/cli.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "files": [
+    "bin/cli.js",
+    "scripts/postinstall.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32",
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

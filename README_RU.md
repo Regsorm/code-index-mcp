@@ -101,6 +101,20 @@ grep_text(repo="X", regex="\\{%\\s*include", path_glob="**/*.html", context_line
 
 ## Быстрый старт
 
+### Установка через npm (самый простой способ)
+
+```bash
+npm install -g @regsorm/code-index-mcp
+```
+
+Шаг `postinstall` скачивает готовый нативный бинарник под вашу платформу (Windows x64, Linux x64, macOS arm64) из GitHub Releases — ничего не компилируется. Запуск как MCP-сервера:
+
+```bash
+npx @regsorm/code-index-mcp serve --path /путь/к/репозиторию
+```
+
+Опубликован также в [официальном MCP-реестре](https://registry.modelcontextprotocol.io/) как `io.github.regsorm/code-index`. Обёртка содержит только публичный бинарник `code-index` (без поддержки 1С); для `bsl-indexer` собирайте из исходников.
+
 ### Сборка из исходников
 
 ```bash

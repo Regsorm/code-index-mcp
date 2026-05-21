@@ -1,0 +1,77 @@
+name: Publish to MCP Registry
+
+# Запускается ПОСЛЕ успешного завершения workflow "Release" (на тег v*).
+# Порядок важен: npm-пакет тянет бинарник из GitHub Releases на postinstall,
+# поэтому публиковать его в npm можно только когда релиз с бинарниками готов.
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types:
+      - completed
+
+jobs:
+  publish:
+    # Только при успешном релизе и только для пушей тегов (head_branch = тег).
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write   # нужно для аутентификации mcp-publisher через GitHub OIDC
+
+    env:
+      TAG: ${{ github.event.workflow_run.head_branch }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Compute version from tag
+        id: ver
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Подставляем версию из тега в server.json и npm/package.json,
+      # чтобы единственным источником истины был сам тег релиза.
+      - name: Sync version into manifests
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+          jq --arg v "$VERSION" '.version = $v' npm/package.json > npm/package.json.tmp
+          mv npm/package.json.tmp npm/package.json
+
+      # --- Публикация npm-обёртки ---
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish npm package
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # --- Публикация визитки в официальный MCP-реестр ---
+      # mcp-publisher тянем из релизов реестра (linux amd64).
+      - name: Install mcp-publisher
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo modelcontextprotocol/registry \
+            --pattern '*linux_amd64.tar.gz' --output mcp-publisher.tar.gz
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+          chmod +x mcp-publisher
+
+      # ВНИМАНИЕ: точное имя метода логина и аргументы свериться один раз
+      # через `./mcp-publisher login --help` при первом прогоне. Для GitHub
+      # Actions используется OIDC-аутентификация (id-token: write выше).
+      - name: Login to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json
+        run: ./mcp-publisher publish
