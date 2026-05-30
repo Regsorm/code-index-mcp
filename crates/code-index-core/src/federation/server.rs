@@ -248,7 +248,7 @@ async fn handle_get_stats(
         }
     }
     let resp = serde_json::json!({ "repos": all });
-    ok_json(serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".to_string()))
+    ok_json(serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string()))
 }
 
 async fn handle_search_text(

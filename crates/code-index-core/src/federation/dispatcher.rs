@@ -56,7 +56,7 @@ pub fn federation_error(tool: &str, ip: &str, message: impl Into<String>) -> Str
         "ip": ip,
         "message": message.into(),
     });
-    serde_json::to_string_pretty(&v)
+    serde_json::to_string(&v)
         .unwrap_or_else(|_| format!("{{\"status\":\"federation_error\",\"tool\":\"{}\"}}", tool))
 }
 

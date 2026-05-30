@@ -31,7 +31,7 @@ pub(crate) const GREP_CODE_DEFAULT_LIMIT: usize = 100;
 
 /// Сериализовать `ToolUnavailable` в JSON-строку.
 pub fn format_unavailable(value: ToolUnavailable) -> String {
-    match serde_json::to_string_pretty(&value) {
+    match serde_json::to_string(&value) {
         Ok(s) => s,
         Err(e) => format!("{{\"status\":\"error\",\"message\":\"Сериализация: {}\"}}", e),
     }
@@ -84,7 +84,7 @@ macro_rules! bail_if_not_ready {
 }
 
 fn to_json<T: serde::Serialize>(value: &T) -> String {
-    match serde_json::to_string_pretty(value) {
+    match serde_json::to_string(value) {
         Ok(s) => s,
         Err(e) => format!("{{\"error\": \"Сериализация: {}\"}}", e),
     }
@@ -125,7 +125,7 @@ pub(crate) fn wrap_with_meta<T: serde::Serialize>(
         "result": result_value,
         "_meta": { "dependent_files": deps },
     });
-    serde_json::to_string_pretty(&wrapped)
+    serde_json::to_string(&wrapped)
         .unwrap_or_else(|e| format!("{{\"error\": \"Сериализация wrap: {}\"}}", e))
 }
 
