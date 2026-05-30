@@ -1,7 +1,7 @@
 {
   "name": "@regsorm/code-index-mcp",
   "version": "0.11.0",
-  "description": "Высокопроизводительный индексатор кода с MCP-протоколом для AI-моделей. Rust + tree-sitter + SQLite. Поиск по 62K файлов за 43 сек.",
+  "description": "Rust code index MCP server (BSL/1C-aware). Static binary auto-downloaded for your OS. Tree-sitter AST, federation, sub-ms search.",
   "mcpName": "io.github.Regsorm/code-index",
   "keywords": [
     "mcp",
@@ -9,7 +9,14 @@
     "code-index",
     "code-search",
     "tree-sitter",
+    "rust",
+    "bsl",
+    "1c",
+    "1c-enterprise",
+    "ai-agent",
     "claude",
+    "claude-code",
+    "cursor",
     "ai"
   ],
   "homepage": "https://github.com/Regsorm/code-index-mcp",

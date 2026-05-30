@@ -6,13 +6,24 @@ Published on Infostart: [Code Index — структурный поиск по �
 
 ---
 
-# Code Index MCP
+# code-index-mcp
 
 [Русская версия](README_RU.md)
 
-Instant code search for AI models. Replaces grep with millisecond queries.
+**Rust-native code index for AI agents. Static binary. Production-grade BSL/1C support.**
 
-> 93K files re-checked in 4s (mtime fast-path) — 282K functions searchable in <1ms — 9 languages — 18 MCP tools
+One static binary for Windows/Linux/macOS — no runtime, no dependencies. Indexes large repositories in seconds, returns results to AI agents over MCP in milliseconds. 25 tools: 18 universal + 7 BSL-specific for 1C:Enterprise configurations.
+
+## What's inside
+
+- **Performance.** 62,000 files indexed in 43 seconds, sub-ms search per query. Production-grade for 100K+ file monorepos.
+- **25 MCP tools.** 18 universal (functions, classes, callers/callees, file content, grep) + 7 BSL-tools (object structure, form handlers, event subscriptions, call graph, data links).
+- **Native BSL/1C.** Parses XML-exports of 1C:Enterprise 8.3 configurations. Data-link graph (object→object edges via reference types in attributes) — ~60,000 edges in seconds for a typical accounting configuration.
+- **Federation.** One MCP server can serve multiple repositories across machines — pass `repo: "alias"` in each tool call.
+- **Compressed content storage.** File contents stored in SQLite via zstd, cheap random-access reads for AI agents.
+- **Tree-sitter AST.** 10 languages with full parsing (Rust, Python, JavaScript, TypeScript, Java, Kotlin, C#, Go, Objective-C, Zig) + fallback for 50+ formats.
+
+Connects to Claude Code, Cursor, any MCP client over HTTP.
 
 ## Problem
 

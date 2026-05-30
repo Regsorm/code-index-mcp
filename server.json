@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Regsorm/code-index",
   "title": "code-index",
-  "description": "Быстрый индексатор кода для AI-моделей. Rust + tree-sitter + SQLite. Мгновенный поиск по символам.",
+  "description": "Rust code index MCP server with native 1C:Enterprise (BSL) support. 25 tools. Static binary.",
   "version": "0.11.0",
   "repository": {
     "url": "https://github.com/Regsorm/code-index-mcp",

@@ -3,7 +3,7 @@ name = "code-index"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Публичный CLI и MCP-сервер code-index — универсальный индексатор кода для AI-моделей"
+description = "Rust code index MCP server for AI agents: 25 tools, tree-sitter AST for 10 languages, static binary, sub-ms search on monorepos."
 
 # Бинарник называется `code-index` (как и пакет).
 [[bin]]
