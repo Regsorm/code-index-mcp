@@ -645,7 +645,7 @@ impl Storage {
         limit: usize,
         context_lines: usize,
         max_total_bytes: usize,
-    ) -> Result<Vec<GrepTextMatch>> {
+    ) -> Result<(Vec<GrepTextMatch>, bool)> {
         let compiled = regex::Regex::new(regex_pattern)
             .context("grep_code: невалидный regex")?;
 
@@ -721,7 +721,8 @@ impl Storage {
                     + path.len();
                 total_bytes = total_bytes.saturating_add(row_bytes);
                 if total_bytes > max_total_bytes {
-                    return Ok(results);
+                    // Упёрлись в байтовый потолок ответа — результат обрезан.
+                    return Ok((results, true));
                 }
                 results.push(GrepTextMatch {
                     path: path.clone(),
@@ -730,11 +731,12 @@ impl Storage {
                     context,
                 });
                 if results.len() >= limit {
-                    return Ok(results);
+                    // Достигнут лимит совпадений — возможно, есть ещё.
+                    return Ok((results, true));
                 }
             }
         }
-        Ok(results)
+        Ok((results, false))
     }
 
     // ── Поисковые запросы ────────────────────────────────────────────────────
@@ -2993,7 +2995,7 @@ mod tests {
             .upsert_file_content(id2, "def bar():\n    nothing_here\n", 4096)
             .unwrap();
 
-        let m = storage
+        let (m, _truncated) = storage
             .grep_code_filtered("specific_word", None, None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1, "только один файл должен совпасть");
@@ -3020,7 +3022,7 @@ mod tests {
             .upsert_file_content(id2, "TARGET_PATTERN in oversize", 1)
             .unwrap();
 
-        let m = storage
+        let (m, _truncated) = storage
             .grep_code_filtered("TARGET_PATTERN", None, None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1, "oversize-файл должен быть пропущен");
@@ -3046,7 +3048,7 @@ mod tests {
             .unwrap();
 
         // Ищем только в /src/
-        let m = storage
+        let (m, _truncated) = storage
             .grep_code_filtered("NEEDLE", Some("/src/*"), None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1, "glob должен ограничить поиск до /src/");
@@ -3065,7 +3067,7 @@ mod tests {
             .upsert_file_content(file_id, "before1\nbefore2\nMATCH\nafter1\nafter2", 4096)
             .unwrap();
 
-        let m = storage
+        let (m, _truncated) = storage
             .grep_code_filtered("MATCH", None, None, 100, 1, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1);
@@ -3093,10 +3095,11 @@ mod tests {
                 .unwrap();
         }
 
-        let m = storage
+        let (m, truncated) = storage
             .grep_code_filtered("COMMON_PATTERN", None, None, 2, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 2, "limit=2 должен вернуть ровно 2 результата");
+        assert!(truncated, "при достижении лимита truncated должен быть true");
     }
 
     // ── migrate_v4 идемпотентность ────────────────────────────────────────────

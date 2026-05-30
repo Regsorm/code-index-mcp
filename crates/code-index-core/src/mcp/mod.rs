@@ -210,6 +210,7 @@ pub struct GrepCodeParams {
     /// иначе full-scan по всем code-файлам репо (zstd-decode каждого) дорогой.
     pub path_glob: Option<String>,
     pub language: Option<String>,
+    /// Максимум совпадений в ответе. Default 100. При достижении — `truncated=true`.
     pub limit: Option<usize>,
     /// Сколько строк до/после совпадения возвращать в `context`. 0 — без контекста.
     pub context_lines: Option<usize>,
@@ -847,7 +848,7 @@ impl CodeIndexServer {
         tools::grep_text(entry, p.regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
-    #[tool(description = "Regex-поиск по содержимому **code-файлов** (Phase 2, v0.8.0): module-level код, идентификаторы, комментарии вне тел, макросы, use-импорты — всё что не ловит grep_body. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла). Файлы oversize=true пропускаются. Возвращает JSON-массив [{path, line, content, context}].")]
+    #[tool(description = "Regex-поиск по содержимому **code-файлов** (Phase 2, v0.8.0): module-level код, идентификаторы, комментарии вне тел, макросы, use-импорты — всё что не ловит grep_body. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла). Файлы oversize=true пропускаются. limit — число совпадений (default 100); при обрезке результат помечается truncated=true (дошлите больший limit, если нужно больше). Возвращает JSON-объект {matches: [{path, line, content, context}], shown, limit, truncated}.")]
     async fn grep_code(&self, Parameters(p): Parameters<GrepCodeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {

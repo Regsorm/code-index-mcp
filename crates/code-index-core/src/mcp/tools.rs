@@ -23,6 +23,11 @@ pub(crate) const READ_FILE_HARD_CAP_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const GREP_TOTAL_BYTES_CAP: usize = 1 * 1024 * 1024;
 /// Default-limit grep_text если path_glob и language не заданы.
 pub(crate) const GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT: usize = 100;
+/// Default-limit grep_code по числу совпадений, если `limit` не передан.
+/// Занижен до 100 (раньше было 500 с фильтром): по статистике использования
+/// модель сама задаёт limit ~20-40, а 500 раздувал ответ вдвое против нативного
+/// Grep (head_limit 250). При обрезке в ответе выставляется `truncated=true`.
+pub(crate) const GREP_CODE_DEFAULT_LIMIT: usize = 100;
 
 /// Сериализовать `ToolUnavailable` в JSON-строку.
 pub fn format_unavailable(value: ToolUnavailable) -> String {
@@ -717,16 +722,7 @@ pub async fn grep_code(
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
-    let want = limit.unwrap_or_else(|| {
-        // Без path_glob/language full-scan по всему репо может быть тяжёлым:
-        // distinct от grep_text здесь сильнее, потому что zstd-decode на каждый
-        // файл — full-scan на 100K файлов реально дорогой. Занижаем default.
-        if path_glob.is_none() && language.is_none() {
-            GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT
-        } else {
-            500
-        }
-    });
+    let want = limit.unwrap_or(GREP_CODE_DEFAULT_LIMIT);
     match storage.grep_code_filtered(
         &regex,
         path_glob.as_deref(),
@@ -735,9 +731,19 @@ pub async fn grep_code(
         context_lines.unwrap_or(0),
         GREP_TOTAL_BYTES_CAP,
     ) {
-        Ok(r) => {
-            let deps: Vec<String> = r.iter().map(|m| m.path.clone()).collect();
-            wrap_with_meta(&r, deps)
+        Ok((matches, truncated)) => {
+            let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
+            let shown = matches.len();
+            // Результат — объект с признаком обрезки: модель видит truncated и
+            // при необходимости дошлёт больший limit. Раньше отдавался голый
+            // массив без признака обрезки — тихая обрезка читалась как «это все».
+            let payload = serde_json::json!({
+                "matches": matches,
+                "shown": shown,
+                "limit": want,
+                "truncated": truncated,
+            });
+            wrap_with_meta(&payload, deps)
         }
         Err(e) => format!("{{\"error\": \"grep_code: {}\"}}", e),
     }
