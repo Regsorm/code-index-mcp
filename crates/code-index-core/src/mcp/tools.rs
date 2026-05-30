@@ -734,11 +734,30 @@ pub async fn grep_code(
         Ok((matches, truncated)) => {
             let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
             let shown = matches.len();
-            // Результат — объект с признаком обрезки: модель видит truncated и
-            // при необходимости дошлёт больший limit. Раньше отдавался голый
-            // массив без признака обрезки — тихая обрезка читалась как «это все».
+            // Группировка находок по файлу: путь хранится один раз как ключ в
+            // `files`, а не повторяется в каждой находке (находки часто кучкуются
+            // в одном файле). Признак обрезки truncated — рядом: модель видит, что
+            // показано не всё, и при необходимости дошлёт больший limit.
+            let mut files = serde_json::Map::new();
+            for m in &matches {
+                let mut obj = serde_json::Map::new();
+                obj.insert("line".to_string(), serde_json::json!(m.line));
+                obj.insert("content".to_string(), serde_json::Value::String(m.content.clone()));
+                if !m.context.is_empty() {
+                    obj.insert(
+                        "context".to_string(),
+                        serde_json::to_value(&m.context).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                let arr = files
+                    .entry(m.path.clone())
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let serde_json::Value::Array(a) = arr {
+                    a.push(serde_json::Value::Object(obj));
+                }
+            }
             let payload = serde_json::json!({
-                "matches": matches,
+                "files": files,
                 "shown": shown,
                 "limit": want,
                 "truncated": truncated,
