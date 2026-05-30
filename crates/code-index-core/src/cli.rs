@@ -14,6 +14,22 @@ use crate::indexer::Indexer;
 use crate::storage::memory::StorageConfig;
 use crate::storage::Storage;
 
+/// Извлечь `daemon_cfg.tools.enabled` из конфига по пути (для моно-ветки
+/// `Commands::Serve`, где `build_repo_entries` загружает конфиг внутри себя
+/// и не возвращает его наружу). При ошибке чтения возвращает пустой Vec —
+/// сама ошибка станет видна в логах `build_repo_entries`, дублировать её
+/// здесь не нужно. Если `config` is `None` (моно с `--path` без `--config`),
+/// тоже пустой Vec — whitelist не задан, фильтр выключен.
+///
+/// Дальнейшая логика (логи, warning о опечатках, установка whitelist) живёт
+/// в [`CodeIndexServer::apply_tools_whitelist`].
+fn tools_whitelist_from_daemon_cfg(config: Option<&Path>) -> Vec<String> {
+    config
+        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
+        .map(|cfg| cfg.tools.enabled)
+        .unwrap_or_default()
+}
+
 #[derive(Parser)]
 #[command(name = "code-index", version, about = "Высокопроизводительный индексатор кода с MCP-протоколом")]
 struct Cli {
@@ -564,12 +580,16 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                             .map(|lang| (p.effective_alias(), lang.clone()))
                     })
                     .collect();
+                // Whitelist tools из daemon.toml [tools].enabled применяется
+                // прямо в chain'е после конструктора. Логи и warning о
+                // неизвестных именах — внутри `apply_tools_whitelist`.
                 let server = CodeIndexServer::from_federated(
                     repos,
                     serve_cfg.me.ip.clone(),
                     registry.take(),
                     local_languages,
-                )?;
+                )?
+                .apply_tools_whitelist(&daemon_cfg.tools.enabled);
                 let federate_router = federation::server::federate_router(server.clone());
                 let allowed = std::sync::Arc::new(federation::whitelist::build(&serve_cfg));
 
@@ -627,6 +647,13 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                 }
                 None => CodeIndexServer::open_readonly_multi(entries)?,
             };
+            // Whitelist tools из daemon.toml [tools].enabled. В моно-ветке
+            // конфиг нужно отдельно загрузить — `build_repo_entries` его
+            // внутри парсит, но наружу не отдаёт. При `--path` без `--config`
+            // helper вернёт пустой список → фильтр выключен.
+            let server = server.apply_tools_whitelist(&tools_whitelist_from_daemon_cfg(
+                config.as_deref(),
+            ));
             let bind_host = host.unwrap_or_else(|| "127.0.0.1".to_string());
 
             // Если запуск с --config — подписываемся на изменения daemon.toml,

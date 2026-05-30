@@ -3,6 +3,25 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [Unreleased]
+
+**Опциональный whitelist MCP-инструментов через `[tools].enabled` в `daemon.toml`.**
+
+Продолжаем борьбу за ваши токены и скорость: теперь сервер можно настроить так, чтобы он отдавал в `tools/list` только нужное подмножество tools, а не все 25 (18 универсальных + 7 BSL). Меньше schema-токенов в каждом `initialize`, меньше путаницы у слабых моделей при выборе tool, тот же функционал для сильных. Поведение по умолчанию не меняется — если секции `[tools]` нет или `enabled` пуст, все зарегистрированные tools остаются доступны (обратная совместимость).
+
+### Добавлено
+
+- **Секция `[tools]` в `daemon.toml`** с полем `enabled: Vec<String>`. Пустой массив или отсутствие секции — все tools доступны. Заполненный — только перечисленные имена попадают в `tools/list`, остальные блокируются на `tools/call` с ошибкой `-32602 Invalid params: tool 'X' is disabled by [tools].enabled whitelist in daemon.toml`. Двойная защита нужна потому, что модель может вызвать tool из своей памяти / системного промпта, минуя `tools/list` — фильтр только в `list_tools` тут бы не помог.
+- **`CodeIndexServer::with_allowed_tools(Option<BTreeSet<String>>)`** — builder для установки whitelist'а программно (используется в `cli.rs`).
+- **`CodeIndexServer::validate_whitelist(&BTreeSet<String>) -> Vec<String>`** — возвращает имена tools, которых нет среди зарегистрированных (опечатки, удалённые tools). Используется в `cli.rs` для warning при старте.
+- **Логи при старте сервера**: при пустом `enabled` — `[tools].enabled пуст — whitelist выключен, все tools доступны`; при непустом — `[tools].enabled whitelist активен: N известных tools разрешены (M в списке)` + warning при опечатках.
+- **3 теста парсинга секции `[tools]`** в `daemon_core::config::tests` (`tools_section_default_empty`, `parses_tools_whitelist`, `parses_empty_tools_section`).
+
+### Совместимость
+
+- Полностью обратно совместимо. Старые `daemon.toml` без секции `[tools]` продолжают работать как раньше (все tools доступны). Поведение по умолчанию — то же, что в v0.10.x.
+- Минимальный функционально безопасный набор: `read_file`, `grep_code`, `get_function`, `find_symbol`, `list_files`, `get_stats`, `health`. Урезание ниже этого набора (например, оставить только `grep_body` без `grep_code`) приведёт к слепоте на импортах/директивах/module-level коде и обходам через дорогой полный `read_file` — экономия токенов будет уничтожена.
+
 ## [0.10.4] — 2026-05-22
 
 **Фикс публикации в MCP-реестр: регистр namespace.**

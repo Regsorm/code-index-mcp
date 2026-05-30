@@ -60,6 +60,12 @@ pub struct DaemonFileConfig {
     /// ```
     #[serde(default, rename = "cache_targets")]
     pub cache_targets: Vec<CacheTargetEntry>,
+
+    /// Опциональная секция `[tools]` — whitelist MCP-инструментов.
+    /// Пустой `enabled` (или отсутствие секции) → все tools разрешены.
+    /// См. [`ToolsSection`].
+    #[serde(default)]
+    pub tools: ToolsSection,
 }
 
 /// Дефолтный hardcoded-лимит размера code-файла, content которого сохраняется
@@ -103,6 +109,50 @@ pub struct CacheTargetEntry {
     /// здесь — только схема + host + port (опционально с path-prefix, но
     /// без `/invalidate`).
     pub url: String,
+}
+
+/// Секция `[tools]` — whitelist MCP-инструментов, отдаваемых клиентам.
+///
+/// Управляет тем, какие MCP-tools модель видит в `tools/list` и какие
+/// разрешены к вызову через `tools/call`. Применяется в обоих режимах
+/// сервера (моно и federation) — фильтрация делается в `CodeIndexServer`
+/// одинаково.
+///
+/// Пустой `enabled` (или отсутствие секции `[tools]` целиком) → все
+/// зарегистрированные tools разрешены, поведение совпадает с v0.10.x
+/// и старее (обратная совместимость).
+///
+/// Заполненный `enabled` → в `tools/list` уходят только перечисленные
+/// имена, остальные блокируются на `tools/call` с ошибкой
+/// `-32602 Invalid params`. Если в списке указано имя несуществующего
+/// tool (опечатка) — сервер при старте печатает warning, но продолжает
+/// работу; неизвестное имя просто не сматчится ни с одним зарегистрированным
+/// tool и поэтому ни на что не влияет.
+///
+/// Пример:
+/// ```toml
+/// [tools]
+/// enabled = ["read_file", "grep_code", "get_function", "find_symbol",
+///            "grep_body", "list_files", "get_stats", "health"]
+/// ```
+///
+/// Имена tools — без префикса `mcp__...` (это префикс, который MCP-клиент
+/// добавляет сам в зависимости от настройки `.mcp.json`). На стороне
+/// сервера каждый tool зарегистрирован под своим коротким именем
+/// (`read_file`, `grep_code`, `get_function`, …).
+///
+/// При урезании списка важно сохранить функциональную полноту: если
+/// убрать `grep_code`, оставив только `grep_body` — модель не сможет
+/// искать вне тел функций (импорты, директивы `&НаСервере`, module-level
+/// объявления), что приведёт к обходам через дорогой полный `read_file`.
+/// Минимальный безопасный набор: `read_file`, `grep_code`, `get_function`,
+/// `find_symbol`, `list_files`, `get_stats`, `health`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolsSection {
+    /// Whitelist по точным именам MCP-tools. Пусто или отсутствует —
+    /// ограничение не применяется (все зарегистрированные tools доступны).
+    #[serde(default)]
+    pub enabled: Vec<String>,
 }
 
 /// Секция `[enrichment]` из конфига демона.
@@ -570,5 +620,43 @@ mod tests {
         assert_eq!(cfg.cache_targets.len(), 2);
         assert_eq!(cfg.cache_targets[0].url, "http://127.0.0.1:8011");
         assert_eq!(cfg.cache_targets[1].url, "http://192.0.2.5:8011");
+    }
+
+    #[test]
+    fn tools_section_default_empty() {
+        // Старые конфиги без секции `[tools]` — поле tools заполняется
+        // дефолтом (`enabled` пуст). Сервер интерпретирует это как
+        // «все tools разрешены» (обратная совместимость).
+        let cfg: DaemonFileConfig = parse_str("").unwrap();
+        assert!(cfg.tools.enabled.is_empty());
+    }
+
+    #[test]
+    fn parses_tools_whitelist() {
+        let text = r#"
+            [tools]
+            enabled = ["read_file", "grep_code", "get_function"]
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(
+            cfg.tools.enabled,
+            vec![
+                "read_file".to_string(),
+                "grep_code".to_string(),
+                "get_function".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_empty_tools_section() {
+        // Секция `[tools]` явно указана, но `enabled` пустой массив —
+        // эквивалентно отсутствию секции (все tools разрешены).
+        let text = r#"
+            [tools]
+            enabled = []
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert!(cfg.tools.enabled.is_empty());
     }
 }

@@ -155,6 +155,7 @@ mod tests {
             enrichment: None,
             indexer: Default::default(),
             cache_targets: Vec::new(),
+            tools: Default::default(),
         }
     }
 

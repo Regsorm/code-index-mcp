@@ -275,6 +275,14 @@ pub struct CodeIndexServer {
     /// (rmcp дёргает `on_initialized` для каждой сессии). Mutex поверх
     /// `Option<Peer>` нужен, потому что `Peer` не Sync без обёртки.
     pub peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
+    /// Опциональный whitelist MCP-инструментов из `daemon.toml [tools].enabled`.
+    /// `None` — фильтр не применяется (все зарегистрированные tools доступны),
+    /// `Some(set)` — в `tools/list` уходят только tools с именами из множества,
+    /// а `tools/call` для остальных возвращает `-32602 Invalid params`.
+    /// Двойная защита нужна потому, что модель может вызвать tool вне
+    /// `tools/list` (из системного промпта/CLAUDE.md) — фильтр в `list_tools`
+    /// её не остановит, без проверки в `call_tool` это уйдёт в router.
+    pub allowed_tools: Arc<Option<BTreeSet<String>>>,
 }
 
 impl CodeIndexServer {
@@ -294,6 +302,7 @@ impl CodeIndexServer {
             extension_tools: Arc::new(ArcSwap::from_pointee(Vec::new())),
             registry: Arc::new(None),
             peer: Arc::new(Mutex::new(None)),
+            allowed_tools: Arc::new(None),
         }
     }
 
@@ -316,6 +325,7 @@ impl CodeIndexServer {
             extension_tools: Arc::new(ArcSwap::from_pointee(extension_tools)),
             registry: Arc::new(Some(registry)),
             peer: Arc::new(Mutex::new(None)),
+            allowed_tools: Arc::new(None),
         }
     }
 
@@ -378,6 +388,7 @@ impl CodeIndexServer {
             extension_tools: Arc::new(ArcSwap::from_pointee(extension_tools)),
             registry: Arc::new(registry),
             peer: Arc::new(Mutex::new(None)),
+            allowed_tools: Arc::new(None),
         })
     }
 
@@ -422,6 +433,106 @@ impl CodeIndexServer {
     /// Список алиасов для описаний и диагностики.
     pub fn repo_aliases(&self) -> Vec<String> {
         self.repos.keys().cloned().collect()
+    }
+
+    /// Builder для опционального whitelist'а MCP-инструментов
+    /// (`daemon.toml [tools].enabled`).
+    ///
+    /// - `None` (или метод не вызван) → фильтр выключен, все зарегистрированные
+    ///   tools отдаются в `tools/list` и доступны через `tools/call`.
+    /// - `Some(set)` → в `tools/list` уходят только tools с именами из множества;
+    ///   `tools/call` для tools вне набора возвращает ошибку
+    ///   `-32602 Invalid params` с пояснением «tool 'X' is disabled by
+    ///   `[tools].enabled` whitelist in daemon.toml».
+    ///
+    /// Пустое множество (`Some(BTreeSet::new())`) трактуется буквально —
+    /// **ни один tool не доступен**. Если намерение — «снять фильтр», передавайте
+    /// `None`, не пустой `Some`. На уровне `daemon.toml` пустой `enabled = []`
+    /// в `cli.rs` маппится в `None` (см. конвертацию в `Commands::Serve`),
+    /// поэтому пользователь не может случайно отключить вообще всё через
+    /// пустой массив.
+    pub fn with_allowed_tools(mut self, allowed: Option<BTreeSet<String>>) -> Self {
+        self.allowed_tools = Arc::new(allowed);
+        self
+    }
+
+    /// Применить whitelist tools из списка имён (типично из
+    /// `daemon.toml [tools].enabled`).
+    ///
+    /// Это convenience-обёртка над [`Self::validate_whitelist`] +
+    /// [`Self::with_allowed_tools`]: преобразует список в множество,
+    /// логирует количество известных/неизвестных tools, при опечатках
+    /// печатает warning, и устанавливает whitelist. Используется обоими
+    /// ветками `code-index serve` (federation и моно) — это единственная
+    /// точка интеграции с `daemon.toml [tools]`.
+    ///
+    /// Поведение:
+    /// - Пустой `enabled` → фильтр выключен (`allowed_tools = None`),
+    ///   все tools доступны. Лог: `[tools].enabled пуст — whitelist выключен`.
+    /// - Непустой → фильтр применяется. Лог: `whitelist активен: N известных
+    ///   tools разрешены (M в списке)`. Если в списке есть имена, не
+    ///   соответствующие ни одному зарегистрированному tool, печатается
+    ///   warning (но сервер запускается — неизвестные имена просто не
+    ///   повлияют ни на что).
+    ///
+    /// Метод **потребляет self и возвращает Self** — удобно для chain'а
+    /// после конструктора:
+    /// ```ignore
+    /// let server = CodeIndexServer::from_federated(...)?
+    ///     .apply_tools_whitelist(&daemon_cfg.tools.enabled);
+    /// ```
+    pub fn apply_tools_whitelist(self, enabled: &[String]) -> Self {
+        if enabled.is_empty() {
+            tracing::info!(
+                "[tools].enabled пуст — whitelist выключен, все tools доступны"
+            );
+            return self;
+        }
+        let allowed: BTreeSet<String> = enabled.iter().cloned().collect();
+        let unknown = self.validate_whitelist(&allowed);
+        if !unknown.is_empty() {
+            tracing::warn!(
+                "[tools].enabled содержит неизвестные имена tools (опечатка?): {:?}. \
+                 Сервер запущен, но эти имена ни на что не повлияют — реальных tools \
+                 с такими именами не зарегистрировано.",
+                unknown
+            );
+        }
+        let known_count = allowed.len().saturating_sub(unknown.len());
+        tracing::info!(
+            "[tools].enabled whitelist активен: {} известных tools разрешены ({} в списке)",
+            known_count,
+            allowed.len(),
+        );
+        self.with_allowed_tools(Some(allowed))
+    }
+
+    /// Проверить, какие имена из whitelist'а НЕ соответствуют ни одному
+    /// зарегистрированному tool (опечатки, удалённые tools).
+    ///
+    /// Возвращает отсортированный список «неизвестных» имён. Сервер
+    /// использует это для warning при старте; неизвестные имена не
+    /// блокируют запуск, потому что в обычной работе они просто ни на
+    /// что не повлияют (никакой реальный tool с таким именем не
+    /// зарегистрирован → фильтрация для него тривиально проходит).
+    pub fn validate_whitelist(&self, whitelist: &BTreeSet<String>) -> Vec<String> {
+        let mut known: BTreeSet<String> = self
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let snapshot = self.extension_tools.load();
+        for ext in snapshot.iter() {
+            known.insert(ext.name().to_string());
+        }
+        let mut unknown: Vec<String> = whitelist
+            .iter()
+            .filter(|name| !known.contains(name.as_str()))
+            .cloned()
+            .collect();
+        unknown.sort();
+        unknown
     }
 
     /// Имена активных языков. Возвращает копию (через клонирование строк),
@@ -785,6 +896,13 @@ impl ServerHandler for CodeIndexServer {
         for ext in extension_snapshot.iter() {
             tools.push(extension_tool_to_rmcp(ext.as_ref()));
         }
+        // Если задан whitelist через `daemon.toml [tools].enabled` —
+        // оставляем только перечисленные tools. Модель видит ровно тот
+        // набор, который оператор разрешил; без whitelist (`None`) фильтр
+        // не применяется (поведение до v0.10.x).
+        if let Some(allowed) = self.allowed_tools.as_ref().as_ref() {
+            tools.retain(|t| allowed.contains(t.name.as_ref()));
+        }
         // Стабильный порядок (как у tool_router::list_all): по имени.
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(ListToolsResult {
@@ -799,6 +917,22 @@ impl ServerHandler for CodeIndexServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        // 0. Whitelist-проверка ДО router-диспетча. Модель может вызвать
+        // tool, отсутствующий в `tools/list` (из системного промпта, из
+        // памяти обучения, из CLAUDE.md проекта) — без этой проверки
+        // вызов уйдёт в router и выполнится. Дублирует фильтр в
+        // `list_tools` намеренно (двойная защита).
+        if let Some(allowed) = self.allowed_tools.as_ref().as_ref() {
+            if !allowed.contains(request.name.as_ref()) {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "tool '{}' is disabled by [tools].enabled whitelist in daemon.toml",
+                        request.name
+                    ),
+                    None,
+                ));
+            }
+        }
         // 1. Сначала core-tools — они есть всегда.
         if self.tool_router.has_route(request.name.as_ref()) {
             let tcc = rmcp::handler::server::tool::ToolCallContext::new(
