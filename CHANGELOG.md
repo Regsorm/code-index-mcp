@@ -3,6 +3,22 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.13.0] — 2026-05-30
+
+**Compact-JSON в выводе MCP-инструментов вместо pretty.**
+
+Вывод MCP-инструментов читает модель, а не человек — отступы и переносы pretty-JSON тратят токены без пользы. Переводим сериализацию ответов на compact (`to_string` вместо `to_string_pretty`). Экономия ~30% на каждом ответе tool'а, особенно заметна для federation (удалённые репо) и для текстовых инструментов. Смысл данных не меняется — JSON тот же, просто без форматирования.
+
+### Изменено
+
+- **Сериализация ответов MCP-инструментов — compact** (`to_string`): `wrap_with_meta` (18 универсальных tools — read_file, grep_*, get_function, list_files и т.д.), `to_json` (`get_stats`/`stat_file`/`health`), `format_unavailable`, federation-форвард (`federation_error` + агрегация `get_stats` по репо).
+- BSL-tools уже отдавали compact через `CallToolResult::structured` — не затронуты.
+
+### Совместимость
+
+- Формат данных не изменился — убрано только pretty-форматирование (отступы/переносы). Любой JSON-парсер читает результат как раньше.
+- **CLI-вывод** (`--json`) и файлы `daemon.json`/`config.json` остаются pretty — они человекочитаемы и не на горячем пути модели.
+
 ## [0.12.0] — 2026-05-30
 
 **`grep_code`: дефолт `limit` снижен 500→100 и добавлен явный флаг обрезки `truncated`.**

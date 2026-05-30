@@ -5,6 +5,22 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.13.0] — 2026-05-30
+
+**Compact JSON in MCP tool output instead of pretty.**
+
+MCP tool output is consumed by the model, not a human — pretty-JSON indentation and newlines waste tokens for nothing. We switch response serialization to compact (`to_string` instead of `to_string_pretty`). ~30% saved on every tool response, especially noticeable for federation (remote repos) and text tools. The data itself is unchanged — same JSON, just unformatted.
+
+### Changed
+
+- **MCP tool response serialization is now compact** (`to_string`): `wrap_with_meta` (18 universal tools — read_file, grep_*, get_function, list_files, etc.), `to_json` (`get_stats`/`stat_file`/`health`), `format_unavailable`, federation forwarding (`federation_error` + per-repo `get_stats` aggregation).
+- BSL-tools already emitted compact via `CallToolResult::structured` — unaffected.
+
+### Compatibility
+
+- The data format is unchanged — only pretty-formatting (indentation/newlines) was removed. Any JSON parser reads the result as before.
+- **CLI output** (`--json`) and the `daemon.json`/`config.json` files stay pretty — they are human-readable and not on the model's hot path.
+
 ## [0.12.0] — 2026-05-30
 
 **`grep_code`: default `limit` lowered 500→100 and an explicit `truncated` flag added.**
