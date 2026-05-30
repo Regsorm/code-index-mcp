@@ -1,14 +1,17 @@
-// bsl-extension — приватный crate code-index для конфигураций 1С.
+// bsl-extension — crate code-index с поддержкой конфигураций 1С.
 //
-// На этапе 2 здесь — скелет: реализация LanguageProcessor::name()=="bsl"
-// и detects() (Configuration.xml в корне), но без специфичных tools или
-// SQLite-расширений. Реальные XML-парсеры метаданных и MCP-tools
-// (`get_object_structure` и т.д.) появятся на этапах 3 и 6.
+// Реализует `LanguageProcessor` для языка "bsl": XML-парсеры выгрузки
+// (Configuration.xml, формы, объекты), SQLite-расширения схемы
+// (metadata_objects / metadata_forms / event_subscriptions /
+// proc_call_graph / data_links) и BSL-специфичные MCP-tools
+// (`get_object_structure`, `get_form_handlers`, `get_event_subscriptions`,
+// `find_path`, `search_terms`, `get_data_links`, `find_data_path`).
 //
-// Этот crate НЕ публикуется в crates.io / на публичный GitHub. Он
-// входит в приватный binary `bsl-indexer`, который запускается на
-// VM RAG. Публичный `code-index` его не подключает — public surface
-// area остаётся «универсальный индексатор без 1С-логики».
+// Подключается к ядру (`code-index-core`) в сборке бинарника `bsl-indexer`
+// (core + эта надстройка). Публичный бинарник `code-index` этот crate НЕ
+// линкует — его public surface остаётся «универсальный индексатор без
+// 1С-логики». При этом ИСХОДНИКИ crate'а лежат в том же публичном репо и
+// распространяются вместе с проектом (полный функционал открыт).
 
 pub mod enrichment;
 pub mod index_extras;
