@@ -5,6 +5,22 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.12.0] — 2026-05-30
+
+**`grep_code`: default `limit` lowered 500→100 and an explicit `truncated` flag added.**
+
+Based on real usage stats (a 2-month sample, ~240 `grep_code` calls): when the model sets `limit` itself, it picks ~20–40 matches (median 30), and specified 500 only twice out of a hundred calls. The old default of 500 (with a `path_glob`/`language` filter) inflated the response twofold versus native Grep (`head_limit` 250) — especially with `context_lines`. We lower the default to 100 and make truncation visible so the model can re-request a larger `limit` instead of treating a truncated list as complete.
+
+### Changed
+
+- **`grep_code` default `limit` 500 → 100** (new `GREP_CODE_DEFAULT_LIMIT` constant). Previously the default depended on the filter: 100 on full-scan / 500 with a `path_glob`/`language` filter; now a single default of 100. An explicitly passed `limit` works as before.
+- **`grep_code` result format**: instead of a bare array `[{path, line, content, context}]`, it now returns an object `{matches: [...], shown, limit, truncated}`. `truncated=true` means the result was cut off by `limit` or the byte cap (1 MB) — there are more matches, re-request with a larger `limit`. Previously truncation was silent and read as "these are all matches".
+- **`Storage::grep_code_filtered`** now returns `(Vec<GrepTextMatch>, bool)` — the second tuple element is the truncation flag.
+
+### Compatibility
+
+- **`grep_code` response format change** (array → object `{matches, …}`). Consumers that parsed the response as an array must read `result.matches`. `mcp-cache-ci` (uses only `_meta.dependent_files`) and federation forwarding are unaffected. `grep_text`/`grep_body` formats are **unchanged** — still arrays.
+
 ## [0.11.0] — 2026-05-30
 
 **Optional whitelist of MCP tools via `[tools].enabled` in `daemon.toml`.**
