@@ -3,7 +3,7 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
-## [Unreleased]
+## [0.11.0] — 2026-05-30
 
 **Опциональный whitelist MCP-инструментов через `[tools].enabled` в `daemon.toml`.**
 

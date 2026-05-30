@@ -3,7 +3,7 @@
   "name": "io.github.Regsorm/code-index",
   "title": "code-index",
   "description": "Быстрый индексатор кода для AI-моделей. Rust + tree-sitter + SQLite. Мгновенный поиск по символам.",
-  "version": "0.10.4",
+  "version": "0.11.0",
   "repository": {
     "url": "https://github.com/Regsorm/code-index-mcp",
     "source": "github"
@@ -13,7 +13,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@regsorm/code-index-mcp",
-      "version": "0.10.4",
+      "version": "0.11.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

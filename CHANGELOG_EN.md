@@ -7,7 +7,7 @@ Versioning — [SemVer](https://semver.org/).
 
 > This English changelog is being introduced gradually. Earlier releases are documented only in the Russian [CHANGELOG.md](CHANGELOG.md) for now.
 
-## [Unreleased]
+## [0.11.0] — 2026-05-30
 
 **Optional whitelist of MCP tools via `[tools].enabled` in `daemon.toml`.**
 
