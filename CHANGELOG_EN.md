@@ -5,6 +5,20 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.14.0] — 2026-05-30
+
+**`grep_code`: matches grouped by file — the path is no longer repeated on every line.**
+
+Previously `grep_code` returned a flat array where the full file path was duplicated in every match — yet matches often cluster in one file (dozens of hits with the same `path`). Matches are now grouped: the path is a key in the `files` object, with a list of `{line, content, context}` under it. On clustered results this noticeably shrinks the response.
+
+### Changed
+
+- **`grep_code` result format**: `{matches: [{path, line, content, context}], …}` → `{files: {"<path>": [{line, content, context}], …}, shown, limit, truncated}`. The path is stored once per file. The `context` field is omitted when `context_lines=0`. The `shown`/`limit`/`truncated` fields are unchanged.
+
+### Compatibility
+
+- **`grep_code` response format change** (`matches` array → `files` object grouped by path). Consumers read `result.files["<path>"]` instead of `result.matches[].path`. `grep_text`/`grep_body` are unaffected — their format is unchanged.
+
 ## [0.13.0] — 2026-05-30
 
 **Compact JSON in MCP tool output instead of pretty.**
