@@ -14,6 +14,7 @@ use std::pin::Pin;
 use code_index_core::extension::{IndexTool, ToolContext};
 use rusqlite::params;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct FindDataPathTool;
 
@@ -90,55 +91,111 @@ impl IndexTool for FindDataPathTool {
             let storage = ctx.storage.lock().await;
             let conn = storage.conn();
 
-            // BFS по data_links. Не разворачиваем терминальные *-узлы
-            // (w.is_universal=0 на шаге рекурсии).
-            let sql = "
-                WITH RECURSIVE walk(cur_obj, depth, path_json) AS (
-                    SELECT
-                        to_object, 1,
-                        json_array(json_object(
-                            'from_object', from_object,
-                            'from_path', from_path,
-                            'to_object', to_object,
-                            'link_kind', link_kind
-                        ))
-                    FROM data_links
-                    WHERE repo = ?1 AND from_object = ?2
-                    UNION ALL
-                    SELECT
-                        dl.to_object, w.depth + 1,
-                        json_insert(w.path_json, '$[#]', json_object(
-                            'from_object', dl.from_object,
-                            'from_path', dl.from_path,
-                            'to_object', dl.to_object,
-                            'link_kind', dl.link_kind
-                        ))
-                    FROM walk w
-                    JOIN data_links dl ON dl.repo = ?1 AND dl.from_object = w.cur_obj
-                    WHERE w.depth < ?3
-                )
-                SELECT path_json FROM walk
-                WHERE cur_obj = ?4
-                ORDER BY depth ASC
-                LIMIT 1
-            ";
+            // BFS с visited-set: каждый узел разворачивается ровно один
+            // раз, поэтому обход ограничен достижимым подграфом (тысячи
+            // узлов), а не числом путей (на плотном циклическом графе связей
+            // 1С их миллионы). Возвращаем кратчайший по числу рёбер путь
+            // from -> to. Терминальные *-узлы (is_universal) исходящих рёбер
+            // не имеют, поэтому не разворачиваются естественным образом.
+            // Seek по (repo, from_object) на каждом шаге обеспечивает ANALYZE
+            // (см. run_index_extras).
+            struct Edge {
+                from_object: String,
+                from_path: String,
+                to_object: String,
+                link_kind: String,
+            }
 
-            let row = conn.query_row(
-                sql,
-                params!["default", &from, max_depth, &to],
-                |r| r.get::<_, String>(0),
-            );
-
-            let result_value = match row {
-                Ok(path_json) => {
-                    let path: Value = serde_json::from_str(&path_json)
-                        .unwrap_or_else(|_| Value::Array(Vec::new()));
-                    json!({ "from": from, "to": to, "found": true, "path": path })
+            let mut stmt = match conn.prepare(
+                "SELECT from_object, from_path, to_object, link_kind \
+                 FROM data_links WHERE repo = ?1 AND from_object = ?2",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    return crate::tools::wrap_with_meta(
+                        json!({ "error": format!("database error: {}", e) }),
+                        Vec::new(),
+                    );
                 }
-                Err(rusqlite::Error::QueryReturnedNoRows) => json!({
+            };
+
+            let mut visited: HashSet<String> = HashSet::new();
+            let mut parent: HashMap<String, Edge> = HashMap::new();
+            let mut queue: VecDeque<(String, i64)> = VecDeque::new();
+            visited.insert(from.clone());
+            queue.push_back((from.clone(), 0));
+            let mut reached = false;
+            let mut db_err: Option<String> = None;
+
+            'bfs: while let Some((node, depth)) = queue.pop_front() {
+                if depth >= max_depth {
+                    continue;
+                }
+                let rows = stmt.query_map(params!["default", &node], |r| {
+                    Ok(Edge {
+                        from_object: r.get(0)?,
+                        from_path: r.get(1)?,
+                        to_object: r.get(2)?,
+                        link_kind: r.get(3)?,
+                    })
+                });
+                let rows = match rows {
+                    Ok(r) => r,
+                    Err(err) => {
+                        db_err = Some(format!("{}", err));
+                        break 'bfs;
+                    }
+                };
+                for edge in rows {
+                    let edge = match edge {
+                        Ok(ed) => ed,
+                        Err(err) => {
+                            db_err = Some(format!("{}", err));
+                            break 'bfs;
+                        }
+                    };
+                    let nxt = edge.to_object.clone();
+                    if nxt == to {
+                        parent.insert(nxt, edge);
+                        reached = true;
+                        break 'bfs;
+                    }
+                    if visited.insert(nxt.clone()) {
+                        parent.insert(nxt.clone(), edge);
+                        queue.push_back((nxt, depth + 1));
+                    }
+                }
+            }
+
+            if let Some(err) = db_err {
+                return crate::tools::wrap_with_meta(
+                    json!({ "error": format!("database error: {}", err) }),
+                    Vec::new(),
+                );
+            }
+
+            let result_value = if reached {
+                let mut edges: Vec<Value> = Vec::new();
+                let mut cur = to.clone();
+                while let Some(edge) = parent.get(&cur) {
+                    edges.push(json!({
+                        "from_object": edge.from_object,
+                        "from_path": edge.from_path,
+                        "to_object": edge.to_object,
+                        "link_kind": edge.link_kind,
+                    }));
+                    let prev = edge.from_object.clone();
+                    if prev == from {
+                        break;
+                    }
+                    cur = prev;
+                }
+                edges.reverse();
+                json!({ "from": from, "to": to, "found": true, "path": edges })
+            } else {
+                json!({
                     "from": from, "to": to, "found": false, "path": [], "max_depth": max_depth,
-                }),
-                Err(e) => json!({"error": format!("database error: {}", e)}),
+                })
             };
             crate::tools::wrap_with_meta(result_value, Vec::new())
         })
