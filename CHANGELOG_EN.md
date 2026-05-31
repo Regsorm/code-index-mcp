@@ -5,6 +5,20 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.14.1] — 2026-05-31
+
+**`find_path`/`find_data_path`: graph-traversal timeouts on large BSL repos fixed (`ANALYZE` after graph build).**
+
+On large configurations (KA 1.1 — `proc_call_graph` ~125k edges, `data_links` ~11.5k) `find_path`/`find_data_path` traversal hit timeouts: depth=3 on the call graph took ~240s. The cause — the repo's SQLite index had no statistics (`sqlite_stat1`), so in the recursive CTE step the planner used only the constant index prefix (`repo=`), scanning all repo edges on every iteration instead of seeking on `(repo, caller_proc_key)` / `(repo, from_object)`. Forcing the index via `INDEXED BY` did not help — statistics are the only lever.
+
+### Fixed
+
+- **The indexer now runs `ANALYZE` at the end of `run_index_extras`** — after rebuilding `proc_call_graph`/`data_links` (and the other BSL tables), SQLite statistics are gathered, and the planner uses a two-column seek in the recursive step of `find_path`/`find_data_path`. On KA 1.1: `find_path` depth=3 went 240s → 0.05s. `ANALYZE` costs ~0.6s on a 2.4 GB DB (it scans index B-trees, not the zstd content blobs) and runs on every (re)index in sync with the graph rebuild.
+
+### Known limitations
+
+- `find_data_path` on a **dense node at depth 4** still traverses millions of paths even after `ANALYZE` — the recursive CTE has no visited-set/cycle-detection and the 1C data-link graph is dense and cyclic. For typical queries and depth ≤3 it is instant; eliminating the blow-up on deep dense traversals is planned separately.
+
 ## [0.14.0] — 2026-05-30
 
 **`grep_code`: matches grouped by file — the path is no longer repeated on every line.**
