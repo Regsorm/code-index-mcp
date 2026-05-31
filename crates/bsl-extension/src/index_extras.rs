@@ -91,6 +91,17 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     if let Err(e) = build_call_graph(conn) {
         tracing::warn!("proc_call_graph: {}", e);
     }
+    // ANALYZE: без статистики SQLite в рекурсивном шаге find_path/
+    // find_data_path использует лишь префикс индекса (repo=) и сканирует
+    // все рёбра repo на каждой итерации (depth=3 ~240с на КА1.1). После
+    // ANALYZE планировщик знает селективность (~5 рёбер на caller_proc_key)
+    // и берёт seek по двум столбцам → depth=3 падает до ~0.05с. Хинт
+    // INDEXED BY это НЕ чинит — решает только статистика. Графы строятся
+    // заново при каждом reindex (DELETE+INSERT), поэтому ANALYZE здесь, в
+    // конце прохода, освежает статистику синхронно с ними (~0.6с на 2.4ГБ).
+    if let Err(e) = conn.execute_batch("ANALYZE;") {
+        tracing::warn!("ANALYZE: {}", e);
+    }
     Ok(())
 }
 
