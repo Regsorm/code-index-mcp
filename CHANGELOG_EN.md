@@ -5,6 +5,16 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.14.2] — 2026-05-31
+
+**`find_data_path`: traversal rewritten as BFS with a visited-set — combinatorial blow-up on dense link graphs eliminated.**
+
+After 0.14.1 (ANALYZE fixed the seek), `find_data_path` traversal on a dense cyclic data-link graph could still expand millions of paths: the recursive CTE enumerated ALL paths up to max_depth without node deduplication (on KA 1.1 a dense node at depth=4 produced ~4.9M intermediate rows plus `path_json` memory growth).
+
+### Fixed
+
+- **`find_data_path` now uses BFS with a visited-set instead of the recursive CTE.** Each object is expanded exactly once (visited HashSet) → traversal is bounded by the reachable subgraph (thousands of nodes), not the number of paths (millions); link-graph cycles are no longer walked in circles. The same shortest-by-edge-count path from → to is returned. Terminal generic `*`-nodes have no outgoing edges and are not expanded. Each step is an index seek on `(repo, from_object)` (provided by the 0.14.1 ANALYZE). `find_path` (call graph) is untouched — its CTE stays, already made fast by ANALYZE.
+
 ## [0.14.1] — 2026-05-31
 
 **`find_path`/`find_data_path`: graph-traversal timeouts on large BSL repos fixed (`ANALYZE` after graph build).**
