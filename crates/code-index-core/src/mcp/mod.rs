@@ -144,6 +144,7 @@ pub struct GrepBodyParams {
     pub pattern: Option<String>,
     pub regex: Option<String>,
     pub language: Option<String>,
+    /// Максимум находок в ответе. Default 100. При обрезке — `truncated=true`.
     pub limit: Option<usize>,
     /// Glob по path для сужения поиска. SQL-pushdown.
     pub path_glob: Option<String>,
@@ -196,6 +197,7 @@ pub struct GrepTextParams {
     /// иначе работает full-scan по всем text-файлам.
     pub path_glob: Option<String>,
     pub language: Option<String>,
+    /// Максимум находок в ответе (default 100; при заданном path_glob/language — 500). При обрезке — `truncated=true`.
     pub limit: Option<usize>,
     /// Сколько строк до/после совпадения возвращать в `context`. 0 — без контекста.
     pub context_lines: Option<usize>,
@@ -790,7 +792,7 @@ impl CodeIndexServer {
         tools::search_text(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP). path_glob — фильтр по пути (SQL pushdown). context_lines — N строк до/после совпадения.")]
+    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP). path_glob — фильтр по пути (SQL pushdown). context_lines — N строк до/после совпадения. limit — число находок (default 100); при обрезке truncated=true. Возвращает JSON-объект {files: {\"<path>\": [{name, kind, line_start, line_end, match_lines, match_count?, context?}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
     async fn grep_body(&self, Parameters(p): Parameters<GrepBodyParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -837,7 +839,7 @@ impl CodeIndexServer {
         tools::read_file(entry, p.path, p.line_start, p.line_end).await
     }
 
-    #[tool(description = "Regex-поиск по содержимому text-файлов. path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого). context_lines — N строк до/после. Возвращает JSON-массив [{path, line, content, context}].")]
+    #[tool(description = "Regex-поиск по содержимому text-файлов. path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого). context_lines — N строк до/после. limit — число находок; при обрезке truncated=true. Возвращает JSON-объект {files: {\"<path>\": [{line, content, context?}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
     async fn grep_text(&self, Parameters(p): Parameters<GrepTextParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {

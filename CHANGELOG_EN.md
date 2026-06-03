@@ -5,6 +5,22 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.15.0] — 2026-06-04
+
+**`grep_text` and `grep_body`: output grouped by file + a `truncated` flag — path duplication eliminated, the same treatment `grep_code` got in 0.14.0.**
+
+`grep_text` and `grep_body` returned a flat array of matches where the full file path was repeated in every match. With many matches in one file this bloated the response (and billed tokens when running over an API). `grep_code` switched to `{files: {"<path>": [...]}}` grouping back in 0.14.0; the same treatment is now applied to the two remaining grep tools.
+
+### Changed
+
+- **`grep_text` groups matches by file.** Response shape `[{path, line, content, context}]` → `{files: {"<path>": [{line, content, context?}]}, shown, limit, truncated}`. The path appears once as the `files` key; `context` is omitted when `context_lines=0`.
+- **`grep_body` groups matches by file.** Shape `[{file_path, name, kind, …}]` → `{files: {"<path>": [{name, kind, line_start, line_end, match_lines, match_count?, context?}]}, shown, limit, truncated}`. `match_count` is omitted when there are ≤3 matches; `context` when `context_lines=0`.
+- **Both tools now return `truncated`.** Storage methods `grep_text_filtered` and `grep_body_with_options` now return `(Vec, bool)` — the flag is set when `limit` or the 1 MB response byte cap is reached, just like `grep_code`. For the legacy `grep_body` path (no `path_glob`/`context_lines`) `truncated` is derived from hitting `limit`. The model sees that not everything is shown and can re-request with a larger `limit`.
+
+### Compatibility
+
+- Consumers that parsed the flat `grep_text`/`grep_body` array must read `result.files` (a "path → array of matches" object) instead of an array; the path field moved out of each match into the key. A one-off output-format breaking change — same as `grep_code` in 0.14.0.
+
 ## [0.14.2] — 2026-05-31
 
 **`find_data_path`: traversal rewritten as BFS with a visited-set — combinatorial blow-up on dense link graphs eliminated.**

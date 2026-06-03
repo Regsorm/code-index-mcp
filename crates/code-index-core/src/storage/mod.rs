@@ -1564,7 +1564,7 @@ impl Storage {
         limit: usize,
         context_lines: usize,
         max_total_bytes: usize,
-    ) -> Result<Vec<GrepTextMatch>> {
+    ) -> Result<(Vec<GrepTextMatch>, bool)> {
         let compiled = regex::Regex::new(regex_pattern)
             .context("grep_text: невалидный regex")?;
 
@@ -1623,7 +1623,7 @@ impl Storage {
                     + path.len();
                 total_bytes = total_bytes.saturating_add(row_bytes);
                 if total_bytes > max_total_bytes {
-                    return Ok(results);
+                    return Ok((results, true));
                 }
                 results.push(GrepTextMatch {
                     path: path.clone(),
@@ -1632,11 +1632,11 @@ impl Storage {
                     context,
                 });
                 if results.len() >= limit {
-                    return Ok(results);
+                    return Ok((results, true));
                 }
             }
         }
-        Ok(results)
+        Ok((results, false))
     }
 
     /// grep_body с поддержкой context_lines. Существующий `grep_body` без
@@ -1652,7 +1652,7 @@ impl Storage {
         limit: usize,
         context_lines: usize,
         max_total_bytes: usize,
-    ) -> Result<Vec<GrepBodyMatch>> {
+    ) -> Result<(Vec<GrepBodyMatch>, bool)> {
         // Базовое условие body
         let (body_condition, body_param) = match (pattern, regex_pattern) {
             (Some(p), _) => ("body LIKE ?".to_string(), format!("%{}%", p)),
@@ -1780,7 +1780,7 @@ impl Storage {
                 + context.iter().map(|c| c.content.len()).sum::<usize>();
             total_bytes = total_bytes.saturating_add(row_bytes);
             if total_bytes > max_total_bytes {
-                return Ok(out);
+                return Ok((out, true));
             }
             out.push(GrepBodyMatch {
                 file_path,
@@ -1793,10 +1793,10 @@ impl Storage {
                 context,
             });
             if out.len() >= limit {
-                return Ok(out);
+                return Ok((out, true));
             }
         }
-        Ok(out)
+        Ok((out, false))
     }
 
     // ── Bulk-load ────────────────────────────────────────────────────────────
@@ -2618,7 +2618,8 @@ mod tests {
             file_id: id,
             content: "host: 10.0.0.1\nport: 8080\nname: example\n".to_string(),
         }).unwrap();
-        let m = storage.grep_text_filtered(r"port:\s*\d+", None, None, 100, 0, 1_000_000).unwrap();
+        let (m, truncated) = storage.grep_text_filtered(r"port:\s*\d+", None, None, 100, 0, 1_000_000).unwrap();
+        assert!(!truncated);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].path, "/cfg.yaml");
         assert_eq!(m[0].line, 2);
@@ -2635,7 +2636,7 @@ mod tests {
             file_id: id,
             content: "a\nb\nFOUND\nd\ne".to_string(),
         }).unwrap();
-        let m = storage.grep_text_filtered(r"FOUND", None, None, 100, 1, 1_000_000).unwrap();
+        let (m, _truncated) = storage.grep_text_filtered(r"FOUND", None, None, 100, 1, 1_000_000).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].context.len(), 3); // строки 2, 3, 4
         assert_eq!(m[0].context[0].line, 2);
@@ -2651,9 +2652,24 @@ mod tests {
         let id2 = storage.upsert_file(&make_file_full("/b.json", "json", 1)).unwrap();
         storage.insert_text_file(&TextFileRecord { id: None, file_id: id1, content: "key: 42".into() }).unwrap();
         storage.insert_text_file(&TextFileRecord { id: None, file_id: id2, content: "{\"key\": 42}".into() }).unwrap();
-        let m = storage.grep_text_filtered(r"42", Some("*.yaml"), None, 100, 0, 1_000_000).unwrap();
+        let (m, _truncated) = storage.grep_text_filtered(r"42", Some("*.yaml"), None, 100, 0, 1_000_000).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].path, "/a.yaml");
+    }
+
+    #[test]
+    fn test_grep_text_truncated_flag() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/many.txt", "text", 5)).unwrap();
+        storage.insert_text_file(&TextFileRecord {
+            id: None,
+            file_id: id,
+            content: "x\nx\nx\nx\nx".to_string(),
+        }).unwrap();
+        // limit=2 при 5 совпадениях → результат обрезан, truncated=true
+        let (m, truncated) = storage.grep_text_filtered(r"x", None, None, 2, 0, 1_000_000).unwrap();
+        assert_eq!(m.len(), 2);
+        assert!(truncated);
     }
 
     #[test]
@@ -2666,7 +2682,7 @@ mod tests {
         fr.body = "def do_thing():\n    target = 1\n    other = 2\n    return target".to_string();
         storage.insert_functions(&[fr]).unwrap();
 
-        let m = storage.grep_body_with_options(
+        let (m, _truncated) = storage.grep_body_with_options(
             Some("target"), None, None, None, 50, 1, 1_000_000,
         ).unwrap();
         assert_eq!(m.len(), 1);

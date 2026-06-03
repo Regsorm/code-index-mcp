@@ -573,38 +573,69 @@ pub async fn grep_body(
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = entry.local_storage().lock().await;
-    // Если есть либо path_glob, либо context_lines — идём через grep_body_with_options.
-    // Иначе старый grep_body для обратной совместимости с CHANGELOG / тестами.
+    // Если есть либо path_glob, либо context_lines — идём через grep_body_with_options
+    // (он отдаёт флаг обрезки). Иначе старый grep_body для обратной совместимости с
+    // CHANGELOG / тестами; там байтового потолка нет, поэтому truncated выводим из
+    // того, что выборка упёрлась в limit.
     let ctx = context_lines.unwrap_or(0);
-    if path_glob.is_some() || ctx > 0 {
-        match storage.grep_body_with_options(
+    let want = limit.unwrap_or(100);
+    let result = if path_glob.is_some() || ctx > 0 {
+        storage.grep_body_with_options(
             pattern.as_deref(),
             regex.as_deref(),
             language.as_deref(),
             path_glob.as_deref(),
-            limit.unwrap_or(100),
+            want,
             ctx,
             GREP_TOTAL_BYTES_CAP,
-        ) {
-            Ok(r) => {
-                let deps: Vec<String> = r.iter().map(|m| m.file_path.clone()).collect();
-                wrap_with_meta(&r, deps)
-            }
-            Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
-        }
+        )
     } else {
-        match storage.grep_body(
-            pattern.as_deref(),
-            regex.as_deref(),
-            language.as_deref(),
-            limit.unwrap_or(100),
-        ) {
-            Ok(r) => {
-                let deps: Vec<String> = r.iter().map(|m| m.file_path.clone()).collect();
-                wrap_with_meta(&r, deps)
+        storage
+            .grep_body(pattern.as_deref(), regex.as_deref(), language.as_deref(), want)
+            .map(|r| {
+                let truncated = r.len() >= want;
+                (r, truncated)
+            })
+    };
+    match result {
+        Ok((matches, truncated)) => {
+            let deps: Vec<String> = matches.iter().map(|m| m.file_path.clone()).collect();
+            let shown = matches.len();
+            // Группировка находок по файлу: путь — один раз как ключ в `files`,
+            // не дублируется в каждой находке (тот же приём, что у grep_code, v0.14.0).
+            let mut files = serde_json::Map::new();
+            for m in &matches {
+                let mut obj = serde_json::Map::new();
+                obj.insert("name".to_string(), serde_json::Value::String(m.name.clone()));
+                obj.insert("kind".to_string(), serde_json::Value::String(m.kind.clone()));
+                obj.insert("line_start".to_string(), serde_json::json!(m.line_start));
+                obj.insert("line_end".to_string(), serde_json::json!(m.line_end));
+                obj.insert("match_lines".to_string(), serde_json::json!(m.match_lines));
+                if let Some(mc) = m.match_count {
+                    obj.insert("match_count".to_string(), serde_json::json!(mc));
+                }
+                if !m.context.is_empty() {
+                    obj.insert(
+                        "context".to_string(),
+                        serde_json::to_value(&m.context).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                let arr = files
+                    .entry(m.file_path.clone())
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let serde_json::Value::Array(a) = arr {
+                    a.push(serde_json::Value::Object(obj));
+                }
             }
-            Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
+            let payload = serde_json::json!({
+                "files": files,
+                "shown": shown,
+                "limit": want,
+                "truncated": truncated,
+            });
+            wrap_with_meta(&payload, deps)
         }
+        Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
     }
 }
 
@@ -698,9 +729,41 @@ pub async fn grep_text(
         context_lines.unwrap_or(0),
         GREP_TOTAL_BYTES_CAP,
     ) {
-        Ok(r) => {
-            let deps: Vec<String> = r.iter().map(|m| m.path.clone()).collect();
-            wrap_with_meta(&r, deps)
+        Ok((matches, truncated)) => {
+            let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
+            let shown = matches.len();
+            // Группировка находок по файлу: путь хранится один раз как ключ в
+            // `files`, а не повторяется в каждой находке (тот же приём, что у
+            // grep_code с v0.14.0). truncated рядом — модель видит, что показано
+            // не всё, и при необходимости дошлёт больший limit.
+            let mut files = serde_json::Map::new();
+            for m in &matches {
+                let mut obj = serde_json::Map::new();
+                obj.insert("line".to_string(), serde_json::json!(m.line));
+                obj.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(m.content.clone()),
+                );
+                if !m.context.is_empty() {
+                    obj.insert(
+                        "context".to_string(),
+                        serde_json::to_value(&m.context).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                let arr = files
+                    .entry(m.path.clone())
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let serde_json::Value::Array(a) = arr {
+                    a.push(serde_json::Value::Object(obj));
+                }
+            }
+            let payload = serde_json::json!({
+                "files": files,
+                "shown": shown,
+                "limit": want,
+                "truncated": truncated,
+            });
+            wrap_with_meta(&payload, deps)
         }
         Err(e) => format!("{{\"error\": \"grep_text: {}\"}}", e),
     }

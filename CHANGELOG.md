@@ -3,6 +3,22 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.15.0] — 2026-06-04
+
+**`grep_text` и `grep_body`: вывод сгруппирован по файлу + флаг `truncated` — устранено дублирование пути, тот же приём, что был сделан для `grep_code` в 0.14.0.**
+
+`grep_text` и `grep_body` отдавали плоский массив находок, где полный путь к файлу повторялся в каждой находке. При множестве совпадений в одном файле это раздувало ответ (и оплачиваемые токены при работе через API). `grep_code` ещё в 0.14.0 перешёл на группировку `{files: {"<path>": [...]}}`; теперь тот же приём применён к двум оставшимся grep-инструментам.
+
+### Изменено
+
+- **`grep_text` группирует находки по файлу.** Формат ответа `[{path, line, content, context}]` → `{files: {"<path>": [{line, content, context?}]}, shown, limit, truncated}`. Путь — один раз как ключ в `files`; `context` опускается при `context_lines=0`.
+- **`grep_body` группирует находки по файлу.** Формат `[{file_path, name, kind, …}]` → `{files: {"<path>": [{name, kind, line_start, line_end, match_lines, match_count?, context?}]}, shown, limit, truncated}`. `match_count` опускается, когда совпадений ≤3; `context` — при `context_lines=0`.
+- **Оба инструмента возвращают `truncated`.** Storage-методы `grep_text_filtered` и `grep_body_with_options` теперь возвращают `(Vec, bool)` — флаг выставляется при достижении `limit` или байтового потолка ответа (1 МБ), как у `grep_code`. Для легаси-пути `grep_body` (без `path_glob`/`context_lines`) `truncated` выводится из достижения `limit`. Модель видит, что показано не всё, и при необходимости дошлёт больший `limit`.
+
+### Совместимость
+
+- Потребители, парсившие плоский массив `grep_text`/`grep_body`, должны читать `result.files` (объект «путь → массив находок») вместо массива; поле пути ушло из каждой находки в ключ. Разовый breaking-change формата вывода — аналогично `grep_code` в 0.14.0.
+
 ## [0.14.2] — 2026-05-31
 
 **`find_data_path`: обход переписан на BFS с visited-set — устранён комбинаторный взрыв на плотном графе связей.**
