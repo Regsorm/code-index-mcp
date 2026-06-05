@@ -5,6 +5,23 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.19.0] — 2026-06-05
+
+**Online extras-layer updates during live editing: after a file edit the call graph, data links and object structure refresh incrementally right in the daemon's watcher loop — surgically (cost scales with the edited file, not the graph), no restart, no full XML walk.**
+
+Previously the daemon built the extras layer (`proc_call_graph`, `data_links`, `metadata_objects.attributes_json`, `metadata_forms`, `event_subscriptions`) once at worker startup and it went stale until restart: `find_path`/`get_callers`/`get_data_links`/`get_object_structure` returned an outdated view during an editing session. The full rebuild (`run_index_extras`) is expensive (~2s, walks all XML), so it was not run on every save.
+
+### Added
+
+- **Incremental extras update in the daemon's watcher loop** (after `commit_batch`), routed by changed-file type:
+  - `.bsl` → **per-file** update of the `direct` call-graph layer: only the edited file's edges are touched (previous ones from the `direct_edge_files` side-map, current ones from the core `calls` table), cost independent of graph size. On KA 1.1 (~123k edges) — ~0 ms vs ~2 s for a full layer rebuild;
+  - object XML (Catalogs/Documents/Registers/…) → per-object update of `data_links` (by `from_object`) and object structure (`attributes_json`);
+  - `Form.xml` / `EventSubscriptions/*.xml` → per-file row update + slice-rebuild of the matching graph layer (`form_event` / `subscription`);
+  - `Configuration.xml` (object-set change) → full `run_index_extras`.
+- New `LanguageProcessor::index_extras_for_files` method (default no-op; universal languages unaffected). BSL implements it via `run_incremental_extras`.
+
+A helper table `direct_edge_files` was added for the per-file graph update (maps direct edges to their source files); `proc_call_graph` stays deduplicated, so `find_path`/`find_data_path` are unaffected. Worker logs now include extras-update timing (full and incremental paths). Equivalence of incremental updates to a full rebuild is covered by tests (`incremental_object_xml_matches_full`, `incremental_call_graph_direct_matches_full`, `incremental_direct_shared_edge_survives`).
+
 ## [0.18.0] — 2026-06-05
 
 **Targeted BSL tooling and CLI refinements from the E2E comparison with `rlm-tools-bsl` (KA 1.1): subscription filter by short module name, a `search_terms` hint when enrichment is empty, a fast `index --force` plus a PID-lock for one-off indexing, and an updated `get_object_structure` description.**

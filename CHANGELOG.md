@@ -3,6 +3,23 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.19.0] — 2026-06-05
+
+**Онлайн-обновление extras-слоя при live-редактировании: после правки файла граф вызовов, связи данных и структура объектов обновляются инкрементально прямо в watcher-цикле демона — точечно (стоимость ~ от размера изменённого файла, не графа), без рестарта и без полного XML-обхода.**
+
+Раньше в демоне extras-слой (`proc_call_graph`, `data_links`, `metadata_objects.attributes_json`, `metadata_forms`, `event_subscriptions`) строился один раз при старте worker'а и протухал до перезапуска: `find_path`/`get_callers`/`get_data_links`/`get_object_structure` отдавали устаревшую картину во время сессии редактирования. Полный пересбор (`run_index_extras`) дорогой (~2 с, обходит все XML), поэтому на каждое сохранение не вызывался.
+
+### Добавлено
+
+- **Инкрементальное обновление extras в watcher-цикле демона** (после `commit_batch`), с маршрутизацией по типу изменённого файла:
+  - `.bsl` → **per-file** обновление слоя `direct` графа вызовов: трогаются только рёбра изменённого файла (прежние — из side-карты `direct_edge_files`, текущие — из core-таблицы `calls`), стоимость не зависит от размера графа. На КА 1.1 (~123k рёбер) — ~0 мс против ~2 с при пересборе всего слоя;
+  - объектный XML (Catalogs/Documents/Registers/…) → per-object обновление `data_links` (по `from_object`) и структуры объекта (`attributes_json`);
+  - `Form.xml` / `EventSubscriptions/*.xml` → per-file обновление строки + slice-rebuild соответствующего слоя графа (`form_event` / `subscription`);
+  - `Configuration.xml` (изменение состава объектов) → полный `run_index_extras`.
+- Новый метод `LanguageProcessor::index_extras_for_files` (реализация по умолчанию — no-op; универсальные языки не затрагиваются). BSL реализует через `run_incremental_extras`.
+
+Для per-file обновления графа добавлена служебная таблица `direct_edge_files` (привязка direct-рёбер к файлам-источникам); `proc_call_graph` остаётся дедуплицированной, поэтому `find_path`/`find_data_path` не затронуты. В лог worker'а добавлен тайминг обновления extras (полный и инкрементальный пути). Эквивалентность инкремента полному пересбору закреплена тестами (`incremental_object_xml_matches_full`, `incremental_call_graph_direct_matches_full`, `incremental_direct_shared_edge_survives`).
+
 ## [0.18.0] — 2026-06-05
 
 **Точечные доработки BSL-инструментов и CLI по итогам E2E-сравнения с `rlm-tools-bsl` (КА 1.1): фильтр подписок по короткому имени модуля, подсказка `search_terms` при пустом обогащении, быстрый `index --force` и PID-lock на разовую индексацию, актуализированное описание `get_object_structure`.**
