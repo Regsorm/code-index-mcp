@@ -828,7 +828,7 @@ impl CodeIndexServer {
         tools::list_files(entry, p.pattern, p.path_prefix, p.language, p.limit).await
     }
 
-    #[tool(description = "Прочитать содержимое файла из индекса. Phase 1: только text-файлы (yaml/md/json/toml/xml/sh и др.). Для code-файлов вернётся category=\"code\" с пустым content. line_start/line_end — 1-based, inclusive. Soft-cap 5000 строк / 500 КБ, hard-cap 2 МБ.")]
+    #[tool(description = "Прочитать содержимое файла из индекса. Отдаёт реальный content и для text-файлов (yaml/md/json/toml/xml/sh и др.), и для code-файлов (zstd-decode из file_contents, Phase 2 v0.8.0+); поле category в ответе — \"text\" или \"code\". Oversize code-файлы (> max_code_file_size_bytes) возвращают oversize=true и пустой content (их читать через get_function/grep_body/grep_code). line_start/line_end — 1-based, inclusive. Soft-cap 5000 строк / 500 КБ (truncated=true при обрезке), hard-cap 2 МБ.")]
     async fn read_file(&self, Parameters(p): Parameters<ReadFileParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
