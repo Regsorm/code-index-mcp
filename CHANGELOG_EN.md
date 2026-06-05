@@ -5,6 +5,21 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.18.0] — 2026-06-05
+
+**Targeted BSL tooling and CLI refinements from the E2E comparison with `rlm-tools-bsl` (KA 1.1): subscription filter by short module name, a `search_terms` hint when enrichment is empty, a fast `index --force` plus a PID-lock for one-off indexing, and an updated `get_object_structure` description.**
+
+### Added
+
+- **`search_terms` returns a `hint` on empty results with an empty enrichment table** — states that `bsl-indexer enrich` has not been run for the repo and points to `grep_body`/`grep_code`/`search_function`/`get_function`. Previously an empty answer read as "no matches" and wasted the call. (E1)
+- **PID-lock for the `index` command** — two concurrent `index` runs on the same path no longer fight over SQLite (RAII lock on `index.lock` next to `index.db`). Shares the daemon mechanism (`acquire_at`). (A2)
+
+### Changed
+
+- **`get_event_subscriptions`: the `handler_module` filter matches both the full name (`CommonModule.X`) and the short one (`X`)** via a suffix `LIKE '%.X'`. Previously a short name found no subscription. (D1)
+- **`index --force` recreates `index.db` from scratch** instead of upserting over the existing DB. On a large DB the old path was pathologically slow (full load into RAM + per-file upsert); deleting the file turns `--force` into a fast fresh path with the same result. (A1)
+- **Updated `get_object_structure` description** — reflects the full structure (attributes with types, tabular sections, register dimensions/resources, `enum_values`, `predefined`, always-present base sections) and explicitly notes that object XML is not indexed as text (don't search it via `list_files`/`grep_text`). (D2)
+
 ## [0.17.0] — 2026-06-05
 
 **`get_object_structure`: a `predefined` section — names of predefined items (Catalog / ChartOfAccounts / ChartOf*).**
