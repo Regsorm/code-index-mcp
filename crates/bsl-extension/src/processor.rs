@@ -99,6 +99,9 @@ impl LanguageProcessor for BslLanguageProcessor {
             // объектами по ссылочным реквизитам/измерениям (data_links).
             Arc::new(crate::tools::GetDataLinksTool),
             Arc::new(crate::tools::FindDataPathTool),
+            // Регистраторы регистра / движения документа (recorder-рёбра
+            // data_links): «кто пишет в регистр» и «куда пишет документ».
+            Arc::new(crate::tools::GetRegisterWritersTool),
             // search_terms — поиск по обогащённым termам (этап 5a).
             // Регистрируется всегда, даже без feature `enrichment`:
             // tool сам по себе read-only, не требует HTTP-клиента.
@@ -204,7 +207,8 @@ mod tests {
 
     #[test]
     fn additional_tools_registered() {
-        // 7 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных.
+        // 8 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
+        // + get_register_writers (регистраторы/движения).
         let p = BslLanguageProcessor::new();
         let tools = p.additional_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -215,7 +219,8 @@ mod tests {
         assert!(names.contains(&"search_terms"));
         assert!(names.contains(&"get_data_links"));
         assert!(names.contains(&"find_data_path"));
-        assert_eq!(tools.len(), 7);
+        assert!(names.contains(&"get_register_writers"));
+        assert_eq!(tools.len(), 8);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::xml::config_dump_info::parse_config_dump_info;
 use crate::xml::configuration::parse_configuration_file;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
 use crate::xml::forms::parse_form_file;
-use crate::xml::object_attributes::parse_object_attributes_file;
+use crate::xml::object_attributes::{parse_object_attributes_file, parse_object_structure_file};
 use crate::xml::object_uuid::{extract_form_uuid_from_file, extract_object_uuid_from_file};
 
 /// Папки выгрузки → singular meta_type. Объектные XML лежат прямо в этих
@@ -46,6 +46,10 @@ const OBJECT_FOLDERS: &[(&str, &str)] = &[
     ("ExchangePlans", "ExchangePlan"),
     ("BusinessProcesses", "BusinessProcess"),
     ("Tasks", "Task"),
+    // Перечисления: ссылочных реквизитов нет (data_links → 0 рёбер), но
+    // нужны для get_object_structure → enum_values (B2). parse_object_structure_xml
+    // собирает <EnumValue>, index_object_attributes пишет в attributes_json.
+    ("Enums", "Enum"),
 ];
 
 /// Repo-key для оффлайн-индексации (через `bsl-indexer index .`).
@@ -67,6 +71,12 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // Открывает XML отдельных объектов (которые остальные проходы не читают).
     if let Err(e) = index_data_links(repo_root, conn) {
         tracing::warn!("data_links: {}", e);
+    }
+    // Полная структура объектов (реквизиты+типы, ТЧ, измерения, ресурсы)
+    // → metadata_objects.attributes_json. Зависит от строк, созданных
+    // index_metadata_objects (выполняется выше), — делает UPDATE по full_name.
+    if let Err(e) = index_object_attributes(repo_root, conn) {
+        tracing::warn!("object_attributes: {}", e);
     }
     if let Err(e) = index_metadata_forms(repo_root, conn) {
         tracing::warn!("metadata_forms: {}", e);
@@ -386,6 +396,90 @@ fn index_data_links(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()>
         "data_links: {} рёбер из {} объектов ({} sub-config)",
         total,
         objects,
+        sub_roots.len()
+    );
+    Ok(())
+}
+
+/// Заполнить `metadata_objects.attributes_json` полной структурой объектов.
+///
+/// Для каждой sub-config обходит те же `OBJECT_FOLDERS`, что и `index_data_links`,
+/// открывает корневой XML объекта (`Catalogs/<Имя>.xml`) и через
+/// `parse_object_structure_file` извлекает ВСЕ реквизиты с типами, табличные
+/// части, измерения и ресурсы. Затем UPDATE строки `metadata_objects` по
+/// `full_name` (строки уже созданы `index_metadata_objects`). Объекты без
+/// структуры (пустой результат) пропускаются — `attributes_json` остаётся NULL.
+fn index_object_attributes(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let mut sub_roots: Vec<std::path::PathBuf> = Vec::new();
+    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file()
+            && entry.file_name().to_str() == Some("Configuration.xml")
+        {
+            if let Some(parent) = entry.path().parent() {
+                sub_roots.push(parent.to_path_buf());
+            }
+        }
+    }
+    if sub_roots.is_empty() {
+        return Ok(());
+    }
+
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    let mut stmt = conn.prepare(
+        "UPDATE metadata_objects SET attributes_json = ? WHERE repo = ? AND full_name = ?",
+    )?;
+
+    let mut filled: usize = 0;
+    for sub_root in &sub_roots {
+        for (folder, meta_type) in OBJECT_FOLDERS {
+            let dir = sub_root.join(folder);
+            if !dir.is_dir() {
+                continue;
+            }
+            let read = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("object_attributes: read_dir({}): {}", dir.display(), e);
+                    continue;
+                }
+            };
+            for entry in read.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if !path.is_file() || path.extension().and_then(|x| x.to_str()) != Some("xml") {
+                    continue;
+                }
+                let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let full_name = format!("{}.{}", meta_type, stem);
+                let structure = match parse_object_structure_file(&path) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!("object_attributes: {}: {}", path.display(), e);
+                        continue;
+                    }
+                };
+                if structure.is_empty() {
+                    continue;
+                }
+                stmt.execute(params![
+                    structure.to_json().to_string(),
+                    REPO_DEFAULT,
+                    &full_name,
+                ])?;
+                filled += 1;
+            }
+        }
+    }
+    drop(stmt);
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!(
+        "object_attributes: заполнено attributes_json у {} объектов ({} sub-config)",
+        filled,
         sub_roots.len()
     );
     Ok(())

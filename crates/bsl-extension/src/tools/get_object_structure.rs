@@ -1,14 +1,15 @@
 // MCP-tool `get_object_structure` — отдаёт структуру объекта конфигурации
 // 1С (Catalog/Document/...) по его full_name (`Catalog.Контрагенты`).
 //
-// Источник данных: таблица `metadata_objects`, заполняется
-// `index_extras::index_metadata_objects` (этап 4c).
+// Источник данных: таблица `metadata_objects`. Имя/тип заполняет
+// `index_extras::index_metadata_objects` (из Configuration.xml), а
+// `attributes_json` — `index_extras::index_object_attributes` (парсит
+// корневой XML объекта `Catalogs/<Name>.xml` через
+// `xml::object_attributes::parse_object_structure_file`): реквизиты с
+// типами, табличные части, измерения и ресурсы регистров.
 //
-// На текущем этапе attributes_json в `metadata_objects` пуст — парсер
-// детальных XML-файлов объекта (Catalogs/<Name>.xml с реквизитами и
-// табличными частями) не реализован, это будущая работа. Пока tool
-// возвращает `meta_type` и `name`, чего достаточно для большинства
-// LLM-запросов «что за объект `Document.РеализацияТоваровУслуг`».
+// `attributes` в ответе = распарсенный `attributes_json` (Null, если объект
+// без полей либо его XML не найден — например, для типов вне OBJECT_FOLDERS).
 
 use std::future::Future;
 use std::pin::Pin;

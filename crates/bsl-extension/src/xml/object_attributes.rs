@@ -49,6 +49,7 @@
 use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use serde_json::{json, Value};
 use std::path::Path;
 
 /// Страховочный предел на число конкретных типов в составном реквизите.
@@ -66,7 +67,10 @@ pub struct DataLinkEdge {
     /// Цель: `Catalog.Контрагенты` (конкретная) либо `*CatalogRef` / `*AnyRef`
     /// / `*DefinedType.X` (обобщённая, терминал обхода).
     pub to_object: String,
-    /// Тип ребра: `attr` | `tabular_attr` | `register_dim`.
+    /// Тип ребра: `attr` | `tabular_attr` | `register_dim` | `recorder`.
+    /// `recorder` — движение документа в регистр (документ → регистр),
+    /// источник — `<RegisterRecords>` в XML документа. У него `from_path`
+    /// пуст (это не реквизит), `to_object` — полное имя регистра.
     pub link_kind: &'static str,
     /// Ребро из составного типа (перечислено несколько конкретных типов).
     pub is_composite: bool,
@@ -79,7 +83,7 @@ pub struct DataLinkEdge {
 /// Возвращает `Ok(Vec::new())`, если файла нет.
 pub fn parse_object_attributes_file(
     path: &Path,
-    owner_full_name: &str,
+    _owner_full_name: &str,
 ) -> Result<Vec<DataLinkEdge>> {
     if !path.is_file() {
         return Ok(Vec::new());
@@ -103,6 +107,8 @@ enum TextTarget {
     FieldName,
     TabularName,
     TypeValue,
+    /// Текст `<xr:Item>` внутри `<RegisterRecords>` — имя регистра-приёмника.
+    RegisterRef,
 }
 
 /// Распарсить содержимое XML объекта в список рёбер связей данных.
@@ -123,6 +129,8 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
     let mut field: Option<FieldAccum> = None;
     // Внутри контейнера <Type> (не <v8:Type>).
     let mut in_type = false;
+    // Внутри <RegisterRecords> — список регистров, в которые пишет документ.
+    let mut in_register_records = false;
     let mut text_target = TextTarget::None;
 
     loop {
@@ -154,6 +162,15 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                         } else if expecting_tabular_name {
                             text_target = TextTarget::TabularName;
                         }
+                    }
+                    "RegisterRecords" => {
+                        // Состав движений документа: <xr:Item> внутри —
+                        // полные имена регистров, в которые документ пишет.
+                        in_register_records = true;
+                    }
+                    "Item" if in_register_records => {
+                        // Текст <xr:Item> — каноническое имя регистра-приёмника.
+                        text_target = TextTarget::RegisterRef;
                     }
                     _ => {
                         // Различаем контейнер <Type> и элемент <v8:Type>.
@@ -199,6 +216,19 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                             }
                         }
                     }
+                    TextTarget::RegisterRef => {
+                        // Документ → регистр: ребро recorder. Цель уже
+                        // в каноническом виде (AccumulationRegister.X и т.п.).
+                        if !txt.is_empty() {
+                            out.push(DataLinkEdge {
+                                from_path: String::new(),
+                                to_object: txt,
+                                link_kind: "recorder",
+                                is_composite: false,
+                                is_universal: false,
+                            });
+                        }
+                    }
                     TextTarget::None => {}
                 }
                 text_target = TextTarget::None;
@@ -215,6 +245,9 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                     }
                     "TabularSection" => {
                         tabular = None;
+                    }
+                    "RegisterRecords" => {
+                        in_register_records = false;
                     }
                     _ => {
                         if raw == "Type" {
@@ -334,6 +367,306 @@ fn local_name(name: &str) -> String {
         Some(idx) => name[idx + 1..].to_string(),
         None => name.to_string(),
     }
+}
+
+// ── Полная структура объекта (для get_object_structure) ────────────────────
+//
+// В отличие от парсера рёбер выше (он оставляет только ссылочные типы),
+// здесь собираем ВСЕ реквизиты с их типами (включая примитивы Строка/Число/
+// Дата), табличные части с их реквизитами, а также измерения и ресурсы
+// регистров. Результат сериализуется в `metadata_objects.attributes_json`
+// и отдаётся MCP-tool `get_object_structure`.
+
+/// Реквизит/измерение/ресурс: имя + человекочитаемый тип.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructField {
+    pub name: String,
+    /// Тип в 1С-нотации: `Строка`, `Число`, `СправочникСсылка.Номенклатура`,
+    /// составной — через ` | `. Пустой тип → `—`.
+    pub type_str: String,
+}
+
+/// Табличная часть: имя + её реквизиты.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructTabular {
+    pub name: String,
+    pub attributes: Vec<StructField>,
+}
+
+/// Полная структура объекта конфигурации.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectStructure {
+    pub attributes: Vec<StructField>,
+    pub dimensions: Vec<StructField>,
+    pub resources: Vec<StructField>,
+    pub tabular_sections: Vec<StructTabular>,
+    /// Значения перечисления (только для meta_type = Enum), порядок из XML.
+    pub enum_values: Vec<String>,
+}
+
+impl ObjectStructure {
+    /// Пусто ли (нет ни одного поля) — такие объекты не пишем в индекс.
+    pub fn is_empty(&self) -> bool {
+        self.attributes.is_empty()
+            && self.dimensions.is_empty()
+            && self.resources.is_empty()
+            && self.tabular_sections.is_empty()
+            && self.enum_values.is_empty()
+    }
+
+    /// Сериализовать в JSON для `attributes_json` (пустые секции опускаем).
+    pub fn to_json(&self) -> Value {
+        let field = |f: &StructField| json!({ "name": f.name, "type": f.type_str });
+        // B1: базовые секции эмитятся ВСЕГДА (пустые → []), чтобы агент
+        // отличал «секции нет» от «инструмент её не отдаёт» и не уходил в XML.
+        let ts: Vec<Value> = self
+            .tabular_sections
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "attributes": t.attributes.iter().map(field).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "attributes".into(),
+            Value::Array(self.attributes.iter().map(field).collect()),
+        );
+        map.insert(
+            "dimensions".into(),
+            Value::Array(self.dimensions.iter().map(field).collect()),
+        );
+        map.insert(
+            "resources".into(),
+            Value::Array(self.resources.iter().map(field).collect()),
+        );
+        map.insert("tabular_sections".into(), Value::Array(ts));
+        // B2: enum_values — только для перечислений (у прочих объектов пусто).
+        if !self.enum_values.is_empty() {
+            map.insert(
+                "enum_values".into(),
+                Value::Array(
+                    self.enum_values
+                        .iter()
+                        .map(|v| Value::String(v.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        Value::Object(map)
+    }
+}
+
+/// Прочитать и распарсить полную структуру объекта по пути.
+/// `Ok(None)` — если файла нет.
+pub fn parse_object_structure_file(path: &Path) -> Result<Option<ObjectStructure>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Не удалось прочитать {}", path.display()))?;
+    Ok(Some(parse_object_structure_xml(&content)?))
+}
+
+/// Распарсить содержимое XML объекта в полную структуру.
+pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+
+    let mut out = ObjectStructure::default();
+    let mut buf = Vec::new();
+
+    // Индекс текущей табличной части (Some, пока мы внутри <TabularSection>).
+    let mut cur_tab: Option<usize> = None;
+    let mut expecting_tabular_name = false;
+    // Текущее разбираемое поле: (kind, name, types).
+    let mut field: Option<(String, Option<String>, Vec<String>)> = None;
+    let mut in_type = false;
+    let mut text_target = TextTarget::None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw);
+                match local.as_str() {
+                    "TabularSection" => {
+                        expecting_tabular_name = true;
+                    }
+                    "Attribute" | "Dimension" | "Resource" | "EnumValue" => {
+                        field = Some((local, None, Vec::new()));
+                    }
+                    "Name" => {
+                        if let Some((_, name, _)) = field.as_ref() {
+                            if name.is_none() {
+                                text_target = TextTarget::FieldName;
+                            }
+                        } else if expecting_tabular_name {
+                            text_target = TextTarget::TabularName;
+                        }
+                    }
+                    _ => {
+                        if raw == "Type" {
+                            if field.is_some() {
+                                in_type = true;
+                            }
+                        } else if raw.ends_with(":Type") && field.is_some() && in_type {
+                            text_target = TextTarget::TypeValue;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if text_target == TextTarget::None {
+                    buf.clear();
+                    continue;
+                }
+                let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                let txt = txt.trim().to_string();
+                match text_target {
+                    TextTarget::FieldName => {
+                        if let Some((_, name, _)) = field.as_mut() {
+                            if !txt.is_empty() {
+                                *name = Some(txt);
+                            }
+                        }
+                    }
+                    TextTarget::TabularName => {
+                        if !txt.is_empty() {
+                            out.tabular_sections.push(StructTabular {
+                                name: txt,
+                                attributes: Vec::new(),
+                            });
+                            cur_tab = Some(out.tabular_sections.len() - 1);
+                            expecting_tabular_name = false;
+                        }
+                    }
+                    TextTarget::TypeValue => {
+                        if let Some((_, _, types)) = field.as_mut() {
+                            if !txt.is_empty() {
+                                types.push(txt);
+                            }
+                        }
+                    }
+                    TextTarget::None => {}
+                    // RegisterRef в структурном парсере не возникает
+                    // (RegisterRecords обрабатывает только parse_object_attributes_xml).
+                    TextTarget::RegisterRef => {}
+                }
+                text_target = TextTarget::None;
+            }
+            Ok(Event::End(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw);
+                match local.as_str() {
+                    "Attribute" | "Dimension" | "Resource" | "EnumValue" => {
+                        if let Some((kind, Some(name), types)) = field.take() {
+                            if !name.is_empty() {
+                                if kind == "EnumValue" {
+                                    // B2: значение перечисления — только имя, без типа.
+                                    out.enum_values.push(name);
+                                } else {
+                                    let f = StructField {
+                                        name,
+                                        type_str: pretty_types(&types),
+                                    };
+                                    match kind.as_str() {
+                                        "Dimension" => out.dimensions.push(f),
+                                        "Resource" => out.resources.push(f),
+                                        _ => match cur_tab {
+                                            Some(i) => out.tabular_sections[i].attributes.push(f),
+                                            None => out.attributes.push(f),
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                        in_type = false;
+                    }
+                    "TabularSection" => {
+                        cur_tab = None;
+                    }
+                    _ => {
+                        if raw == "Type" {
+                            in_type = false;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "object XML: ошибка парсинга на позиции {}: {}",
+                    reader.buffer_position(),
+                    e
+                ));
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(out)
+}
+
+/// Склеить типы поля в человекочитаемую 1С-строку (составной → через ` | `).
+fn pretty_types(types: &[String]) -> String {
+    if types.is_empty() {
+        return "—".to_string();
+    }
+    let mut parts: Vec<String> = types.iter().map(|t| pretty_one_type(t)).collect();
+    parts.dedup();
+    parts.join(" | ")
+}
+
+/// Один тип `<v8:Type>` → 1С-нотация. Примитивы и ссылки переводятся,
+/// прочее отдаётся как есть (без префикса схемы).
+fn pretty_one_type(t: &str) -> String {
+    let t = t.trim();
+    match t {
+        "xs:string" => return "Строка".to_string(),
+        "xs:decimal" => return "Число".to_string(),
+        "xs:boolean" => return "Булево".to_string(),
+        "xs:dateTime" | "xs:date" => return "Дата".to_string(),
+        _ => {}
+    }
+    if let Some(rest) = t.strip_prefix("cfg:") {
+        if let Some(dt) = rest.strip_prefix("DefinedType.") {
+            return format!("ОпределяемыйТип.{}", dt);
+        }
+        if let Some((kind_ref, name)) = rest.split_once('.') {
+            if let Some(kind) = kind_ref.strip_suffix("Ref") {
+                return format!("{}.{}", ru_ref_kind(kind), name);
+            }
+        } else if let Some(kind) = rest.strip_suffix("Ref") {
+            return ru_ref_kind(kind);
+        }
+        return rest.to_string();
+    }
+    if let Some(rest) = t.strip_prefix("v8:") {
+        return rest.to_string();
+    }
+    t.to_string()
+}
+
+/// `Catalog` → `СправочникСсылка` и т.д.; неизвестное — `<Kind>Ссылка`.
+fn ru_ref_kind(kind: &str) -> String {
+    match kind {
+        "Catalog" => "СправочникСсылка",
+        "Document" => "ДокументСсылка",
+        "Enum" => "ПеречислениеСсылка",
+        "ChartOfCharacteristicTypes" => "ПланВидовХарактеристикСсылка",
+        "ChartOfAccounts" => "ПланСчетовСсылка",
+        "ChartOfCalculationTypes" => "ПланВидовРасчетаСсылка",
+        "ExchangePlan" => "ПланОбменаСсылка",
+        "BusinessProcess" => "БизнесПроцессСсылка",
+        "Task" => "ЗадачаСсылка",
+        "Any" => "ЛюбаяСсылка",
+        other => return format!("{}Ссылка", other),
+    }
+    .to_string()
 }
 
 #[cfg(test)]
@@ -509,6 +842,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_register_records() {
+        // <RegisterRecords> документа → рёбра recorder (документ → регистр).
+        // Реквизит шапки даёт обычное attr-ребро и не путается с recorder.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core"
+                xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Document uuid="root">
+    <Properties>
+      <Name>РеализацияТоваровУслуг</Name>
+      <RegisterRecords>
+        <xr:Item xsi:type="xr:MDObjectRef">AccumulationRegister.ТоварыНаСкладах</xr:Item>
+        <xr:Item xsi:type="xr:MDObjectRef">AccumulationRegister.Продажи</xr:Item>
+        <xr:Item xsi:type="xr:MDObjectRef">AccountingRegister.Хозрасчетный</xr:Item>
+      </RegisterRecords>
+    </Properties>
+    <ChildObjects>
+      <Attribute uuid="a1">
+        <Properties><Name>Контрагент</Name>
+          <Type><v8:Type>cfg:CatalogRef.Контрагенты</v8:Type></Type>
+        </Properties>
+      </Attribute>
+    </ChildObjects>
+  </Document>
+</MetaDataObject>"#;
+        let edges = parse_object_attributes_xml(xml).unwrap();
+
+        let recorders: Vec<_> = edges.iter().filter(|e| e.link_kind == "recorder").collect();
+        assert_eq!(recorders.len(), 3, "три регистра-приёмника: {:?}", edges);
+        let targets: Vec<&str> = recorders.iter().map(|e| e.to_object.as_str()).collect();
+        assert!(targets.contains(&"AccumulationRegister.ТоварыНаСкладах"));
+        assert!(targets.contains(&"AccumulationRegister.Продажи"));
+        assert!(targets.contains(&"AccountingRegister.Хозрасчетный"));
+        // У recorder-ребра пустой from_path, не composite и не universal.
+        assert!(recorders.iter().all(|e| e.from_path.is_empty()));
+        assert!(recorders.iter().all(|e| !e.is_composite && !e.is_universal));
+
+        // Реквизит шапки по-прежнему даёт attr-ребро (recorder не ломает разбор).
+        let attr = edges.iter().find(|e| e.from_path == "Контрагент").unwrap();
+        assert_eq!(attr.link_kind, "attr");
+        assert_eq!(attr.to_object, "Catalog.Контрагенты");
+    }
+
+    #[test]
     fn composite_cap_collapses_pathological_lists() {
         // > MAX_COMPOSITE_TARGETS конкретных типов → один *Multiple.
         let mut types = String::new();
@@ -530,5 +907,62 @@ mod tests {
         assert_eq!(edges.len(), 1, "патологический перечень схлопнут в один узел");
         assert_eq!(edges[0].to_object, "*Multiple");
         assert!(edges[0].is_universal);
+    }
+
+    #[test]
+    fn parses_enum_values() {
+        // B2: <EnumValue> в ChildObjects перечисления → ObjectStructure.enum_values.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Enum uuid="root">
+    <Properties><Name>ВедениеВзаиморасчетовПоДоговорам</Name></Properties>
+    <ChildObjects>
+      <EnumValue uuid="e1"><Properties><Name>ПоДоговоруВЦелом</Name></Properties></EnumValue>
+      <EnumValue uuid="e2"><Properties><Name>ПоЗаказам</Name></Properties></EnumValue>
+      <EnumValue uuid="e3"><Properties><Name>ПоСчетам</Name></Properties></EnumValue>
+    </ChildObjects>
+  </Enum>
+</MetaDataObject>"#;
+        let st = parse_object_structure_xml(xml).unwrap();
+        assert_eq!(
+            st.enum_values,
+            vec!["ПоДоговоруВЦелом", "ПоЗаказам", "ПоСчетам"]
+        );
+        assert!(!st.is_empty(), "перечисление со значениями не пусто");
+        assert!(st.attributes.is_empty() && st.tabular_sections.is_empty());
+
+        // to_json: базовые секции пусты, но присутствуют; enum_values заполнен.
+        let j = st.to_json();
+        let obj = j.as_object().unwrap();
+        assert!(obj.get("attributes").unwrap().as_array().unwrap().is_empty());
+        assert_eq!(obj.get("enum_values").unwrap().as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn to_json_always_emits_base_sections() {
+        // B1: даже при пустых секциях ключи attributes/dimensions/resources/
+        // tabular_sections присутствуют — агент видит форму, не уходит в XML.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Catalog uuid="root">
+    <Properties><Name>Контрагенты</Name></Properties>
+    <ChildObjects>
+      <Attribute uuid="a1"><Properties><Name>ИНН</Name>
+        <Type><v8:Type>xs:string</v8:Type></Type>
+      </Properties></Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>"#;
+        let st = parse_object_structure_xml(xml).unwrap();
+        let j = st.to_json();
+        let obj = j.as_object().unwrap();
+        for key in ["attributes", "dimensions", "resources", "tabular_sections"] {
+            assert!(obj.contains_key(key), "ключ {} должен присутствовать всегда", key);
+            assert!(obj.get(key).unwrap().is_array());
+        }
+        assert_eq!(obj.get("attributes").unwrap().as_array().unwrap().len(), 1);
+        assert!(obj.get("dimensions").unwrap().as_array().unwrap().is_empty());
+        // enum_values НЕ эмитится для не-перечисления.
+        assert!(!obj.contains_key("enum_values"));
     }
 }
