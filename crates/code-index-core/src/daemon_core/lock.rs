@@ -18,21 +18,27 @@ pub struct DaemonPidLock {
 /// жив — возвращается ошибка с указанием PID.
 pub fn acquire() -> Result<DaemonPidLock> {
     let state_dir = paths::ensure_state_dir()?;
-    let pid_path = state_dir.join("daemon.pid");
+    acquire_at(state_dir.join("daemon.pid"), "Демон code-index")
+}
 
+/// Захватить PID-lock по произвольному пути. Используется и демоном
+/// (`daemon.pid`), и разовой командой `index` (A2 — lock на целевую
+/// `index.db`, чтобы два `index --force` не дрались за SQLite).
+pub fn acquire_at(pid_path: PathBuf, who: &str) -> Result<DaemonPidLock> {
     if pid_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = content.trim().parse::<u32>() {
                 if is_process_alive(pid) {
                     bail!(
-                        "Демон code-index уже запущен (PID {}). PID-файл: {}",
+                        "{} уже запущен (PID {}). PID-файл: {}",
+                        who,
                         pid,
                         pid_path.display()
                     );
                 }
             }
         }
-        eprintln!("[daemon] Найден устаревший PID-файл, перезаписываем");
+        eprintln!("[lock] Найден устаревший PID-файл, перезаписываем");
     }
 
     std::fs::write(&pid_path, std::process::id().to_string())?;

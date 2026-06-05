@@ -711,6 +711,31 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             let db_path = db_dir.join("index.db");
             let config = IndexConfig::load(&abs_path)?;
 
+            // A2: PID-lock на целевую БД — два `index --force` по одному пути
+            // не должны драться за SQLite. RAII, держится до конца команды.
+            let _index_lock = crate::daemon_core::lock::acquire_at(
+                db_dir.join("index.lock"),
+                "Индексация пути",
+            )?;
+
+            // A1: при --force пересоздаём БД с нуля. full_reindex(force) поверх
+            // большой существующей index.db патологически медленный (грузит всю
+            // БД в RAM + upsert каждого файла). Удаление превращает force в
+            // быстрый fresh-путь — тот же итог (полная переиндексация) без деградации.
+            if force {
+                for p in [
+                    db_path.clone(),
+                    db_path.with_extension("db-wal"),
+                    db_path.with_extension("db-shm"),
+                ] {
+                    if p.exists() {
+                        if let Err(e) = std::fs::remove_file(&p) {
+                            tracing::warn!("A1: не удалось удалить {:?}: {}", p, e);
+                        }
+                    }
+                }
+            }
+
             // 4. Открыть Storage с автоопределением режима
             let storage_config = StorageConfig {
                 mode: config.storage_mode.clone(),
