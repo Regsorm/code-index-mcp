@@ -59,6 +59,9 @@ impl IndexTool for GetEventSubscriptionsTool {
                 .get("handler_module")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            // D1: фильтр матчит и полное имя (`CommonModule.X`), и короткое
+            // (`X`) — через суффиксный LIKE `%.X`. Строка владеющая, для ToSql.
+            let like_module = handler_module.as_ref().map(|m| format!("%.{}", m));
             // Фильтр по событию — двусторонний: в БД событие хранится в русском
             // виде (`ПриЗаписи`), поэтому вход нормализуем тем же маппингом
             // (англ. `OnWrite` → рус., рус./неизвестное — без изменений), чтобы
@@ -75,13 +78,16 @@ impl IndexTool for GetEventSubscriptionsTool {
             let mut where_parts: Vec<&str> = vec!["repo = ?"];
             let mut params_vec: Vec<&dyn rusqlite::ToSql> = vec![&"default" as &dyn rusqlite::ToSql];
             if handler_module.is_some() {
-                where_parts.push("handler_module = ?");
+                where_parts.push("(handler_module = ? OR handler_module LIKE ?)");
             }
             if event.is_some() {
                 where_parts.push("event = ?");
             }
             if let Some(ref m) = handler_module {
                 params_vec.push(m as &dyn rusqlite::ToSql);
+            }
+            if let Some(ref lm) = like_module {
+                params_vec.push(lm as &dyn rusqlite::ToSql);
             }
             if let Some(ref e) = event {
                 params_vec.push(e as &dyn rusqlite::ToSql);
