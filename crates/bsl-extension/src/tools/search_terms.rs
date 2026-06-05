@@ -138,13 +138,31 @@ impl IndexTool for SearchTermsTool {
                 }
             };
 
-            crate::tools::wrap_with_meta(
-                json!({
-                    "query": query,
-                    "results": rows,
-                }),
-                Vec::new(),
-            )
+            // E1: пустой результат + пустая таблица обогащения → подсказка,
+            // что enrich не запускался (иначе пусто читается как «нет совпадений»,
+            // и агент зря тратит вызов вместо grep_body/search_function).
+            let mut result = json!({ "query": query, "results": rows });
+            if result["results"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false)
+            {
+                let enriched: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM procedure_enrichment WHERE repo = ?1",
+                        params![ctx.repo],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if enriched == 0 {
+                    result["hint"] = json!(
+                        "Таблица обогащения пуста — `bsl-indexer enrich` не запускался \
+                         для этого репо. search_terms ищет только по обогащённым termам; \
+                         для поиска по коду используйте grep_body/grep_code/search_function/get_function."
+                    );
+                }
+            }
+            crate::tools::wrap_with_meta(result, Vec::new())
         })
     }
 }
