@@ -5,6 +5,28 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.16.0] — 2026-06-05
+
+**1C metadata tools: `get_object_structure` now returns the full structure (including enum values), a new `get_register_writers` tool (register recorders / document movements), subscription event names normalized to Russian.**
+
+A round of BSL-layer improvements following the E2E comparison with `rlm-tools-bsl` on the KA 1.1 configuration: the main gap "which documents write movements into a register" is closed, and `get_object_structure` is no longer a stub for enums and always returns a predictable response shape.
+
+### Added
+
+- **New MCP tool `get_register_writers`** — register recorders and document movements from the declarative `<RegisterRecords>` set (recorder edges of the `data_links` graph). For a register (`AccumulationRegister.ТоварыНаСкладах`) it returns the documents writing movements in `writers`; for a document (`Document.РеализацияТоваровУслуг`) the target registers in `writes_to`. A single call covers both directions — no need to know the object kind in advance. 8 BSL tools on top of the 18 universal ones.
+- **recorder edges in the `data_links` graph** — the "document → register" relation (`link_kind=recorder`) from a document's declarative movement set. `get_data_links(register, direction=in)` now lists recorder documents (previously empty — register movements were not modeled by the graph). The source is the document XML `<RegisterRecords>`, not posting-code parsing — no false positives.
+- **`get_object_structure` for enumerations** — an `enum_values` section with the enum's values (previously `Enum.*` returned an empty structure). The `Enums` folder was added to the metadata indexer's walk.
+
+### Changed
+
+- **`get_object_structure` returns the full object structure** — attributes with types in 1C notation (`СправочникСсылка.X`, composite via `|`), tabular sections with columns, register dimensions/resources. Previously a documented stub `attributes: null`.
+- **`get_object_structure` always emits the base sections** `attributes`/`dimensions`/`resources`/`tabular_sections` (empty as `[]`, not omitted). The consumer distinguishes "the section is absent" from "the tool did not return it" and does not fall back to raw XML.
+- **Event names in `get_event_subscriptions` normalized to Russian** (`OnWrite`→`ПриЗаписи`, `Posting`→`ОбработкаПроведения`, etc.); the filter is bidirectional — accepts both the Russian name and the English platform enum.
+
+### Fixed
+
+- **Updated the `read_file` tool docstring** — it returns content for code files too (zstd-decode from `file_contents`, Phase 2 v0.8.0+; the `category` field is `"text"`/`"code"`), not "text files only, empty for code". The old description was stale after Phase 2 and misleading.
+
 ## [0.15.0] — 2026-06-04
 
 **`grep_text` and `grep_body`: output grouped by file + a `truncated` flag — path duplication eliminated, the same treatment `grep_code` got in 0.14.0.**

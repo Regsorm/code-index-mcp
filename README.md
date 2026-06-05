@@ -135,7 +135,7 @@ cargo build --release -p bsl-indexer --features enrichment   # extra build with 
 
 Binaries:
 * `target/release/code-index[.exe]` — main binary (no 1C support).
-* `target/release/bsl-indexer[.exe]` — full 1C support (XML metadata parsers, BSL call graph, data-links graph, MCP tools `get_object_structure` / `get_form_handlers` / `find_path` / `search_terms` / `get_data_links` / `find_data_path`, optional LLM enrichment under cargo feature `enrichment`).
+* `target/release/bsl-indexer[.exe]` — full 1C support (XML metadata parsers, BSL call graph, data-links graph, MCP tools `get_object_structure` / `get_form_handlers` / `find_path` / `search_terms` / `get_data_links` / `find_data_path` / `get_register_writers`, optional LLM enrichment under cargo feature `enrichment`).
 
 GitHub Releases publish 6 ready artifacts per tag: `code-index` × {Win, Linux, macOS} + `bsl-indexer` × {Win, Linux, macOS}.
 
@@ -328,13 +328,14 @@ When BSL repos are present in `daemon.toml` (`language = "bsl"`), 5 BSL-specific
 
 | Tool | Description |
 |------|-------------|
-| `get_object_structure` | Structure of a 1C metadata object (Catalog, Document, InformationRegister, ...) by `full_name` like `Document.SalesInvoice` |
+| `get_object_structure` | Full structure of a 1C metadata object by `full_name` (`Document.SalesInvoice`): attributes with 1C-notation types, tabular sections with columns, register dimensions/resources; `enum_values` for enumerations. Base sections (`attributes`/`dimensions`/`resources`/`tabular_sections`) are always present (empty as `[]`) |
 | `get_form_handlers` | Managed-form event handlers by `(owner_full_name, form_name)`. For typical document form returns ~120 `(event, handler)` pairs |
-| `get_event_subscriptions` | All event subscriptions from `EventSubscriptions/*.xml`, optional filter by handler module |
+| `get_event_subscriptions` | All event subscriptions from `EventSubscriptions/*.xml`, optional filter by handler module. Event names normalized to Russian (`OnWrite`→`ПриЗаписи`); filter accepts both Russian and the English platform enum |
 | `find_path` | Call-chain between two procedures via `proc_call_graph` (recursive CTE, max_depth=3) |
 | `search_terms` | FTS search by business terms enriched per procedure by an LLM (after `bsl-indexer enrich`) |
 | `get_data_links` | **Data-links graph (v0.10.0):** what an object references / what references it, via reference-typed attributes, register dimensions and tabular-section attributes (`data_links` table). `direction=out\|in\|both`, `depth=1..4`. Replaces a series of `get_object_structure` calls when tracing relations. Targets like `*CatalogRef`/`*AnyRef`/`*DefinedType.X` are generalized refs (terminal, not expanded) |
 | `find_data_path` | **Data-links graph (v0.10.0):** chain of reference links from one object to another (BFS over `data_links`, like `find_path` but for data, not calls) |
+| `get_register_writers` | **Register recorders / document movements (v0.16.0):** for a register (`AccumulationRegister.Stock`) returns `writers` — documents writing movements; for a document — `writes_to` (target registers). From the declarative `<RegisterRecords>` set (recorder edges of `data_links`). One call covers both directions |
 
 These tools appear in `tools/list` **only when at least one BSL repo is configured** (conditional registration). When the repo set changes in `daemon.toml`, the server emits `notifications/tools/list_changed`. On Claude Code 2.1.120 this notification is currently [ignored](https://github.com/anthropics/claude-code/issues/13646); workaround — manual `/mcp Reconnect`.
 
