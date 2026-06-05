@@ -215,6 +215,7 @@ pub fn run_worker(
     //     продолжаем — например, для репо без Configuration.xml (старая
     //     выгрузка обработок) парсер может ничего не найти и это нормально.
     if let Some(proc) = resolved_processor.as_ref() {
+        let t0 = std::time::Instant::now();
         if let Err(e) = proc.index_extras(&path, &mut storage) {
             eprintln!(
                 "[worker:{}] index_extras процессора '{}' упал: {}. \
@@ -223,8 +224,8 @@ pub fn run_worker(
             );
         } else {
             eprintln!(
-                "[worker:{}] index_extras процессора '{}' выполнен",
-                path.display(), proc.name()
+                "[worker:{}] index_extras (полный) процессора '{}' выполнен за {} мс",
+                path.display(), proc.name(), t0.elapsed().as_millis()
             );
         }
     }
@@ -362,6 +363,46 @@ pub fn run_worker(
                 false
             }
         };
+
+        // 8a. Инкрементальное обновление extras-слоя (граф вызовов, data_links,
+        //     структура объектов, формы, подписки) для файлов этого батча.
+        //     Базовый индекс уже закоммичен (calls/AST/file_contents свежие),
+        //     поэтому slice-rebuild графа из `calls` корректен. Для
+        //     универсальных языков — no-op (default-impl trait'а). Функция ведёт
+        //     свои BEGIN/COMMIT внутри, поэтому вызывается после commit_batch.
+        if commit_ok {
+            if let Some(proc) = resolved_processor.as_ref() {
+                let mut changed_paths: Vec<PathBuf> = Vec::new();
+                let mut deleted_paths: Vec<PathBuf> = Vec::new();
+                for event in &batch {
+                    match event {
+                        FileEvent::Modified(p) | FileEvent::Created(p) => {
+                            changed_paths.push(p.clone())
+                        }
+                        FileEvent::Deleted(p) => deleted_paths.push(p.clone()),
+                    }
+                }
+                let t0 = std::time::Instant::now();
+                match proc.index_extras_for_files(
+                    &path,
+                    &mut storage,
+                    &changed_paths,
+                    &deleted_paths,
+                ) {
+                    Ok(()) => eprintln!(
+                        "[worker:{}] index_extras_for_files (инкремент): {} мс (changed={}, deleted={})",
+                        path.display(), t0.elapsed().as_millis(),
+                        changed_paths.len(), deleted_paths.len()
+                    ),
+                    Err(e) => eprintln!(
+                        "[worker:{}] index_extras_for_files процессора '{}' упал: {}. \
+                         Базовая индексация при этом сохранена.",
+                        path.display(), proc.name(), e
+                    ),
+                }
+            }
+        }
+
         // В disk-режиме (а worker сюда попадает всегда в disk после reopen на шаге 7)
         // flush_to_disk через Connection::backup() — бесполезное копирование БД самой
         // в себя, WAL не уменьшает. checkpoint_truncate реально схлопывает WAL.

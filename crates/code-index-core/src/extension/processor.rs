@@ -16,7 +16,7 @@
 // `LanguageParser`-ов из core (Python/Rust/JS/TS/Java/Go/BSL). Никаких
 // схем не добавляет, специфичных tools не имеет.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::parser::LanguageParser;
@@ -74,6 +74,26 @@ pub trait LanguageProcessor: Send + Sync {
     /// не Send. Если в будущем понадобится async — переходим на
     /// async_runtime::spawn_blocking в caller'е.
     fn index_extras(&self, _repo_root: &Path, _storage: &mut Storage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Инкрементальное обновление специфичных таблиц для конкретных файлов
+    /// батча watcher'а — вместо полного `index_extras`. `changed` —
+    /// созданные/изменённые пути, `deleted` — удалённые. Вызывается из
+    /// watcher-цикла демона после `commit_batch` на полностью открытой БД
+    /// (реализация ведёт свои BEGIN/COMMIT внутри).
+    ///
+    /// Реализация по умолчанию — no-op (универсальные процессоры специфичных
+    /// таблиц не имеют). BSL переопределяет: slice-rebuild затронутых слоёв
+    /// графа вызовов + per-object апдейт XML-слоёв (data_links / структура /
+    /// формы / подписки) только для реально изменённых объектов.
+    fn index_extras_for_files(
+        &self,
+        _repo_root: &Path,
+        _storage: &mut Storage,
+        _changed: &[PathBuf],
+        _deleted: &[PathBuf],
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
