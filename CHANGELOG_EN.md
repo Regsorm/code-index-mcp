@@ -5,6 +5,16 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.17.0] — 2026-06-05
+
+**`get_object_structure`: a `predefined` section — names of predefined items (Catalog / ChartOfAccounts / ChartOf*).**
+
+Closes the C2 gap from the E2E comparison with `rlm-tools-bsl`: predefined items (`Catalogs.Quality.New`, etc.) live in a separate `<Object>/Ext/Predefined.xml` and previously required manual XML reading. Now there is a `predefined` section right in the object structure.
+
+### Added
+
+- **`get_object_structure` returns a `predefined` section** — names of an object's predefined items from the adjacent `<Object>/Ext/Predefined.xml` (`<Item>/<Name>`). Populated during indexing for `Catalog`/`ChartOfAccounts`/`ChartOfCharacteristicTypes`/`ChartOfCalculationTypes`; absent for objects without predefined items. Verified on live KA 1.1: `Catalog.Качество` → `["Новый"]`, `Catalog.СтатьиЗатрат` → `["СписаниеНДСНаРасходы","СписаниеНДСНаРасходыПрочие"]`.
+
 ## [0.16.0] — 2026-06-05
 
 **1C metadata tools: `get_object_structure` now returns the full structure (including enum values), a new `get_register_writers` tool (register recorders / document movements), subscription event names normalized to Russian.**
