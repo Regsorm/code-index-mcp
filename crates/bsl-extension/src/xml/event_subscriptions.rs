@@ -48,6 +48,30 @@ pub struct EventSubscription {
     pub sources: Vec<String>,
 }
 
+/// Нормализует имя события подписки к русскому виду (как в конфигураторе 1С).
+///
+/// В XML-выгрузке `<Event>` может хранить английский идентификатор платформы
+/// (`OnWrite`, `Posting`) — так выгружают многие конфигурации (УТ, КА). Другие
+/// пишут уже русское имя (`ПриЗаписи`). Чтобы тул всегда отдавал единообразные
+/// русские названия, известные английские значения переводим, а неизвестные
+/// или уже-русские — возвращаем без изменений (ничего не теряем).
+pub fn event_to_russian(event: &str) -> &str {
+    match event {
+        "BeforeWrite" => "ПередЗаписью",
+        "OnWrite" => "ПриЗаписи",
+        "AfterWrite" => "ПослеЗаписи",
+        "BeforeDelete" => "ПередУдалением",
+        "OnCopy" => "ПриКопировании",
+        "Filling" => "ОбработкаЗаполнения",
+        "FillCheckProcessing" => "ОбработкаПроверкиЗаполнения",
+        "Posting" => "ОбработкаПроведения",
+        "UndoPosting" => "ОбработкаУдаленияПроведения",
+        "OnSetNewNumber" => "ПриУстановкеНовогоНомера",
+        "OnSetNewCode" => "ПриУстановкеНовогоКода",
+        other => other,
+    }
+}
+
 /// Распарсить XML-описание подписки.
 pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscription>> {
     let mut reader = Reader::from_str(content);
@@ -143,7 +167,8 @@ pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscri
 
     Ok(Some(EventSubscription {
         name,
-        event,
+        // Нормализуем событие к русскому виду (англ. `OnWrite` → `ПриЗаписи`).
+        event: event_to_russian(&event).to_string(),
         handler_module: module,
         handler_proc: proc_,
         sources,
@@ -226,5 +251,34 @@ mod tests {
         let sub = parse_event_subscription_xml(xml).unwrap().unwrap();
         assert_eq!(sub.handler_module, "");
         assert_eq!(sub.handler_proc, "BareName");
+    }
+
+    #[test]
+    fn normalizes_english_event_to_russian() {
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject>
+  <EventSubscription>
+    <Properties>
+      <Name>Sub</Name>
+      <Event>OnWrite</Event>
+      <Handler>Mod.Proc</Handler>
+    </Properties>
+  </EventSubscription>
+</MetaDataObject>
+"#;
+        let sub = parse_event_subscription_xml(xml).unwrap().unwrap();
+        assert_eq!(sub.event, "ПриЗаписи");
+    }
+
+    #[test]
+    fn event_to_russian_maps_known_and_keeps_unknown() {
+        assert_eq!(event_to_russian("BeforeWrite"), "ПередЗаписью");
+        assert_eq!(event_to_russian("Posting"), "ОбработкаПроведения");
+        assert_eq!(event_to_russian("UndoPosting"), "ОбработкаУдаленияПроведения");
+        assert_eq!(event_to_russian("OnSetNewCode"), "ПриУстановкеНовогоКода");
+        // уже-русское — без изменений
+        assert_eq!(event_to_russian("ПриЗаписи"), "ПриЗаписи");
+        // неизвестное — без изменений
+        assert_eq!(event_to_russian("СовсемДругоеСобытие"), "СовсемДругоеСобытие");
     }
 }

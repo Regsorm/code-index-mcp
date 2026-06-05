@@ -38,7 +38,7 @@ impl IndexTool for GetEventSubscriptionsTool {
                 },
                 "event": {
                     "type": "string",
-                    "description": "Опционально: вернуть только подписки на заданное событие (например, 'ПриЗаписи')"
+                    "description": "Опционально: фильтр по событию. Принимает русское имя ('ПриЗаписи', 'ОбработкаПроведения') либо английское ('OnWrite', 'Posting') — нормализуется автоматически"
                 }
             },
             "required": ["repo"]
@@ -59,10 +59,14 @@ impl IndexTool for GetEventSubscriptionsTool {
                 .get("handler_module")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            // Фильтр по событию — двусторонний: в БД событие хранится в русском
+            // виде (`ПриЗаписи`), поэтому вход нормализуем тем же маппингом
+            // (англ. `OnWrite` → рус., рус./неизвестное — без изменений), чтобы
+            // матчились оба варианта.
             let event = args
                 .get("event")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(|s| crate::xml::event_subscriptions::event_to_russian(s).to_string());
 
             let storage = ctx.storage.lock().await;
             let conn = storage.conn();
