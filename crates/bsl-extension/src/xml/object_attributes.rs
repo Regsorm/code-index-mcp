@@ -402,6 +402,9 @@ pub struct ObjectStructure {
     pub tabular_sections: Vec<StructTabular>,
     /// Значения перечисления (только для meta_type = Enum), порядок из XML.
     pub enum_values: Vec<String>,
+    /// Имена предопределённых элементов (Catalog/ChartOfAccounts/ChartOf*),
+    /// из соседнего `<Объект>/Ext/Predefined.xml`. Порядок из XML.
+    pub predefined: Vec<String>,
 }
 
 impl ObjectStructure {
@@ -412,6 +415,7 @@ impl ObjectStructure {
             && self.resources.is_empty()
             && self.tabular_sections.is_empty()
             && self.enum_values.is_empty()
+            && self.predefined.is_empty()
     }
 
     /// Сериализовать в JSON для `attributes_json` (пустые секции опускаем).
@@ -455,6 +459,18 @@ impl ObjectStructure {
                 ),
             );
         }
+        // C2: predefined — имена предопределённых элементов (если есть).
+        if !self.predefined.is_empty() {
+            map.insert(
+                "predefined".into(),
+                Value::Array(
+                    self.predefined
+                        .iter()
+                        .map(|v| Value::String(v.clone()))
+                        .collect(),
+                ),
+            );
+        }
         Value::Object(map)
     }
 }
@@ -467,7 +483,67 @@ pub fn parse_object_structure_file(path: &Path) -> Result<Option<ObjectStructure
     }
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Не удалось прочитать {}", path.display()))?;
-    Ok(Some(parse_object_structure_xml(&content)?))
+    let mut structure = parse_object_structure_xml(&content)?;
+
+    // C2: предопределённые элементы — в соседнем `<Объект>/Ext/Predefined.xml`
+    // (Catalog/ChartOfAccounts/ChartOf*). path `<...>/Catalogs/Качество.xml`
+    // → `<...>/Catalogs/Качество/Ext/Predefined.xml`.
+    let predef = path.with_extension("").join("Ext").join("Predefined.xml");
+    if predef.is_file() {
+        if let Ok(pc) = std::fs::read_to_string(&predef) {
+            structure.predefined = parse_predefined_xml(&pc);
+        }
+    }
+
+    Ok(Some(structure))
+}
+
+/// Распарсить `Predefined.xml` объекта в список имён предопределённых
+/// элементов — `<Item>/<Name>` (первое имя в каждом `<Item>`).
+pub fn parse_predefined_xml(content: &str) -> Vec<String> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = Vec::new();
+    // Внутри <Item> и имя ещё не взято.
+    let mut in_item = false;
+    let mut want_name = false;
+    let mut take_text = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
+                if local == "Item" {
+                    in_item = true;
+                    want_name = true;
+                } else if local == "Name" && in_item && want_name {
+                    take_text = true;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if take_text {
+                    let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    let txt = txt.trim().to_string();
+                    if !txt.is_empty() {
+                        out.push(txt);
+                        want_name = false;
+                    }
+                    take_text = false;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
+                if local == "Item" {
+                    in_item = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
 }
 
 /// Распарсить содержимое XML объекта в полную структуру.
@@ -964,5 +1040,29 @@ mod tests {
         assert!(obj.get("dimensions").unwrap().as_array().unwrap().is_empty());
         // enum_values НЕ эмитится для не-перечисления.
         assert!(!obj.contains_key("enum_values"));
+    }
+
+    #[test]
+    fn parses_predefined_items() {
+        // C2: <Item>/<Name> из Predefined.xml → имена предопределённых.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<PredefinedData xmlns="http://v8.1c.ru/8.3/xcf/predef"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xsi:type="CatalogPredefinedItems" version="2.20">
+    <Item id="d05404a0">
+        <Name>Новый</Name>
+        <Code>000000001</Code>
+        <Description>Новый</Description>
+        <IsFolder>false</IsFolder>
+    </Item>
+    <Item id="abc123">
+        <Name>Брак</Name>
+        <Code>000000002</Code>
+        <Description>Брак</Description>
+        <IsFolder>false</IsFolder>
+    </Item>
+</PredefinedData>"#;
+        let names = parse_predefined_xml(xml);
+        assert_eq!(names, vec!["Новый", "Брак"]);
     }
 }
