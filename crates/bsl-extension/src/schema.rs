@@ -324,6 +324,35 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_dl_from ON data_links(repo, from_object);",
     // idx_dl_to — обратный обход «кто ссылается на X» (get_data_links in).
     "CREATE INDEX IF NOT EXISTS idx_dl_to ON data_links(repo, to_object);",
+
+    // ── direct_edge_files ─────────────────────────────────────────────────
+    // Привязка direct-рёбер графа вызовов к файлам-источникам. Нужна ТОЛЬКО
+    // для инкрементального per-file обновления: `proc_call_graph` хранит
+    // direct-рёбра дедуплицированно, по голым именам, без файла — поэтому
+    // при правке одного .bsl нельзя узнать, какие рёбра «его». Эта таблица
+    // помнит, какие рёбра (caller→callee) даёт каждый файл, и позволяет
+    // обновлять граф точечно: удалить прежние рёбра файла, добавить новые,
+    // не трогая остальной граф (см. `update_call_graph_direct_for_file`).
+    //
+    // Строка на ребро файла: (repo, caller, callee, source_file). При правке
+    // одного .bsl читаем прежние рёбра файла (по source_file), сносим их,
+    // пишем новые из `calls` — точечно, не трогая остальной граф.
+    // «Прежние» рёбра нельзя взять из `calls` (её базовый индексатор обновляет
+    // ДО нашего шага), поэтому нужна отдельная таблица. proc_call_graph
+    // остаётся дедуплицированной — find_path не затронут. Заполняется при
+    // полном построении (`build_call_graph`).
+    "
+    CREATE TABLE IF NOT EXISTS direct_edge_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        caller TEXT NOT NULL,
+        callee TEXT NOT NULL,
+        source_file TEXT NOT NULL,
+        UNIQUE(repo, caller, callee, source_file)
+    );
+    ",
+    // Прежние рёбра файла + per-file DELETE при обновлении/удалении файла.
+    "CREATE INDEX IF NOT EXISTS idx_def_source ON direct_edge_files(repo, source_file);",
 ];
 
 #[cfg(test)]

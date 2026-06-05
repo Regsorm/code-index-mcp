@@ -115,6 +115,464 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     Ok(())
 }
 
+// ───────────────────────── Инкрементальное обновление ─────────────────────
+//
+// Slice-rebuild графа вызовов и per-object/per-file апдейт XML-слоёв для
+// файлов одного watcher-батча. Семантика идентична полному `run_index_extras`
+// (см. тест эквивалентности в конце файла). Новых таблиц/колонок не вводит —
+// все slice-функции дедуплицированы так же, как полное построение
+// (`build_call_graph`), и `find_path`/`find_data_path` это не затрагивает.
+
+/// Точечно обновить слой `direct` графа вызовов для ОДНОГО файла.
+///
+/// proc_call_graph дедуплицирован и не помнит источник ребра, поэтому
+/// «прежние» рёбра файла берём из side-таблицы `direct_edge_files`, а
+/// «текущие» — из core-таблицы `calls` (её базовый индексатор уже обновил
+/// по этому файлу к моменту вызова). Трогаем только рёбра этого файла:
+///   1) прежние рёбра файла, которых больше нет ни в одном файле
+///      (проверка `calls` — она глобальна и актуальна), удаляем из графа;
+///   2) текущие рёбра файла доинсертим (существующие отсекает UNIQUE).
+/// Стоимость — O(рёбер одного файла), не зависит от размера графа.
+fn update_call_graph_direct_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    abs_path: &Path,
+) -> Result<()> {
+    // rel-путь в формате files.path (forward slash, относительно корня репо).
+    let rel = abs_path
+        .strip_prefix(repo_root)
+        .unwrap_or(abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+
+    // Прежние рёбра файла (из side-карты).
+    let old: Vec<(String, String)> = {
+        let mut st = conn.prepare(
+            "SELECT caller, callee FROM direct_edge_files \
+             WHERE repo = ?1 AND source_file = ?2",
+        )?;
+        let v = st
+            .query_map(params![REPO_DEFAULT, &rel], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        v
+    };
+    // Текущие рёбра файла (из calls; для удалённого файла — пусто, files-строки нет).
+    let new: Vec<(String, String)> = {
+        let mut st = conn.prepare(
+            "SELECT DISTINCT c.caller, c.callee \
+             FROM calls c JOIN files f ON f.id = c.file_id \
+             WHERE f.path = ?1 AND c.caller IS NOT NULL AND c.callee IS NOT NULL",
+        )?;
+        let v = st
+            .query_map(params![&rel], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        v
+    };
+
+    // Обновляем side-карту файла: снести прежние записи, записать текущие.
+    conn.execute(
+        "DELETE FROM direct_edge_files WHERE repo = ?1 AND source_file = ?2",
+        params![REPO_DEFAULT, &rel],
+    )?;
+    {
+        let mut ins = conn.prepare(
+            "INSERT OR IGNORE INTO direct_edge_files (repo, caller, callee, source_file) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (caller, callee) in &new {
+            ins.execute(params![REPO_DEFAULT, caller, callee, &rel])?;
+        }
+    }
+
+    use std::collections::HashSet;
+    let new_set: HashSet<&(String, String)> = new.iter().collect();
+
+    // Рёбра, которые файл перестал давать → удалить из графа, если их больше
+    // не даёт ни один файл (проверка по глобальной и уже актуальной `calls`).
+    {
+        let mut chk =
+            conn.prepare("SELECT 1 FROM calls WHERE caller = ?1 AND callee = ?2 LIMIT 1")?;
+        let mut del = conn.prepare(
+            "DELETE FROM proc_call_graph \
+             WHERE repo = ?1 AND call_type = 'direct' \
+               AND caller_proc_key = ?2 AND callee_proc_name = ?3",
+        )?;
+        for e in &old {
+            if new_set.contains(e) {
+                continue;
+            }
+            let still = match chk.query_row(params![&e.0, &e.1], |_| Ok(())) {
+                Ok(()) => true,
+                Err(rusqlite::Error::QueryReturnedNoRows) => false,
+                Err(err) => return Err(err.into()),
+            };
+            if !still {
+                del.execute(params![REPO_DEFAULT, &e.0, &e.1])?;
+            }
+        }
+    }
+
+    // Текущие рёбра файла → в граф (существующие отсекает UNIQUE без записи).
+    {
+        let mut ins = conn.prepare(
+            "INSERT OR IGNORE INTO proc_call_graph \
+             (repo, caller_proc_key, callee_proc_name, call_type) \
+             VALUES (?1, ?2, ?3, 'direct')",
+        )?;
+        for (caller, callee) in &new {
+            ins.execute(params![REPO_DEFAULT, caller, callee])?;
+        }
+    }
+
+    conn.execute("COMMIT", [])?;
+    tracing::debug!(
+        "call_graph direct per-file {}: old={} new={}",
+        rel,
+        old.len(),
+        new.len()
+    );
+    Ok(())
+}
+
+/// Пересобрать слой `subscription` графа вызовов из таблицы
+/// `event_subscriptions`. Идентично subscription-части `build_call_graph`.
+fn rebuild_call_graph_subscription(conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM proc_call_graph WHERE repo = ? AND call_type = 'subscription'",
+        params![REPO_DEFAULT],
+    )?;
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO proc_call_graph \
+         (repo, caller_proc_key, callee_proc_name, call_type) \
+         SELECT ?, 'event::' || event, handler_module || '.' || handler_proc, 'subscription' \
+         FROM event_subscriptions \
+         WHERE repo = ? AND handler_module != '' AND handler_proc != ''",
+        params![REPO_DEFAULT, REPO_DEFAULT],
+    )?;
+    conn.execute("COMMIT", [])?;
+    tracing::debug!("proc_call_graph subscription (slice-rebuild): {} рёбер", n);
+    Ok(())
+}
+
+/// Пересобрать слой `form_event` графа вызовов из таблицы `metadata_forms`.
+/// Идентично form_event-части `build_call_graph`.
+fn rebuild_call_graph_form_event(conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM proc_call_graph WHERE repo = ? AND call_type = 'form_event'",
+        params![REPO_DEFAULT],
+    )?;
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT owner_full_name, form_name, handlers_json \
+             FROM metadata_forms WHERE repo = ?",
+        )?;
+        let mapped = stmt
+            .query_map(params![REPO_DEFAULT], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        mapped
+    };
+    let mut form_count = 0usize;
+    {
+        let mut insert = conn.prepare(
+            "INSERT OR IGNORE INTO proc_call_graph \
+             (repo, caller_proc_key, callee_proc_name, call_type) \
+             VALUES (?, ?, ?, 'form_event')",
+        )?;
+        for (owner, form_name, handlers_json) in rows {
+            let parsed: Vec<serde_json::Value> =
+                serde_json::from_str(&handlers_json).unwrap_or_default();
+            for h in parsed {
+                let event = h.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                let handler = h.get("handler").and_then(|v| v.as_str()).unwrap_or("");
+                if event.is_empty() || handler.is_empty() {
+                    continue;
+                }
+                let caller_key = format!("form::{}::{}::{}", owner, form_name, event);
+                let callee_name = format!("{}::{}::{}", owner, form_name, handler);
+                insert.execute(params![REPO_DEFAULT, caller_key, callee_name])?;
+                form_count += 1;
+            }
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    tracing::debug!("proc_call_graph form_event (slice-rebuild): {} рёбер", form_count);
+    Ok(())
+}
+
+/// По пути к корневому XML объекта определить `(meta_type, full_name)`.
+/// Возвращает `None`, если файл не лежит прямо в одной из `OBJECT_FOLDERS`
+/// (т.е. это не корневой XML объекта со ссылочными реквизитами/структурой).
+fn object_full_name_from_path(xml_path: &Path) -> Option<(&'static str, String)> {
+    if xml_path.extension().and_then(|e| e.to_str()) != Some("xml") {
+        return None;
+    }
+    let stem = xml_path.file_stem().and_then(|s| s.to_str())?;
+    let parent_name = xml_path.parent()?.file_name()?.to_str()?;
+    for (folder, meta_type) in OBJECT_FOLDERS {
+        if *folder == parent_name {
+            return Some((meta_type, format!("{}.{}", meta_type, stem)));
+        }
+    }
+    None
+}
+
+/// Per-object обновление `data_links` для одного объекта: удалить его прежние
+/// рёбра (`from_object = X`) и переразобрать только его XML. Покрывает и
+/// recorder-рёбра (движения документа), т.к. они тоже имеют `from_object`
+/// = документ. Если файл удалён — рёбра просто исчезают.
+fn update_data_links_for_object(conn: &rusqlite::Connection, xml_path: &Path) -> Result<()> {
+    let owner_full = match object_full_name_from_path(xml_path) {
+        Some((_mt, full)) => full,
+        None => return Ok(()),
+    };
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM data_links WHERE repo = ? AND from_object = ?",
+        params![REPO_DEFAULT, &owner_full],
+    )?;
+    if xml_path.is_file() {
+        match parse_object_attributes_file(xml_path, &owner_full) {
+            Ok(edges) => {
+                let mut stmt = conn.prepare(
+                    "INSERT OR IGNORE INTO data_links \
+                     (repo, from_object, from_path, to_object, link_kind, is_composite, is_universal) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )?;
+                for edge in edges {
+                    stmt.execute(params![
+                        REPO_DEFAULT,
+                        &owner_full,
+                        &edge.from_path,
+                        &edge.to_object,
+                        edge.link_kind,
+                        edge.is_composite as i64,
+                        edge.is_universal as i64,
+                    ])?;
+                }
+            }
+            Err(e) => tracing::warn!("update_data_links_for_object {}: {}", xml_path.display(), e),
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Per-object обновление `metadata_objects.attributes_json` для одного объекта.
+/// Переразбирает только его XML и пишет полную структуру (или NULL, если
+/// структура пуста — совпадает с состоянием после полного пересбора, где
+/// пустые объекты остаются с NULL от `index_metadata_objects`). Строка объекта
+/// должна уже существовать (создаётся `index_metadata_objects` при изменении
+/// Configuration.xml — это покрывается отдельной веткой полного пересбора).
+fn update_object_attributes_for_object(conn: &rusqlite::Connection, xml_path: &Path) -> Result<()> {
+    let owner_full = match object_full_name_from_path(xml_path) {
+        Some((_mt, full)) => full,
+        None => return Ok(()),
+    };
+    let json_opt: Option<String> = if xml_path.is_file() {
+        match parse_object_structure_file(xml_path) {
+            Ok(Some(s)) if !s.is_empty() => Some(s.to_json().to_string()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    conn.execute(
+        "UPDATE metadata_objects SET attributes_json = ? WHERE repo = ? AND full_name = ?",
+        params![json_opt, REPO_DEFAULT, &owner_full],
+    )?;
+    Ok(())
+}
+
+/// Per-file обновление строки `metadata_forms` для одной формы по её Form.xml.
+/// Слой `form_event` графа пересобирается отдельно (после всех форм батча).
+fn update_metadata_forms_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    form_xml_path: &Path,
+) -> Result<()> {
+    let (owner_full, form_name) = match decode_form_path(repo_root, form_xml_path) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_forms WHERE repo = ? AND owner_full_name = ? AND form_name = ?",
+        params![REPO_DEFAULT, &owner_full, &form_name],
+    )?;
+    if form_xml_path.is_file() {
+        match parse_form_file(form_xml_path) {
+            Ok(handlers) => {
+                let handlers_json = serde_json::to_string(
+                    &handlers
+                        .iter()
+                        .map(|h| serde_json::json!({"event": h.event, "handler": h.handler}))
+                        .collect::<Vec<_>>(),
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO metadata_forms \
+                     (repo, owner_full_name, form_name, handlers_json) VALUES (?, ?, ?, ?)",
+                    params![REPO_DEFAULT, &owner_full, &form_name, &handlers_json],
+                )?;
+            }
+            Err(e) => tracing::warn!("update_metadata_forms_for_file {}: {}", form_xml_path.display(), e),
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Per-file обновление строки `event_subscriptions` по её XML. Слой
+/// `subscription` графа пересобирается отдельно (после всех подписок батча).
+fn update_event_subscription_for_file(conn: &rusqlite::Connection, xml_path: &Path) -> Result<()> {
+    let in_dir = xml_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        == Some("EventSubscriptions");
+    if !in_dir || xml_path.extension().and_then(|e| e.to_str()) != Some("xml") {
+        return Ok(());
+    }
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    if xml_path.is_file() {
+        match parse_event_subscription_file(xml_path) {
+            Ok(Some(sub)) => {
+                let sources_json = serde_json::to_string(&sub.sources)?;
+                conn.execute(
+                    "DELETE FROM event_subscriptions WHERE repo = ? AND name = ?",
+                    params![REPO_DEFAULT, &sub.name],
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO event_subscriptions \
+                     (repo, name, event, handler_module, handler_proc, sources_json) \
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    params![
+                        REPO_DEFAULT,
+                        &sub.name,
+                        &sub.event,
+                        &sub.handler_module,
+                        &sub.handler_proc,
+                        &sources_json
+                    ],
+                )?;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("update_event_subscription_for_file {}: {}", xml_path.display(), e),
+        }
+    } else {
+        // Файл удалён — имя подписки прочитать неоткуда; в выгрузке 1С имя
+        // подписки совпадает с именем файла (EventSubscriptions/<Name>.xml),
+        // удаляем по stem как приближению.
+        if let Some(stem) = xml_path.file_stem().and_then(|s| s.to_str()) {
+            conn.execute(
+                "DELETE FROM event_subscriptions WHERE repo = ? AND name = ?",
+                params![REPO_DEFAULT, stem],
+            )?;
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Инкрементально обновить extras для файлов одного watcher-батча.
+///
+/// Маршрутизация по типу файла:
+///   * `.bsl` → slice-rebuild слоя `direct` из `calls` (без чтения файлов);
+///   * объектный XML (в `OBJECT_FOLDERS`) → per-object `data_links` +
+///     структура (только этот объект);
+///   * `Form.xml` → per-form строка + slice-rebuild слоя `form_event`;
+///   * `EventSubscriptions/*.xml` → per-sub строка + slice-rebuild слоя
+///     `subscription`.
+///
+/// Изменение `Configuration.xml` = структурное изменение состава объектов
+/// (добавление/удаление/переименование): редкое, приходит большим батчом —
+/// для него делаем полный `run_index_extras` (проще и корректнее, чем
+/// частично латать состав + attributes_json всех объектов).
+///
+/// `ANALYZE` здесь не вызываем (в отличие от полного пути): статистика,
+/// собранная при initial reindex, остаётся достаточной; ежебатчевый ANALYZE
+/// (~0.6 с) убил бы выигрыш. Содержимое таблиц от ANALYZE не зависит, поэтому
+/// эквивалентность full↔incremental не нарушается.
+pub fn run_incremental_extras(
+    repo_root: &Path,
+    storage: &mut Storage,
+    changed: &[std::path::PathBuf],
+    deleted: &[std::path::PathBuf],
+) -> Result<()> {
+    let mut bsl_paths: Vec<&std::path::PathBuf> = Vec::new();
+    let mut config_changed = false;
+    let mut object_xmls: Vec<&std::path::PathBuf> = Vec::new();
+    let mut form_xmls: Vec<&std::path::PathBuf> = Vec::new();
+    let mut sub_xmls: Vec<&std::path::PathBuf> = Vec::new();
+
+    // changed + deleted объединяем: конкретное действие (reinsert vs delete)
+    // функции решают по наличию файла на диске.
+    for p in changed.iter().chain(deleted.iter()) {
+        let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("bsl") {
+            bsl_paths.push(p);
+        } else if fname == "Configuration.xml" {
+            config_changed = true;
+        } else if fname == "Form.xml" {
+            form_xmls.push(p);
+        } else if p
+            .parent()
+            .and_then(|d| d.file_name())
+            .and_then(|s| s.to_str())
+            == Some("EventSubscriptions")
+            && ext == "xml"
+        {
+            sub_xmls.push(p);
+        } else if object_full_name_from_path(p).is_some() {
+            object_xmls.push(p);
+        }
+    }
+
+    // Структурное изменение состава объектов → полный пересбор.
+    if config_changed {
+        return run_index_extras(repo_root, storage);
+    }
+
+    let conn = storage.conn();
+    for p in &object_xmls {
+        update_data_links_for_object(conn, p)?;
+        update_object_attributes_for_object(conn, p)?;
+    }
+    for p in &form_xmls {
+        update_metadata_forms_for_file(repo_root, conn, p)?;
+    }
+    for p in &sub_xmls {
+        update_event_subscription_for_file(conn, p)?;
+    }
+    // .bsl — точечный per-file апдейт слоя direct (O(рёбер файла)).
+    for p in &bsl_paths {
+        update_call_graph_direct_for_file(repo_root, conn, p)?;
+    }
+    if !form_xmls.is_empty() {
+        rebuild_call_graph_form_event(conn)?;
+    }
+    if !sub_xmls.is_empty() {
+        rebuild_call_graph_subscription(conn)?;
+    }
+    Ok(())
+}
+
 /// Построить граф вызовов из заполненных metadata_forms,
 /// event_subscriptions и core-таблицы `calls`. Удаляет старые ребра
 /// этого репо и вставляет свежие — идемпотентно.
@@ -139,6 +597,21 @@ fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
          SELECT ?, caller, callee, 'direct' \
          FROM calls \
          WHERE caller IS NOT NULL AND callee IS NOT NULL",
+        params![REPO_DEFAULT],
+    )?;
+
+    // Привязка direct-рёбер к файлам (для per-file инкремента). Полный
+    // пересбор: очищаем и наполняем заново из calls ⋈ files. proc_call_graph
+    // остаётся дедуплицированной — это лишь side-карта «файл → его рёбра».
+    conn.execute(
+        "DELETE FROM direct_edge_files WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO direct_edge_files (repo, caller, callee, source_file) \
+         SELECT DISTINCT ?, c.caller, c.callee, f.path \
+         FROM calls c JOIN files f ON f.id = c.file_id \
+         WHERE c.caller IS NOT NULL AND c.callee IS NOT NULL",
         params![REPO_DEFAULT],
     )?;
 
@@ -1235,5 +1708,253 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM data_links WHERE repo = ?", params![REPO_DEFAULT], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "повторный run не должен плодить дубликаты рёбер");
+    }
+
+    // ── Эквивалентность инкрементального обновления полному пересбору ──────
+    //
+    // Главный приёмочный тест варианта A: после правки одного файла +
+    // run_incremental_extras итоговые таблицы должны совпасть с полным
+    // run_index_extras на той же конечной версии репо.
+
+    fn snapshot_pcg(conn: &rusqlite::Connection) -> Vec<(String, String, String)> {
+        let mut v: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT caller_proc_key, callee_proc_name, call_type \
+                 FROM proc_call_graph WHERE repo = ?",
+            )
+            .unwrap()
+            .query_map(params![REPO_DEFAULT], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        v.sort();
+        v
+    }
+
+    fn snapshot_dl(conn: &rusqlite::Connection) -> Vec<(String, String, String, String)> {
+        let mut v: Vec<(String, String, String, String)> = conn
+            .prepare(
+                "SELECT from_object, from_path, to_object, link_kind \
+                 FROM data_links WHERE repo = ?",
+            )
+            .unwrap()
+            .query_map(params![REPO_DEFAULT], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        v.sort();
+        v
+    }
+
+    fn snapshot_attrs(conn: &rusqlite::Connection) -> Vec<(String, Option<String>)> {
+        let mut v: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT full_name, attributes_json FROM metadata_objects WHERE repo = ?")
+            .unwrap()
+            .query_map(params![REPO_DEFAULT], |r| {
+                Ok((r.get(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        v.sort();
+        v
+    }
+
+    fn ensure_file(conn: &rusqlite::Connection, path: &str) -> i64 {
+        conn.execute(
+            "INSERT OR IGNORE INTO files (path, content_hash, language) VALUES (?, 'h', 'bsl')",
+            params![path],
+        )
+        .unwrap();
+        conn.query_row("SELECT id FROM files WHERE path = ?", params![path], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn set_calls(conn: &rusqlite::Connection, file_id: i64, edges: &[(&str, &str)]) {
+        conn.execute("DELETE FROM calls WHERE file_id = ?", params![file_id])
+            .unwrap();
+        for (caller, callee) in edges {
+            conn.execute(
+                "INSERT INTO calls (file_id, caller, callee, line) VALUES (?, ?, ?, 1)",
+                params![file_id, caller, callee],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn incremental_object_xml_matches_full() {
+        let cfg = r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Document>Реализация</Document>
+</ChildObjects></Configuration></MetaDataObject>"#;
+        let doc_v1 = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Document uuid="root"><Properties><Name>Реализация</Name></Properties>
+    <ChildObjects>
+      <Attribute uuid="a1"><Properties><Name>Контрагент</Name>
+        <Type><v8:Type>cfg:CatalogRef.Контрагенты</v8:Type></Type>
+      </Properties></Attribute>
+    </ChildObjects>
+  </Document>
+</MetaDataObject>"#;
+        // v2: реквизит переименован + сменил тип ссылки + добавлен второй.
+        let doc_v2 = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Document uuid="root"><Properties><Name>Реализация</Name></Properties>
+    <ChildObjects>
+      <Attribute uuid="a1"><Properties><Name>Партнёр</Name>
+        <Type><v8:Type>cfg:CatalogRef.Организации</v8:Type></Type>
+      </Properties></Attribute>
+      <Attribute uuid="a2"><Properties><Name>Склад</Name>
+        <Type><v8:Type>cfg:CatalogRef.Склады</v8:Type></Type>
+      </Properties></Attribute>
+    </ChildObjects>
+  </Document>
+</MetaDataObject>"#;
+
+        // truth: репо сразу в версии v2, полный пересбор.
+        let tmp_t = TempDir::new().unwrap();
+        let repo_t = tmp_t.path().join("repo");
+        write(&repo_t.join("Configuration.xml"), cfg);
+        write(&repo_t.join("Documents").join("Реализация.xml"), doc_v2);
+        let mut st_t = fresh_storage(&tmp_t);
+        run_index_extras(&repo_t, &mut st_t).unwrap();
+
+        // incr: репо v1 → полный пересбор → правка XML на v2 → инкремент.
+        let tmp_i = TempDir::new().unwrap();
+        let repo_i = tmp_i.path().join("repo");
+        write(&repo_i.join("Configuration.xml"), cfg);
+        let doc_path = repo_i.join("Documents").join("Реализация.xml");
+        write(&doc_path, doc_v1);
+        let mut st_i = fresh_storage(&tmp_i);
+        run_index_extras(&repo_i, &mut st_i).unwrap();
+        write(&doc_path, doc_v2);
+        run_incremental_extras(&repo_i, &mut st_i, &[doc_path.clone()], &[]).unwrap();
+
+        assert_eq!(
+            snapshot_dl(st_i.conn()),
+            snapshot_dl(st_t.conn()),
+            "data_links после инкремента != полному пересбору"
+        );
+        assert_eq!(
+            snapshot_attrs(st_i.conn()),
+            snapshot_attrs(st_t.conn()),
+            "attributes_json после инкремента != полному пересбору"
+        );
+    }
+
+    #[test]
+    fn incremental_call_graph_direct_matches_full() {
+        // Репо с подпиской и формой — проверяем, что инкремент .bsl
+        // пересобирает только слой direct и НЕ затирает subscription/form_event.
+        let cfg = r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Document>Реализация</Document>
+</ChildObjects></Configuration></MetaDataObject>"#;
+        let sub = r#"<?xml version="1.0"?>
+<MetaDataObject>
+  <EventSubscription><Properties>
+    <Name>Подписка1</Name>
+    <Source><Type><v8:Type>cfg:DocumentRef.Реализация</v8:Type></Type></Source>
+    <Event>ПриЗаписи</Event>
+    <Handler>ОбщийМодуль.Обработчик</Handler>
+  </Properties></EventSubscription>
+</MetaDataObject>"#;
+        let form = r#"<?xml version="1.0"?>
+<Form><Events>
+  <Event name="ПриОткрытии">ПриОткрытииСервер</Event>
+</Events></Form>"#;
+
+        let build = |tmp: &TempDir| -> (std::path::PathBuf, Storage) {
+            let repo = tmp.path().join("repo");
+            write(&repo.join("Configuration.xml"), cfg);
+            write(&repo.join("EventSubscriptions").join("Подписка1.xml"), sub);
+            write(
+                &repo
+                    .join("Documents")
+                    .join("Реализация")
+                    .join("Forms")
+                    .join("ФормаДокумента")
+                    .join("Ext")
+                    .join("Form.xml"),
+                form,
+            );
+            (repo, fresh_storage(tmp))
+        };
+
+        // truth: calls = v2, полный пересбор.
+        let tmp_t = TempDir::new().unwrap();
+        let (repo_t, mut st_t) = build(&tmp_t);
+        let fid_t = ensure_file(st_t.conn(), "Documents/Реализация/Ext/ObjectModule.bsl");
+        set_calls(st_t.conn(), fid_t, &[("ПриЗаписи", "ВыполнитьC"), ("ПриЗаписи", "Общее")]);
+        run_index_extras(&repo_t, &mut st_t).unwrap();
+
+        // incr: calls = v1 → полный пересбор → правка .bsl (calls → v2) → инкремент.
+        let tmp_i = TempDir::new().unwrap();
+        let (repo_i, mut st_i) = build(&tmp_i);
+        let fid_i = ensure_file(st_i.conn(), "Documents/Реализация/Ext/ObjectModule.bsl");
+        set_calls(st_i.conn(), fid_i, &[("ПриЗаписи", "ВыполнитьB"), ("ПриЗаписи", "Общее")]);
+        run_index_extras(&repo_i, &mut st_i).unwrap();
+        set_calls(st_i.conn(), fid_i, &[("ПриЗаписи", "ВыполнитьC"), ("ПриЗаписи", "Общее")]);
+        let bsl_path = repo_i
+            .join("Documents")
+            .join("Реализация")
+            .join("Ext")
+            .join("ObjectModule.bsl");
+        run_incremental_extras(&repo_i, &mut st_i, &[bsl_path], &[]).unwrap();
+
+        assert_eq!(
+            snapshot_pcg(st_i.conn()),
+            snapshot_pcg(st_t.conn()),
+            "proc_call_graph после инкремента .bsl != полному пересбору"
+        );
+    }
+
+    #[test]
+    fn incremental_direct_shared_edge_survives() {
+        // Ключевое свойство per-file: ребро A->B дают ДВА файла (F1 и F2).
+        // F1 дополнительно даёт A->C. Правим F1 → у него остаётся только A->B.
+        // Ожидаем: A->B выживает (его держит F2), A->C исчезает (больше никто
+        // не даёт). Результат обязан совпасть с полным пересбором.
+        fn setup(tmp: &TempDir, f1_edges: &[(&str, &str)]) -> (std::path::PathBuf, Storage, i64) {
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let mut st = fresh_storage(tmp);
+            let f1 = ensure_file(st.conn(), "F1.bsl");
+            let f2 = ensure_file(st.conn(), "F2.bsl");
+            set_calls(st.conn(), f1, f1_edges);
+            set_calls(st.conn(), f2, &[("A", "B")]);
+            (repo, st, f1)
+        }
+
+        // truth: конечное состояние сразу (F1={A->B}, F2={A->B}), полный пересбор.
+        let tmp_t = TempDir::new().unwrap();
+        let (repo_t, mut st_t, _) = setup(&tmp_t, &[("A", "B")]);
+        run_index_extras(&repo_t, &mut st_t).unwrap();
+
+        // incr: F1 сперва {A->B, A->C}; полный пересбор; затем F1 -> {A->B}; инкремент F1.
+        let tmp_i = TempDir::new().unwrap();
+        let (repo_i, mut st_i, f1_i) = setup(&tmp_i, &[("A", "B"), ("A", "C")]);
+        run_index_extras(&repo_i, &mut st_i).unwrap();
+        set_calls(st_i.conn(), f1_i, &[("A", "B")]);
+        run_incremental_extras(&repo_i, &mut st_i, &[repo_i.join("F1.bsl")], &[]).unwrap();
+
+        let s_i = snapshot_pcg(st_i.conn());
+        assert_eq!(
+            s_i,
+            snapshot_pcg(st_t.conn()),
+            "after incremental != full rebuild (shared edge)"
+        );
+        assert!(
+            s_i.iter().any(|(c, e, _)| c == "A" && e == "B"),
+            "A->B должно выжить (его даёт F2)"
+        );
+        assert!(
+            !s_i.iter().any(|(c, e, _)| c == "A" && e == "C"),
+            "A->C должно исчезнуть (больше никто не даёт)"
+        );
     }
 }

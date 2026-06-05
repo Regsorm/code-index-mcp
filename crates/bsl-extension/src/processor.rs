@@ -121,6 +121,20 @@ impl LanguageProcessor for BslLanguageProcessor {
     ) -> anyhow::Result<()> {
         crate::index_extras::run_index_extras(repo_root, storage)
     }
+
+    /// Инкрементальное обновление extras для файлов одного watcher-батча.
+    /// Slice-rebuild затронутых слоёв графа вызовов + per-object/per-file
+    /// апдейт XML-слоёв. Реализация в
+    /// [`crate::index_extras::run_incremental_extras`].
+    fn index_extras_for_files(
+        &self,
+        repo_root: &std::path::Path,
+        storage: &mut Storage,
+        changed: &[std::path::PathBuf],
+        deleted: &[std::path::PathBuf],
+    ) -> anyhow::Result<()> {
+        crate::index_extras::run_incremental_extras(repo_root, storage, changed, deleted)
+    }
 }
 
 #[cfg(test)]
