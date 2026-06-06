@@ -52,6 +52,34 @@ fn build_file_matcher(patterns: &[String]) -> GlobSet {
     builder.build().unwrap_or_else(|_| GlobSet::empty())
 }
 
+/// Классифицировать notify-событие в `FileEvent`.
+///
+/// Каталоги игнорируются (`None` — индексируем только файлы). `Create`/`Modify`
+/// на пути, которого уже нет на диске, трактуются как `Deleted`: при
+/// переименовании файла в новое имя notify присылает на старое имя
+/// `Modify(Name(RenameMode::From))` уже после того, как путь исчез. Без этого
+/// строка старого имени осталась бы фантомом в индексе до полного reindex.
+fn classify_event(kind: &notify::EventKind, path: &Path) -> Option<FileEvent> {
+    // Каталоги не индексируем (события создания/переименования папок).
+    if path.is_dir() {
+        return None;
+    }
+    match kind {
+        notify::EventKind::Create(_) if path.is_file() => {
+            Some(FileEvent::Created(path.to_path_buf()))
+        }
+        notify::EventKind::Modify(_) if path.is_file() => {
+            Some(FileEvent::Modified(path.to_path_buf()))
+        }
+        // Путь исчез (rename старого имени / быстрое удаление) — это удаление.
+        notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
+            Some(FileEvent::Deleted(path.to_path_buf()))
+        }
+        notify::EventKind::Remove(_) => Some(FileEvent::Deleted(path.to_path_buf())),
+        _ => None,
+    }
+}
+
 /// Создать watcher и вернуть receiver для событий файловой системы.
 ///
 /// Watcher работает в фоновом потоке notify. Возвращает кортеж
@@ -90,16 +118,9 @@ pub fn create_watcher(
                         }
                     }
 
-                    // Для событий не-удаления — проверяем, что это файл, а не директория
-                    if !matches!(event.kind, notify::EventKind::Remove(_)) && !path.is_file() {
-                        continue;
-                    }
-
-                    let file_event = match event.kind {
-                        notify::EventKind::Create(_) => FileEvent::Created(path.clone()),
-                        notify::EventKind::Modify(_) => FileEvent::Modified(path.clone()),
-                        notify::EventKind::Remove(_) => FileEvent::Deleted(path.clone()),
-                        _ => continue,
+                    let file_event = match classify_event(&event.kind, path) {
+                        Some(ev) => ev,
+                        None => continue,
                     };
 
                     let _ = tx.send(file_event);
@@ -234,6 +255,53 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_classify_event_rename_from_becomes_delete() {
+        use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+        use notify::EventKind;
+
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("a.bsl");
+        fs::write(&file, "x").unwrap();
+        let missing = tmp.path().join("gone.bsl");
+        let dir = tmp.path().join("sub");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Существующий файл: Create → Created, Modify → Modified.
+        assert!(matches!(
+            classify_event(&EventKind::Create(CreateKind::File), &file),
+            Some(FileEvent::Created(_))
+        ));
+        assert!(matches!(
+            classify_event(&EventKind::Modify(ModifyKind::Any), &file),
+            Some(FileEvent::Modified(_))
+        ));
+
+        // Ключевой случай: rename старого имени приходит как Modify(Name(From))
+        // на уже исчезнувшем пути → должно стать Deleted (иначе фантом).
+        assert!(matches!(
+            classify_event(
+                &EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                &missing
+            ),
+            Some(FileEvent::Deleted(_))
+        ));
+        // Create на исчезнувшем пути тоже трактуется как удаление.
+        assert!(matches!(
+            classify_event(&EventKind::Create(CreateKind::Any), &missing),
+            Some(FileEvent::Deleted(_))
+        ));
+
+        // Явное удаление → Deleted.
+        assert!(matches!(
+            classify_event(&EventKind::Remove(RemoveKind::File), &missing),
+            Some(FileEvent::Deleted(_))
+        ));
+
+        // Каталог игнорируется.
+        assert!(classify_event(&EventKind::Create(CreateKind::Folder), &dir).is_none());
+    }
 
     #[test]
     fn test_watcher_detects_file_creation() {

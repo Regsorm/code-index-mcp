@@ -5,6 +5,14 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.19.2] — 2026-06-06
+
+**Renaming a file to a new name no longer leaves an orphaned index row under the old name.**
+
+### Fixed
+
+- **The watcher now correctly removes the old name on a file rename.** Previously the `notify` event `Modify(Name(RenameMode::From))` — delivered for the old name's path that no longer exists — was either dropped by the `!path.is_file()` check or turned into `Modified` and silently swallowed by `NotFound` during hashing, leaving the old-name row as a phantom in the index until the next full reindex (showing up in `stat_file`/`list_files`/the graph with stale data). The classification logic was extracted into `classify_event`: directories are ignored, and `Create`/`Modify` on a path missing from disk are treated as `Deleted`. Covered by the test `test_classify_event_rename_from_becomes_delete`. (Atomic-save `tmp`→rename over an existing file worked before and still works — the target path stays a file.)
+
 ## [0.19.1] — 2026-06-06
 
 **The daemon's incremental path now writes `mtime`/`file_size` for new and changed files — previously the watcher left these fields NULL.**
