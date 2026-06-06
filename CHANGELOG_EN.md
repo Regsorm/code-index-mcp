@@ -5,6 +5,14 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.19.1] — 2026-06-06
+
+**The daemon's incremental path now writes `mtime`/`file_size` for new and changed files — previously the watcher left these fields NULL.**
+
+### Fixed
+
+- **`Storage::upsert_file` now persists `mtime`/`file_size`** (added to `INSERT` and `ON CONFLICT DO UPDATE` with `COALESCE` so real values are never clobbered by `NULL`). With a live daemon, creating/changing a file used to leave the `files` row with `mtime = NULL` and `file_size = NULL`: the values did reach the `FileRecord` (both from full indexing and from the watcher via `std::fs::metadata`), but `upsert_file` dropped them. A real `mtime` was written only by the separate `update_file_metadata`, which on the write path runs only for unchanged-hash files — so freshly created/just-changed files (the "hottest" ones) kept an empty `mtime`. This hurt `stat_file`/`list_files`, the cheap freshness check (`code-index-guard`), and the phase-1b "fast skip by mtime+size" on subsequent full reindexes. Both paths now write `mtime`/`file_size` in one place. Covered by the regression test `test_upsert_file_persists_mtime_and_size`.
+
 ## [0.19.0] — 2026-06-05
 
 **Online extras-layer updates during live editing: after a file edit the call graph, data links and object structure refresh incrementally right in the daemon's watcher loop — surgically (cost scales with the edited file, not the graph), no restart, no full XML walk.**

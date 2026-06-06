@@ -200,14 +200,16 @@ impl Storage {
     /// Вставить или обновить запись файла; возвращает id строки
     pub fn upsert_file(&self, record: &FileRecord) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO files (path, content_hash, ast_hash, language, lines_total, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO files (path, content_hash, ast_hash, language, lines_total, indexed_at, mtime, file_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(path) DO UPDATE SET
                  content_hash = excluded.content_hash,
                  ast_hash     = excluded.ast_hash,
                  language     = excluded.language,
                  lines_total  = excluded.lines_total,
-                 indexed_at   = excluded.indexed_at",
+                 indexed_at   = excluded.indexed_at,
+                 mtime        = COALESCE(excluded.mtime, files.mtime),
+                 file_size    = COALESCE(excluded.file_size, files.file_size)",
             params![
                 record.path,
                 record.content_hash,
@@ -215,6 +217,8 @@ impl Storage {
                 record.language,
                 record.lines_total as i64,
                 record.indexed_at,
+                record.mtime,
+                record.file_size,
             ],
         )
         .context("upsert_file: ошибка выполнения запроса")?;
@@ -2483,7 +2487,8 @@ mod tests {
     fn test_stat_file_meta_existing_text() {
         let storage = Storage::open_in_memory().unwrap();
         let id = storage.upsert_file(&make_file_full("/cfg.yaml", "yaml", 50)).unwrap();
-        // upsert_file пока не пишет mtime/file_size — это делает отдельный update_file_metadata.
+        // upsert_file пишет mtime/file_size из FileRecord; здесь дополнительно
+        // фиксируем точные значения через update_file_metadata (те же).
         storage.update_file_metadata("/cfg.yaml", 1714305600, 2500).unwrap();
         // Помечаем как text-файл (есть запись в text_files).
         storage.insert_text_file(&TextFileRecord {
@@ -2500,6 +2505,35 @@ mod tests {
         assert_eq!(r.mtime, Some(1714305600));
         assert_eq!(r.size, Some(2500));
         assert_eq!(r.category.as_deref(), Some("text"));
+    }
+
+    /// Регрессия: upsert_file сам пишет mtime/file_size из FileRecord
+    /// (без отдельного update_file_metadata). Защищает инкрементальный путь
+    /// watcher'а от записи строки с mtime=NULL/file_size=NULL.
+    #[test]
+    fn test_upsert_file_persists_mtime_and_size() {
+        let storage = Storage::open_in_memory().unwrap();
+        // make_file_full: mtime=Some(1714305600), file_size=Some(50*50)
+        storage.upsert_file(&make_file_full("/new.bsl", "bsl", 50)).unwrap();
+
+        let rec = storage
+            .get_file_by_path("/new.bsl")
+            .unwrap()
+            .expect("файл должен быть в индексе");
+        assert_eq!(rec.mtime, Some(1714305600), "mtime должен записаться через upsert_file");
+        assert_eq!(rec.file_size, Some(2500), "file_size должен записаться через upsert_file");
+
+        // Повторный upsert с None в mtime/file_size не должен затирать уже записанные
+        // значения (COALESCE на пути ON CONFLICT DO UPDATE).
+        let mut updated = make_file_full("/new.bsl", "bsl", 60);
+        updated.mtime = None;
+        updated.file_size = None;
+        storage.upsert_file(&updated).unwrap();
+
+        let rec2 = storage.get_file_by_path("/new.bsl").unwrap().unwrap();
+        assert_eq!(rec2.mtime, Some(1714305600), "None не должен затирать существующий mtime");
+        assert_eq!(rec2.file_size, Some(2500), "None не должен затирать существующий file_size");
+        assert_eq!(rec2.lines_total, 60, "прочие поля при этом обновляются");
     }
 
     #[test]
