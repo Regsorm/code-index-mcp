@@ -640,11 +640,14 @@ All data tools return a unified JSON envelope:
 ```json
 {
   "result": <previous plain payload>,
-  "_meta": { "dependent_files": ["src/X.bsl", "src/Y.bsl"] }
+  "_meta": {
+    "dependent_files": ["src/X.bsl", "src/Y.bsl"],
+    "file_mtimes": { "src/X.bsl": 1717689600, "src/Y.bsl": 1717689600 }
+  }
 }
 ```
 
-`_meta.dependent_files` lists files the response depends on. Consumed by the caching proxy (`mcp-cache-ci` 0.2.0+) for point invalidation when a file changes on disk. Clients that don't use this field just read `result` as before.
+`_meta.dependent_files` lists files the response depends on; `_meta.file_mtimes` (0.20.0+) maps each of them to its indexed mtime (unix seconds). Both fields are consumed by the companion caching proxy **`mcp-cache-ci`** (`dependent_files` since its 0.2.0; `file_mtimes` with 0.4.0+): for point invalidation when a file changes on disk, and for write-triggered lazy revalidation — on an FS event the daemon also sends an early `POST /mark-dirty {repo, files:[{path, mtime}]}`, so the proxy keeps forwarding to source until the index catches up with disk (`index_mtime >= observed`) before caching again. Clients that don't use these fields just read `result` as before.
 
 Diagnostic tools (`health`, `get_stats`, `stat_file`) are not wrapped — their format is unchanged.
 

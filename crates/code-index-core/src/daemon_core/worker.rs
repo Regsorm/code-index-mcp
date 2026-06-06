@@ -327,6 +327,24 @@ pub fn run_worker(
             continue;
         }
 
+        // Ранний mark-dirty (#1471): сообщаем cache-ci об изменённых путях с
+        // observed-mtime ДО переразбора/commit. Это даёт прокси сразу пометить
+        // зависимые записи «грязными» и не отдавать их как HIT, пока индекс не
+        // догнал диск. В дополнение к invalidate после commit (ниже); снимается
+        // сверкой mtime на стороне cache-ci. Best-effort.
+        if let Some(cc) = &cache_client {
+            if !cc.is_empty() {
+                let dirty = collect_dirty_paths(&path, &batch);
+                if !dirty.is_empty() {
+                    let cc_clone = cc.clone();
+                    let repo = entry.effective_alias();
+                    tokio_block_on(async move {
+                        cc_clone.mark_dirty_files(&repo, &dirty).await;
+                    });
+                }
+            }
+        }
+
         tokio_block_on(async {
             state.set_status(&path, PathStatus::ReindexingBatch).await;
             state
@@ -468,6 +486,50 @@ fn collect_invalidate_paths(root: &PathBuf, batch: &[FileEvent]) -> Vec<String> 
         }
     }
     set.into_iter().collect()
+}
+
+/// Собрать (rel_path, observed_mtime) для Modified/Created событий батча — вход
+/// для раннего `mark-dirty` (write-triggered ленивая ревалидация, #1471).
+///
+/// Deleted пропускаем: mtime у удалённого файла нет, его кэш-записи закрывает
+/// `invalidate` после commit. `mtime` читается прямым `stat` (worker co-located
+/// с файлами) — unix-секунды, та же семантика, что у `files.mtime` в индексе.
+/// Дедуп по пути; при нескольких событиях по одному файлу берём максимум mtime.
+/// Forward-slash формат совпадает с rel_path в SQLite и с `dependent_files`.
+fn collect_dirty_paths(root: &PathBuf, batch: &[FileEvent]) -> Vec<(String, i64)> {
+    use std::collections::HashMap;
+    let mut map: HashMap<String, i64> = HashMap::new();
+    for event in batch {
+        let abs = match event {
+            FileEvent::Modified(p) | FileEvent::Created(p) => p,
+            FileEvent::Deleted(_) => continue,
+        };
+        let mtime = match std::fs::metadata(abs)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+        {
+            Some(m) => m,
+            None => continue, // файл уже исчез (atomic save .tmp→rename) — пропустим
+        };
+        let rel = abs
+            .strip_prefix(root)
+            .unwrap_or(abs)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel.is_empty() {
+            continue;
+        }
+        map.entry(rel)
+            .and_modify(|e| {
+                if mtime > *e {
+                    *e = mtime;
+                }
+            })
+            .or_insert(mtime);
+    }
+    map.into_iter().collect()
 }
 
 fn tokio_block_on<F: std::future::Future<Output = ()>>(fut: F) {

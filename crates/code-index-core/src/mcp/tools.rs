@@ -106,7 +106,16 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 ///
 /// Дубликаты в `dependent_files` дедуплицируются (HashSet → Vec, без гарантии
 /// порядка — cache-ci порядок не использует).
+///
+/// Дополнительно в `_meta` кладётся `file_mtimes: {<rel_path>: <i64>}` — индексный
+/// mtime (unix-секунды) каждого зависимого файла. Это вход для write-triggered
+/// ленивой ревалидации в `mcp-cache-ci`: прокси сверяет его с observed-mtime из
+/// `mark-dirty` и кладёт ответ в кэш только когда индекс реально догнал диск
+/// (`index_mtime >= observed_mtime`). См. карточку #1471. Файлы, для которых mtime
+/// в индексе отсутствует, просто не попадают в карту (cache-ci трактует это как
+/// «не могу сверить» → продолжает форвардить, пока путь dirty).
 pub(crate) fn wrap_with_meta<T: serde::Serialize>(
+    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
     result: &T,
     dependent_files: Vec<String>,
 ) -> String {
@@ -117,13 +126,19 @@ pub(crate) fn wrap_with_meta<T: serde::Serialize>(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
+    let mut file_mtimes = serde_json::Map::with_capacity(deps.len());
+    for p in &deps {
+        if let Some(m) = storage.mtime_for_path(p) {
+            file_mtimes.insert(p.clone(), serde_json::json!(m));
+        }
+    }
     let result_value = match serde_json::to_value(result) {
         Ok(v) => v,
         Err(e) => return format!("{{\"error\": \"Сериализация result: {}\"}}", e),
     };
     let wrapped = serde_json::json!({
         "result": result_value,
-        "_meta": { "dependent_files": deps },
+        "_meta": { "dependent_files": deps, "file_mtimes": file_mtimes },
     });
     serde_json::to_string(&wrapped)
         .unwrap_or_else(|e| format!("{{\"error\": \"Сериализация wrap: {}\"}}", e))
@@ -207,7 +222,7 @@ pub async fn search_function(
                 r.truncate(want);
             }
             let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
-            wrap_with_meta(&r, deps)
+            wrap_with_meta(&storage, &r, deps)
         }
         Err(e) => format!("{{\"error\": \"search_function: {}\"}}", e),
     }
@@ -239,7 +254,7 @@ pub async fn search_class(
                 r.truncate(want);
             }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            wrap_with_meta(&r, deps)
+            wrap_with_meta(&storage, &r, deps)
         }
         Err(e) => format!("{{\"error\": \"search_class: {}\"}}", e),
     }
@@ -262,7 +277,7 @@ pub async fn get_function(
                 r.retain(|fr| matches_with(&matcher, &lookup_path(&storage, fr.file_id)));
             }
             let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
-            wrap_with_meta(&r, deps)
+            wrap_with_meta(&storage, &r, deps)
         }
         Err(e) => format!("{{\"error\": \"get_function: {}\"}}", e),
     }
@@ -285,7 +300,7 @@ pub async fn get_class(
                 r.retain(|cr| matches_with(&matcher, &lookup_path(&storage, cr.file_id)));
             }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            wrap_with_meta(&r, deps)
+            wrap_with_meta(&storage, &r, deps)
         }
         Err(e) => format!("{{\"error\": \"get_class: {}\"}}", e),
     }
@@ -301,7 +316,7 @@ pub async fn get_callers(
     match storage.get_callers(&function_name, language.as_deref()) {
         Ok(r) => {
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            wrap_with_meta(&r, deps)
+            wrap_with_meta(&storage, &r, deps)
         }
         Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
     }
@@ -317,7 +332,7 @@ pub async fn get_callees(
     match storage.get_callees(&function_name, language.as_deref()) {
         Ok(r) => {
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            wrap_with_meta(&r, deps)
+            wrap_with_meta(&storage, &r, deps)
         }
         Err(e) => format!("{{\"error\": \"get_callees: {}\"}}", e),
     }
@@ -351,7 +366,7 @@ pub async fn find_symbol(
             deps.extend(collect_paths_via(&storage, &r.classes, |cr| cr.file_id));
             deps.extend(collect_paths_via(&storage, &r.variables, |vr| vr.file_id));
             deps.extend(collect_paths_via(&storage, &r.imports, |ir| ir.file_id));
-            wrap_with_meta(&r, deps)
+            wrap_with_meta(&storage, &r, deps)
         }
         Err(e) => format!("{{\"error\": \"find_symbol: {}\"}}", e),
     }
@@ -369,7 +384,7 @@ pub async fn get_imports(
         return match storage.get_imports_by_file(fid) {
             Ok(r) => {
                 let deps = collect_paths_via(&storage, &r, |ir| ir.file_id);
-                wrap_with_meta(&r, deps)
+                wrap_with_meta(&storage, &r, deps)
             }
             Err(e) => format!("{{\"error\": \"get_imports_by_file: {}\"}}", e),
         };
@@ -378,7 +393,7 @@ pub async fn get_imports(
         return match storage.get_imports_by_module(m, language.as_deref()) {
             Ok(r) => {
                 let deps = collect_paths_via(&storage, &r, |ir| ir.file_id);
-                wrap_with_meta(&r, deps)
+                wrap_with_meta(&storage, &r, deps)
             }
             Err(e) => format!("{{\"error\": \"get_imports_by_module: {}\"}}", e),
         };
@@ -395,7 +410,7 @@ pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
             // запросил из таблицы files. Если результат пустой — entry всё равно
             // помечается как зависящий от этого path (туда придёт invalidate при
             // изменении).
-            wrap_with_meta(&s, vec![path.clone()])
+            wrap_with_meta(&storage, &s, vec![path.clone()])
         }
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден\"}}", path),
         Err(e) => format!("{{\"error\": \"get_file_summary: {}\"}}", e),
@@ -556,7 +571,7 @@ pub async fn search_text(
                 .into_iter()
                 .map(|(path, snippet)| serde_json::json!({ "path": path, "snippet": snippet }))
                 .collect();
-            wrap_with_meta(&items, deps)
+            wrap_with_meta(&storage, &items, deps)
         }
         Err(e) => format!("{{\"error\": \"search_text: {}\"}}", e),
     }
@@ -633,7 +648,7 @@ pub async fn grep_body(
                 "limit": want,
                 "truncated": truncated,
             });
-            wrap_with_meta(&payload, deps)
+            wrap_with_meta(&storage, &payload, deps)
         }
         Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
     }
@@ -671,7 +686,7 @@ pub async fn list_files(
     ) {
         Ok(r) => {
             let deps: Vec<String> = r.iter().map(|lf| lf.path.clone()).collect();
-            wrap_with_meta(&r, deps)
+            wrap_with_meta(&storage, &r, deps)
         }
         Err(e) => format!("{{\"error\": \"list_files: {}\"}}", e),
     }
@@ -697,7 +712,7 @@ pub async fn read_file(
         // file_size в ответе всё равно показывается, оператор может сравнить.
         None,
     ) {
-        Ok(Some(r)) => wrap_with_meta(&r, vec![path.clone()]),
+        Ok(Some(r)) => wrap_with_meta(&storage, &r, vec![path.clone()]),
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден в индексе\"}}", path),
         Err(e) => format!("{{\"error\": \"read_file: {}\"}}", e),
     }
@@ -763,7 +778,7 @@ pub async fn grep_text(
                 "limit": want,
                 "truncated": truncated,
             });
-            wrap_with_meta(&payload, deps)
+            wrap_with_meta(&storage, &payload, deps)
         }
         Err(e) => format!("{{\"error\": \"grep_text: {}\"}}", e),
     }
@@ -825,7 +840,7 @@ pub async fn grep_code(
                 "limit": want,
                 "truncated": truncated,
             });
-            wrap_with_meta(&payload, deps)
+            wrap_with_meta(&storage, &payload, deps)
         }
         Err(e) => format!("{{\"error\": \"grep_code: {}\"}}", e),
     }

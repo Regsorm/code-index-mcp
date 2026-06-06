@@ -5,6 +5,21 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.20.0] — 2026-06-06
+
+**`_meta.file_mtimes` in search-tool responses + an early daemon signal `POST /mark-dirty` — for write-triggered lazy cache revalidation in `mcp-cache-ci` (#1471).**
+
+### Added
+
+- **`_meta.file_mtimes` in MCP tool responses.** Alongside the existing `_meta.dependent_files`, serve now returns a `{<rel_path>: <index_mtime>}` map (unix seconds from the `files.mtime` column) for each dependent file. This is the input for write-triggered lazy revalidation in `mcp-cache-ci`: the proxy compares the index mtime against the observed mtime from `mark-dirty` and caches a response only once the index has caught up with disk (`index_mtime >= observed`). Implemented in `wrap_with_meta` (batched via the new `Storage::mtime_for_path`), applied to all cacheable search tools (`search_function`/`get_function`/`grep_body`/`grep_code`/`read_file`/`get_file_summary`/...). `stat_file` is unaffected (non-cacheable, carries no `_meta`).
+- **The daemon sends `POST /mark-dirty` on FS events.** At the start of batch processing (BEFORE reparse/commit), in addition to `POST /invalidate` after commit, the daemon sends cache-ci `{repo, files:[{path, mtime}]}` with the observed mtimes of changed files (`PathEntry::effective_alias()` as `repo`). The proxy marks dependent entries dirty immediately, shrinking the window in which the cache could serve stale data; the flag is cleared by the mtime check on the cache-ci side. Best-effort: errors and 404s (a cache-ci without support) are logged and never block the daemon. New `CacheClient::mark_dirty_files`, helper `collect_dirty_paths` in `worker.rs`.
+
+### Compatibility
+
+- **Additive, not breaking.** `_meta.file_mtimes` is a new field next to `dependent_files`; old consumers ignore it. `mark-dirty` is a separate channel in addition to `invalidate`. Full effect requires `mcp-cache-ci` ≥ 0.4.0; with an older cache-ci `mark-dirty` returns 404 (swallowed) and `file_mtimes` is ignored.
+- BSL tools (`bsl-extension`) do **not** yet emit `file_mtimes` (follow-up): for dirty files depended on only by BSL responses, cache-ci keeps forwarding while the path is dirty (safe degradation).
+- Workspace version 0.19.2 → **0.20.0** (minor — new functionality).
+
 ## [0.19.2] — 2026-06-06
 
 **Renaming a file to a new name no longer leaves an orphaned index row under the old name.**

@@ -247,6 +247,22 @@ impl Storage {
         Ok(r)
     }
 
+    /// Индексный mtime файла (unix-секунды) по относительному пути из таблицы
+    /// `files`. `None` если файла нет в индексе либо mtime не записан.
+    ///
+    /// Используется `mcp::tools::wrap_with_meta` для поля `_meta.file_mtimes` —
+    /// write-triggered ленивая ревалидация в `mcp-cache-ci` сверяет этот mtime
+    /// с observed-mtime из `mark-dirty` (см. карточку #1471).
+    pub fn mtime_for_path(&self, path: &str) -> Option<i64> {
+        let r: rusqlite::Result<Option<i64>> = self.conn.query_row(
+            "SELECT mtime FROM files WHERE path = ?1",
+            params![path],
+            |row| row.get::<_, Option<i64>>(0),
+        );
+        // Нет строки → Err(QueryReturnedNoRows) → None; строка с NULL → Ok(None).
+        r.ok().flatten()
+    }
+
     /// Получить запись файла по пути
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileRecord>> {
         let mut stmt = self.conn.prepare(

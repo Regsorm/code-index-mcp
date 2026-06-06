@@ -3,6 +3,21 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.20.0] — 2026-06-06
+
+**`_meta.file_mtimes` в ответах поисковых tools + ранний сигнал демона `POST /mark-dirty` — для write-triggered ленивой ревалидации кэша `mcp-cache-ci` (#1471).**
+
+### Добавлено
+
+- **`_meta.file_mtimes` в ответах MCP-tools.** Рядом с существующим `_meta.dependent_files` serve теперь отдаёт карту `{<rel_path>: <index_mtime>}` (unix-секунды из колонки `files.mtime`) по каждому зависимому файлу. Это вход для write-triggered ленивой ревалидации в `mcp-cache-ci`: прокси сверяет индексный mtime с observed-mtime из `mark-dirty` и кэширует ответ только когда индекс догнал диск (`index_mtime >= observed`). Реализовано в `wrap_with_meta` (батч через новый `Storage::mtime_for_path`), применяется ко всем cacheable поисковым tools (`search_function`/`get_function`/`grep_body`/`grep_code`/`read_file`/`get_file_summary`/...). `stat_file` не затронут (non-cacheable, `_meta` не несёт).
+- **Демон шлёт `POST /mark-dirty` при FS-событии.** В начале обработки батча (ДО переразбора/commit), в дополнение к `POST /invalidate` после commit, демон отправляет cache-ci `{repo, files:[{path, mtime}]}` с observed-mtime изменённых файлов (`PathEntry::effective_alias()` как `repo`). Прокси сразу помечает зависимые записи грязными, сужая окно, в котором кэш мог бы отдать старьё; флаг снимается сверкой mtime на стороне cache-ci. Best-effort: ошибки и 404 (cache-ci без поддержки) логируются, демон не блокируется. Новый `CacheClient::mark_dirty_files`, helper `collect_dirty_paths` в `worker.rs`.
+
+### Совместимость
+
+- **Аддитивно, не breaking.** `_meta.file_mtimes` — новое поле рядом с `dependent_files`, старые потребители его игнорируют. `mark-dirty` — отдельный канал в дополнение к `invalidate`. Полный эффект — с `mcp-cache-ci` ≥ 0.4.0; со старым cache-ci `mark-dirty` вернёт 404 (проглатывается), `file_mtimes` игнорируется.
+- BSL-tools (`bsl-extension`) пока **не** добавляют `file_mtimes` (follow-up): для dirty-файлов, от которых зависят только BSL-ответы, cache-ci продолжит форвардить, пока путь грязный (безопасная деградация).
+- Workspace version 0.19.2 → **0.20.0** (minor — новая функциональность).
+
 ## [0.19.2] — 2026-06-06
 
 **Переименование файла в новое имя больше не оставляет в индексе осиротевшую строку под старым именем.**

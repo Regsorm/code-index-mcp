@@ -113,6 +113,65 @@ impl CacheClient {
         }
         ok_count
     }
+
+    /// Послать ранний сигнal `POST /mark-dirty {repo, files:[{path, mtime}]}`
+    /// всем target'ам параллельно (write-triggered ленивая ревалидация, #1471).
+    ///
+    /// Вызывается worker'ом в начале обработки батча — ДО переразбора и commit,
+    /// в дополнение к [`invalidate_files`] после commit. `mtime` — observed
+    /// (наблюдённый на диске на момент события) unix-секунды; cache-ci хранит
+    /// max observed на путь и сверяет с индексным mtime из ответа serve, чтобы
+    /// не закэшировать старьё в окне переразбора.
+    ///
+    /// `repo` — `effective_alias()` пути (тот же scope, что клиент шлёт в `repo`
+    /// аргументе tool-call). Best-effort: ошибки логируются, не пробрасываются.
+    pub async fn mark_dirty_files(&self, repo: &str, files: &[(String, i64)]) -> usize {
+        if files.is_empty() || self.targets.is_empty() {
+            return 0;
+        }
+        let files_json: Vec<serde_json::Value> = files
+            .iter()
+            .map(|(path, mtime)| json!({ "path": path, "mtime": mtime }))
+            .collect();
+        let payload = json!({ "repo": repo, "files": files_json });
+        let mut joins = Vec::with_capacity(self.targets.len());
+        for target in self.targets.iter() {
+            let url = format!("{}/mark-dirty", target.url);
+            let body = payload.clone();
+            let client = self.client.clone();
+            joins.push(tokio::spawn(async move {
+                match client.post(&url).json(&body).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            true
+                        } else {
+                            // 404 ожидаем на cache-ci старее 0.4.0 (нет роута) —
+                            // best-effort, invalidate после commit подстрахует.
+                            let body_text =
+                                resp.text().await.unwrap_or_else(|_| "<no body>".into());
+                            eprintln!(
+                                "[cache_client] {} non-2xx ({}): {}",
+                                url, status, body_text
+                            );
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[cache_client] {} send error: {}", url, e);
+                        false
+                    }
+                }
+            }));
+        }
+        let mut ok_count = 0usize;
+        for j in joins {
+            if let Ok(true) = j.await {
+                ok_count += 1;
+            }
+        }
+        ok_count
+    }
 }
 
 #[cfg(test)]
