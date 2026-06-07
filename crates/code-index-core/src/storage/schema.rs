@@ -63,27 +63,10 @@ AFTER UPDATE ON classes BEGIN
     VALUES (new.id, new.name, new.docstring, new.body);
 END;
 
--- Триггеры синхронизации FTS: text_files
-
-CREATE TRIGGER IF NOT EXISTS fts_text_files_insert
-AFTER INSERT ON text_files BEGIN
-    INSERT INTO fts_text_files(rowid, content)
-    VALUES (new.id, new.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS fts_text_files_delete
-AFTER DELETE ON text_files BEGIN
-    INSERT INTO fts_text_files(fts_text_files, rowid, content)
-    VALUES ('delete', old.id, old.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS fts_text_files_update
-AFTER UPDATE ON text_files BEGIN
-    INSERT INTO fts_text_files(fts_text_files, rowid, content)
-    VALUES ('delete', old.id, old.content);
-    INSERT INTO fts_text_files(rowid, content)
-    VALUES (new.id, new.content);
-END;
+-- FTS text_files: триггеров НЕТ. Указатель fts_text_files стал contentless и
+-- наполняется напрямую из Rust (storage::*), т.к. на contentless авто-синк
+-- триггерами из таблицы-источника невозможен (delete требует старый текст —
+-- он разжимается в Rust из text_contents).
 ";
 
 /// Полная SQL-схема базы данных
@@ -157,11 +140,10 @@ CREATE TABLE IF NOT EXISTS variables (
     line    INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS text_files (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    content TEXT    NOT NULL DEFAULT ''
-);
+-- Сырой текст text-файлов (yaml/md/json/xml/sh/...) хранится СЖАТО (zstd) в
+-- таблице `text_contents` (создаётся в migrate_v5 по образцу `file_contents`
+-- для кода). Отдельной таблицы `text_files` с несжатым TEXT больше нет —
+-- содержимое лежит в `text_contents.content_blob` и разжимается в Rust.
 
 -- FTS5 виртуальные таблицы для полнотекстового поиска
 
@@ -182,10 +164,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_classes USING fts5(
     content_rowid='id'
 );
 
+-- contentless (content=''): хранит только индекс слов, без копии текста.
+-- rowid = files.id; наполняется напрямую из Rust при записи text_contents
+-- (на contentless нет ни авто-триггеров, ни команды 'rebuild' из источника).
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_text_files USING fts5(
     content,
-    content='text_files',
-    content_rowid='id'
+    content=''
 );
 ";
 
@@ -206,6 +190,7 @@ pub fn initialize_tables_only(conn: &rusqlite::Connection) -> rusqlite::Result<(
     migrate_v2(conn)?;
     migrate_v3(conn)?;
     migrate_v4(conn)?;
+    migrate_v5(conn)?;
     Ok(())
 }
 
@@ -232,6 +217,7 @@ pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     migrate_v2(conn)?;
     migrate_v3(conn)?;
     migrate_v4(conn)?;
+    migrate_v5(conn)?;
     // Создаём триггеры
     conn.execute_batch(TRIGGERS_SQL)?;
     // Создаём индексы
@@ -300,6 +286,87 @@ pub fn migrate_v4(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Миграция v5: text-контент → zstd (`text_contents`) + `fts_text_files` → contentless.
+///
+/// Было: `text_files(id, file_id, content TEXT)` (сырой текст) + `fts_text_files`
+/// в режиме external-content (`content='text_files'`). Стало:
+/// `text_contents(file_id PK, content_blob BLOB zstd, oversize)` (структурно —
+/// копия `file_contents` для кода) + `fts_text_files` contentless (`content=''`),
+/// наполняемый напрямую из Rust.
+///
+/// Почему отдельная миграция, а не «просто перезалить»: режим хранения у FTS5
+/// фиксируется при создании и командой не меняется — указатель пересоздаём.
+/// Перенос делается НА МЕСТЕ (читаем `text_files`, жмём в `text_contents`,
+/// кормим новый указатель) — без полной переиндексации (разбор кода/XML не
+/// трогается). Идемпотентно: если `text_contents` уже есть и `fts_text_files`
+/// уже contentless — выходим сразу.
+pub fn migrate_v5(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    // Сигнал завершения миграции — ОТСУТСТВИЕ таблицы text_files. Это надёжно
+    // при обрыве: если перенос оборвался посреди цикла, text_files ещё на месте
+    // → на следующем старте перемигрируем ПОЛНОСТЬЮ заново (идемпотентно).
+    let has_old_text_files = conn.prepare("SELECT 1 FROM text_files LIMIT 0").is_ok();
+    if !has_old_text_files {
+        // text_files нет → миграция завершена ЛИБО это свежая БД. В обоих
+        // случаях лишь гарантируем существование text_contents (на свежей БД
+        // SQL_SCHEMA её не создаёт — это делает миграция; fts_text_files там
+        // уже contentless из SQL_SCHEMA).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS text_contents (
+                file_id      INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+                content_blob BLOB,
+                oversize     INTEGER NOT NULL DEFAULT 0
+             );",
+        )?;
+        return Ok(());
+    }
+
+    // text_files на месте → (пере)мигрируем ПОЛНОСТЬЮ. Идемпотентно даже после
+    // обрыва: text_contents наполняется через INSERT OR REPLACE, указатель
+    // пересоздаётся с нуля каждый прогон (нет дублей), text_files дропается
+    // последним шагом.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS text_contents (
+            file_id      INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            content_blob BLOB,
+            oversize     INTEGER NOT NULL DEFAULT 0
+         );",
+    )?;
+    // Снимаем старые триггеры и пересоздаём указатель как contentless (с нуля).
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS fts_text_files_insert;
+         DROP TRIGGER IF EXISTS fts_text_files_delete;
+         DROP TRIGGER IF EXISTS fts_text_files_update;
+         DROP TABLE IF EXISTS fts_text_files;
+         CREATE VIRTUAL TABLE fts_text_files USING fts5(content, content='');",
+    )?;
+    // Перенос: старый сырой текст → zstd в text_contents + наполняем указатель.
+    const ZSTD_LEVEL: i32 = 3; // как у file_contents
+    let rows: Vec<(i64, String)> = {
+        let mut sel = conn.prepare("SELECT file_id, content FROM text_files")?;
+        let mapped = sel
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        mapped
+    };
+    {
+        let mut ins_tc = conn.prepare(
+            "INSERT OR REPLACE INTO text_contents (file_id, content_blob, oversize) \
+             VALUES (?1, ?2, 0)",
+        )?;
+        let mut ins_fts =
+            conn.prepare("INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)")?;
+        for (file_id, content) in rows {
+            let blob = zstd::encode_all(content.as_bytes(), ZSTD_LEVEL)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            ins_tc.execute(rusqlite::params![file_id, blob])?;
+            ins_fts.execute(rusqlite::params![file_id, content])?;
+        }
+    }
+    conn.execute_batch("DROP TABLE text_files;")?;
+
+    Ok(())
+}
+
 /// Удалить все обычные индексы и FTS-триггеры (перед bulk-load).
 ///
 /// Вызывается перед массовой загрузкой данных, чтобы ускорить INSERT:
@@ -365,10 +432,12 @@ pub fn rebuild_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Re
     conn.execute_batch(TRIGGERS_SQL)?;
 
     // Перестраиваем FTS-индексы из данных основных таблиц
+    // fts_text_files НЕ перестраиваем через 'rebuild' — он contentless, таблицы-
+    // источника для rebuild у него нет. Его наполняет Rust-путь записи
+    // text_contents (в т.ч. при bulk-load), поэтому к этому моменту он уже полон.
     conn.execute_batch("
         INSERT INTO fts_functions(fts_functions) VALUES('rebuild');
         INSERT INTO fts_classes(fts_classes) VALUES('rebuild');
-        INSERT INTO fts_text_files(fts_text_files) VALUES('rebuild');
     ")?;
 
     Ok(())

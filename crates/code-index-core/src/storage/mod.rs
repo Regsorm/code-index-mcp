@@ -296,8 +296,12 @@ impl Storage {
         Ok(())
     }
 
-    /// Удалить файл и все связанные записи (каскадно через FK)
+    /// Удалить файл и все связанные записи (каскадно через FK).
+    /// ВАЖНО: contentless-указатель `fts_text_files` НЕ обслуживается ни
+    /// триггером, ни каскадом — поэтому ПЕРЕД каскадным удалением вручную
+    /// снимаем токены текстового файла (для code-файлов это no-op).
     pub fn delete_file(&self, file_id: i64) -> Result<()> {
+        self.delete_text_file_by_file(file_id)?;
         self.conn
             .execute("DELETE FROM files WHERE id = ?1", params![file_id])
             .context("delete_file: ошибка удаления")?;
@@ -453,20 +457,67 @@ impl Storage {
 
     // ── Text files ───────────────────────────────────────────────────────────
 
-    /// Вставить запись текстового файла
-    pub fn insert_text_file(&self, record: &TextFileRecord) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO text_files (file_id, content) VALUES (?1, ?2)",
-            params![record.file_id, record.content],
-        )
-        .context("insert_text_file")?;
+    /// FTS-очистка contentless-указателя для текстового файла: читает текущий
+    /// сжатый текст из `text_contents`, разжимает и подаёт указателю команду
+    /// удаления токенов (на contentless `delete` требует ИМЕННО старый текст).
+    /// No-op, если записи нет / blob пустой. Нужно и при удалении, и перед
+    /// повторной вставкой (идемпотентность contentless-указателя).
+    fn fts_text_delete(&self, file_id: i64) -> Result<()> {
+        let row: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row(
+                "SELECT content_blob FROM text_contents WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .context("fts_text_delete: SELECT text_contents")?;
+        if let Some(Some(blob)) = row {
+            let bytes = Self::decode_zstd_safe(&blob).context("fts_text_delete: zstd decode")?;
+            if let Ok(content) = String::from_utf8(bytes) {
+                self.conn
+                    .execute(
+                        "INSERT INTO fts_text_files(fts_text_files, rowid, content) \
+                         VALUES ('delete', ?1, ?2)",
+                        params![file_id, content],
+                    )
+                    .context("fts_text_delete: FTS delete")?;
+            }
+        }
         Ok(())
     }
 
-    /// Удалить запись текстового файла
-    pub fn delete_text_file_by_file(&self, file_id: i64) -> Result<()> {
+    /// Вставить запись текстового файла: сырой текст СЖИМАЕТСЯ (zstd) в
+    /// `text_contents`, плюс наполняется contentless-указатель `fts_text_files`
+    /// (rowid = file_id). Идемпотентно: если запись уже была — старый токен
+    /// указателя снимается, чтобы не задвоить.
+    pub fn insert_text_file(&self, record: &TextFileRecord) -> Result<()> {
+        // Снять старый FTS-токен, если запись существовала (повтор без delete).
+        self.fts_text_delete(record.file_id)?;
+        let blob = zstd::encode_all(record.content.as_bytes(), Self::FILE_CONTENTS_ZSTD_LEVEL)
+            .context("insert_text_file: zstd encode")?;
         self.conn
-            .execute("DELETE FROM text_files WHERE file_id = ?1", params![file_id])
+            .execute(
+                "INSERT OR REPLACE INTO text_contents (file_id, content_blob, oversize) \
+                 VALUES (?1, ?2, 0)",
+                params![record.file_id, blob],
+            )
+            .context("insert_text_file: INSERT text_contents")?;
+        self.conn
+            .execute(
+                "INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)",
+                params![record.file_id, record.content],
+            )
+            .context("insert_text_file: FTS insert")?;
+        Ok(())
+    }
+
+    /// Удалить запись текстового файла: снимает токен contentless-указателя
+    /// (по разжатому старому тексту) и удаляет строку `text_contents`.
+    pub fn delete_text_file_by_file(&self, file_id: i64) -> Result<()> {
+        self.fts_text_delete(file_id)?;
+        self.conn
+            .execute("DELETE FROM text_contents WHERE file_id = ?1", params![file_id])
             .context("delete_text_file_by_file")?;
         Ok(())
     }
@@ -572,7 +623,7 @@ impl Storage {
             "SELECT fi.id, fi.path
              FROM files fi
              WHERE fi.id NOT IN (SELECT file_id FROM file_contents)
-               AND fi.id NOT IN (SELECT file_id FROM text_files)
+               AND fi.id NOT IN (SELECT file_id FROM text_contents)
              ORDER BY fi.path",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -587,7 +638,7 @@ impl Storage {
         let n: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM text_files WHERE file_id = ?1",
+                "SELECT COUNT(*) FROM text_contents WHERE file_id = ?1",
                 params![file_id],
                 |r| r.get(0),
             )
@@ -649,6 +700,30 @@ impl Storage {
             }
         };
         Ok(Some((content_opt, oversize)))
+    }
+
+    /// Прочитать сырой текст text-файла из `text_contents` (разжать zstd).
+    /// `None` — записи нет / blob пустой. Зеркало `read_file_content` для
+    /// текстовой стороны, но без oversize-семантики (text хранится целиком).
+    pub fn read_text_content(&self, file_id: i64) -> Result<Option<String>> {
+        let blob: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row(
+                "SELECT content_blob FROM text_contents WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .context("read_text_content: SELECT text_contents")?;
+        match blob {
+            None | Some(None) => Ok(None),
+            Some(Some(b)) => {
+                let bytes =
+                    Self::decode_zstd_safe(&b).context("read_text_content: zstd decode")?;
+                let text = String::from_utf8(bytes).context("read_text_content: UTF-8")?;
+                Ok(Some(text))
+            }
+        }
     }
 
     /// grep_code: regex-поиск по содержимому **code-файлов** через `file_contents`.
@@ -829,41 +904,92 @@ impl Storage {
         }
     }
 
-    /// Полнотекстовый поиск по текстовым файлам; возвращает (path, фрагмент контента)
+    /// Построить компактную вырезку вокруг первого совпадения для search_text.
+    /// На contentless-указателе snippet() недоступен (текста при нём нет),
+    /// поэтому фрагмент собираем сами из разжатого текста: первый «словный»
+    /// токен запроса, поиск без учёта регистра, окно ~80 байт до/после
+    /// (с выравниванием на границы символов) и маркер «…».
+    fn build_text_snippet(content: &str, query: &str) -> String {
+        const WIN: usize = 80;
+        let token = query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .find(|t| !t.is_empty())
+            .unwrap_or("");
+        let needle = token.to_lowercase();
+        let center = if needle.is_empty() {
+            0
+        } else {
+            content.to_lowercase().find(&needle).unwrap_or(0)
+        }
+        .min(content.len());
+        let mut start = center.saturating_sub(WIN);
+        let mut end = (center + needle.len() + WIN).min(content.len());
+        while start > 0 && !content.is_char_boundary(start) {
+            start -= 1;
+        }
+        while end < content.len() && !content.is_char_boundary(end) {
+            end += 1;
+        }
+        let core = content[start..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut s = String::new();
+        if start > 0 {
+            s.push('…');
+        }
+        s.push_str(&core);
+        if end < content.len() {
+            s.push('…');
+        }
+        s
+    }
+
+    /// Полнотекстовый поиск по текстовым файлам; возвращает (path, фрагмент контента).
+    /// Указатель `fts_text_files` теперь contentless → `snippet()` недоступен:
+    /// берём rowid (=file_id) + путь по rank, затем строим вырезку в Rust из
+    /// разжатого `text_contents`.
     pub fn search_text(&self, query: &str, limit: usize, language: Option<&str>) -> Result<Vec<(String, String)>> {
         let safe_query = sanitize_fts_query(query);
-        match language {
+        let hits: Vec<(i64, String)> = match language {
             Some(lang) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT fi.path, snippet(fts_text_files, 0, '[', ']', '...', 20)
+                    "SELECT ft.rowid, fi.path
                      FROM fts_text_files ft
-                     JOIN text_files tf ON tf.id = ft.rowid
-                     JOIN files fi ON fi.id = tf.file_id
+                     JOIN files fi ON fi.id = ft.rowid
                      WHERE fts_text_files MATCH ?1 AND fi.language = ?2
                      ORDER BY rank
                      LIMIT ?3",
                 )?;
                 let rows = stmt.query_map(params![safe_query, lang, limit as i64], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?;
-                rows.map(|r| r.map_err(Into::into)).collect()
+                rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
             }
             None => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT fi.path, snippet(fts_text_files, 0, '[', ']', '...', 20)
+                    "SELECT ft.rowid, fi.path
                      FROM fts_text_files ft
-                     JOIN text_files tf ON tf.id = ft.rowid
-                     JOIN files fi ON fi.id = tf.file_id
+                     JOIN files fi ON fi.id = ft.rowid
                      WHERE fts_text_files MATCH ?1
                      ORDER BY rank
                      LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![safe_query, limit as i64], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?;
-                rows.map(|r| r.map_err(Into::into)).collect()
+                rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
             }
+        };
+        let mut out: Vec<(String, String)> = Vec::with_capacity(hits.len());
+        for (file_id, path) in hits {
+            let snippet = match self.read_text_content(file_id)? {
+                Some(content) => Self::build_text_snippet(&content, query),
+                None => String::new(),
+            };
+            out.push((path, snippet));
         }
+        Ok(out)
     }
 
     /// Поиск подстроки или regex в телах функций и классов.
@@ -1238,7 +1364,7 @@ impl Storage {
             total_imports:    count("imports")?,
             total_calls:      count("calls")?,
             total_variables:  count("variables")?,
-            total_text_files: count("text_files")?,
+            total_text_files: count("text_contents")?,
             indexing_status: None,
         })
     }
@@ -1298,13 +1424,13 @@ impl Storage {
                 let has_text: i64 = self
                     .conn
                     .query_row(
-                        "SELECT COUNT(*) FROM text_files tf
-                         JOIN files fi ON fi.id = tf.file_id
+                        "SELECT COUNT(*) FROM text_contents tc
+                         JOIN files fi ON fi.id = tc.file_id
                          WHERE fi.path = ?1",
                         params![path_db],
                         |r| r.get(0),
                     )
-                    .context("stat_file_meta: проверка text_files")?;
+                    .context("stat_file_meta: проверка text_contents")?;
                 let category = if has_text > 0 { "text" } else { "code" };
 
                 // oversize актуален только для code-файлов (для text всегда None).
@@ -1440,16 +1566,11 @@ impl Storage {
         };
         let lines_total = lines_total_i as usize;
 
-        // Пытаемся прочитать содержимое из text_files (для yaml/md/xml/sh и т.п.)
+        // Содержимое text-файла (yaml/md/xml/sh и т.п.) хранится СЖАТО (zstd)
+        // в text_contents — разжимаем в Rust.
         let content_opt: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT content FROM text_files WHERE file_id = ?1",
-                params![file_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .context("read_file_text: ошибка SELECT text_files")?;
+            .read_text_content(file_id)
+            .context("read_file_text: чтение text_contents")?;
 
         if let Some(content) = content_opt {
             let (sliced, lines_returned, truncated) = slice_with_caps(
@@ -1588,10 +1709,11 @@ impl Storage {
         let compiled = regex::Regex::new(regex_pattern)
             .context("grep_text: невалидный regex")?;
 
-        // SQL: pre-filter по REGEXP (ускоряет, отсекает файлы без матча).
-        let mut conds: Vec<String> = vec!["tf.content REGEXP ?".to_string()];
-        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(regex_pattern.to_string())];
+        // Контент text-файлов теперь сжат (zstd) в text_contents — SQL REGEXP по
+        // нему невозможен. SQL делает только pre-filter по path_glob/language,
+        // regex применяется к разжатому тексту в Rust (как в grep_code).
+        let mut conds: Vec<String> = vec!["tc.content_blob IS NOT NULL".to_string()];
+        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(g) = path_glob {
             conds.push("fi.path GLOB ?".to_string());
             params_dyn.push(Box::new(normalize_glob(g)));
@@ -1601,8 +1723,8 @@ impl Storage {
             params_dyn.push(Box::new(l.to_string()));
         }
         let sql = format!(
-            "SELECT fi.path, tf.content
-             FROM text_files tf JOIN files fi ON fi.id = tf.file_id
+            "SELECT fi.path, tc.content_blob
+             FROM text_contents tc JOIN files fi ON fi.id = tc.file_id
              WHERE {}
              ORDER BY fi.path",
             conds.join(" AND ")
@@ -1610,16 +1732,28 @@ impl Storage {
         let mut stmt = self.conn.prepare(&sql)?;
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
-        let candidate_rows: Vec<(String, String)> = stmt
+        let candidate_rows: Vec<(String, Vec<u8>)> = stmt
             .query_map(params_refs.as_slice(), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        // Post-process: построчный поиск, контекст, ограничение по limit и байтам
+        // Post-process: разжать blob, построчный поиск, контекст, лимиты.
         let mut results: Vec<GrepTextMatch> = Vec::new();
         let mut total_bytes: usize = 0;
-        for (path, content) in candidate_rows {
+        for (path, blob) in candidate_rows {
+            let bytes = match Self::decode_zstd_safe(&blob) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let content = match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Быстрый отказ: нет совпадения во всём файле — пропускаем построчный обход.
+            if !compiled.is_match(&content) {
+                continue;
+            }
             let lines: Vec<&str> = content.lines().collect();
             for (i, line) in lines.iter().enumerate() {
                 if !compiled.is_match(line) {
@@ -2893,6 +3027,86 @@ mod tests {
             !storage.has_text_file(code_id).unwrap(),
             "code-файл без записи в text_files → false"
         );
+    }
+
+    // ── migrate_v5: перенос text_files → text_contents (zstd) + contentless FTS ──
+
+    /// Проверяет САМУ ветку переноса migrate_v5 (её не задевают тесты на свежих
+    /// БД — там переносить нечего): создаём СТАРУЮ схему (text_files +
+    /// external-content fts_text_files), наполняем, запускаем migrate_v5 и
+    /// проверяем, что текст перенесён в сжатый text_contents, старая таблица
+    /// удалена, а contentless-указатель ищет по rowid=file_id. Это тот код,
+    /// который побежит по живым базам при первом старте новой версии.
+    #[test]
+    fn test_migrate_v5_transforms_old_text_files() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // Старая схема: text_files (сырой TEXT) + external-content указатель.
+        conn.execute_batch(
+            "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE text_files(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 file_id INTEGER NOT NULL,
+                 content TEXT NOT NULL DEFAULT '');
+             CREATE VIRTUAL TABLE fts_text_files USING fts5(
+                 content, content='text_files', content_rowid='id');
+             INSERT INTO files(id, path) VALUES (1, 'a.xml'), (2, 'b.yaml');
+             INSERT INTO text_files(file_id, content)
+                 VALUES (1, 'привет мир контрагент'),
+                        (2, 'key: value номенклатура');
+             INSERT INTO fts_text_files(fts_text_files) VALUES('rebuild');",
+        )
+        .unwrap();
+
+        crate::storage::schema::migrate_v5(&conn).unwrap();
+
+        // Старая таблица удалена.
+        assert!(
+            conn.prepare("SELECT 1 FROM text_files LIMIT 0").is_err(),
+            "text_files должен быть удалён после миграции"
+        );
+        // Весь текст перенесён в text_contents.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM text_contents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "оба text-файла должны попасть в text_contents");
+        // Контент сжат и корректно разжимается.
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT content_blob FROM text_contents WHERE file_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let txt = String::from_utf8(zstd::decode_all(&blob[..]).unwrap()).unwrap();
+        assert_eq!(txt, "привет мир контрагент");
+        // Указатель стал contentless и ищет (rowid = file_id).
+        let hit: i64 = conn
+            .query_row(
+                "SELECT ft.rowid FROM fts_text_files ft \
+                 WHERE fts_text_files MATCH 'номенклатура'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 2, "MATCH должен вернуть rowid=file_id второго файла");
+        // Новый указатель именно contentless (в DDL нет content='text_files').
+        let ddl: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'fts_text_files'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !ddl.contains("content='text_files'"),
+            "указатель должен стать contentless, DDL={ddl}"
+        );
+        // Идемпотентность: повторный вызов — no-op, без дублей.
+        crate::storage::schema::migrate_v5(&conn).unwrap();
+        let n2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM text_contents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 2, "повторная миграция не должна дублировать");
     }
 
     // ── read_file_text для code-файлов (Phase 2) ───────────────────────────────
