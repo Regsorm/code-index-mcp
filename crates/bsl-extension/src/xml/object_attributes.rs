@@ -473,6 +473,48 @@ impl ObjectStructure {
         }
         Value::Object(map)
     }
+
+    /// Слить структуру из другой sub-config (расширения) в эту (обычно base).
+    /// Union по имени: поля/ТЧ/значения из `other`, которых ещё нет в `self`,
+    /// добавляются в конец; одноимённые сохраняют версию `self` (base-приоритет
+    /// типа). Для одноимённых табличных частей объединяются их реквизиты.
+    ///
+    /// Нужно потому, что объект в расширениях ДОБАВЛЯЕТ реквизиты к базовому, а
+    /// `attributes_json` — единый блоб на объект: без мерджа последняя
+    /// обработанная sub-config затирала бы базовую структуру (баг до 0.21.0 —
+    /// тяжёлый документ с 145 реквизитами получал 1 реквизит из расширения).
+    pub fn merge_from(&mut self, other: &ObjectStructure) {
+        merge_fields(&mut self.attributes, &other.attributes);
+        merge_fields(&mut self.dimensions, &other.dimensions);
+        merge_fields(&mut self.resources, &other.resources);
+        for ot in &other.tabular_sections {
+            match self.tabular_sections.iter_mut().find(|t| t.name == ot.name) {
+                Some(existing) => merge_fields(&mut existing.attributes, &ot.attributes),
+                None => self.tabular_sections.push(ot.clone()),
+            }
+        }
+        merge_names(&mut self.enum_values, &other.enum_values);
+        merge_names(&mut self.predefined, &other.predefined);
+    }
+}
+
+/// Добавить поля из `add`, которых ещё нет в `into` (сравнение по имени).
+/// Существующие одноимённые сохраняют версию `into` (base-приоритет).
+fn merge_fields(into: &mut Vec<StructField>, add: &[StructField]) {
+    for f in add {
+        if !into.iter().any(|e| e.name == f.name) {
+            into.push(f.clone());
+        }
+    }
+}
+
+/// Добавить строки из `add`, которых ещё нет в `into` (порядок сохраняется).
+fn merge_names(into: &mut Vec<String>, add: &[String]) {
+    for n in add {
+        if !into.iter().any(|e| e == n) {
+            into.push(n.clone());
+        }
+    }
 }
 
 /// Прочитать и распарсить полную структуру объекта по пути.
@@ -748,6 +790,47 @@ fn ru_ref_kind(kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_from_unions_base_and_extension() {
+        // base: Контрагент + ТЧ Товары{Номенклатура}.
+        let mut base = ObjectStructure {
+            attributes: vec![StructField {
+                name: "Контрагент".into(),
+                type_str: "СправочникСсылка.Контрагенты".into(),
+            }],
+            tabular_sections: vec![StructTabular {
+                name: "Товары".into(),
+                attributes: vec![StructField {
+                    name: "Номенклатура".into(),
+                    type_str: "СправочникСсылка.Номенклатура".into(),
+                }],
+            }],
+            ..Default::default()
+        };
+        // extension: одноимённый Контрагент (другой тип — base должен победить),
+        // новый реквизит УОП_Поле, и доп. реквизит в ТЧ Товары.
+        let ext = ObjectStructure {
+            attributes: vec![
+                StructField { name: "Контрагент".into(), type_str: "ПроизвольнаяСсылка".into() },
+                StructField { name: "УОП_Поле".into(), type_str: "Дата".into() },
+            ],
+            tabular_sections: vec![StructTabular {
+                name: "Товары".into(),
+                attributes: vec![StructField { name: "УОП_ТЧПоле".into(), type_str: "Число".into() }],
+            }],
+            ..Default::default()
+        };
+        base.merge_from(&ext);
+        // 2 реквизита шапки: базовый + добавленный расширением.
+        assert_eq!(base.attributes.len(), 2);
+        // base-версия типа одноимённого реквизита сохранена.
+        assert_eq!(base.attributes[0].type_str, "СправочникСсылка.Контрагенты");
+        assert_eq!(base.attributes[1].name, "УОП_Поле");
+        // ТЧ Товары слита: 2 реквизита (base + расширение), не задвоена.
+        assert_eq!(base.tabular_sections.len(), 1);
+        assert_eq!(base.tabular_sections[0].attributes.len(), 2);
+    }
 
     #[test]
     fn classify_concrete_ref() {

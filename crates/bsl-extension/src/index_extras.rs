@@ -26,7 +26,14 @@ use crate::xml::config_dump_info::parse_config_dump_info;
 use crate::xml::configuration::parse_configuration_file;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
 use crate::xml::forms::parse_form_file;
-use crate::xml::object_attributes::{parse_object_attributes_file, parse_object_structure_file};
+use crate::code_usages::extract_code_usages;
+use crate::xml::metadata_refs::{
+    parse_defined_type_targets_file, parse_exchange_plan_content_file,
+    parse_functional_option_location_file, parse_role_rights_file, parse_subsystem_content_file,
+};
+use crate::xml::object_attributes::{
+    parse_object_attributes_file, parse_object_structure_file, ObjectStructure,
+};
 use crate::xml::object_uuid::{extract_form_uuid_from_file, extract_object_uuid_from_file};
 
 /// Папки выгрузки → singular meta_type. Объектные XML лежат прямо в этих
@@ -71,6 +78,20 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // Открывает XML отдельных объектов (которые остальные проходы не читают).
     if let Err(e) = index_data_links(repo_root, conn) {
         tracing::warn!("data_links: {}", e);
+    }
+    // Рёбра data_links КОНФИГУРАЦИОННОГО уровня (подсистемы, планы обмена,
+    // определяемые типы, расположение ФО). Строго ПОСЛЕ index_data_links —
+    // та wipe-ит все рёбра repo и пишет объектные; эта добавляет свои link_kind.
+    if let Err(e) = index_metadata_refs(repo_root, conn) {
+        tracing::warn!("data_links(config-level): {}", e);
+    }
+    // Права ролей → отдельная таблица role_rights.
+    if let Err(e) = index_role_rights(repo_root, conn) {
+        tracing::warn!("role_rights: {}", e);
+    }
+    // Обратный индекс использований объектов МД в коде (.bsl) → metadata_code_usages.
+    if let Err(e) = index_metadata_code_usages(repo_root, conn) {
+        tracing::warn!("metadata_code_usages: {}", e);
     }
     // Полная структура объектов (реквизиты+типы, ТЧ, измерения, ресурсы)
     // → metadata_objects.attributes_json. Зависит от строк, созданных
@@ -372,24 +393,34 @@ fn update_data_links_for_object(conn: &rusqlite::Connection, xml_path: &Path) ->
 }
 
 /// Per-object обновление `metadata_objects.attributes_json` для одного объекта.
-/// Переразбирает только его XML и пишет полную структуру (или NULL, если
-/// структура пуста — совпадает с состоянием после полного пересбора, где
-/// пустые объекты остаются с NULL от `index_metadata_objects`). Строка объекта
-/// должна уже существовать (создаётся `index_metadata_objects` при изменении
-/// Configuration.xml — это покрывается отдельной веткой полного пересбора).
-fn update_object_attributes_for_object(conn: &rusqlite::Connection, xml_path: &Path) -> Result<()> {
+/// Переразбирает структуру по ВСЕМ sub-config'ам этого объекта (base + копии в
+/// расширениях) и пишет СЛИТУЮ структуру (или NULL, если ни в одной sub-config
+/// нет непустой структуры). Мердж нужен, чтобы правка XML объекта в одном
+/// расширении не затирала базовые реквизиты (см. `ObjectStructure::merge_from`);
+/// без него инкремент расходился бы с полным пересбором. Строка объекта должна
+/// уже существовать (создаётся `index_metadata_objects`).
+fn update_object_attributes_for_object(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    xml_path: &Path,
+) -> Result<()> {
     let owner_full = match object_full_name_from_path(xml_path) {
         Some((_mt, full)) => full,
         None => return Ok(()),
     };
-    let json_opt: Option<String> = if xml_path.is_file() {
-        match parse_object_structure_file(xml_path) {
-            Ok(Some(s)) if !s.is_empty() => Some(s.to_json().to_string()),
-            _ => None,
-        }
-    } else {
-        None
+    // Папка (plural) и имя объекта — из пути изменённого XML; ищем копии этого
+    // объекта во всех sub-config и мерджим (base-first).
+    let folder = match xml_path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
     };
+    let stem = match xml_path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+    let roots = sub_config_roots(repo_root);
+    let json_opt =
+        merged_object_structure(&roots, &folder, &stem).map(|s| s.to_json().to_string());
     conn.execute(
         "UPDATE metadata_objects SET attributes_json = ? WHERE repo = ? AND full_name = ?",
         params![json_opt, REPO_DEFAULT, &owner_full],
@@ -519,12 +550,29 @@ pub fn run_incremental_extras(
     let mut object_xmls: Vec<&std::path::PathBuf> = Vec::new();
     let mut form_xmls: Vec<&std::path::PathBuf> = Vec::new();
     let mut sub_xmls: Vec<&std::path::PathBuf> = Vec::new();
+    // Источники data_links конфиг-уровня / role_rights изменились в этом батче.
+    // Они лежат вне OBJECT_FOLDERS и не привязаны к одному объекту → при
+    // попадании дешевле полностью пересобрать соответствующую таблицу.
+    let mut refs_dirty = false;
+    let mut roles_dirty = false;
 
     // changed + deleted объединяем: конкретное действие (reinsert vs delete)
     // функции решают по наличию файла на диске.
     for p in changed.iter().chain(deleted.iter()) {
         let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let has_comp =
+            |name: &str| p.components().any(|c| c.as_os_str().to_str() == Some(name));
+        if fname == "Rights.xml" && has_comp("Roles") {
+            roles_dirty = true;
+        }
+        if has_comp("Subsystems")
+            || (fname == "Content.xml" && has_comp("ExchangePlans"))
+            || has_comp("DefinedTypes")
+            || has_comp("FunctionalOptions")
+        {
+            refs_dirty = true;
+        }
         if ext.eq_ignore_ascii_case("bsl") {
             bsl_paths.push(p);
         } else if fname == "Configuration.xml" {
@@ -552,7 +600,7 @@ pub fn run_incremental_extras(
     let conn = storage.conn();
     for p in &object_xmls {
         update_data_links_for_object(conn, p)?;
-        update_object_attributes_for_object(conn, p)?;
+        update_object_attributes_for_object(repo_root, conn, p)?;
     }
     for p in &form_xmls {
         update_metadata_forms_for_file(repo_root, conn, p)?;
@@ -560,9 +608,16 @@ pub fn run_incremental_extras(
     for p in &sub_xmls {
         update_event_subscription_for_file(conn, p)?;
     }
-    // .bsl — точечный per-file апдейт слоя direct (O(рёбер файла)).
+    // .bsl — точечный per-file апдейт слоя direct (O(рёбер файла)) + обратного
+    // индекса использований объектов МД в коде (metadata_code_usages).
     for p in &bsl_paths {
         update_call_graph_direct_for_file(repo_root, conn, p)?;
+        update_code_usages_for_file(repo_root, conn, p)?;
+    }
+    // Слой extension_override зависит от functions.override_* (обновляется
+    // core-индексатором при правке .bsl) — полный пересбор дёшев (один SELECT).
+    if !bsl_paths.is_empty() {
+        rebuild_call_graph_extension_override(conn)?;
     }
     if !form_xmls.is_empty() {
         rebuild_call_graph_form_event(conn)?;
@@ -570,12 +625,45 @@ pub fn run_incremental_extras(
     if !sub_xmls.is_empty() {
         rebuild_call_graph_subscription(conn)?;
     }
+    // Конфиг-уровневые источники: полный пересбор затронутой таблицы. Каждая
+    // функция сносит только свои строки (data_links config link_kind / всю
+    // role_rights), не трогая объектные рёбра графа данных.
+    if refs_dirty {
+        index_metadata_refs(repo_root, conn)?;
+    }
+    if roles_dirty {
+        index_role_rights(repo_root, conn)?;
+    }
     Ok(())
 }
 
 /// Построить граф вызовов из заполненных metadata_forms,
 /// event_subscriptions и core-таблицы `calls`. Удаляет старые ребра
 /// этого репо и вставляет свежие — идемпотентно.
+/// Полный пересбор слоя `extension_override` из `functions.override_*`.
+/// Идентично subscription-/form_event-частям `build_call_graph`. Вызывается
+/// инкрементально при изменении `.bsl` — override-данные живут в `functions`,
+/// которую core-индексатор обновляет на правку модуля расширения.
+fn rebuild_call_graph_extension_override(conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM proc_call_graph WHERE repo = ? AND call_type = 'extension_override'",
+        params![REPO_DEFAULT],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO proc_call_graph \
+         (repo, caller_proc_key, callee_proc_name, call_type) \
+         SELECT ?, f.override_target, f.name, 'extension_override' \
+         FROM functions f \
+         WHERE f.override_type IS NOT NULL AND f.override_target IS NOT NULL \
+           AND f.override_target != '' AND f.name != ''",
+        params![REPO_DEFAULT],
+    )?;
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
 fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
     conn.execute("BEGIN", [])?;
@@ -682,13 +770,31 @@ fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
         }
     }
 
+    // ── extension_override: перехваты расширений (&Перед/&После/&Вместо) ──
+    // Данные уже в functions.override_type/override_target (заполняет парсер
+    // bsl::extract_override_info при core-индексации) — отдельный парсер CFE НЕ
+    // нужен. Ребро: вызов БАЗОВОГО метода (override_target) достигает
+    // реализации-перехватчика (имя функции-перехватчика). По голому имени — как
+    // direct-рёбра (общий предел резолва, этап 4e). Так `find_path` проходит
+    // «сквозь &Вместо»: путь до базового метода продолжается в перехватчик.
+    let override_count = conn.execute(
+        "INSERT OR IGNORE INTO proc_call_graph \
+         (repo, caller_proc_key, callee_proc_name, call_type) \
+         SELECT ?, f.override_target, f.name, 'extension_override' \
+         FROM functions f \
+         WHERE f.override_type IS NOT NULL AND f.override_target IS NOT NULL \
+           AND f.override_target != '' AND f.name != ''",
+        params![REPO_DEFAULT],
+    )?;
+
     conn.execute("COMMIT", [])?;
 
     tracing::info!(
-        "proc_call_graph: {} direct + {} subscription + {} form_event ребер",
+        "proc_call_graph: {} direct + {} subscription + {} form_event + {} extension_override ребер",
         direct_count,
         subscription_count,
-        form_count
+        form_count,
+        override_count
     );
 
     // TODO(этап 4e): resolution callee_proc_key через functions.qualified_name —
@@ -874,36 +980,455 @@ fn index_data_links(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()>
     Ok(())
 }
 
-/// Заполнить `metadata_objects.attributes_json` полной структурой объектов.
+/// Заполнить рёбра `data_links` КОНФИГУРАЦИОННОГО уровня (этап 3.1):
+/// `subsystem_content`, `exchange_plan_content`, `defined_type_content`,
+/// `functional_option_location`. Источники — отдельные XML, которые
+/// `index_data_links` не читает (Subsystems/**, ExchangePlans/<X>/Ext/Content.xml,
+/// DefinedTypes/<X>.xml, FunctionalOptions/<X>.xml).
 ///
-/// Для каждой sub-config обходит те же `OBJECT_FOLDERS`, что и `index_data_links`,
-/// открывает корневой XML объекта (`Catalogs/<Имя>.xml`) и через
-/// `parse_object_structure_file` извлекает ВСЕ реквизиты с типами, табличные
-/// части, измерения и ресурсы. Затем UPDATE строки `metadata_objects` по
-/// `full_name` (строки уже созданы `index_metadata_objects`). Объекты без
-/// структуры (пустой результат) пропускаются — `attributes_json` остаётся NULL.
-fn index_object_attributes(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    let mut sub_roots: Vec<std::path::PathBuf> = Vec::new();
+/// ВАЖНО: вызывать ПОСЛЕ `index_data_links` — она wipe-ит все рёбра repo и
+/// пишет объектные. Эта функция сносит только СВОИ `link_kind` (идемпотентность
+/// + корректность инкрементального пути, где `index_data_links` не вызывается).
+fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let roots = sub_config_roots(repo_root);
+    if roots.is_empty() {
+        return Ok(());
+    }
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM data_links WHERE repo = ?1 AND link_kind IN \
+         ('subsystem_content','exchange_plan_content','defined_type_content','functional_option_location')",
+        params![REPO_DEFAULT],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO data_links \
+         (repo, from_object, from_path, to_object, link_kind, is_composite, is_universal) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )?;
+
+    let mut total: usize = 0;
+    for root in &roots {
+        // ── Подсистемы: Subsystems/**.xml ──────────────────────────────────
+        // Файл-определение подсистемы лежит прямо в папке "Subsystems"
+        // (вложенные — в <Parent>/Subsystems/<Child>.xml). Ext/Forms — пропуск.
+        let sub_dir = root.join("Subsystems");
+        if sub_dir.is_dir() {
+            for entry in WalkDir::new(&sub_dir).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("xml") {
+                    continue;
+                }
+                if path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str())
+                    != Some("Subsystems")
+                {
+                    continue;
+                }
+                let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let from_object = format!("Subsystem.{}", stem);
+                match parse_subsystem_content_file(path) {
+                    Ok(items) => {
+                        for to_object in items {
+                            stmt.execute(params![
+                                REPO_DEFAULT,
+                                &from_object,
+                                "",
+                                &to_object,
+                                "subsystem_content",
+                                0_i64,
+                                0_i64
+                            ])?;
+                            total += 1;
+                        }
+                    }
+                    Err(e) => tracing::warn!("subsystem_content {}: {}", path.display(), e),
+                }
+            }
+        }
+
+        // ── Планы обмена: ExchangePlans/<Имя>/Ext/Content.xml ───────────────
+        let ep_dir = root.join("ExchangePlans");
+        if ep_dir.is_dir() {
+            for entry in WalkDir::new(&ep_dir).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file()
+                    || entry.file_name().to_str() != Some("Content.xml")
+                {
+                    continue;
+                }
+                let path = entry.path();
+                // <Имя> = папка на два уровня выше (…/<Имя>/Ext/Content.xml).
+                let name = path
+                    .parent()
+                    .and_then(|ext| ext.parent())
+                    .and_then(|d| d.file_name())
+                    .and_then(|s| s.to_str());
+                let name = match name {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let from_object = format!("ExchangePlan.{}", name);
+                match parse_exchange_plan_content_file(path) {
+                    Ok(items) => {
+                        for to_object in items {
+                            stmt.execute(params![
+                                REPO_DEFAULT,
+                                &from_object,
+                                "",
+                                &to_object,
+                                "exchange_plan_content",
+                                0_i64,
+                                0_i64
+                            ])?;
+                            total += 1;
+                        }
+                    }
+                    Err(e) => tracing::warn!("exchange_plan_content {}: {}", path.display(), e),
+                }
+            }
+        }
+
+        // ── Определяемые типы: DefinedTypes/<Имя>.xml ───────────────────────
+        let dt_dir = root.join("DefinedTypes");
+        if dt_dir.is_dir() {
+            if let Ok(read) = std::fs::read_dir(&dt_dir) {
+                for entry in read.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if !path.is_file()
+                        || path.extension().and_then(|e| e.to_str()) != Some("xml")
+                    {
+                        continue;
+                    }
+                    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let from_object = format!("DefinedType.{}", stem);
+                    match parse_defined_type_targets_file(&path) {
+                        Ok(targets) => {
+                            let is_composite = targets.len() > 1;
+                            for (to_object, is_universal) in targets {
+                                stmt.execute(params![
+                                    REPO_DEFAULT,
+                                    &from_object,
+                                    "",
+                                    &to_object,
+                                    "defined_type_content",
+                                    is_composite as i64,
+                                    is_universal as i64
+                                ])?;
+                                total += 1;
+                            }
+                        }
+                        Err(e) => tracing::warn!("defined_type_content {}: {}", path.display(), e),
+                    }
+                }
+            }
+        }
+
+        // ── Функциональные опции: FunctionalOptions/<Имя>.xml (<Location>) ──
+        let fo_dir = root.join("FunctionalOptions");
+        if fo_dir.is_dir() {
+            if let Ok(read) = std::fs::read_dir(&fo_dir) {
+                for entry in read.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if !path.is_file()
+                        || path.extension().and_then(|e| e.to_str()) != Some("xml")
+                    {
+                        continue;
+                    }
+                    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let from_object = format!("FunctionalOption.{}", stem);
+                    match parse_functional_option_location_file(&path) {
+                        Ok(Some((to_object, raw_location))) => {
+                            stmt.execute(params![
+                                REPO_DEFAULT,
+                                &from_object,
+                                &raw_location,
+                                &to_object,
+                                "functional_option_location",
+                                0_i64,
+                                0_i64
+                            ])?;
+                            total += 1;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!("functional_option_location {}: {}", path.display(), e)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    drop(stmt);
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!(
+        "data_links(config-level): {} рёбер ({} sub-config)",
+        total,
+        roots.len()
+    );
+    Ok(())
+}
+
+/// Заполнить `role_rights` из `Roles/<Имя>/Ext/Rights.xml` по всем sub-config.
+/// Полный wipe+rebuild одной таблицы — идемпотентно. Хранятся только granted-
+/// права (`<value>true</value>`). Имя роли = папка на два уровня выше Rights.xml.
+fn index_role_rights(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let roots = sub_config_roots(repo_root);
+    if roots.is_empty() {
+        return Ok(());
+    }
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute("DELETE FROM role_rights WHERE repo = ?", params![REPO_DEFAULT])?;
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO role_rights (repo, role_name, object_name, right_name) \
+         VALUES (?, ?, ?, ?)",
+    )?;
+
+    let mut total: usize = 0;
+    let mut roles: usize = 0;
+    for root in &roots {
+        let roles_dir = root.join("Roles");
+        if !roles_dir.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(&roles_dir).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() || entry.file_name().to_str() != Some("Rights.xml") {
+                continue;
+            }
+            let path = entry.path();
+            let role_name = path
+                .parent()
+                .and_then(|ext| ext.parent())
+                .and_then(|d| d.file_name())
+                .and_then(|s| s.to_str());
+            let role_name = match role_name {
+                Some(n) => n,
+                None => continue,
+            };
+            match parse_role_rights_file(path) {
+                Ok(rights) => {
+                    roles += 1;
+                    for r in rights {
+                        stmt.execute(params![
+                            REPO_DEFAULT,
+                            role_name,
+                            &r.object_name,
+                            &r.right_name
+                        ])?;
+                        total += 1;
+                    }
+                }
+                Err(e) => tracing::warn!("role_rights {}: {}", path.display(), e),
+            }
+        }
+    }
+    drop(stmt);
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!(
+        "role_rights: {} прав из {} ролей ({} sub-config)",
+        total,
+        roles,
+        roots.len()
+    );
+    Ok(())
+}
+
+/// Путь модуля относительно корня репо в формате `files.path`
+/// (forward slash). Совпадает с конвенцией direct_edge_files/code_path.
+fn rel_path(repo_root: &Path, abs: &Path) -> String {
+    abs.strip_prefix(repo_root)
+        .unwrap_or(abs)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Заполнить `metadata_code_usages` (этап 3.2): обратный индекс использований
+/// объектов МД в коде. Проходит ВСЕ `.bsl` репо, извлекает обращения лёгким
+/// regex-слоем (`extract_code_usages`). Полный пересбор (DELETE по repo +
+/// INSERT) — идемпотентно. Чтение .bsl с диска (как core-индексатор); файлы не
+/// в UTF-8 пропускаются.
+fn index_metadata_code_usages(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_code_usages WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO metadata_code_usages \
+         (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )?;
+
+    let mut total: usize = 0;
+    let mut files: usize = 0;
+    for entry in WalkDir::new(repo_root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let is_bsl = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("bsl"))
+            == Some(true);
+        if !is_bsl {
+            continue;
+        }
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue, // не UTF-8 / нечитаемый — пропуск
+        };
+        let usages = extract_code_usages(&content);
+        if usages.is_empty() {
+            continue;
+        }
+        let rel = rel_path(repo_root, path);
+        files += 1;
+        for u in usages {
+            stmt.execute(params![
+                REPO_DEFAULT,
+                &u.object_ref,
+                &u.object_ref_key,
+                &u.member_path,
+                u.usage_kind,
+                &rel,
+                u.line as i64,
+            ])?;
+            total += 1;
+        }
+    }
+    drop(stmt);
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!(
+        "metadata_code_usages: {} обращений из {} .bsl",
+        total,
+        files
+    );
+    Ok(())
+}
+
+/// Per-file обновление `metadata_code_usages` для одного `.bsl`: снести прежние
+/// строки файла и переразобрать (или просто снести, если файл удалён).
+fn update_code_usages_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    bsl_path: &Path,
+) -> Result<()> {
+    let rel = rel_path(repo_root, bsl_path);
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_code_usages WHERE repo = ?1 AND file_path = ?2",
+        params![REPO_DEFAULT, &rel],
+    )?;
+    if bsl_path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(bsl_path) {
+            let usages = extract_code_usages(&content);
+            if !usages.is_empty() {
+                let mut stmt = conn.prepare(
+                    "INSERT INTO metadata_code_usages \
+                     (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )?;
+                for u in usages {
+                    stmt.execute(params![
+                        REPO_DEFAULT,
+                        &u.object_ref,
+                        &u.object_ref_key,
+                        &u.member_path,
+                        u.usage_kind,
+                        &rel,
+                        u.line as i64,
+                    ])?;
+                }
+            }
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Корни sub-config'ов репо: каталоги, содержащие `Configuration.xml` на
+/// глубине ≤ 3 (base/ + extensions/<name>/). base-роуты идут ПЕРВЫМИ — их
+/// структура приоритетна при мердже одноимённых реквизитов (см.
+/// `ObjectStructure::merge_from`).
+fn sub_config_roots(repo_root: &Path) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
     for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file()
             && entry.file_name().to_str() == Some("Configuration.xml")
         {
             if let Some(parent) = entry.path().parent() {
-                sub_roots.push(parent.to_path_buf());
+                roots.push(parent.to_path_buf());
             }
         }
     }
+    // base-роуты первыми: путь без компонента "extensions". sort_by_key стабилен,
+    // поэтому относительный порядок внутри групп сохраняется.
+    roots.sort_by_key(|p| u8::from(p.components().any(|c| c.as_os_str() == "extensions")));
+    roots
+}
+
+/// Структура объекта, слитая по всем его копиям в sub-config'ах (base +
+/// расширения). Роуты должны быть отсортированы base-first (см.
+/// `sub_config_roots`) — тогда базовые типы реквизитов приоритетны, а
+/// расширения добавляют только свои новые поля/ТЧ. Возвращает `None`, если ни в
+/// одной sub-config нет непустой структуры этого объекта.
+fn merged_object_structure(
+    roots: &[std::path::PathBuf],
+    folder: &str,
+    stem: &str,
+) -> Option<ObjectStructure> {
+    let mut acc: Option<ObjectStructure> = None;
+    for root in roots {
+        let path = root.join(folder).join(format!("{}.xml", stem));
+        match parse_object_structure_file(&path) {
+            Ok(Some(s)) if !s.is_empty() => match acc.as_mut() {
+                Some(a) => a.merge_from(&s),
+                None => acc = Some(s),
+            },
+            _ => {}
+        }
+    }
+    acc.filter(|s| !s.is_empty())
+}
+
+/// Заполнить `metadata_objects.attributes_json` полной структурой объектов.
+///
+/// Для КАЖДОГО объекта структура аккумулируется по ВСЕМ sub-config'ам (base +
+/// расширения) и мерджится (base-first, см. `ObjectStructure::merge_from`) —
+/// иначе последняя обработанная sub-config затирала бы базовую структуру (баг
+/// до 0.21.0: тяжёлый документ с 145 реквизитами получал 1 реквизит из
+/// расширения). Затем UPDATE строки `metadata_objects` по `full_name` (строки
+/// уже созданы `index_metadata_objects`). Объекты без структуры остаются с
+/// `attributes_json = NULL`.
+fn index_object_attributes(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let sub_roots = sub_config_roots(repo_root);
     if sub_roots.is_empty() {
         return Ok(());
     }
 
-    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
-    conn.execute("BEGIN", [])?;
-    let mut stmt = conn.prepare(
-        "UPDATE metadata_objects SET attributes_json = ? WHERE repo = ? AND full_name = ?",
-    )?;
-
-    let mut filled: usize = 0;
+    // Аккумулируем структуру каждого объекта по всем sub-config'ам. Каждый XML
+    // парсится один раз; merge_from добавляет только новые поля расширений.
+    let mut acc: std::collections::HashMap<String, ObjectStructure> =
+        std::collections::HashMap::new();
     for sub_root in &sub_roots {
         for (folder, meta_type) in OBJECT_FOLDERS {
             let dir = sub_root.join(folder);
@@ -926,7 +1451,6 @@ fn index_object_attributes(repo_root: &Path, conn: &rusqlite::Connection) -> Res
                     Some(s) => s,
                     None => continue,
                 };
-                let full_name = format!("{}.{}", meta_type, stem);
                 let structure = match parse_object_structure_file(&path) {
                     Ok(Some(s)) => s,
                     Ok(None) => continue,
@@ -938,20 +1462,39 @@ fn index_object_attributes(repo_root: &Path, conn: &rusqlite::Connection) -> Res
                 if structure.is_empty() {
                     continue;
                 }
-                stmt.execute(params![
-                    structure.to_json().to_string(),
-                    REPO_DEFAULT,
-                    &full_name,
-                ])?;
-                filled += 1;
+                let full_name = format!("{}.{}", meta_type, stem);
+                match acc.get_mut(&full_name) {
+                    Some(existing) => existing.merge_from(&structure),
+                    None => {
+                        acc.insert(full_name, structure);
+                    }
+                }
             }
         }
+    }
+
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    let mut stmt = conn.prepare(
+        "UPDATE metadata_objects SET attributes_json = ? WHERE repo = ? AND full_name = ?",
+    )?;
+    let mut filled: usize = 0;
+    for (full_name, structure) in &acc {
+        if structure.is_empty() {
+            continue;
+        }
+        stmt.execute(params![
+            structure.to_json().to_string(),
+            REPO_DEFAULT,
+            full_name,
+        ])?;
+        filled += 1;
     }
     drop(stmt);
     conn.execute("COMMIT", [])?;
 
     tracing::info!(
-        "object_attributes: заполнено attributes_json у {} объектов ({} sub-config)",
+        "object_attributes: заполнено attributes_json у {} объектов ({} sub-config, base-first merge)",
         filled,
         sub_roots.len()
     );
@@ -1504,6 +2047,60 @@ mod tests {
     }
 
     #[test]
+    fn call_graph_includes_extension_override() {
+        // Перехват &Вместо ПробитьЧек в расширении → ребро extension_override
+        // ПробитьЧек → EEРМК_ПробитьЧек. Источник — functions.override_*.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><Properties><Name>C</Name></Properties></Configuration></MetaDataObject>"#,
+        );
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        let conn = storage.conn();
+        // Перехватчик в functions (как будто его распарсил core-парсер из CFE).
+        conn.execute(
+            "INSERT INTO files (path, content_hash, language) \
+             VALUES ('extensions/E/Documents/X/Ext/Form/Module.bsl', 'h', 'bsl')",
+            [],
+        )
+        .unwrap();
+        let fid: i64 = conn
+            .query_row("SELECT id FROM files WHERE path LIKE '%Module.bsl'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO functions (file_id, name, override_type, override_target) \
+             VALUES (?, 'EEРМК_ПробитьЧек', 'Вместо', 'ПробитьЧек')",
+            params![fid],
+        )
+        .unwrap();
+        build_call_graph(conn).unwrap();
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM proc_call_graph \
+                 WHERE call_type = 'extension_override' \
+                   AND caller_proc_key = 'ПробитьЧек' AND callee_proc_name = 'EEРМК_ПробитьЧек'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1, "должно появиться ребро перехвата extension_override");
+
+        // Инкрементальный rebuild идемпотентен (не дублирует ребро).
+        rebuild_call_graph_extension_override(conn).unwrap();
+        let cnt2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM proc_call_graph WHERE call_type = 'extension_override'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt2, 1, "rebuild не должен дублировать ребро");
+    }
+
+    #[test]
     fn call_graph_combines_subscriptions_and_form_events() {
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("repo");
@@ -1600,6 +2197,276 @@ mod tests {
         assert_eq!(row.0, "Documents.Реализация");
         assert_eq!(row.1, "ФормаДокумента");
         assert!(row.2.contains("ПриОткрытии"));
+    }
+
+    /// Создать фикстуру конфигурации с источниками конфиг-уровня и ролью.
+    fn write_config_level_fixture(repo: &Path) {
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects/></Configuration></MetaDataObject>"#,
+        );
+        // Подсистема с составом (2 объекта).
+        write(
+            &repo.join("Subsystems").join("Продажи.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:xr="x" xmlns:xsi="y"><Subsystem><Properties>
+  <Name>Продажи</Name>
+  <Content>
+    <xr:Item xsi:type="xr:MDObjectRef">Document.РеализацияТоваровУслуг</xr:Item>
+    <xr:Item xsi:type="xr:MDObjectRef">Catalog.Контрагенты</xr:Item>
+  </Content>
+</Properties><ChildObjects/></Subsystem></MetaDataObject>"#,
+        );
+        // План обмена: Content.xml.
+        write(
+            &repo.join("ExchangePlans").join("Обмен").join("Ext").join("Content.xml"),
+            r#"<?xml version="1.0"?>
+<ExchangePlanContent xmlns="z">
+  <Item><Metadata>Catalog.Номенклатура</Metadata><AutoRecord>Deny</AutoRecord></Item>
+</ExchangePlanContent>"#,
+        );
+        // Определяемый тип: составной (2 ссылочных, 1 примитив отброшен).
+        write(
+            &repo.join("DefinedTypes").join("Адресат.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="c"><DefinedType><Properties><Name>Адресат</Name>
+  <Type>
+    <v8:Type>cfg:CatalogRef.Пользователи</v8:Type>
+    <v8:Type>cfg:EnumRef.ВидыДат</v8:Type>
+    <v8:Type>xs:string</v8:Type>
+  </Type>
+</Properties></DefinedType></MetaDataObject>"#,
+        );
+        // Функциональная опция: Location в ресурс регистра.
+        write(
+            &repo.join("FunctionalOptions").join("ФО.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><FunctionalOption><Properties><Name>ФО</Name>
+  <Location>InformationRegister.Настройки.Resource.Значение</Location>
+  <Content/></Properties></FunctionalOption></MetaDataObject>"#,
+        );
+        // Роль: Read=true и Posting=false на документе.
+        write(
+            &repo.join("Roles").join("Роль1").join("Ext").join("Rights.xml"),
+            r#"<?xml version="1.0"?>
+<Rights xmlns="r"><object>
+  <name>Document.РеализацияТоваровУслуг</name>
+  <right><name>Read</name><value>true</value></right>
+  <right><name>Posting</name><value>false</value></right>
+</object></Rights>"#,
+        );
+    }
+
+    #[test]
+    fn fills_metadata_refs_and_role_rights() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write_config_level_fixture(&repo);
+
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        let conn = storage.conn();
+
+        // subsystem_content: 2 ребра, from_object = Subsystem.Продажи.
+        let subs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM data_links WHERE link_kind='subsystem_content' \
+                 AND from_object='Subsystem.Продажи'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(subs, 2, "subsystem_content");
+
+        // exchange_plan_content: ExchangePlan.Обмен → Catalog.Номенклатура.
+        let ep: String = conn
+            .query_row(
+                "SELECT to_object FROM data_links WHERE link_kind='exchange_plan_content' \
+                 AND from_object='ExchangePlan.Обмен'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ep, "Catalog.Номенклатура");
+
+        // defined_type_content: 2 ссылочных, is_composite=1, примитив отброшен.
+        let (dt_cnt, dt_comp): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(is_composite) FROM data_links \
+                 WHERE link_kind='defined_type_content' AND from_object='DefinedType.Адресат'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dt_cnt, 2, "defined_type_content edges");
+        assert_eq!(dt_comp, 1, "defined_type_content is_composite");
+
+        // functional_option_location: FunctionalOption.ФО → InformationRegister.Настройки.
+        let (fo_to, fo_path): (String, String) = conn
+            .query_row(
+                "SELECT to_object, from_path FROM data_links \
+                 WHERE link_kind='functional_option_location' AND from_object='FunctionalOption.ФО'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fo_to, "InformationRegister.Настройки");
+        assert!(fo_path.ends_with("Resource.Значение"));
+
+        // role_rights: только granted (Read), Posting=false отброшен.
+        let rr: Vec<(String, String, String)> = {
+            let mut s = conn
+                .prepare("SELECT role_name, object_name, right_name FROM role_rights ORDER BY right_name")
+                .unwrap();
+            let rows = s
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap();
+            rows.map(|x| x.unwrap()).collect()
+        };
+        assert_eq!(
+            rr,
+            vec![(
+                "Роль1".to_string(),
+                "Document.РеализацияТоваровУслуг".to_string(),
+                "Read".to_string()
+            )]
+        );
+
+        // Идемпотентность: повторный полный прогон не плодит дубли.
+        run_index_extras(&repo, &mut storage).unwrap();
+        let conn = storage.conn();
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM data_links WHERE link_kind IN \
+                 ('subsystem_content','exchange_plan_content','defined_type_content','functional_option_location')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 2 + 1 + 2 + 1, "config-level data_links после повтора");
+        let rr_total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM role_rights", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rr_total, 1, "role_rights после повтора");
+    }
+
+    #[test]
+    fn incremental_rebuilds_metadata_refs_and_role_rights() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write_config_level_fixture(&repo);
+
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+
+        // Снимок «эталона» — полный пересбор отдельной свежей БД.
+        let cnt = |st: &mut Storage, sql: &str| -> i64 {
+            st.conn().query_row(sql, [], |r| r.get(0)).unwrap()
+        };
+        let dl_sql = "SELECT COUNT(*) FROM data_links WHERE link_kind IN \
+             ('subsystem_content','exchange_plan_content','defined_type_content','functional_option_location')";
+        let rr_sql = "SELECT COUNT(*) FROM role_rights";
+
+        // Меняем состав подсистемы (добавили объект) и право роли (добавили Posting=true).
+        write(
+            &repo.join("Subsystems").join("Продажи.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:xr="x" xmlns:xsi="y"><Subsystem><Properties>
+  <Name>Продажи</Name>
+  <Content>
+    <xr:Item xsi:type="xr:MDObjectRef">Document.РеализацияТоваровУслуг</xr:Item>
+    <xr:Item xsi:type="xr:MDObjectRef">Catalog.Контрагенты</xr:Item>
+    <xr:Item xsi:type="xr:MDObjectRef">Catalog.Склады</xr:Item>
+  </Content>
+</Properties><ChildObjects/></Subsystem></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("Roles").join("Роль1").join("Ext").join("Rights.xml"),
+            r#"<?xml version="1.0"?>
+<Rights xmlns="r"><object>
+  <name>Document.РеализацияТоваровУслуг</name>
+  <right><name>Read</name><value>true</value></right>
+  <right><name>Posting</name><value>true</value></right>
+</object></Rights>"#,
+        );
+
+        let changed = vec![
+            repo.join("Subsystems").join("Продажи.xml"),
+            repo.join("Roles").join("Роль1").join("Ext").join("Rights.xml"),
+        ];
+        run_incremental_extras(&repo, &mut storage, &changed, &[]).unwrap();
+
+        // Инкремент должен совпасть с полным пересбором с нуля — отдельная БД,
+        // тот же (уже изменённый) репо.
+        let tmp2 = TempDir::new().unwrap();
+        let mut full = fresh_storage(&tmp2);
+        run_index_extras(&repo, &mut full).unwrap();
+
+        assert_eq!(cnt(&mut storage, dl_sql), 3 + 1 + 2 + 1, "data_links после инкремента");
+        assert_eq!(cnt(&mut storage, rr_sql), 2, "role_rights после инкремента");
+        assert_eq!(
+            cnt(&mut storage, dl_sql),
+            cnt(&mut full, dl_sql),
+            "config data_links: инкремент != полный пересбор"
+        );
+        assert_eq!(
+            cnt(&mut storage, rr_sql),
+            cnt(&mut full, rr_sql),
+            "role_rights: инкремент != полный пересбор"
+        );
+    }
+
+    #[test]
+    fn fills_metadata_code_usages_from_bsl() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects/></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("CommonModules").join("М").join("Ext").join("Module.bsl"),
+            "Процедура П()\n\tДок = Документы.РеализацияТоваровУслуг.СоздатьДокумент();\n\tТекст = \"ВЫБРАТЬ Ссылка ИЗ Документ.Заказ.Товары\";\nКонецПроцедуры",
+        );
+
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        let conn = storage.conn();
+        let rows: Vec<(String, Option<String>, String, i64)> = {
+            let mut s = conn
+                .prepare("SELECT object_ref, member_path, usage_kind, line FROM metadata_code_usages ORDER BY line")
+                .unwrap();
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("Document.РеализацияТоваровУслуг".to_string(), None, "manager".to_string(), 2),
+                ("Document.Заказ".to_string(), Some("Товары".to_string()), "query".to_string(), 3),
+            ]
+        );
+
+        // file_path записан относительным с forward slash.
+        let fp: String = conn
+            .query_row("SELECT DISTINCT file_path FROM metadata_code_usages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fp, "CommonModules/М/Ext/Module.bsl");
+
+        // Идемпотентность: повторный прогон не плодит дубли.
+        run_index_extras(&repo, &mut storage).unwrap();
+        let cnt: i64 = storage
+            .conn()
+            .query_row("SELECT COUNT(*) FROM metadata_code_usages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt, 2);
     }
 
     #[test]

@@ -13,6 +13,7 @@
 // 1С-логики». При этом ИСХОДНИКИ crate'а лежат в том же публичном репо и
 // распространяются вместе с проектом (полный функционал открыт).
 
+pub mod code_usages;
 pub mod enrichment;
 pub mod index_extras;
 pub mod module_constants;

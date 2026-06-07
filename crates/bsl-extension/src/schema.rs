@@ -297,6 +297,16 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     //   * `register_dim`  — измерение регистра.
     //   * `recorder`      — движение: документ → регистр (этап 2).
     //   * `owner`         — подчинённый справочник → владелец (этап 2).
+    //   ── связи конфигурационного уровня (xml::metadata_refs, этап 3.1) ──
+    //   * `subsystem_content`          — подсистема → объект её состава.
+    //     `from_object` = `Subsystem.<Имя>` (листовое имя подсистемы).
+    //   * `exchange_plan_content`      — план обмена → объект состава.
+    //     `from_object` = `ExchangePlan.<Имя>`.
+    //   * `defined_type_content`       — определяемый тип → конкретный тип.
+    //     `from_object` = `DefinedType.<Имя>`.
+    //   * `functional_option_location` — ФО → объект хранения значения
+    //     (константа/ресурс регистра). `from_object` = `FunctionalOption.<Имя>`,
+    //     `from_path` — полный путь хранения из `<Location>`.
     //
     // `is_composite` — ребро из составного типа (перечислено несколько
     // конкретных типов). `is_universal` — обобщённый тип, схлопнут в
@@ -353,6 +363,71 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     ",
     // Прежние рёбра файла + per-file DELETE при обновлении/удалении файла.
     "CREATE INDEX IF NOT EXISTS idx_def_source ON direct_edge_files(repo, source_file);",
+
+    // ── role_rights ───────────────────────────────────────────────────────
+    // Права ролей конфигурации: одна строка = одно granted-право пары
+    // роль↔объект. Источник — `Roles/<Имя>/Ext/Rights.xml` (парсит
+    // `xml::metadata_refs::parse_role_rights`). Хранятся только включённые
+    // права (`<value>true</value>`).
+    //
+    // Право — это атрибут пары (роль, объект), а не ссылка объект→объект,
+    // поэтому отдельная таблица, а не `link_kind` в `data_links` (решение
+    // дизайна #1475: data_links — однородный граф объект↔объект).
+    //
+    //   * `role_name`   — имя роли (`ДобавлениеИзменениеДокументов`).
+    //   * `object_name` — полное имя объекта (`Document.X`, `Configuration.Y`).
+    //   * `right_name`  — имя права (`Read`, `Insert`, `Posting`, `ThinClient`).
+    //
+    // UNIQUE защищает от дублей при повторном `index_extras`.
+    "
+    CREATE TABLE IF NOT EXISTS role_rights (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        role_name TEXT NOT NULL,
+        object_name TEXT NOT NULL,
+        right_name TEXT NOT NULL,
+        UNIQUE(repo, role_name, object_name, right_name)
+    );
+    ",
+    // idx_rr_object — «какие роли дают права на объект X» (основной hot path).
+    "CREATE INDEX IF NOT EXISTS idx_rr_object ON role_rights(repo, object_name);",
+    // idx_rr_role — «что разрешает роль X».
+    "CREATE INDEX IF NOT EXISTS idx_rr_role ON role_rights(repo, role_name);",
+
+    // ── metadata_code_usages ──────────────────────────────────────────────
+    // Обратный индекс использований объектов метаданных В КОДЕ (.bsl). Одна
+    // строка = одно обращение. КОД-производная (в отличие от data_links —
+    // декларативных ссылок из XML): наполняется лёгким source-aware regex-слоем
+    // по телам модулей (`code_usages::extract_code_usages`).
+    //
+    //   * `object_ref`     — канонический объект (`Document.РеализацияТоваровУслуг`).
+    //   * `object_ref_key` — `lower(object_ref)` для индексного поиска без UDF
+    //     (точное сравнение по кириллице).
+    //   * `member_path`    — имя ТЧ для `query` (3-й сегмент пути), иначе NULL.
+    //   * `usage_kind`     — `manager` (Документы.X) | `ref_type` ("ДокументСсылка.X")
+    //     | `query` (путь метаданных в тексте запроса).
+    //   * `file_path`      — путь модуля относительно корня репо (forward slash).
+    //   * `line`           — номер строки (1-based).
+    //
+    // Без UNIQUE: один объект может упоминаться многократно (в т.ч. в одной
+    // строке). Идемпотентность — через DELETE по repo (полный пересбор) или по
+    // file_path (инкремент) перед INSERT.
+    "
+    CREATE TABLE IF NOT EXISTS metadata_code_usages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        object_ref TEXT NOT NULL,
+        object_ref_key TEXT NOT NULL,
+        member_path TEXT,
+        usage_kind TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        line INTEGER NOT NULL
+    );
+    ",
+    // idx_mcu_ref — «где в коде используется объект X» (основной hot path).
+    "CREATE INDEX IF NOT EXISTS idx_mcu_ref ON metadata_code_usages(repo, object_ref_key);",
+    // idx_mcu_file — per-file DELETE при инкрементальном обновлении модуля.
+    "CREATE INDEX IF NOT EXISTS idx_mcu_file ON metadata_code_usages(repo, file_path);",
 ];
 
 #[cfg(test)]

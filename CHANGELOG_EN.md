@@ -5,6 +5,31 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.21.0] — 2026-06-07
+
+**1C data-graph expansion and per-object "impact map" (reverse links + code usage + role rights) + text-file storage moved to a compressed format (`migrate_v5`).**
+
+### Added
+
+- **New configuration-level edge kinds in `data_links`.** The parser `bsl-extension/src/xml/metadata_refs.rs` (event-based `quick_xml`) adds, alongside the object edges (`attr`/`tabular_attr`/`register_dim`/`recorder`/`owner`), four links: `subsystem_content` (`from=Subsystem.X` — subsystem contents), `exchange_plan_content` (`from=ExchangePlan.X` — exchange-plan contents), `defined_type_content` (`from=DefinedType.X` — defined-type targets, reusing `object_attributes::classify_type`), `functional_option_location` (`from=FunctionalOption.X`, `from_path` = full `Location`). On production UT: subsystem_content 22762, exchange_plan_content 9302, defined_type_content 4728, functional_option_location 564.
+- **Table `role_rights`** (`repo, role_name, object_name, right_name`, UNIQUE + indexes by object and by role) — role rights on objects from `Roles/<X>/Ext/Rights.xml` (only `<value>true</value>`). A right is an attribute of the role↔object pair, hence a separate table rather than a `data_links` edge. UT: 49,695 rights / 1236 roles / 6329 objects.
+- **Table `metadata_code_usages`** — a reverse index of metadata-object usage IN `.bsl` CODE (module `bsl-extension/src/code_usages.rs`, a hand-written scanner with no `regex`): `manager` (`Документы.X` in code), `ref_type` (`"ДокументСсылка.X"` / `"DocumentRef.X"` in a string literal), `query` (a metadata path inside query text; the 3rd segment → `member_path`). UT: ~280k usages (query 149,835 / manager 110,194 / ref_type 20,420). `object_ref_key` is stored lowercased (SQLite `lower()` does not lowercase Cyrillic) — for a pinpoint lookup filter by the exact `object_ref`.
+- **MCP tool `find_references`** — a per-object "impact map" in one call: reverse `data_links` (by `to_object`) + `metadata_code_usages` + `role_rights`, broken down by kind with samples (`limit`).
+- **MCP tool `bsl_sql`** — an arbitrary read-only `SELECT`/`WITH` over a repo's `index.db` (the long tail of metadata/graph queries with no dedicated named tool). Guard: `SELECT`/`WITH` only + `Statement::readonly()` + row cap + timeout.
+- **MCP tool `get_object_profile`** — a full object "passport" in one call (structure + forms + modules + data links) instead of a series of `get_object_structure`/`get_form_handlers`/`get_data_links`.
+- BSL tool count 8 → **11**. All new tables are maintained incrementally in the daemon's watcher loop (rebuild by path component / per-`.bsl`).
+
+### Fixed
+
+- **`attributes_json` merge with extensions present** (`object_attributes::ObjectStructure::merge_from`) — attributes from the base configuration and extensions are merged rather than clobbering each other. `extension_override` edges are accounted for when (re)building the call graph.
+
+### Compatibility
+
+- **Index schema v4 → v5.** Text-file storage (md/xml/yaml/json/toml/sh…) moved from `text_files(content TEXT)` + external-content FTS to `text_contents(content_blob BLOB)` (zstd) + a contentless `fts_text_files` fed from Rust. `migrate_v5` migrates existing indexes IN PLACE on the first start of the new binary; fresh DBs are created directly in the new schema. `search_text`/`grep_text`/`read_file(text)`/`stat_file` behave as before. (Implementation — a separate `feat(core)` commit.)
+- **External consumers that read the index's text directly via the `text_files` table must switch to `text_contents`** (raw → zstd-decode). In particular `code-index-guard` (`serveability`) was updated in lockstep: otherwise on a migrated DB the query fails with `no such table: text_files` and native `Read` blocking silently turns off.
+- Additive for BSL: the new tables / edge kinds / tools do not break existing responses.
+- Workspace version 0.20.0 → **0.21.0** (minor — new functionality).
+
 ## [0.20.0] — 2026-06-06
 
 **`_meta.file_mtimes` in search-tool responses + an early daemon signal `POST /mark-dirty` — for write-triggered lazy cache revalidation in `mcp-cache-ci` (#1471).**

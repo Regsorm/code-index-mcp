@@ -16,7 +16,10 @@
 // попадают в MCP `tools/list` только если хотя бы у одного репо
 // `language = "bsl"` (этап 1.5/1.6 → conditional registration).
 
+pub mod bsl_sql;
 pub mod find_data_path;
+pub mod find_references;
+pub mod get_object_profile;
 pub mod find_path;
 pub mod get_data_links;
 pub mod get_event_subscriptions;
@@ -25,11 +28,14 @@ pub mod get_object_structure;
 pub mod get_register_writers;
 pub mod search_terms;
 
+pub use bsl_sql::BslSqlTool;
 pub use find_data_path::FindDataPathTool;
 pub use find_path::FindPathTool;
+pub use find_references::FindReferencesTool;
 pub use get_data_links::GetDataLinksTool;
 pub use get_event_subscriptions::GetEventSubscriptionsTool;
 pub use get_form_handlers::GetFormHandlersTool;
+pub use get_object_profile::GetObjectProfileTool;
 pub use get_object_structure::GetObjectStructureTool;
 pub use get_register_writers::GetRegisterWritersTool;
 pub use search_terms::SearchTermsTool;

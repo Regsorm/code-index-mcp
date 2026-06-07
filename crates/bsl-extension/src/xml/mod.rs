@@ -14,10 +14,15 @@
 // - `object_attributes` — XML отдельных объектов (Catalogs/<X>.xml и т.д.):
 //   ссылочные типы реквизитов/измерений → рёбра графа связей данных.
 //   Источник для `data_links`.
+// - `metadata_refs` — связи КОНФИГУРАЦИОННОГО уровня (состав подсистем и
+//   планов обмена, типы определяемых типов, расположение функциональных
+//   опций) → доп. рёбра `data_links`; плюс права ролей (Rights.xml) для
+//   отдельной таблицы `role_rights`.
 
 pub mod config_dump_info;
 pub mod configuration;
 pub mod event_subscriptions;
 pub mod forms;
+pub mod metadata_refs;
 pub mod object_attributes;
 pub mod object_uuid;

@@ -107,6 +107,19 @@ impl LanguageProcessor for BslLanguageProcessor {
             // tool сам по себе read-only, не требует HTTP-клиента.
             // Если таблица пуста — просто вернёт {"results": []}.
             Arc::new(crate::tools::SearchTermsTool),
+            // bsl_sql — произвольный read-only SELECT по index.db репо
+            // («инструмент инструментов»: длинный хвост запросов по
+            // метаданным/графам без отдельного named-tool). Guard:
+            // только SELECT/WITH + Statement::readonly() + row-cap + таймаут.
+            Arc::new(crate::tools::BslSqlTool),
+            // get_object_profile — полный паспорт объекта за 1 вызов
+            // (структура + формы + модули + связи данных). Горячий агрегат
+            // вместо серии get_object_structure/get_form_handlers/get_data_links.
+            Arc::new(crate::tools::GetObjectProfileTool),
+            // find_references — «карта влияния»: всё, что ссылается на объект,
+            // одним вызовом (реверс data_links + metadata_code_usages +
+            // role_rights). Реверс get_data_links плюс код и права.
+            Arc::new(crate::tools::FindReferencesTool),
         ]
     }
 
@@ -221,8 +234,10 @@ mod tests {
 
     #[test]
     fn additional_tools_registered() {
-        // 8 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
-        // + get_register_writers (регистраторы/движения).
+        // 11 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
+        // + get_register_writers (регистраторы/движения) + bsl_sql (произвольный
+        // read-only SELECT) + get_object_profile (паспорт объекта за 1 вызов)
+        // + find_references (карта влияния: реверс data_links + код + права).
         let p = BslLanguageProcessor::new();
         let tools = p.additional_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -234,7 +249,10 @@ mod tests {
         assert!(names.contains(&"get_data_links"));
         assert!(names.contains(&"find_data_path"));
         assert!(names.contains(&"get_register_writers"));
-        assert_eq!(tools.len(), 8);
+        assert!(names.contains(&"bsl_sql"));
+        assert!(names.contains(&"get_object_profile"));
+        assert!(names.contains(&"find_references"));
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]

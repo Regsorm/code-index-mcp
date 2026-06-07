@@ -3,6 +3,31 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.21.0] — 2026-06-07
+
+**Расширение графа данных 1С и «карта влияния» объекта (реверс связей + использование в коде + права ролей) + перевод хранения текстовых файлов на сжатый формат (`migrate_v5`).**
+
+### Добавлено
+
+- **Новые виды рёбер уровня конфигурации в `data_links`.** Парсер `bsl-extension/src/xml/metadata_refs.rs` (event-based `quick_xml`) добавляет к объектным рёбрам (`attr`/`tabular_attr`/`register_dim`/`recorder`/`owner`) четыре связи: `subsystem_content` (`from=Subsystem.X` — состав подсистемы), `exchange_plan_content` (`from=ExchangePlan.X` — состав плана обмена), `defined_type_content` (`from=DefinedType.X` — цели определяемого типа, через переиспользование `object_attributes::classify_type`), `functional_option_location` (`from=FunctionalOption.X`, `from_path` = полный `Location`). На боевой УТ: subsystem_content 22762, exchange_plan_content 9302, defined_type_content 4728, functional_option_location 564.
+- **Таблица `role_rights`** (`repo, role_name, object_name, right_name`, UNIQUE + индексы по объекту и роли) — права ролей на объекты из `Roles/<X>/Ext/Rights.xml` (только `<value>true</value>`). Право — атрибут пары роль↔объект, поэтому отдельная таблица, а не ребро `data_links`. УТ: 49 695 прав / 1236 ролей / 6329 объектов.
+- **Таблица `metadata_code_usages`** — обратный индекс использования объектов метаданных В КОДЕ `.bsl` (модуль `bsl-extension/src/code_usages.rs`, ручной сканер без `regex`): `manager` (`Документы.X` в коде), `ref_type` (`"ДокументСсылка.X"` / `"DocumentRef.X"` в литерале), `query` (путь метаданных в тексте запроса; 3-й сегмент → `member_path`). УТ: ~280 тыс. обращений (query 149 835 / manager 110 194 / ref_type 20 420). `object_ref_key` хранится в нижнем регистре (SQLite `lower()` не лоуэркейсит кириллицу) — для точечного поиска фильтровать по точному `object_ref`.
+- **MCP-tool `find_references`** — «карта влияния» объекта одним вызовом: реверс `data_links` (по `to_object`) + `metadata_code_usages` + `role_rights`, с разбивкой по видам и примерами (`limit`).
+- **MCP-tool `bsl_sql`** — произвольный read-only `SELECT`/`WITH` по `index.db` репо (длинный хвост запросов по метаданным/графам без отдельного named-tool). Guard: только `SELECT`/`WITH` + `Statement::readonly()` + потолок строк + таймаут.
+- **MCP-tool `get_object_profile`** — полный «паспорт» объекта за один вызов (структура + формы + модули + связи данных) вместо серии `get_object_structure`/`get_form_handlers`/`get_data_links`.
+- Число BSL-tools 8 → **11**. Все новые таблицы поддерживаются инкрементально в watcher-цикле демона (пересбор по компонентам пути / per-`.bsl`).
+
+### Исправлено
+
+- **Мердж `attributes_json` при наличии расширений** (`object_attributes::ObjectStructure::merge_from`) — реквизиты из базовой конфигурации и расширений объединяются, а не затирают друг друга. Рёбра `extension_override` в графе вызовов учитываются при пере/построении.
+
+### Совместимость
+
+- **Схема индекса v4 → v5.** Хранение текстовых файлов (md/xml/yaml/json/toml/sh…) переведено со схемы `text_files(content TEXT)` + external-content FTS на `text_contents(content_blob BLOB)` (zstd) + `fts_text_files` contentless, наполняемый из Rust. `migrate_v5` мигрирует существующие индексы НА МЕСТЕ при первом старте нового бинарника; свежие БД создаются сразу в новой схеме. `search_text`/`grep_text`/`read_file(text)`/`stat_file` работают как прежде. (Реализация — отдельный коммит `feat(core)`.)
+- **Внешние потребители, читающие текст индекса напрямую через таблицу `text_files`, должны перейти на `text_contents`** (raw → zstd-decode). В частности `code-index-guard` (`serveability`) обновлён в lockstep: иначе на мигрированной БД запрос падает с `no such table: text_files`, и блокировка нативного `Read` молча отключается.
+- Аддитивно для BSL: новые таблицы / виды рёбер / tools не ломают существующие ответы.
+- Workspace version 0.20.0 → **0.21.0** (minor — новая функциональность).
+
 ## [0.20.0] — 2026-06-06
 
 **`_meta.file_mtimes` в ответах поисковых tools + ранний сигнал демона `POST /mark-dirty` — для write-triggered ленивой ревалидации кэша `mcp-cache-ci` (#1471).**
