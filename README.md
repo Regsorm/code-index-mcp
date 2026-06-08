@@ -324,6 +324,19 @@ max_code_file_size_bytes = 10485760  # 10 MB for this repo only
 
 Priority: per-path → `[indexer]` section → 5 MB default. Files exceeding the limit are stored with `oversize=1` and `content_blob=NULL`; AST parsing, FTS, and call-graph edges still work for them in full. `read_file` and `grep_code` return a hint explaining how to query such files via `get_function`/`get_class`/`grep_body`.
 
+### Connection pool (v0.24.0)
+
+In `serve`, each repo is read through a pool of read-only SQLite connections instead of a single connection behind a mutex. Concurrent requests to the **same** repo now run in parallel — a heavy query (`bsl_sql`, a full `grep_code`, recursive `find_path`/`get_call_tree`) no longer blocks a fast `get_function` on that repo. Tune via an optional `[pool]` section in `serve.toml`:
+
+```toml
+[pool]
+pool_size = 4               # connections per repo (default 4)
+per_conn_cache_kib = 16384  # page-cache per connection, KiB (default 16384 = 16 MB)
+busy_timeout_ms = 5000      # SQLite busy_timeout per connection, ms (default 5000)
+```
+
+All fields are optional; omitting the section uses the defaults. The default is memory-neutral: `4 × 16 MB = 64 MB` per active repo, the same as the previous single connection. Connections open lazily up to `pool_size` and return to the pool when a request finishes; `0` is clamped to a safe value. WAL mode (already used by the index) makes the multiple readers safe alongside the indexing daemon's writes.
+
 ### Additional tools for 1C repos (only in `bsl-indexer`, v0.6+)
 
 When BSL repos are present in `daemon.toml` (`language = "bsl"`), 5 BSL-specific tools are auto-registered:

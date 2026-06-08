@@ -5,6 +5,25 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.24.0] — 2026-06-08
+
+**Per-repo pool of read-only connections in `serve`: requests to one repo are no longer serialized behind a single mutex.**
+
+### Added
+
+- **Per-repo connection pool (`storage::pool::StoragePool`).** Previously each repo in `serve` was served by a single `rusqlite::Connection` behind a `tokio::sync::Mutex` — any tool held the mutex for its whole duration, so a heavy query (`bsl_sql` up to 8 s, a full `grep_code`, recursive `find_path`/`get_call_tree`) delayed ALL other requests to the SAME repo, including an instant `get_function`. Now `serve` keeps several read-only connections to one `index.db` and reads the index in parallel (SQLite in WAL mode is designed for many readers). Connections are opened lazily up to `pool_size` and returned to the pool when the request finishes; the number of concurrently checked-out connections is bounded by a semaphore. Does not affect data/results — concurrency only.
+- **`[pool]` section in `serve.toml`** — three optional parameters (defaults in parentheses): `pool_size` (4) — connections per repo; `per_conn_cache_kib` (16384 = 16 MB) — page-cache per connection; `busy_timeout_ms` (5000) — wait on brief locks during the daemon's checkpoint/backup. A missing section or fields fall back to defaults; `0` is sanitized (`pool_size`→1, `cache`→default). **The default is memory-neutral:** 4 × 16 MB = 64 MB per active repo — the same as the previous single connection (`cache_size=-64000`).
+- **`busy_timeout` on read-only connections** (previously unset → default 0): a brief `SQLITE_BUSY` during the daemon's checkpoint/backup window is now waited out instead of becoming an error.
+
+### Changed
+
+- `RepoEntry.storage` field: `Option<Arc<Mutex<Storage>>>` → `Option<Arc<StoragePool>>`; method `local_storage()` → `storage_pool()`. Tool handlers (core `mcp::tools::*` and all extension BSL tools) acquire a connection via `pool.get().await` instead of `lock().await`. Internal change — no effect on the MCP contract (`tools/list`, response shapes).
+- `CodeIndexServer::from_federated` takes a `PoolConfig` (from `serve.toml [pool]`); mono-mode and test constructors use the default `PoolConfig` / a single-connection pool (`StoragePool::single`).
+
+### Tests
+
+- Pool unit tests: connection reuse, `0` sanitization, single-mode; **"a heavy holder does not block a second request" at `pool_size>=2`** and the contrast **"a single-connection pool serializes"**. Whole workspace green (262+ tests).
+
 ## [0.23.0] — 2026-06-08
 
 **Universal call graph: recursive `find_path` and `get_call_tree` over the `calls` table (any language). The BSL-specific `find_path` was renamed to `find_path_bsl`.**
