@@ -441,10 +441,106 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_mcu_file ON metadata_code_usages(repo, file_path);",
 ];
 
+/// Идемпотентная миграция существующей БД до текущей схемы расширений.
+/// Догоняет `*_key`-колонки, добавленные позже создания таблиц: `CREATE TABLE
+/// IF NOT EXISTS` не добавляет колонку в уже существующую таблицу, а следующий
+/// `CREATE INDEX` по отсутствующей колонке рвёт весь DDL-батч
+/// `apply_schema_extensions`. Вызывать ДО применения `SCHEMA_EXTENSIONS`.
+/// Безопасно на свежей БД (таблиц ещё нет — ALTER пропускается) и при повторе.
+pub fn migrate_extensions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    ensure_column(conn, "data_links", "to_object_key", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "role_rights", "object_name_key", "TEXT NOT NULL DEFAULT ''")?;
+    Ok(())
+}
+
+/// `ALTER TABLE <table> ADD COLUMN <column> <decl>` — только если таблица уже
+/// существует и колонки в ней нет. На свежей БД (таблицы ещё нет) — no-op:
+/// колонку создаст `CREATE TABLE` из `SCHEMA_EXTENSIONS`.
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> anyhow::Result<()> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |r| r.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table))?;
+    let has_column = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    drop(stmt);
+    if !has_column {
+        conn.execute_batch(&format!(
+            "ALTER TABLE \"{}\" ADD COLUMN \"{}\" {};",
+            table, column, decl
+        ))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info(\"{}\")", table))
+            .unwrap();
+        let found = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|n| n == column);
+        found
+    }
+
+    #[test]
+    fn migrate_extensions_backfills_missing_key_column() {
+        // Симуляция старой БД (как 0.20.0): data_links без to_object_key,
+        // role_rights ещё нет. migrate_extensions + SCHEMA_EXTENSIONS не должны
+        // падать, а колонка/индекс по *_key — появиться.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE data_links (
+                repo TEXT NOT NULL, from_object TEXT NOT NULL, from_path TEXT,
+                to_object TEXT NOT NULL, link_kind TEXT NOT NULL,
+                is_composite INTEGER NOT NULL DEFAULT 0,
+                is_universal INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(repo, from_object, from_path, to_object));",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "data_links", "to_object_key"));
+
+        super::migrate_extensions(&conn).unwrap();
+        for ddl in SCHEMA_EXTENSIONS {
+            conn.execute_batch(ddl)
+                .expect("DDL после migrate_extensions не должен падать");
+        }
+        assert!(column_exists(&conn, "data_links", "to_object_key"));
+
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_dl_to_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "idx_dl_to_key должен создаться после миграции");
+
+        // role_rights создалась штатно и колонка object_name_key на месте.
+        assert!(column_exists(&conn, "role_rights", "object_name_key"));
+
+        // Идемпотентность: повтор миграции — no-op, не падает.
+        super::migrate_extensions(&conn).unwrap();
+    }
 
     #[test]
     fn schema_extensions_apply_cleanly() {

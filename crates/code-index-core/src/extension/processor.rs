@@ -54,6 +54,15 @@ pub trait LanguageProcessor: Send + Sync {
         &[]
     }
 
+    /// Идемпотентная миграция уже существующей БД ПЕРЕД `schema_extensions`.
+    /// Догоняет колонки/таблицы, добавленные в новых версиях, которых нет в БД
+    /// от старого бинарника: `CREATE TABLE IF NOT EXISTS` не добавляет колонку
+    /// в существующую таблицу, а следующий `CREATE INDEX` по отсутствующей
+    /// колонке рвёт весь DDL-батч `apply_schema_extensions`. Default — no-op.
+    fn migrate_schema(&self, _conn: &rusqlite::Connection) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Дополнительные MCP-инструменты, поставляемые этим процессором.
     /// Регистрируются в `tools/list` если хотя бы один репо имеет
     /// `language = self.name()`.

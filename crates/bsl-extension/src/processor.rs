@@ -86,6 +86,13 @@ impl LanguageProcessor for BslLanguageProcessor {
         crate::schema::SCHEMA_EXTENSIONS
     }
 
+    /// Идемпотентно догнать схему существующей БД до текущей версии расширений
+    /// (новые `*_key`-колонки) ДО `apply_schema_extensions` — иначе `CREATE INDEX`
+    /// по отсутствующей колонке рвёт DDL-батч на БД от старого бинарника.
+    fn migrate_schema(&self, conn: &rusqlite::Connection) -> anyhow::Result<()> {
+        crate::schema::migrate_extensions(conn)
+    }
+
     /// MCP-tools, специфичные для конфигураций 1С. Регистрируются в
     /// MCP `tools/list` только если хотя бы у одного репо
     /// `language = "bsl"` (conditional registration этапа 1.5).

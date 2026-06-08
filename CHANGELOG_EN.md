@@ -28,6 +28,7 @@ Versioning — [SemVer](https://semver.org/).
 ### Compatibility
 
 - **BSL index schema: added `*_key` columns** (`data_links.to_object_key`, `role_rights.object_name_key`) with `DEFAULT ''` + indexes — additive, existing queries unaffected. On older indexes the keys are backfilled on the new binary's first start.
+- **Existing-DB migration (`migrate_schema` hook on `LanguageProcessor`).** Before `apply_schema_extensions`, the language processor idempotently adds missing `*_key` columns via `ALTER TABLE ADD COLUMN` (no-op on a fresh DB). Without this, upgrading on top of a 0.20.0/0.21.0 DB broke: `CREATE TABLE IF NOT EXISTS` does not add a column to an existing table, and the subsequent `CREATE INDEX` on the missing column aborted the whole DDL batch, so the `role_rights`/`metadata_code_usages` tables were not created and `find_references` did not work.
 - The `lower()`/`upper()` override changes behavior only for Cyrillic (Latin — as before); internal queries and FTS are untouched.
 - Workspace version 0.21.0 → **0.22.0** (minor — new functionality + a fix).
 

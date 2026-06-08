@@ -159,6 +159,15 @@ pub fn run_worker(
         .as_ref()
         .and_then(|reg| reg.resolve(entry.language.as_deref(), &path).cloned());
     if let Some(proc) = resolved_processor.as_ref() {
+        // 5a-0. Догнать схему существующей БД (idempotent ALTER) ДО
+        //       apply_schema_extensions: иначе CREATE INDEX по новой колонке
+        //       рвёт DDL-батч на БД, созданной старым бинарником.
+        if let Err(e) = proc.migrate_schema(storage.conn()) {
+            eprintln!(
+                "[worker:{}] migrate_schema ('{}') упал: {}",
+                path.display(), proc.name(), e
+            );
+        }
         let exts = proc.schema_extensions();
         if !exts.is_empty() {
             if let Err(e) = storage.apply_schema_extensions(exts) {

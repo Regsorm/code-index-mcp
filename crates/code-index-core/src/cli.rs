@@ -756,6 +756,13 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             // даёт единый контракт «индексация» независимо от запуска.
             if let Some(reg) = registry.as_ref() {
                 if let Some(proc) = reg.resolve(None, &abs_path) {
+                    if let Err(e) = proc.migrate_schema(storage.conn()) {
+                        tracing::warn!(
+                            "migrate_schema процессора '{}' упал: {}",
+                            proc.name(),
+                            e
+                        );
+                    }
                     let exts = proc.schema_extensions();
                     if !exts.is_empty() {
                         storage.apply_schema_extensions(exts)?;
