@@ -1,7 +1,10 @@
 /// Модуль хранилища — SQLite через rusqlite (bundled)
 pub mod memory;
 pub mod models;
+pub mod pool;
 pub mod schema;
+
+pub use pool::{PoolConfig, PooledStorage, StoragePool};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
