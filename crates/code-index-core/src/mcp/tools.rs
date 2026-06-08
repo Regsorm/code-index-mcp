@@ -124,6 +124,18 @@ macro_rules! bail_if_not_ready {
     }};
 }
 
+/// Макрос-хелпер: взять read-only соединение из пула репо. При ошибке открытия
+/// (битый/недоступный файл индекса) — немедленно вернуть error-JSON. Заменяет
+/// прежний `entry.local_storage().lock().await` (один мьютекс → пул соединений).
+macro_rules! acquire_storage {
+    ($entry:expr) => {
+        match $entry.storage_pool().get().await {
+            Ok(s) => s,
+            Err(e) => return format!("{{\"error\": \"storage pool: {}\"}}", e),
+        }
+    };
+}
+
 fn to_json<T: serde::Serialize>(value: &T) -> String {
     match serde_json::to_string(value) {
         Ok(s) => s,
@@ -156,7 +168,7 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 /// в индексе отсутствует, просто не попадают в карту (cache-ci трактует это как
 /// «не могу сверить» → продолжает форвардить, пока путь dirty).
 pub(crate) fn wrap_with_meta<T: serde::Serialize>(
-    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
+    storage: &crate::storage::Storage,
     result: &T,
     dependent_files: Vec<String>,
 ) -> String {
@@ -167,7 +179,7 @@ pub(crate) fn wrap_with_meta<T: serde::Serialize>(
 /// Используется, когда результат ПУСТ: модель часто повторяет тот же неподходящий
 /// вызов ×3. На непустом результате `hint=None` — форма ответа не меняется.
 pub(crate) fn wrap_with_meta_hint<T: serde::Serialize>(
-    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
+    storage: &crate::storage::Storage,
     result: &T,
     dependent_files: Vec<String>,
     hint: Option<&str>,
@@ -181,7 +193,7 @@ pub(crate) fn wrap_with_meta_hint<T: serde::Serialize>(
 /// Используется для `hint` (пустой результат) и для `{truncated,total,limit}`
 /// (cap на крупных списках — get_callers/get_callees/get_imports).
 pub(crate) fn wrap_with_meta_extra<T: serde::Serialize>(
-    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
+    storage: &crate::storage::Storage,
     result: &T,
     dependent_files: Vec<String>,
     extra: Option<serde_json::Value>,
@@ -220,7 +232,7 @@ pub(crate) fn wrap_with_meta_extra<T: serde::Serialize>(
 /// Применяется к Vec<FunctionRecord>, Vec<ClassRecord>, Vec<CallRecord> и т.п.
 /// Дубликаты не нужно дедуплицировать здесь — `wrap_with_meta` сам сделает.
 pub(crate) fn collect_paths_via<R>(
-    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
+    storage: &crate::storage::Storage,
     records: &[R],
     extract: impl Fn(&R) -> i64,
 ) -> Vec<String> {
@@ -247,7 +259,7 @@ pub(crate) fn build_path_matcher(glob: &str) -> Result<globset::GlobMatcher, Str
 /// (она не пройдёт ни один matcher, так что результат честно отбросится).
 /// Storage уже заблокирован вызывающей стороной (передаётся через `&MutexGuard`).
 pub(crate) fn lookup_path(
-    storage: &tokio::sync::MutexGuard<'_, crate::storage::Storage>,
+    storage: &crate::storage::Storage,
     file_id: i64,
 ) -> String {
     storage
@@ -321,7 +333,7 @@ pub async fn search_function(
     path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     let want = limit.unwrap_or(20);
     // Если path_glob задан — берём с запасом (5×, до 500), потом фильтруем по пути,
     // потом обрезаем до want. Это компромисс между точностью и нагрузкой.
@@ -363,7 +375,7 @@ pub async fn search_class(
     path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     let want = limit.unwrap_or(20);
     let sql_limit = if path_glob.is_some() {
         (want.saturating_mul(5)).min(500)
@@ -400,7 +412,7 @@ pub async fn get_function(
     path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     match storage.get_function_by_name(&name) {
         Ok(mut r) => {
             if let Some(ref g) = path_glob {
@@ -424,7 +436,7 @@ pub async fn get_class(
     path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     match storage.get_class_by_name(&name) {
         Ok(mut r) => {
             if let Some(ref g) = path_glob {
@@ -449,7 +461,7 @@ pub async fn get_callers(
     limit: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     match storage.get_callers(&function_name, language.as_deref()) {
         Ok(mut r) => {
             let cap = limit.unwrap_or(CALL_GRAPH_DEFAULT_LIMIT);
@@ -478,7 +490,7 @@ pub async fn get_callees(
     limit: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     match storage.get_callees(&function_name, language.as_deref()) {
         Ok(mut r) => {
             let cap = limit.unwrap_or(CALL_GRAPH_DEFAULT_LIMIT);
@@ -509,7 +521,7 @@ pub async fn find_path(
 ) -> String {
     bail_if_not_ready!(entry);
     let depth = max_depth.unwrap_or(5);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     match storage.find_call_path(&from, &to, depth, language.as_deref()) {
         Ok(opt) => {
             let found = opt.is_some();
@@ -544,7 +556,7 @@ pub async fn get_call_tree(
     let down = !matches!(direction.as_deref(), Some("callers") | Some("up"));
     let depth = max_depth.unwrap_or(3);
     let cap = max_nodes.unwrap_or(200);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     match storage.get_call_tree(&root, down, depth, cap, language.as_deref()) {
         Ok((edges, truncated)) => {
             let tree = build_call_tree_json(&root, down, &edges);
@@ -635,7 +647,7 @@ pub async fn find_symbol(
     path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     match storage.find_symbol(&name, language.as_deref()) {
         Ok(mut r) => {
             if let Some(ref g) = path_glob {
@@ -675,7 +687,7 @@ pub async fn get_imports(
     limit: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     let cap = limit.unwrap_or(IMPORTS_DEFAULT_LIMIT);
     let cap_extra = |total: usize| {
         (total > cap).then(|| serde_json::json!({ "truncated": true, "total": total, "limit": cap }))
@@ -707,7 +719,7 @@ pub async fn get_imports(
 
 pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     match storage.get_file_summary(&path) {
         Ok(Some(s)) => {
             // Это КАРТА/оглавление файла, а не исходник: тела функций/классов
@@ -803,7 +815,16 @@ pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
 async fn local_stats(alias: &str, entry: &RepoEntry) -> serde_json::Value {
     let root = entry.local_root();
     let path_info = client::path_status_async(root).await.ok();
-    let storage = entry.local_storage().lock().await;
+    let storage = match entry.storage_pool().get().await {
+        Ok(s) => s,
+        Err(e) => {
+            return serde_json::json!({
+                "repo": alias,
+                "error": format!("storage pool: {}", e),
+                "path": root.display().to_string(),
+            });
+        }
+    };
     match storage.get_stats() {
         Ok(mut stats) => {
             stats.indexing_status = None;
@@ -929,7 +950,7 @@ pub async fn search_text(
     path_glob: Option<String>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     let want = limit.unwrap_or(20);
     let sql_limit = if path_glob.is_some() {
         (want.saturating_mul(5)).min(500)
@@ -968,7 +989,7 @@ pub async fn grep_body(
     context_lines: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     // Если есть либо path_glob, либо context_lines — идём через grep_body_with_options
     // (он отдаёт флаг обрезки). Иначе старый grep_body для обратной совместимости с
     // CHANGELOG / тестами; там байтового потолка нет, поэтому truncated выводим из
@@ -1040,7 +1061,7 @@ pub async fn grep_body(
 
 pub async fn stat_file(entry: &RepoEntry, path: String) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     // stat_file намеренно НЕ заворачиваем в `_meta` — он non-cacheable по
     // policy (всегда быстрая прямая выборка, к тому же быстро меняется на
     // тонких операциях типа `oversize` после реиндексации). Прокси даже не
@@ -1059,7 +1080,7 @@ pub async fn list_files(
     limit: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     match storage.list_files_filtered(
         pattern.as_deref(),
         path_prefix.as_deref(),
@@ -1081,7 +1102,7 @@ pub async fn read_file(
     line_end: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     match storage.read_file_text(
         &path,
         line_start,
@@ -1109,7 +1130,7 @@ pub async fn grep_text(
     context_lines: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     let want = limit.unwrap_or_else(|| {
         // Без path_glob и language full-scan может быть тяжёлым — занижаем default.
         if path_glob.is_none() && language.is_none() {
@@ -1182,7 +1203,7 @@ pub async fn grep_code(
     context_lines: Option<usize>,
 ) -> String {
     bail_if_not_ready!(entry);
-    let storage = entry.local_storage().lock().await;
+    let storage = acquire_storage!(entry);
     let want = limit.unwrap_or(GREP_CODE_DEFAULT_LIMIT);
     match storage.grep_code_filtered(
         &regex,

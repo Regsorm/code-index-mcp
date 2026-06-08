@@ -117,6 +117,7 @@ mod tests {
                     port: None,
                 })
                 .collect(),
+            pool: Default::default(),
         }
     }
 
@@ -135,6 +136,7 @@ mod tests {
                     port,
                 })
                 .collect(),
+            pool: Default::default(),
         }
     }
 

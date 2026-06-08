@@ -85,7 +85,14 @@ impl IndexTool for GetRegisterWritersTool {
                 }
             };
 
-            let storage = ctx.storage.lock().await;
+            let storage = match ctx.storage.get().await {
+                Ok(s) => s,
+                Err(e) => {
+                    return crate::tools::wrap_error(serde_json::json!({
+                        "error": format!("storage pool: {}", e)
+                    }));
+                }
+            };
             let conn = storage.conn();
 
             // writers — кто пишет в этот объект как в регистр (to_object = object).

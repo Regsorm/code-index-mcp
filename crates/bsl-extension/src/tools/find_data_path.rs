@@ -88,7 +88,14 @@ impl IndexTool for FindDataPathTool {
                 .unwrap_or(4)
                 .clamp(1, 8);
 
-            let storage = ctx.storage.lock().await;
+            let storage = match ctx.storage.get().await {
+                Ok(s) => s,
+                Err(e) => {
+                    return crate::tools::wrap_error(serde_json::json!({
+                        "error": format!("storage pool: {}", e)
+                    }));
+                }
+            };
             let conn = storage.conn();
 
             // BFS с visited-set: каждый узел разворачивается ровно один

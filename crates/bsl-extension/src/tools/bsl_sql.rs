@@ -148,7 +148,14 @@ impl IndexTool for BslSqlTool {
             };
 
             // ── Выполнение ────────────────────────────────────────────────
-            let storage = ctx.storage.lock().await;
+            let storage = match ctx.storage.get().await {
+                Ok(s) => s,
+                Err(e) => {
+                    return crate::tools::wrap_error(serde_json::json!({
+                        "error": format!("storage pool: {}", e)
+                    }));
+                }
+            };
             let conn = storage.conn();
 
             let mut stmt = match conn.prepare(sql) {

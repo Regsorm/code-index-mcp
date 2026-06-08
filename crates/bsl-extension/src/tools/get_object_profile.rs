@@ -114,7 +114,14 @@ impl IndexTool for GetObjectProfileTool {
                 })
                 .unwrap_or_default();
 
-            let storage = ctx.storage.lock().await;
+            let storage = match ctx.storage.get().await {
+                Ok(s) => s,
+                Err(e) => {
+                    return crate::tools::wrap_error(serde_json::json!({
+                        "error": format!("storage pool: {}", e)
+                    }));
+                }
+            };
             let conn = storage.conn();
 
             // interrupt-таймаут против runaway-запросов на больших data_links

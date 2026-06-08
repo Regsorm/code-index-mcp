@@ -83,6 +83,7 @@ mod tests {
                 ServePathEntry { alias: "ut".to_string(), ip: "192.0.2.50".to_string(), port: None },
                 ServePathEntry { alias: "dev".to_string(), ip: "192.0.2.10".to_string(), port: None },
             ],
+            pool: Default::default(),
         };
         let set = build(&cfg);
         assert!(set.contains(&"127.0.0.1".parse::<IpAddr>().unwrap()));
@@ -102,6 +103,7 @@ mod tests {
             paths: vec![
                 ServePathEntry { alias: "ut".to_string(), ip: "not-ip".to_string(), port: None },
             ],
+            pool: Default::default(),
         };
         let set = build(&cfg);
         // Только loopback + me.ip (paths[0] не парсится — пропущена).

@@ -457,7 +457,7 @@ async fn handle_extension_tool(
         }
     };
 
-    let storage = entry.local_storage();
+    let storage = entry.storage_pool();
     let root_path: Option<&std::path::Path> = entry.root_path.as_deref();
     let language: Option<&str> = entry.language.as_deref();
     let ctx = crate::extension::ToolContext {

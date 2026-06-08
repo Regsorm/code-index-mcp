@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use crate::extension::{IndexTool, ProcessorRegistry};
 use crate::federation::client::RemoteClientPool;
 use crate::federation::repos::FederatedRepo;
-use crate::storage::Storage;
+use crate::storage::{PoolConfig, Storage, StoragePool};
 
 pub mod config_watch;
 pub mod tools;
@@ -44,9 +44,10 @@ pub(crate) const LEGACY_OWN_IP: &str = "127.0.0.1";
 pub struct RepoEntry {
     /// Канонический путь к корню проекта (только для local).
     pub root_path: Option<PathBuf>,
-    /// SQLite-подключение (только для local). Mutex сериализует доступ к
-    /// rusqlite::Connection (не Sync). БД read-only, на запись не конкурирует.
-    pub storage: Option<Arc<Mutex<Storage>>>,
+    /// Пул read-only SQLite-соединений (только для local). Несколько соединений
+    /// позволяют читать индекс одновременно — запросы к одному репо больше не
+    /// сериализуются на едином мьютексе. БД read-only, на запись не конкурирует.
+    pub storage: Option<Arc<StoragePool>>,
     /// IP машины, на которой лежит репо (для решения local vs remote и логов).
     pub ip: String,
     /// Порт удалённого `code-index serve` для federate-форвардинга.
@@ -74,11 +75,11 @@ impl RepoEntry {
         })
     }
 
-    /// Ссылка на SQLite-хранилище — для local. Panic для remote.
-    pub fn local_storage(&self) -> &Arc<Mutex<Storage>> {
+    /// Ссылка на пул соединений — для local. Panic для remote.
+    pub fn storage_pool(&self) -> &Arc<StoragePool> {
         self.storage.as_ref().unwrap_or_else(|| {
             panic!(
-                "local_storage() вызван для remote-репо ip={} — это баг диспатчера",
+                "storage_pool() вызван для remote-репо ip={} — это баг диспатчера",
                 self.ip
             )
         })
@@ -392,6 +393,7 @@ impl CodeIndexServer {
         own_ip: String,
         registry: Option<ProcessorRegistry>,
         local_languages: BTreeMap<String, String>,
+        pool_cfg: PoolConfig,
     ) -> anyhow::Result<Self> {
         let mut map = BTreeMap::new();
         for repo in repos {
@@ -403,10 +405,10 @@ impl CodeIndexServer {
                         repo.ip
                     )
                 })?;
-                let storage = Storage::open_file_readonly(db_path)?;
+                let storage = StoragePool::open_file_readonly(db_path, pool_cfg)?;
                 RepoEntry {
                     root_path: repo.root_path,
-                    storage: Some(Arc::new(Mutex::new(storage))),
+                    storage: Some(storage),
                     ip: repo.ip,
                     port: repo.port,
                     is_local: true,
@@ -448,10 +450,10 @@ impl CodeIndexServer {
     pub fn open_readonly_multi(entries: Vec<(String, PathBuf, PathBuf)>) -> anyhow::Result<Self> {
         let mut map = BTreeMap::new();
         for (alias, root_path, db_path) in entries {
-            let storage = Storage::open_file_readonly(&db_path)?;
+            let storage = StoragePool::open_file_readonly(&db_path, PoolConfig::default())?;
             map.insert(alias, RepoEntry {
                 root_path: Some(root_path),
-                storage: Some(Arc::new(Mutex::new(storage))),
+                storage: Some(storage),
                 ip: LEGACY_OWN_IP.to_string(),
                 port: crate::federation::client::DEFAULT_REMOTE_PORT,
                 is_local: true,
@@ -471,7 +473,7 @@ impl CodeIndexServer {
         let mut map = BTreeMap::new();
         map.insert(alias.into(), RepoEntry {
             root_path: Some(root_path),
-            storage: Some(Arc::new(Mutex::new(storage))),
+            storage: Some(StoragePool::single(storage)),
             ip: LEGACY_OWN_IP.to_string(),
             port: crate::federation::client::DEFAULT_REMOTE_PORT,
             is_local: true,
@@ -1093,7 +1095,7 @@ impl ServerHandler for CodeIndexServer {
                 serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"raw": body}));
             return Ok(CallToolResult::structured(value));
         }
-        let storage = entry.local_storage();
+        let storage = entry.storage_pool();
         let root_path: Option<&Path> = entry.root_path.as_deref();
         let language: Option<&str> = entry.language.as_deref();
 

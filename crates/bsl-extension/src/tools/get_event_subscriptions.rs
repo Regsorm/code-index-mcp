@@ -96,7 +96,14 @@ impl IndexTool for GetEventSubscriptionsTool {
                 .unwrap_or(DEFAULT_LIMIT)
                 .clamp(1, MAX_LIMIT);
 
-            let storage = ctx.storage.lock().await;
+            let storage = match ctx.storage.get().await {
+                Ok(s) => s,
+                Err(e) => {
+                    return crate::tools::wrap_error(serde_json::json!({
+                        "error": format!("storage pool: {}", e)
+                    }));
+                }
+            };
             let conn = storage.conn();
 
             // Динамический WHERE для опциональных фильтров.

@@ -588,6 +588,7 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                     serve_cfg.me.ip.clone(),
                     registry.take(),
                     local_languages,
+                    serve_cfg.pool.resolve(),
                 )?
                 .apply_tools_whitelist(&daemon_cfg.tools.enabled);
                 let federate_router = federation::server::federate_router(server.clone());
@@ -633,10 +634,13 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                 Some(reg) => {
                     let mut map = std::collections::BTreeMap::new();
                     for (alias, root_path, db_path) in entries {
-                        let storage = Storage::open_file_readonly(&db_path)?;
+                        let storage = crate::storage::StoragePool::open_file_readonly(
+                            &db_path,
+                            crate::storage::PoolConfig::default(),
+                        )?;
                         map.insert(alias, crate::mcp::RepoEntry {
                             root_path: Some(root_path),
-                            storage: Some(std::sync::Arc::new(tokio::sync::Mutex::new(storage))),
+                            storage: Some(storage),
                             ip: "127.0.0.1".to_string(),
                             port: crate::federation::client::DEFAULT_REMOTE_PORT,
                             is_local: true,

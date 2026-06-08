@@ -22,20 +22,19 @@ use bsl_extension::{
     },
 };
 use code_index_core::extension::{IndexTool, ToolContext};
-use code_index_core::storage::Storage;
+use code_index_core::storage::{Storage, StoragePool};
 use rusqlite::params;
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
 
 const REPO: &str = "default";
 
-fn fresh_storage() -> (TempDir, Arc<Mutex<Storage>>) {
+fn fresh_storage() -> (TempDir, Arc<StoragePool>) {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("test.db");
     let storage = Storage::open_file(&db_path).unwrap();
     storage.apply_schema_extensions(SCHEMA_EXTENSIONS).unwrap();
-    (tmp, Arc::new(Mutex::new(storage)))
+    (tmp, StoragePool::single(storage))
 }
 
 /// Запустить tool и вернуть **распакованное** значение `result` из ответа.
@@ -46,7 +45,7 @@ fn fresh_storage() -> (TempDir, Arc<Mutex<Storage>>) {
 /// чтобы сохранить совместимость существующих assert'ов по `res["..."]`.
 async fn run_tool(
     tool: &dyn IndexTool,
-    storage: &Arc<Mutex<Storage>>,
+    storage: &Arc<StoragePool>,
     args: Value,
 ) -> Value {
     let ctx = ToolContext {
@@ -69,7 +68,7 @@ async fn run_tool(
 async fn get_object_structure_returns_existing() {
     let (_tmp, storage) = fresh_storage();
     {
-        let s = storage.lock().await;
+        let s = storage.get().await.unwrap();
         s.conn()
             .execute(
                 "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym) \
@@ -128,7 +127,7 @@ async fn get_form_handlers_returns_array() {
     ])
     .to_string();
     {
-        let s = storage.lock().await;
+        let s = storage.get().await.unwrap();
         s.conn()
             .execute(
                 "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
@@ -159,7 +158,7 @@ async fn get_form_handlers_returns_array() {
 async fn get_event_subscriptions_lists_all_when_no_filters() {
     let (_tmp, storage) = fresh_storage();
     {
-        let s = storage.lock().await;
+        let s = storage.get().await.unwrap();
         for (name, ev, m, p) in &[
             ("Sub1", "ПриЗаписи", "Логирование", "Записать"),
             ("Sub2", "ПередЗаписью", "Аудит", "Проверить"),
@@ -187,7 +186,7 @@ async fn get_event_subscriptions_lists_all_when_no_filters() {
 async fn get_event_subscriptions_filters_by_handler_module() {
     let (_tmp, storage) = fresh_storage();
     {
-        let s = storage.lock().await;
+        let s = storage.get().await.unwrap();
         for (name, m) in &[("A", "ModX"), ("B", "ModY"), ("C", "ModX")] {
             s.conn()
                 .execute(
@@ -213,7 +212,7 @@ async fn get_event_subscriptions_filters_by_handler_module() {
 async fn find_path_returns_direct_edge_when_exists() {
     let (_tmp, storage) = fresh_storage();
     {
-        let s = storage.lock().await;
+        let s = storage.get().await.unwrap();
         s.conn()
             .execute(
                 "INSERT INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) \
@@ -239,7 +238,7 @@ async fn find_path_returns_direct_edge_when_exists() {
 async fn find_path_walks_two_hops() {
     let (_tmp, storage) = fresh_storage();
     {
-        let s = storage.lock().await;
+        let s = storage.get().await.unwrap();
         s.conn()
             .execute(
                 "INSERT INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) \
@@ -277,7 +276,7 @@ async fn find_path_respects_max_depth() {
     let (_tmp, storage) = fresh_storage();
     {
         // Цепочка A → B → C → D, max_depth=2 → не должен найти D (длина 3).
-        let s = storage.lock().await;
+        let s = storage.get().await.unwrap();
         s.conn()
             .execute(
                 "INSERT INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) VALUES \
@@ -306,8 +305,8 @@ async fn find_path_respects_max_depth() {
 // ── search_terms (этап 5a) ────────────────────────────────────────────────
 
 /// Хелпер: засеять `procedure_enrichment` тремя записями для тестов.
-async fn seed_enrichment(storage: &Arc<Mutex<Storage>>) {
-    let s = storage.lock().await;
+async fn seed_enrichment(storage: &Arc<StoragePool>) {
+    let s = storage.get().await.unwrap();
     let conn = s.conn();
     for (proc_key, terms) in &[
         ("Расчёт.Старт",         "запуск, инициализация, проведение"),
@@ -397,7 +396,7 @@ async fn search_terms_filters_by_repo() {
     // Запись в другой repo не должна находиться по нашему alias.
     let (_tmp, storage) = fresh_storage();
     {
-        let s = storage.lock().await;
+        let s = storage.get().await.unwrap();
         s.conn()
             .execute(
                 "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \

@@ -13,9 +13,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
-use crate::storage::Storage;
+use crate::storage::StoragePool;
 
 /// Контекст одного вызова MCP-инструмента. Лёгкая обёртка — в каждом
 /// tool-call создаётся свежий, поля внутри уже шарятся через `Arc`.
@@ -28,9 +26,9 @@ pub struct ToolContext<'a> {
     /// Язык, под который репо классифицирован при загрузке конфига.
     /// Может быть `None` если auto-detect не сработал и оператор ещё не указал.
     pub language: Option<&'a str>,
-    /// Подключение к SQLite. `Mutex` сериализует доступ — `rusqlite::Connection`
-    /// не Sync.
-    pub storage: &'a Arc<Mutex<Storage>>,
+    /// Пул read-only соединений к SQLite репо. Несколько соединений читают
+    /// одновременно; tool берёт одно через `ctx.storage.get().await`.
+    pub storage: &'a Arc<StoragePool>,
 }
 
 impl<'a> ToolContext<'a> {

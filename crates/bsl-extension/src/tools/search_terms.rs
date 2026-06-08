@@ -87,7 +87,14 @@ impl IndexTool for SearchTermsTool {
                 .unwrap_or(20)
                 .clamp(1, 200);
 
-            let storage = ctx.storage.lock().await;
+            let storage = match ctx.storage.get().await {
+                Ok(s) => s,
+                Err(e) => {
+                    return crate::tools::wrap_error(serde_json::json!({
+                        "error": format!("storage pool: {}", e)
+                    }));
+                }
+            };
             let conn = storage.conn();
 
             // FTS5 поиск по terms + JOIN с procedure_enrichment для proc_key,

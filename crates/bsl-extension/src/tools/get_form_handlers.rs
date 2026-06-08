@@ -73,7 +73,14 @@ impl IndexTool for GetFormHandlersTool {
                 }
             };
 
-            let storage = ctx.storage.lock().await;
+            let storage = match ctx.storage.get().await {
+                Ok(s) => s,
+                Err(e) => {
+                    return crate::tools::wrap_error(serde_json::json!({
+                        "error": format!("storage pool: {}", e)
+                    }));
+                }
+            };
             let conn = storage.conn();
             let row = conn.query_row(
                 "SELECT handlers_json \

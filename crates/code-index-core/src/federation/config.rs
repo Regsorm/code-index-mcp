@@ -35,6 +35,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::client::DEFAULT_REMOTE_PORT;
+use crate::storage::pool::{
+    PoolConfig, DEFAULT_BUSY_TIMEOUT_MS, DEFAULT_PER_CONN_CACHE_KIB, DEFAULT_POOL_SIZE,
+};
 
 /// Полная конфигурация serve, прочитанная из `serve.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +48,39 @@ pub struct ServeFileConfig {
     /// Секции `[[paths]]` — реестр репозиториев в федерации.
     #[serde(default, rename = "paths")]
     pub paths: Vec<ServePathEntry>,
+
+    /// Секция `[pool]` — настройки пула read-only соединений на репозиторий.
+    /// Отсутствует → дефолты (4 соединения × 16 МБ кеша).
+    #[serde(default)]
+    pub pool: PoolSettings,
+}
+
+/// Секция `[pool]` — тюнинг пула соединений serve. Все поля опциональны,
+/// при отсутствии берутся дефолты из `storage::pool`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PoolSettings {
+    /// Число соединений на репо. Отсутствует → `DEFAULT_POOL_SIZE` (4).
+    #[serde(default)]
+    pub pool_size: Option<usize>,
+    /// Размер page-cache на соединение, КиБ. Отсутствует → `DEFAULT_PER_CONN_CACHE_KIB` (16384 = 16 МБ).
+    #[serde(default)]
+    pub per_conn_cache_kib: Option<usize>,
+    /// busy_timeout соединения, мс. Отсутствует → `DEFAULT_BUSY_TIMEOUT_MS` (5000).
+    #[serde(default)]
+    pub busy_timeout_ms: Option<u32>,
+}
+
+impl PoolSettings {
+    /// Свернуть в `PoolConfig`, подставив дефолты для незаданных полей и
+    /// санитизировав значения (`max_size>=1`, `cache_kib>0`).
+    pub fn resolve(&self) -> PoolConfig {
+        PoolConfig {
+            max_size: self.pool_size.unwrap_or(DEFAULT_POOL_SIZE),
+            cache_kib: self.per_conn_cache_kib.unwrap_or(DEFAULT_PER_CONN_CACHE_KIB),
+            busy_timeout_ms: self.busy_timeout_ms.unwrap_or(DEFAULT_BUSY_TIMEOUT_MS),
+        }
+        .sanitized()
+    }
 }
 
 /// Секция `[me]`.
