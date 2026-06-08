@@ -1,5 +1,10 @@
-// MCP-tool `find_path` — находит путь от одной процедуры до другой
-// в графе вызовов через recursive CTE по `proc_call_graph`.
+// MCP-tool `find_path_bsl` — находит путь от одной процедуры до другой
+// в BSL-графе вызовов через recursive CTE по `proc_call_graph`.
+//
+// BSL-специфичный аналог универсального `find_path` (ядро, таблица `calls`):
+// `proc_call_graph` богаче — хранит `call_type` и ключи процедур,
+// дедуплицирован и repo-scoped. Доступен только для репозиториев с
+// `language = "bsl"`.
 //
 // Запрос:
 //   from = "ОбщегоНазначенияСервер.Старт"
@@ -17,18 +22,19 @@ use code_index_core::extension::{IndexTool, ToolContext};
 use rusqlite::params;
 use serde_json::{json, Value};
 
-pub struct FindPathTool;
+pub struct FindPathBslTool;
 
-impl IndexTool for FindPathTool {
+impl IndexTool for FindPathBslTool {
     fn name(&self) -> &str {
-        "find_path"
+        "find_path_bsl"
     }
 
     fn description(&self) -> &str {
-        "Ищет путь в графе вызовов от процедуры 'from' до процедуры 'to' \
+        "Ищет путь в BSL-графе вызовов от процедуры 'from' до процедуры 'to' \
          через таблицу proc_call_graph. Возвращает первый найденный путь \
          (BFS) длиной до max_depth (по умолчанию 3) — массив рёбер с \
          caller/callee/call_type. Пустой массив, если пути нет. \
+         BSL-вариант (с call_type) универсального find_path. \
          For BSL/1C repositories only."
     }
 

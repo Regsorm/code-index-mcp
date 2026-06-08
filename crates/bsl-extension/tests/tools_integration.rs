@@ -17,7 +17,7 @@ use std::sync::Arc;
 use bsl_extension::{
     schema::SCHEMA_EXTENSIONS,
     tools::{
-        FindPathTool, GetEventSubscriptionsTool, GetFormHandlersTool, GetObjectStructureTool,
+        FindPathBslTool, GetEventSubscriptionsTool, GetFormHandlersTool, GetObjectStructureTool,
         SearchTermsTool,
     },
 };
@@ -207,7 +207,7 @@ async fn get_event_subscriptions_filters_by_handler_module() {
     assert_eq!(res["count"].as_u64(), Some(2), "filter ModX → 2 совпадения");
 }
 
-// ── find_path ─────────────────────────────────────────────────────────────
+// ── find_path_bsl ───────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn find_path_returns_direct_edge_when_exists() {
@@ -223,7 +223,7 @@ async fn find_path_returns_direct_edge_when_exists() {
             .unwrap();
     }
     let res = run_tool(
-        &FindPathTool,
+        &FindPathBslTool,
         &storage,
         serde_json::json!({"repo": REPO, "from": "A", "to": "B", "max_depth": 3}),
     )
@@ -249,7 +249,7 @@ async fn find_path_walks_two_hops() {
             .unwrap();
     }
     let res = run_tool(
-        &FindPathTool,
+        &FindPathBslTool,
         &storage,
         serde_json::json!({"repo": REPO, "from": "A", "to": "C", "max_depth": 3}),
     )
@@ -263,7 +263,7 @@ async fn find_path_walks_two_hops() {
 async fn find_path_returns_not_found_when_no_path() {
     let (_tmp, storage) = fresh_storage();
     let res = run_tool(
-        &FindPathTool,
+        &FindPathBslTool,
         &storage,
         serde_json::json!({"repo": REPO, "from": "A", "to": "B"}),
     )
@@ -287,7 +287,7 @@ async fn find_path_respects_max_depth() {
             .unwrap();
     }
     let res_short = run_tool(
-        &FindPathTool,
+        &FindPathBslTool,
         &storage,
         serde_json::json!({"repo": REPO, "from": "A", "to": "D", "max_depth": 2}),
     )
@@ -295,7 +295,7 @@ async fn find_path_respects_max_depth() {
     assert_eq!(res_short["found"].as_bool(), Some(false));
 
     let res_full = run_tool(
-        &FindPathTool,
+        &FindPathBslTool,
         &storage,
         serde_json::json!({"repo": REPO, "from": "A", "to": "D", "max_depth": 3}),
     )

@@ -9,8 +9,9 @@
 //   (owner_full_name, form_name) и возвращает массив (event, handler).
 // - `get_event_subscriptions` — отдаёт все подписки репо из
 //   `event_subscriptions` (с опциональной фильтрацией по handler-модулю).
-// - `find_path` — проходит по `proc_call_graph` через recursive CTE
-//   и возвращает первый путь из caller в callee длиной до max_depth.
+// - `find_path_bsl` — проходит по `proc_call_graph` через recursive CTE
+//   и возвращает первый путь из caller в callee длиной до max_depth
+//   (BSL-вариант универсального `find_path` ядра по таблице `calls`).
 //
 // Регистрируются в `BslLanguageProcessor::additional_tools()` и
 // попадают в MCP `tools/list` только если хотя бы у одного репо
@@ -20,7 +21,7 @@ pub mod bsl_sql;
 pub mod find_data_path;
 pub mod find_references;
 pub mod get_object_profile;
-pub mod find_path;
+pub mod find_path_bsl;
 pub mod get_data_links;
 pub mod get_event_subscriptions;
 pub mod get_form_handlers;
@@ -30,7 +31,7 @@ pub mod search_terms;
 
 pub use bsl_sql::BslSqlTool;
 pub use find_data_path::FindDataPathTool;
-pub use find_path::FindPathTool;
+pub use find_path_bsl::FindPathBslTool;
 pub use find_references::FindReferencesTool;
 pub use get_data_links::GetDataLinksTool;
 pub use get_event_subscriptions::GetEventSubscriptionsTool;

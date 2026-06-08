@@ -101,7 +101,7 @@ impl LanguageProcessor for BslLanguageProcessor {
             Arc::new(crate::tools::GetObjectStructureTool),
             Arc::new(crate::tools::GetFormHandlersTool),
             Arc::new(crate::tools::GetEventSubscriptionsTool),
-            Arc::new(crate::tools::FindPathTool),
+            Arc::new(crate::tools::FindPathBslTool),
             // Граф связей данных (этап 1): окрестность объекта и путь между
             // объектами по ссылочным реквизитам/измерениям (data_links).
             Arc::new(crate::tools::GetDataLinksTool),
@@ -251,7 +251,7 @@ mod tests {
         assert!(names.contains(&"get_object_structure"));
         assert!(names.contains(&"get_form_handlers"));
         assert!(names.contains(&"get_event_subscriptions"));
-        assert!(names.contains(&"find_path"));
+        assert!(names.contains(&"find_path_bsl"));
         assert!(names.contains(&"search_terms"));
         assert!(names.contains(&"get_data_links"));
         assert!(names.contains(&"find_data_path"));

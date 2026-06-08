@@ -122,7 +122,7 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     if let Err(e) = build_call_graph(conn) {
         tracing::warn!("proc_call_graph: {}", e);
     }
-    // ANALYZE: без статистики SQLite в рекурсивном шаге find_path/
+    // ANALYZE: без статистики SQLite в рекурсивном шаге find_path_bsl/
     // find_data_path использует лишь префикс индекса (repo=) и сканирует
     // все рёбра repo на каждой итерации (depth=3 ~240с на КА1.1). После
     // ANALYZE планировщик знает селективность (~5 рёбер на caller_proc_key)
@@ -142,7 +142,7 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
 // файлов одного watcher-батча. Семантика идентична полному `run_index_extras`
 // (см. тест эквивалентности в конце файла). Новых таблиц/колонок не вводит —
 // все slice-функции дедуплицированы так же, как полное построение
-// (`build_call_graph`), и `find_path`/`find_data_path` это не затрагивает.
+// (`build_call_graph`), и `find_path_bsl`/`find_data_path` это не затрагивает.
 
 /// Точечно обновить слой `direct` графа вызовов для ОДНОГО файла.
 ///
@@ -776,7 +776,7 @@ fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     // bsl::extract_override_info при core-индексации) — отдельный парсер CFE НЕ
     // нужен. Ребро: вызов БАЗОВОГО метода (override_target) достигает
     // реализации-перехватчика (имя функции-перехватчика). По голому имени — как
-    // direct-рёбра (общий предел резолва, этап 4e). Так `find_path` проходит
+    // direct-рёбра (общий предел резолва, этап 4e). Так `find_path_bsl` проходит
     // «сквозь &Вместо»: путь до базового метода продолжается в перехватчик.
     let override_count = conn.execute(
         "INSERT OR IGNORE INTO proc_call_graph \
