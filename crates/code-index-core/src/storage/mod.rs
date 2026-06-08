@@ -1235,6 +1235,174 @@ impl Storage {
         }
     }
 
+    /// Кратчайший путь A→B в универсальном графе вызовов (итеративный cycle-safe BFS по `calls`).
+    ///
+    /// Возвращает рёбра первого найденного пути (BFS, длина ≤ `max_depth`) или
+    /// `None`, если пути нет. Это языко-нейтральный аналог BSL-tool'а
+    /// `find_path_bsl` (тот ходит по `proc_call_graph` с `call_type`).
+    /// `language` — опциональный фильтр по языку файла-источника ребра.
+    /// `max_depth` зажимается в [1, 10] для защиты от взрыва на густых графах.
+    pub fn find_call_path(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: i64,
+        language: Option<&str>,
+    ) -> Result<Option<Vec<CallEdge>>> {
+        use std::collections::{HashMap, HashSet, VecDeque};
+        let depth_limit = max_depth.clamp(1, 10);
+        // Путь к самому себе — пустая цепочка рёбер.
+        if from == to {
+            return Ok(Some(Vec::new()));
+        }
+        // Итеративный BFS по УНИКАЛЬНЫМ узлам графа `calls`: каждый узел
+        // разворачивается ровно один раз (HashSet `visited`), поэтому циклы и
+        // кратные рёбра (один и тот же caller→callee на разных строках кода)
+        // не дают экспоненциального взрыва, как в рекурсивном CTE с UNION ALL,
+        // который хранил каждый частичный путь отдельной строкой. NODE_CAP —
+        // жёсткий предохранитель против обхода патологически больших подграфов.
+        const NODE_CAP: usize = 200_000;
+        let sql = if language.is_some() {
+            "SELECT c.callee, c.line FROM calls c \
+             JOIN files fi ON fi.id = c.file_id \
+             WHERE c.caller = ?1 AND fi.language = ?2"
+        } else {
+            "SELECT c.callee, c.line FROM calls c WHERE c.caller = ?1"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(from.to_string());
+        // parent: узел → (предшественник, номер строки ребра) для реконструкции.
+        let mut parent: HashMap<String, (String, i64)> = HashMap::new();
+        let mut queue: VecDeque<(String, i64)> = VecDeque::new();
+        queue.push_back((from.to_string(), 0));
+        let mut found = false;
+        'bfs: while let Some((node, d)) = queue.pop_front() {
+            if d >= depth_limit {
+                continue;
+            }
+            let rows: Vec<(String, i64)> = if let Some(lang) = language {
+                stmt.query_map(params![node, lang], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                stmt.query_map(params![node], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (callee, line) in rows {
+                if visited.contains(&callee) {
+                    continue;
+                }
+                visited.insert(callee.clone());
+                parent.insert(callee.clone(), (node.clone(), line));
+                if callee == to {
+                    found = true;
+                    break 'bfs;
+                }
+                if visited.len() >= NODE_CAP {
+                    break 'bfs;
+                }
+                queue.push_back((callee, d + 1));
+            }
+        }
+        if !found {
+            return Ok(None);
+        }
+        // Реконструкция пути from→to по parent-указателям (обратный проход).
+        let mut chain: Vec<CallEdge> = Vec::new();
+        let mut cur = to.to_string();
+        while let Some((prev, line)) = parent.get(&cur) {
+            chain.push(CallEdge {
+                caller: prev.clone(),
+                callee: cur.clone(),
+                line: *line,
+            });
+            if prev.as_str() == from {
+                break;
+            }
+            cur = prev.clone();
+        }
+        chain.reverse();
+        Ok(Some(chain))
+    }
+
+    /// Дерево вызовов от корня `root` на глубину `max_depth` (recursive CTE по
+    /// `calls`). `down = true` — обход callee-рёбер (что в итоге вызывает root
+    /// вглубь); `down = false` — caller-рёбер (кто в итоге вызывает root).
+    ///
+    /// Возвращает рёбра с глубиной от корня (1 = прямые рёбра) и флаг
+    /// `truncated` (если число рёбер достигло `max_nodes`). `max_depth`
+    /// зажимается в [1, 10], `max_nodes` — в [1, 5000]. UNION дедуплицирует
+    /// повторы рёбер между ветками и ограничивает циклы (глубиной).
+    pub fn get_call_tree(
+        &self,
+        root: &str,
+        down: bool,
+        max_depth: i64,
+        max_nodes: i64,
+        language: Option<&str>,
+    ) -> Result<(Vec<CallTreeEdge>, bool)> {
+        let depth = max_depth.clamp(1, 10);
+        let cap = max_nodes.clamp(1, 5000);
+        // Берём cap+1 строк, чтобы понять, обрезали ли результат.
+        let fetch = cap + 1;
+        // node — следующая вершина обхода; стартовая колонка и направление
+        // join зависят от `down`.
+        let node_recur = if down { "c.callee" } else { "c.caller" };
+        let start_col = if down { "caller" } else { "callee" };
+        let join_recur = if down { "c.caller = t.node" } else { "c.callee = t.node" };
+        let (anchor_join, lang_filter, recur_join) = if language.is_some() {
+            (
+                " JOIN files fi ON fi.id = c.file_id",
+                " AND fi.language = ?4",
+                " JOIN files fi ON fi.id = c.file_id AND fi.language = ?4",
+            )
+        } else {
+            ("", "", "")
+        };
+        let node_anchor = if down { "c.callee" } else { "c.caller" };
+        let sql = format!(
+            "
+            WITH RECURSIVE tree(node, depth, caller, callee, line) AS (
+                SELECT {node_anchor}, 1, c.caller, c.callee, c.line
+                  FROM calls c{anchor_join}
+                 WHERE c.{start_col} = ?1{lang_filter}
+                UNION
+                SELECT {node_recur}, t.depth + 1, c.caller, c.callee, c.line
+                  FROM tree t
+                  JOIN calls c ON {join_recur}{recur_join}
+                 WHERE t.depth < ?2
+            )
+            SELECT caller, callee, line, depth FROM tree
+            ORDER BY depth, caller, callee LIMIT ?3
+            "
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row<'_>| {
+            Ok(CallTreeEdge {
+                caller: r.get(0)?,
+                callee: r.get(1)?,
+                line: r.get(2)?,
+                depth: r.get(3)?,
+            })
+        };
+        let mut rows: Vec<CallTreeEdge> = if let Some(lang) = language {
+            stmt.query_map(params![root, depth, fetch, lang], map_row)?
+                .collect::<rusqlite::Result<_>>()?
+        } else {
+            stmt.query_map(params![root, depth, fetch], map_row)?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let truncated = rows.len() as i64 > cap;
+        if truncated {
+            rows.truncate(cap as usize);
+        }
+        Ok((rows, truncated))
+    }
+
     /// Объединённый поиск символа по имени (функции + классы + переменные + импорты)
     pub fn find_symbol(&self, name: &str, language: Option<&str>) -> Result<SymbolSearchResult> {
         // Функции
@@ -2547,6 +2715,113 @@ mod tests {
         assert_eq!(stats.total_files, 1);
         assert_eq!(stats.total_functions, 2);
         assert_eq!(stats.total_calls, 1);
+    }
+
+    // ── find_call_path / get_call_tree (универсальный граф вызовов) ──────────
+
+    /// Вставить рёбра графа вызовов в один файл.
+    fn seed_calls(storage: &Storage, file_id: i64, edges: &[(&str, &str)]) {
+        let calls: Vec<CallRecord> = edges
+            .iter()
+            .enumerate()
+            .map(|(i, (caller, callee))| CallRecord {
+                id: None,
+                file_id,
+                caller: (*caller).to_string(),
+                callee: (*callee).to_string(),
+                line: i + 1,
+            })
+            .collect();
+        storage.insert_calls(&calls).unwrap();
+    }
+
+    #[test]
+    fn find_call_path_direct_and_two_hops() {
+        let storage = Storage::open_in_memory().unwrap();
+        let fid = storage.upsert_file(&make_file("/g.py")).unwrap();
+        seed_calls(&storage, fid, &[("A", "B"), ("B", "C")]);
+
+        // Прямое ребро A→B.
+        let direct = storage.find_call_path("A", "B", 3, None).unwrap().expect("путь A→B");
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].caller, "A");
+        assert_eq!(direct[0].callee, "B");
+
+        // Два прыжка A→B→C.
+        let two = storage.find_call_path("A", "C", 3, None).unwrap().expect("путь A→C");
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[1].callee, "C");
+    }
+
+    #[test]
+    fn find_call_path_none_and_respects_depth() {
+        let storage = Storage::open_in_memory().unwrap();
+        // Пустая база — пути нет.
+        assert!(storage.find_call_path("A", "B", 5, None).unwrap().is_none());
+
+        let fid = storage.upsert_file(&make_file("/g.py")).unwrap();
+        seed_calls(&storage, fid, &[("A", "B"), ("B", "C"), ("C", "D")]);
+
+        // A→D длиной 3: при max_depth=2 не должен найтись.
+        assert!(storage.find_call_path("A", "D", 2, None).unwrap().is_none());
+        // При max_depth=3 — путь из 3 рёбер.
+        assert_eq!(storage.find_call_path("A", "D", 3, None).unwrap().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn find_call_path_language_filter() {
+        let storage = Storage::open_in_memory().unwrap();
+        let py = storage.upsert_file(&make_file("/a.py")).unwrap();
+        let rs = storage.upsert_file(&make_file_full("/a.rs", "rust", 10)).unwrap();
+        seed_calls(&storage, py, &[("A", "B")]);
+        seed_calls(&storage, rs, &[("X", "Y")]);
+
+        // Python-ребро A→B отфильтровано при language=rust.
+        assert!(storage.find_call_path("A", "B", 3, Some("rust")).unwrap().is_none());
+        assert!(storage.find_call_path("A", "B", 3, Some("python")).unwrap().is_some());
+        assert!(storage.find_call_path("X", "Y", 3, Some("rust")).unwrap().is_some());
+    }
+
+    #[test]
+    fn get_call_tree_down_levels() {
+        let storage = Storage::open_in_memory().unwrap();
+        let fid = storage.upsert_file(&make_file("/t.py")).unwrap();
+        // A→B, A→C, B→D.
+        seed_calls(&storage, fid, &[("A", "B"), ("A", "C"), ("B", "D")]);
+
+        let (edges, trunc) = storage.get_call_tree("A", true, 3, 100, None).unwrap();
+        assert!(!trunc);
+        assert_eq!(edges.len(), 3);
+        let ab = edges.iter().find(|e| e.caller == "A" && e.callee == "B").unwrap();
+        assert_eq!(ab.depth, 1);
+        let bd = edges.iter().find(|e| e.caller == "B" && e.callee == "D").unwrap();
+        assert_eq!(bd.depth, 2);
+    }
+
+    #[test]
+    fn get_call_tree_up_direction() {
+        let storage = Storage::open_in_memory().unwrap();
+        let fid = storage.upsert_file(&make_file("/t.py")).unwrap();
+        // A→B, B→D: кто вызывает D — B (d1), A (d2, через B).
+        seed_calls(&storage, fid, &[("A", "B"), ("B", "D")]);
+
+        let (edges, _) = storage.get_call_tree("D", false, 3, 100, None).unwrap();
+        assert!(edges.iter().any(|e| e.caller == "B" && e.callee == "D" && e.depth == 1));
+        assert!(edges.iter().any(|e| e.caller == "A" && e.callee == "B" && e.depth == 2));
+    }
+
+    #[test]
+    fn get_call_tree_truncates_at_max_nodes() {
+        let storage = Storage::open_in_memory().unwrap();
+        let fid = storage.upsert_file(&make_file("/t.py")).unwrap();
+        let edges_in: Vec<(&str, &str)> =
+            vec![("A", "B0"), ("A", "B1"), ("A", "B2"), ("A", "B3"), ("A", "B4"),
+                 ("A", "B5"), ("A", "B6"), ("A", "B7"), ("A", "B8"), ("A", "B9")];
+        seed_calls(&storage, fid, &edges_in);
+
+        let (edges, trunc) = storage.get_call_tree("A", true, 2, 5, None).unwrap();
+        assert!(trunc, "10 рёбер при max_nodes=5 → truncated");
+        assert_eq!(edges.len(), 5);
     }
 
     #[test]

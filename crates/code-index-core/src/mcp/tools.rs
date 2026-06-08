@@ -500,6 +500,134 @@ pub async fn get_callees(
     }
 }
 
+pub async fn find_path(
+    entry: &RepoEntry,
+    from: String,
+    to: String,
+    max_depth: Option<i64>,
+    language: Option<String>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let depth = max_depth.unwrap_or(5);
+    let storage = entry.local_storage().lock().await;
+    match storage.find_call_path(&from, &to, depth, language.as_deref()) {
+        Ok(opt) => {
+            let found = opt.is_some();
+            let path = opt.unwrap_or_default();
+            let result = serde_json::json!({
+                "from": from,
+                "to": to,
+                "found": found,
+                "path": path,
+                "max_depth": depth.clamp(1, 10),
+            });
+            // На пустом результате — hint (модель часто повторяет тот же вызов).
+            let hint = (!found).then_some(
+                "Путь не найден в графе вызовов. Увеличьте max_depth, проверьте точные имена функций (get_function) или снимите language=.",
+            );
+            wrap_with_meta_hint(&storage, &result, Vec::new(), hint)
+        }
+        Err(e) => format!("{{\"error\": \"find_path: {}\"}}", e),
+    }
+}
+
+pub async fn get_call_tree(
+    entry: &RepoEntry,
+    root: String,
+    direction: Option<String>,
+    max_depth: Option<i64>,
+    max_nodes: Option<i64>,
+    language: Option<String>,
+) -> String {
+    bail_if_not_ready!(entry);
+    // direction: callees|down (что вызывает root, вглубь) | callers|up (кто вызывает root).
+    let down = !matches!(direction.as_deref(), Some("callers") | Some("up"));
+    let depth = max_depth.unwrap_or(3);
+    let cap = max_nodes.unwrap_or(200);
+    let storage = entry.local_storage().lock().await;
+    match storage.get_call_tree(&root, down, depth, cap, language.as_deref()) {
+        Ok((edges, truncated)) => {
+            let tree = build_call_tree_json(&root, down, &edges);
+            let empty = edges.is_empty();
+            let result = serde_json::json!({
+                "root": root,
+                "direction": if down { "callees" } else { "callers" },
+                "max_depth": depth.clamp(1, 10),
+                "edge_count": edges.len(),
+                "edges": edges,
+                "tree": tree,
+            });
+            let extra = if truncated {
+                Some(serde_json::json!({
+                    "truncated": true,
+                    "limit": cap.clamp(1, 5000),
+                    "hint": "Дерево обрезано по max_nodes. Уменьшите max_depth или увеличьте max_nodes.",
+                }))
+            } else if empty {
+                Some(serde_json::json!({
+                    "hint": "Дерево пустое: у корня нет рёбер в этом направлении. Проверьте точное имя (get_function) или смените direction.",
+                }))
+            } else {
+                None
+            };
+            wrap_with_meta_extra(&storage, &result, Vec::new(), extra)
+        }
+        Err(e) => format!("{{\"error\": \"get_call_tree: {}\"}}", e),
+    }
+}
+
+/// Собрать вложенное дерево `{name, children:[...]}` из плоских рёбер
+/// `get_call_tree`. Обход строго по уровням глубины (ребёнок узла на глубине d —
+/// это ребро глубины d+1 с этим узлом в роли родителя), поэтому дерево не глубже
+/// `max_depth` и циклы невозможны (глубина строго растёт). `down=true` — дети
+/// узла его callee; `down=false` — его caller.
+fn build_call_tree_json(
+    root: &str,
+    down: bool,
+    edges: &[crate::storage::models::CallTreeEdge],
+) -> serde_json::Value {
+    use std::collections::{BTreeSet, HashMap};
+    // by_depth: глубина → родитель → отсортированное множество (ребёнок, line).
+    let mut by_depth: HashMap<i64, HashMap<&str, BTreeSet<(&str, i64)>>> = HashMap::new();
+    for e in edges {
+        let (parent, child) = if down {
+            (e.caller.as_str(), e.callee.as_str())
+        } else {
+            (e.callee.as_str(), e.caller.as_str())
+        };
+        by_depth
+            .entry(e.depth)
+            .or_default()
+            .entry(parent)
+            .or_default()
+            .insert((child, e.line));
+    }
+    let max_d = edges.iter().map(|e| e.depth).max().unwrap_or(0);
+
+    fn build(
+        node: &str,
+        depth: i64,
+        max_d: i64,
+        by_depth: &HashMap<i64, HashMap<&str, BTreeSet<(&str, i64)>>>,
+    ) -> serde_json::Value {
+        let mut children = Vec::new();
+        if depth < max_d {
+            if let Some(kids) = by_depth.get(&(depth + 1)).and_then(|m| m.get(node)) {
+                for (child, line) in kids {
+                    let mut sub = build(child, depth + 1, max_d, by_depth);
+                    if let Some(obj) = sub.as_object_mut() {
+                        obj.insert("line".to_string(), serde_json::json!(line));
+                    }
+                    children.push(sub);
+                }
+            }
+        }
+        serde_json::json!({ "name": node, "children": children })
+    }
+
+    build(root, 0, max_d, &by_depth)
+}
+
 pub async fn find_symbol(
     entry: &RepoEntry,
     name: String,

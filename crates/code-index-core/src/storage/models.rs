@@ -71,6 +71,24 @@ pub struct CallRecord {
     pub line: usize,
 }
 
+/// Ребро универсального графа вызовов (таблица `calls`).
+/// Используется в пути `find_path` (рекурсивный обход).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallEdge {
+    pub caller: String,
+    pub callee: String,
+    pub line: i64,
+}
+
+/// Ребро дерева вызовов с глубиной от корня (`get_call_tree`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallTreeEdge {
+    pub caller: String,
+    pub callee: String,
+    pub line: i64,
+    pub depth: i64,
+}
+
 /// Запись переменной
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VariableRecord {

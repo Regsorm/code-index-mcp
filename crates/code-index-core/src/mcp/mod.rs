@@ -125,6 +125,37 @@ pub struct FunctionNameParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FindPathParams {
+    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    pub repo: String,
+    /// Имя функции-источника (caller) — начало пути.
+    pub from: String,
+    /// Имя функции-цели (callee) — конец пути.
+    pub to: String,
+    /// Максимальная длина пути (число рёбер), [1..10]. По умолчанию 5.
+    pub max_depth: Option<i64>,
+    /// Опциональный фильтр по языку файла-источника ребра (rust/python/bsl/…).
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct CallTreeParams {
+    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    pub repo: String,
+    /// Имя функции-корня дерева.
+    pub root: String,
+    /// Направление: "callees"/"down" (что вызывает root, вглубь — по умолчанию)
+    /// или "callers"/"up" (кто вызывает root).
+    pub direction: Option<String>,
+    /// Глубина дерева (число уровней), [1..10]. По умолчанию 3.
+    pub max_depth: Option<i64>,
+    /// Cap на число рёбер, [1..5000]. По умолчанию 200; при обрезке — truncated=true.
+    pub max_nodes: Option<i64>,
+    /// Опциональный фильтр по языку файла-источника ребра.
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ImportParams {
     /// Алиас репозитория (из --path alias=dir при запуске сервера).
     pub repo: String,
@@ -235,7 +266,7 @@ pub struct GrepCodeParams {
 }
 
 /// Универсальные параметры для federation-форварда extension-tools
-/// (`get_object_structure`, `get_form_handlers`, `find_path` и т.д.).
+/// (`get_object_structure`, `get_form_handlers`, `find_path_bsl` и т.д.).
 ///
 /// Введён в v0.8.1 как замена per-tool routes: extension-tools меняются
 /// чаще, чем core, и заводить отдельный route на каждый — лишний шум.
@@ -746,6 +777,28 @@ impl CodeIndexServer {
             ).await;
         }
         tools::get_callees(entry, p.function_name, p.language, p.limit).await
+    }
+
+    #[tool(description = "Кратчайший путь в графе вызовов от функции 'from' до 'to' через таблицу calls (рекурсивный CTE, BFS, max_depth по умолчанию 5, [1..10]). Универсальный, любой язык. Возвращает {from,to,found,path:[{caller,callee,line}]}. Для BSL с call_type — find_path_bsl.")]
+    async fn find_path(&self, Parameters(p): Parameters<FindPathParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "find_path", &p,
+            ).await;
+        }
+        tools::find_path(entry, p.from, p.to, p.max_depth, p.language).await
+    }
+
+    #[tool(description = "Дерево вызовов от функции 'root' на глубину max_depth (по умолчанию 3, [1..10]) через таблицу calls. direction: callees/down (что вызывает root вглубь, по умолчанию) или callers/up (кто вызывает root). max_nodes cap (default 200). Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}.")]
+    async fn get_call_tree(&self, Parameters(p): Parameters<CallTreeParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "get_call_tree", &p,
+            ).await;
+        }
+        tools::get_call_tree(entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language).await
     }
 
     #[tool(description = "Универсальный поиск символа по точному имени в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-объект {functions, classes, variables, imports}.")]

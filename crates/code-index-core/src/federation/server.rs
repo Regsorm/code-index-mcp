@@ -20,9 +20,10 @@ use axum::{
 };
 
 use crate::mcp::{
-    tools, CodeIndexServer, ExtensionToolParams, FilePathParams, FunctionNameParams,
-    GrepBodyParams, GrepCodeParams, GrepTextParams, ImportParams, ListFilesParams, NameParams,
-    ReadFileParams, RepoEntry, SearchParams, StatFileParams, StatsParams,
+    tools, CallTreeParams, CodeIndexServer, ExtensionToolParams, FilePathParams, FindPathParams,
+    FunctionNameParams, GrepBodyParams, GrepCodeParams, GrepTextParams, ImportParams,
+    ListFilesParams, NameParams, ReadFileParams, RepoEntry, SearchParams, StatFileParams,
+    StatsParams,
 };
 
 use super::dispatcher::federation_error;
@@ -39,6 +40,8 @@ pub fn federate_router(server: CodeIndexServer) -> Router {
         .route("/federate/get_class", post(handle_get_class))
         .route("/federate/get_callers", post(handle_get_callers))
         .route("/federate/get_callees", post(handle_get_callees))
+        .route("/federate/find_path", post(handle_find_path))
+        .route("/federate/get_call_tree", post(handle_get_call_tree))
         .route("/federate/find_symbol", post(handle_find_symbol))
         .route("/federate/get_imports", post(handle_get_imports))
         .route("/federate/get_file_summary", post(handle_get_file_summary))
@@ -163,6 +166,28 @@ async fn handle_get_callees(
         Err(r) => return r,
     };
     ok_json(tools::get_callees(entry, p.function_name, p.language, p.limit).await)
+}
+
+async fn handle_find_path(
+    State(server): State<Server>,
+    Json(p): Json<FindPathParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "find_path") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(tools::find_path(entry, p.from, p.to, p.max_depth, p.language).await)
+}
+
+async fn handle_get_call_tree(
+    State(server): State<Server>,
+    Json(p): Json<CallTreeParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "get_call_tree") {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    ok_json(tools::get_call_tree(entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language).await)
 }
 
 async fn handle_find_symbol(
