@@ -12,6 +12,13 @@
 // Терминальные `*`-узлы (is_universal: *CatalogRef / *AnyRef /
 // *DefinedType.X) не разворачиваются дальше — у них нет исходящих рёбер,
 // обход на них естественно останавливается (защита от fan-out и шума).
+//
+// Защита контекста: каждое направление ограничено `limit` рёбрами
+// (default 100, max 1000). При превышении возвращаются первые `limit`
+// рёбер, рядом — `out_total`/`out_truncated` (и `in_*`), чтобы модель
+// видела полный размер и при необходимости сузила запрос (direction/depth)
+// или дослала больший limit. Без этого «центральные» объекты (ЗаказКлиента,
+// Номенклатура) отдавали сотни-тысячи рёбер и переполняли контекст агента.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,6 +26,11 @@ use std::pin::Pin;
 use code_index_core::extension::{IndexTool, ToolContext};
 use rusqlite::params;
 use serde_json::{json, Value};
+
+/// Потолок рёбер на одно направление по умолчанию.
+const DEFAULT_LIMIT: i64 = 100;
+/// Жёсткий максимум (защита от выгрузки тысяч рёбер в контекст).
+const MAX_LIMIT: i64 = 1000;
 
 pub struct GetDataLinksTool;
 
@@ -33,7 +45,10 @@ impl IndexTool for GetDataLinksTool {
          типа), 'in' — какие объекты ссылаются на него. Обходит граф до глубины \
          depth (по умолчанию 1, максимум 4). Заменяет серию get_metadata_structure \
          при анализе связей. Цель вида '*CatalogRef'/'*AnyRef'/'*DefinedType.X' — \
-         обобщённая ссылка (терминал, дальше не разворачивается). For BSL/1C repositories only."
+         обобщённая ссылка (терминал, дальше не разворачивается). Каждое направление \
+         ограничено параметром limit (default 100, max 1000); при превышении рядом с \
+         out/in отдаются out_total/out_truncated (и in_total/in_truncated). \
+         For BSL/1C repositories only."
     }
 
     fn input_schema(&self) -> Value {
@@ -57,6 +72,12 @@ impl IndexTool for GetDataLinksTool {
                     "default": 1,
                     "minimum": 1,
                     "maximum": 4
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Потолок рёбер на направление (default 100, max 1000). При превышении — первые limit + флаг *_truncated и счётчик *_total.",
+                    "default": 100,
+                    "minimum": 1
                 }
             },
             "required": ["repo", "object"]
@@ -90,24 +111,33 @@ impl IndexTool for GetDataLinksTool {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(1)
                 .clamp(1, 4);
+            let limit: i64 = args
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(DEFAULT_LIMIT)
+                .clamp(1, MAX_LIMIT);
 
             let storage = ctx.storage.lock().await;
             let conn = storage.conn();
 
-            let mut result = json!({ "object": object, "depth": depth });
+            let mut result = json!({ "object": object, "depth": depth, "limit": limit });
 
             if direction == "out" || direction == "both" {
-                match query_links(conn, &object, depth, Direction::Out) {
-                    Ok(v) => {
+                match query_links(conn, &object, depth, Direction::Out, limit) {
+                    Ok((v, total, truncated)) => {
                         result["out"] = Value::Array(v);
+                        result["out_total"] = json!(total);
+                        result["out_truncated"] = json!(truncated);
                     }
                     Err(e) => return crate::tools::wrap_error(json!({"error": format!("database error (out): {}", e)})),
                 }
             }
             if direction == "in" || direction == "both" {
-                match query_links(conn, &object, depth, Direction::In) {
-                    Ok(v) => {
+                match query_links(conn, &object, depth, Direction::In, limit) {
+                    Ok((v, total, truncated)) => {
                         result["in"] = Value::Array(v);
+                        result["in_total"] = json!(total);
+                        result["in_truncated"] = json!(truncated);
                     }
                     Err(e) => return crate::tools::wrap_error(json!({"error": format!("database error (in): {}", e)})),
                 }
@@ -123,19 +153,11 @@ enum Direction {
     In,
 }
 
-/// Собрать рёбра окрестности объекта в заданном направлении до глубины depth.
-/// Out: идём по from_object → to_object (на что ссылается).
-/// In:  идём по to_object → from_object (кто ссылается).
-/// Терминальные `*`-узлы (is_universal=1) не разворачиваются на следующий шаг.
-fn query_links(
-    conn: &rusqlite::Connection,
-    object: &str,
-    depth: i64,
-    dir: Direction,
-) -> rusqlite::Result<Vec<Value>> {
-    // Для out стартовая привязка по from_object, переход by to_object.
-    // Для in — зеркально (start by to_object, переход by from_object).
-    let sql = match dir {
+/// Тело recursive-CTE для направления (без LIMIT) — переиспользуется и для
+/// выборки рёбер (с LIMIT), и для COUNT(*) при подсчёте total.
+fn walk_cte(dir: &Direction) -> &'static str {
+    match dir {
+        // Out: стартовая привязка по from_object, переход by to_object.
         Direction::Out => "
             WITH RECURSIVE walk(from_object, from_path, to_object, link_kind, is_composite, is_universal, depth) AS (
                 SELECT from_object, from_path, to_object, link_kind, is_composite, is_universal, 1
@@ -149,6 +171,7 @@ fn query_links(
             SELECT DISTINCT from_object, from_path, to_object, link_kind, is_composite, is_universal, depth
             FROM walk ORDER BY depth, from_object, from_path
         ",
+        // In: зеркально (start by to_object, переход by from_object).
         Direction::In => "
             WITH RECURSIVE walk(from_object, from_path, to_object, link_kind, is_composite, is_universal, depth) AS (
                 SELECT from_object, from_path, to_object, link_kind, is_composite, is_universal, 1
@@ -162,10 +185,26 @@ fn query_links(
             SELECT DISTINCT from_object, from_path, to_object, link_kind, is_composite, is_universal, depth
             FROM walk ORDER BY depth, from_object, from_path
         ",
-    };
+    }
+}
 
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params!["default", object, depth], |r| {
+/// Собрать рёбра окрестности объекта в заданном направлении до глубины depth,
+/// не более `limit` штук. Возвращает (рёбра, total, truncated):
+/// total — полное число рёбер (через COUNT, только если упёрлись в limit),
+/// truncated — true, если рёбер было больше limit.
+/// Терминальные `*`-узлы (is_universal=1) не разворачиваются на следующий шаг (только Out).
+fn query_links(
+    conn: &rusqlite::Connection,
+    object: &str,
+    depth: i64,
+    dir: Direction,
+    limit: i64,
+) -> rusqlite::Result<(Vec<Value>, i64, bool)> {
+    let cte = walk_cte(&dir);
+    // Берём limit+1, чтобы отличить «ровно limit» от «есть ещё».
+    let data_sql = format!("{cte} LIMIT ?4");
+    let mut stmt = conn.prepare(&data_sql)?;
+    let rows = stmt.query_map(params!["default", object, depth, limit + 1], |r| {
         Ok(json!({
             "from_object": r.get::<_, String>(0)?,
             "from_path": r.get::<_, String>(1)?,
@@ -180,5 +219,18 @@ fn query_links(
     for row in rows {
         out.push(row?);
     }
-    Ok(out)
+    let truncated = out.len() as i64 > limit;
+    if truncated {
+        out.truncate(limit as usize);
+    }
+    // total: если не обрезано — это и есть len; иначе считаем COUNT по тому же CTE.
+    let total = if truncated {
+        let count_sql = format!("SELECT COUNT(*) FROM ({cte})");
+        conn.query_row(&count_sql, params!["default", object, depth], |r| {
+            r.get::<_, i64>(0)
+        })?
+    } else {
+        out.len() as i64
+    };
+    Ok((out, total, truncated))
 }

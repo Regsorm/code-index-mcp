@@ -19,14 +19,20 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use code_index_core::extension::{IndexTool, ToolContext};
 use rusqlite::params;
 use serde_json::{json, Value};
 
-/// Сколько исходящих/входящих рёбер связей данных отдавать максимум
-/// (защита от выгрузки тысяч строк по «центральным» объектам вроде Организации).
-const LINKS_CAP: usize = 200;
+/// Сколько исходящих рёбер связей данных отдавать максимум (защита от выгрузки
+/// тысяч строк по «центральным» объектам вроде Организации). Снижен 200→60:
+/// для обзорного паспорта 60 рёбер достаточно, `out_total` показывает полное
+/// число, за деталями — get_data_links. Экономия токенов на центральных объектах.
+const LINKS_CAP: usize = 60;
+/// Таймаут набора запросов (как в bsl_sql): sqlite3_interrupt против runaway
+/// COUNT/SELECT на больших data_links (центральные регистры/объекты).
+const QUERY_TIMEOUT_SECS: u64 = 8;
 
 pub struct GetObjectProfileTool;
 
@@ -43,8 +49,10 @@ impl IndexTool for GetObjectProfileTool {
          — UUID для dbgs-breakpoints — и code_path), data_links (исходящие ссылки, \
          движения в регистры для документов / регистраторы для регистров, число входящих \
          ссылок). Заменяет серию get_object_structure + get_form_handlers + get_data_links \
-         одним round-trip'ом. Имя — singular meta_type ('<MetaType>.<Name>'). For BSL/1C \
-         repositories only."
+         одним round-trip'ом. Имя — singular meta_type ('<MetaType>.<Name>'). \
+         Параметр sections=['structure'|'forms'|'modules'|'data_links'] сужает ответ \
+         (по умолчанию все секции) — удешевляет вызов, когда нужна только часть. For \
+         BSL/1C repositories only."
     }
 
     fn input_schema(&self) -> Value {
@@ -55,6 +63,11 @@ impl IndexTool for GetObjectProfileTool {
                 "full_name": {
                     "type": "string",
                     "description": "Полное имя объекта вида '<MetaType>.<Name>' (singular), например 'Document.РеализацияТоваровУслуг'"
+                },
+                "sections": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["structure", "forms", "modules", "data_links"] },
+                    "description": "Какие секции вернуть. По умолчанию (опущено) — все. Рычаг удешевления: ['structure'] вернёт только реквизиты/ТЧ/измерения/ресурсы без форм, модулей и связей данных."
                 }
             },
             "required": ["repo", "full_name"]
@@ -90,103 +103,39 @@ impl IndexTool for GetObjectProfileTool {
                     }));
                 }
             };
-            let folder = meta_type_to_folder(&meta_type);
+            // Выбор секций (опц.) — рычаг удешевления ответа: ['structure'] и т.п.
+            let sections: Vec<String> = args
+                .get("sections")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
 
             let storage = ctx.storage.lock().await;
             let conn = storage.conn();
 
-            // ── Заголовок + структура (metadata_objects, singular key) ────────
-            let header = conn.query_row(
-                "SELECT meta_type, name, synonym, attributes_json \
-                 FROM metadata_objects WHERE repo = ?1 AND full_name = ?2",
-                params![REPO, &full_name],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                    ))
-                },
-            );
+            // interrupt-таймаут против runaway-запросов на больших data_links
+            // (центральные регистры/объекты). Паттерн как в bsl_sql: handle живёт
+            // в отдельной задаче, по истечении дёргает sqlite3_interrupt; гасим
+            // после сборки.
+            let handle = conn.get_interrupt_handle();
+            let timer = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(QUERY_TIMEOUT_SECS)).await;
+                handle.interrupt();
+            });
 
-            let (found, db_meta_type, db_name, synonym, structure) = match header {
-                Ok((mt, nm, syn, attrs)) => {
-                    let structure = attrs
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                        .unwrap_or(Value::Null);
-                    (true, mt, nm, syn, structure)
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    // Объект может не иметь записи в metadata_objects (тип вне
-                    // OBJECT_FOLDERS — например DataProcessor/Report), но формы/модули
-                    // у него есть. Не выходим — отдаём что найдём, found=false.
-                    (false, meta_type.clone(), name.clone(), None, Value::Null)
-                }
-                Err(e) => {
-                    return crate::tools::wrap_error(json!({
-                        "error": format!("database error (header): {}", e)
-                    }));
-                }
-            };
+            let result = assemble_profile(conn, &full_name, &meta_type, &name, &sections);
+            timer.abort();
 
-            // ── Формы (metadata_forms, plural folder key) ─────────────────────
-            let forms = match folder.as_deref() {
-                Some(fld) => {
-                    let owner = format!("{}.{}", fld, name);
-                    match query_forms(conn, &owner) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            return crate::tools::wrap_error(json!({
-                                "error": format!("database error (forms): {}", e)
-                            }))
-                        }
-                    }
-                }
-                None => Vec::new(),
-            };
-
-            // ── Модули (metadata_modules, plural folder key) ──────────────────
-            let modules = match folder.as_deref() {
-                Some(fld) => {
-                    let prefix = format!("{}.{}.", fld, name);
-                    match query_modules(conn, &prefix) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            return crate::tools::wrap_error(json!({
-                                "error": format!("database error (modules): {}", e)
-                            }))
-                        }
-                    }
-                }
-                None => Vec::new(),
-            };
-
-            // ── Связи данных (data_links, singular key) ───────────────────────
-            let data_links = match query_data_links(conn, &full_name) {
-                Ok(v) => v,
-                Err(e) => {
-                    return crate::tools::wrap_error(json!({
-                        "error": format!("database error (data_links): {}", e)
-                    }))
-                }
-            };
-
-            crate::tools::wrap_with_meta(
-                json!({
-                    "full_name": full_name,
-                    "found": found,
-                    "meta_type": db_meta_type,
-                    "name": db_name,
-                    "synonym": synonym,
-                    "structure": structure,
-                    "forms": forms,
-                    "modules": modules,
-                    "data_links": data_links,
-                }),
-                Vec::new(),
-            )
+            match result {
+                Ok(v) => crate::tools::wrap_with_meta(v, Vec::new()),
+                Err(e) => crate::tools::wrap_error(json!({
+                    "error": format!("database error: {}", e)
+                })),
+            }
         })
     }
 }
@@ -194,6 +143,110 @@ impl IndexTool for GetObjectProfileTool {
 /// Repo-ключ внутри per-repo index.db. Все BSL-таблицы пишут 'default'
 /// (каждый репо — отдельный файл БД). См. index_extras::REPO_DEFAULT.
 const REPO: &str = "default";
+
+/// Сборка паспорта объекта одним проходом — под общим interrupt-таймаутом из
+/// execute (все запросы используют один conn, прерываются разом по таймауту).
+fn assemble_profile(
+    conn: &rusqlite::Connection,
+    full_name: &str,
+    meta_type: &str,
+    name: &str,
+    sections: &[String],
+) -> rusqlite::Result<Value> {
+    let folder = meta_type_to_folder(meta_type);
+    // Выбор секций: пустой список → все (обратная совместимость). Иначе — только
+    // запрошенные (рычаг удешевления: ['structure'] вернёт лишь реквизиты/ТЧ).
+    let all = sections.is_empty();
+    let want = |s: &str| all || sections.iter().any(|x| x == s);
+    let (want_structure, want_forms, want_modules, want_links) =
+        (want("structure"), want("forms"), want("modules"), want("data_links"));
+
+    // ── Заголовок + структура (metadata_objects, singular key) ────────────
+    let header = conn.query_row(
+        "SELECT meta_type, name, synonym, attributes_json \
+         FROM metadata_objects WHERE repo = ?1 AND full_name = ?2",
+        params![REPO, full_name],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        },
+    );
+
+    let (found, db_meta_type, db_name, synonym, structure) = match header {
+        Ok((mt, nm, syn, attrs)) => {
+            let structure = attrs
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or(Value::Null);
+            (true, mt, nm, syn, structure)
+        }
+        // Объект может не иметь записи в metadata_objects (тип вне OBJECT_FOLDERS —
+        // например DataProcessor/Report), но формы/модули у него есть. Не выходим —
+        // отдаём что найдём, found=false.
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            (false, meta_type.to_string(), name.to_string(), None, Value::Null)
+        }
+        Err(e) => return Err(e),
+    };
+
+    // ── Формы / модули (plural folder key) ── только если запрошены ────────
+    let forms = if want_forms {
+        match folder.as_deref() {
+            Some(fld) => query_forms(conn, &format!("{}.{}", fld, name))?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let modules = if want_modules {
+        match folder.as_deref() {
+            Some(fld) => query_modules(conn, &format!("{}.{}.", fld, name))?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // ── Связи данных (data_links, singular key) ── только если запрошены ───
+    let data_links = if want_links {
+        query_data_links(conn, full_name)?
+    } else {
+        Value::Null
+    };
+
+    // Сборка: заголовок всегда; секции — только запрошенные (омитим ключ, а не
+    // null, чтобы агент видел, что секция не запрашивалась, и мог дозапросить).
+    let mut obj = serde_json::Map::new();
+    obj.insert("full_name".into(), json!(full_name));
+    obj.insert("found".into(), json!(found));
+    obj.insert("meta_type".into(), json!(db_meta_type));
+    obj.insert("name".into(), json!(db_name));
+    obj.insert("synonym".into(), json!(synonym));
+    if want_structure {
+        obj.insert("structure".into(), structure);
+    }
+    if want_forms {
+        obj.insert("forms".into(), json!(forms));
+    }
+    if want_modules {
+        obj.insert("modules".into(), json!(modules));
+    }
+    if want_links {
+        obj.insert("data_links".into(), data_links);
+    }
+    if !all {
+        obj.insert("sections_returned".into(), json!(sections));
+        obj.insert(
+            "sections_available".into(),
+            json!(["structure", "forms", "modules", "data_links"]),
+        );
+    }
+    Ok(Value::Object(obj))
+}
 
 /// Формы объекта: имя + распарсенный список обработчиков.
 fn query_forms(conn: &rusqlite::Connection, owner_full_name: &str) -> rusqlite::Result<Vec<Value>> {
@@ -422,5 +475,22 @@ mod tests {
         assert_eq!(dl["out"][0]["to_object"], json!("Catalog.Контрагенты"));
         assert_eq!(dl["writes_to_registers"][0], json!("AccumulationRegister.Продажи"));
         assert_eq!(dl["incoming_refs_count"], json!(0));
+
+        // sections=['structure'] → только structure, без forms/modules/data_links
+        let only = assemble_profile(&conn, "Document.Реализация", "Document", "Реализация",
+            &["structure".to_string()]).unwrap();
+        let o = only.as_object().unwrap();
+        assert!(o.contains_key("structure"), "structure должна быть");
+        assert!(!o.contains_key("forms"), "forms не запрашивалась → ключа нет");
+        assert!(!o.contains_key("modules"));
+        assert!(!o.contains_key("data_links"));
+        assert_eq!(o["sections_returned"], json!(["structure"]));
+
+        // пустой список → все секции, без sections_returned (обратная совместимость)
+        let full = assemble_profile(&conn, "Document.Реализация", "Document", "Реализация", &[]).unwrap();
+        let f = full.as_object().unwrap();
+        assert!(f.contains_key("structure") && f.contains_key("forms")
+            && f.contains_key("modules") && f.contains_key("data_links"));
+        assert!(!f.contains_key("sections_returned"));
     }
 }

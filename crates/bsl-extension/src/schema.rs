@@ -327,6 +327,10 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
         link_kind TEXT NOT NULL,
         is_composite INTEGER NOT NULL DEFAULT 0,
         is_universal INTEGER NOT NULL DEFAULT 0,
+        -- to_object_key = lower(to_object): регистронезависимый реверс-поиск по
+        -- кириллице (SQLite lower() её не берёт — считаем в Rust), используется
+        -- find_references.data_refs. Заполняется при наполнении data_links.
+        to_object_key TEXT NOT NULL DEFAULT '',
         UNIQUE(repo, from_object, from_path, to_object)
     );
     ",
@@ -334,6 +338,8 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_dl_from ON data_links(repo, from_object);",
     // idx_dl_to — обратный обход «кто ссылается на X» (get_data_links in).
     "CREATE INDEX IF NOT EXISTS idx_dl_to ON data_links(repo, to_object);",
+    // idx_dl_to_key — регистронезависимый реверс по lower(to_object) (find_references).
+    "CREATE INDEX IF NOT EXISTS idx_dl_to_key ON data_links(repo, to_object_key);",
 
     // ── direct_edge_files ─────────────────────────────────────────────────
     // Привязка direct-рёбер графа вызовов к файлам-источникам. Нужна ТОЛЬКО
@@ -386,11 +392,16 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
         role_name TEXT NOT NULL,
         object_name TEXT NOT NULL,
         right_name TEXT NOT NULL,
+        -- object_name_key = lower(object_name): регистронезависимый поиск прав
+        -- по объекту (кириллица — в Rust), используется find_references.role_rights.
+        object_name_key TEXT NOT NULL DEFAULT '',
         UNIQUE(repo, role_name, object_name, right_name)
     );
     ",
     // idx_rr_object — «какие роли дают права на объект X» (основной hot path).
     "CREATE INDEX IF NOT EXISTS idx_rr_object ON role_rights(repo, object_name);",
+    // idx_rr_object_key — регистронезависимый поиск прав по lower(object_name).
+    "CREATE INDEX IF NOT EXISTS idx_rr_object_key ON role_rights(repo, object_name_key);",
     // idx_rr_role — «что разрешает роль X».
     "CREATE INDEX IF NOT EXISTS idx_rr_role ON role_rights(repo, role_name);",
 

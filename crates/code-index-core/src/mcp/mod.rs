@@ -119,6 +119,9 @@ pub struct FunctionNameParams {
     pub repo: String,
     pub function_name: String,
     pub language: Option<String>,
+    /// Cap на число рёбер графа вызовов (default 200). При обрезке в ответе —
+    /// {truncated, total, limit}. Защищает от мегабайтных ответов на «горячих» функциях.
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -128,6 +131,8 @@ pub struct ImportParams {
     pub file_id: Option<i64>,
     pub module: Option<String>,
     pub language: Option<String>,
+    /// Cap на число импортов в ответе (default 200). При обрезке — {truncated, total, limit}.
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -141,8 +146,13 @@ pub struct FilePathParams {
 pub struct GrepBodyParams {
     /// Алиас репозитория (из --path alias=dir при запуске сервера).
     pub repo: String,
+    /// Подстрока (LIKE).
     pub pattern: Option<String>,
+    /// Регулярное выражение (REGEXP).
     pub regex: Option<String>,
+    /// Алиас для `regex` (частая путаница: модели передают `query`).
+    /// Если ни `pattern`, ни `regex` не заданы — используется `query` как regex.
+    pub query: Option<String>,
     pub language: Option<String>,
     /// Максимум находок в ответе. Default 100. При обрезке — `truncated=true`.
     pub limit: Option<usize>,
@@ -192,7 +202,10 @@ pub struct ReadFileParams {
 pub struct GrepTextParams {
     pub repo: String,
     /// Регулярное выражение (синтаксис crate `regex`).
-    pub regex: String,
+    pub regex: Option<String>,
+    /// Алиас для `regex` (частая путаница: модели передают `query`).
+    /// Если `regex` не задан — используется `query` как regex.
+    pub query: Option<String>,
     /// Glob по path. Хотя бы один из {path_glob, language} желателен —
     /// иначе работает full-scan по всем text-файлам.
     pub path_glob: Option<String>,
@@ -207,7 +220,10 @@ pub struct GrepTextParams {
 pub struct GrepCodeParams {
     pub repo: String,
     /// Регулярное выражение (синтаксис crate `regex`).
-    pub regex: String,
+    pub regex: Option<String>,
+    /// Алиас для `regex` (частая путаница: модели передают `query`).
+    /// Если `regex` не задан — используется `query` как regex.
+    pub query: Option<String>,
     /// Glob по path. Хотя бы один из {path_glob, language} желателен —
     /// иначе full-scan по всем code-файлам репо (zstd-decode каждого) дорогой.
     pub path_glob: Option<String>,
@@ -666,7 +682,7 @@ fn collect_extension_tools(
 
 #[tool_router]
 impl CodeIndexServer {
-    #[tool(description = "FTS поиск функций по указанному репо: по имени, docstring, телу. path_glob — опциональный фильтр по пути (`src/**/*.py`). Возвращает JSON-массив FunctionRecord.")]
+    #[tool(description = "Нечёткий FTS-поиск функций по СЛОВАМ: OR между словами запроса, префиксные термы, ранжирование bm25 (имя важнее qualified_name/docstring/тела). Принимает и точное имя, и описание из нескольких слов ('расчёт цены продажи реализация') — не требует одного точного идентификатора. Для ТОЧНОГО имени символа — get_function; для regex по коду — grep_code. path_glob — фильтр по пути (`src/**/*.py`). Возвращает JSON-массив FunctionRecord; при 0 совпадений — поле hint с подсказкой.")]
     async fn search_function(&self, Parameters(p): Parameters<SearchParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -677,7 +693,7 @@ impl CodeIndexServer {
         tools::search_function(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "FTS поиск классов по указанному репо: по имени, docstring, телу. path_glob — опциональный фильтр по пути. Возвращает JSON-массив ClassRecord.")]
+    #[tool(description = "Нечёткий FTS-поиск классов по СЛОВАМ: OR между словами, префиксные термы, ранжирование bm25 (имя важнее docstring/тела). Принимает описание из нескольких слов. Для ТОЧНОГО имени — get_class. path_glob — фильтр по пути. Возвращает JSON-массив ClassRecord; при 0 совпадений — поле hint.")]
     async fn search_class(&self, Parameters(p): Parameters<SearchParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -710,7 +726,7 @@ impl CodeIndexServer {
         tools::get_class(entry, p.name, p.path_glob).await
     }
 
-    #[tool(description = "Найти вызывателей функции (callers) в указанном репо. Возвращает JSON-массив CallRecord.")]
+    #[tool(description = "Найти вызывателей функции (callers) в указанном репо. limit — cap (default 200); на «горячих» функциях ответ обрезается с {truncated,total,limit}. Возвращает JSON-массив CallRecord.")]
     async fn get_callers(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -718,10 +734,10 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_callers", &p,
             ).await;
         }
-        tools::get_callers(entry, p.function_name, p.language).await
+        tools::get_callers(entry, p.function_name, p.language, p.limit).await
     }
 
-    #[tool(description = "Найти что вызывает функция (callees) в указанном репо. Возвращает JSON-массив CallRecord.")]
+    #[tool(description = "Найти что вызывает функция (callees) в указанном репо. limit — cap (default 200); при обрезке {truncated,total,limit}. Возвращает JSON-массив CallRecord.")]
     async fn get_callees(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -729,7 +745,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_callees", &p,
             ).await;
         }
-        tools::get_callees(entry, p.function_name, p.language).await
+        tools::get_callees(entry, p.function_name, p.language, p.limit).await
     }
 
     #[tool(description = "Универсальный поиск символа по точному имени в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-объект {functions, classes, variables, imports}.")]
@@ -743,7 +759,7 @@ impl CodeIndexServer {
         tools::find_symbol(entry, p.name, p.language, p.path_glob).await
     }
 
-    #[tool(description = "Импорты файла (file_id) или модуля (module) в указанном репо. Возвращает JSON-массив ImportRecord.")]
+    #[tool(description = "Импорты файла (file_id) или модуля (module) в указанном репо. limit — cap (default 200); при обрезке {truncated,total,limit}. Возвращает JSON-массив ImportRecord.")]
     async fn get_imports(&self, Parameters(p): Parameters<ImportParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -751,10 +767,10 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_imports", &p,
             ).await;
         }
-        tools::get_imports(entry, p.file_id, p.module, p.language).await
+        tools::get_imports(entry, p.file_id, p.module, p.language, p.limit).await
     }
 
-    #[tool(description = "Карта файла в указанном репо: функции, классы, импорты, переменные. Возвращает JSON-объект FileSummary.")]
+    #[tool(description = "Карта/оглавление файла БЕЗ тел функций/классов (безопасно на больших модулях): имена, сигнатуры (args/return_type), диапазоны строк, обрезанные docstring, импорты, переменные + functions_total/classes_total. Тело конкретной функции — get_function(name) или read_file(line_start,line_end). Возвращает JSON-объект.")]
     async fn get_file_summary(&self, Parameters(p): Parameters<FilePathParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -792,7 +808,7 @@ impl CodeIndexServer {
         tools::search_text(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP). path_glob — фильтр по пути (SQL pushdown). context_lines — N строк до/после совпадения. limit — число находок (default 100); при обрезке truncated=true. Возвращает JSON-объект {files: {\"<path>\": [{name, kind, line_start, line_end, match_lines, match_count?, context?}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
+    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP); query — алиас regex. path_glob — фильтр по пути (SQL pushdown). context_lines — N строк до/после совпадения. limit — число находок (default 100); при обрезке truncated=true. Возвращает JSON-объект {files: {\"<path>\": [{name, kind, line_start, line_end, match_lines, match_count?, context?}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
     async fn grep_body(&self, Parameters(p): Parameters<GrepBodyParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -800,8 +816,13 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "grep_body", &p,
             ).await;
         }
+        // `query` — алиас для `regex` (частая путаница моделей).
+        let regex = p.regex.clone().or_else(|| p.query.clone());
+        if p.pattern.is_none() && regex.is_none() {
+            return "{\"error\": \"grep_body: укажите pattern= (подстрока) или regex= (regexp). Для кода вне тел функций — grep_code(regex=…); по xml/md/yaml — grep_text(regex=…).\"}".to_string();
+        }
         tools::grep_body(
-            entry, p.pattern, p.regex, p.language, p.limit, p.path_glob, p.context_lines,
+            entry, p.pattern, regex, p.language, p.limit, p.path_glob, p.context_lines,
         )
         .await
     }
@@ -839,7 +860,7 @@ impl CodeIndexServer {
         tools::read_file(entry, p.path, p.line_start, p.line_end).await
     }
 
-    #[tool(description = "Regex-поиск по содержимому text-файлов. path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого). context_lines — N строк до/после. limit — число находок; при обрезке truncated=true. Возвращает JSON-объект {files: {\"<path>\": [{line, content, context?}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
+    #[tool(description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=). path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого). context_lines — N строк до/после. limit — число находок; при обрезке truncated=true. Возвращает JSON-объект {files: {\"<path>\": [{line, content, context?}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
     async fn grep_text(&self, Parameters(p): Parameters<GrepTextParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -847,10 +868,15 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "grep_text", &p,
             ).await;
         }
-        tools::grep_text(entry, p.regex, p.path_glob, p.language, p.limit, p.context_lines).await
+        // `query` — алиас для `regex` (частая путаница моделей).
+        let regex = match p.regex.clone().or_else(|| p.query.clone()) {
+            Some(r) if !r.trim().is_empty() => r,
+            _ => return "{\"error\": \"grep_text: укажите regex= (синтаксис crate regex), не query=. Для кода .bsl/.py/.rs — grep_code(regex=…) или grep_body.\"}".to_string(),
+        };
+        tools::grep_text(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
-    #[tool(description = "Regex-поиск по содержимому **code-файлов** (Phase 2, v0.8.0): module-level код, идентификаторы, комментарии вне тел, макросы, use-импорты — всё что не ловит grep_body. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла). Файлы oversize=true пропускаются. limit — число совпадений (default 100); при обрезке результат помечается truncated=true (дошлите больший limit, если нужно больше). Возвращает JSON-объект {files: {\"<path>\": [{line, content, context}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
+    #[tool(description = "Regex-поиск по содержимому **code-файлов** (Phase 2, v0.8.0; параметр regex=, синоним query=): module-level код, идентификаторы, комментарии вне тел, макросы, use-импорты — всё что не ловит grep_body. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла). Файлы oversize=true пропускаются. limit — число совпадений (default 100); при обрезке результат помечается truncated=true (дошлите больший limit, если нужно больше). Возвращает JSON-объект {files: {\"<path>\": [{line, content, context}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
     async fn grep_code(&self, Parameters(p): Parameters<GrepCodeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -858,7 +884,12 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "grep_code", &p,
             ).await;
         }
-        tools::grep_code(entry, p.regex, p.path_glob, p.language, p.limit, p.context_lines).await
+        // `query` — алиас для `regex` (частая путаница моделей).
+        let regex = match p.regex.clone().or_else(|| p.query.clone()) {
+            Some(r) if !r.trim().is_empty() => r,
+            _ => return "{\"error\": \"grep_code: укажите regex= (синтаксис crate regex), не query=. Для тел функций/классов — grep_body; для xml/md/yaml — grep_text(regex=…).\"}".to_string(),
+        };
+        tools::grep_code(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
     #[tool(description = "Проверка живости MCP-сервера и демона индексации по всем подключённым репо. Возвращает JSON.")]

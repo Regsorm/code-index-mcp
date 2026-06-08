@@ -101,9 +101,59 @@ impl IndexTool for GetObjectStructureTool {
                         "attributes": attrs_value,
                     })
                 }
-                Err(rusqlite::Error::QueryReturnedNoRows) => json!({
-                    "error": format!("object '{}' not found in repo '{}'", full_name, ctx.repo)
-                }),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    // fuzzy-подсказка: объект не найден — предложим похожие по
+                    // префиксу имени. Ловит опечатки в середине слова, напр.
+                    // 'Document.РеализацияТоваровИУслуг' → 'РеализацияТоваровУслуг'
+                    // (префикс 'Реализ' совпадает). Слабое место #5 прогона УТ-11.
+                    let (mtype, short) = match full_name.split_once('.') {
+                        Some((t, n)) => (Some(t.to_string()), n.to_string()),
+                        None => (None, full_name.clone()),
+                    };
+                    let prefix: String = short.chars().take(6).collect();
+                    let like_prefix = format!("{}%", prefix);
+                    let mut suggestions: Vec<String> = Vec::new();
+                    // 1) тот же meta_type + префикс имени
+                    if let Some(ref t) = mtype {
+                        if let Ok(mut s) = conn.prepare(
+                            "SELECT full_name FROM metadata_objects \
+                             WHERE repo = 'default' AND meta_type = ?1 AND name LIKE ?2 \
+                             ORDER BY name LIMIT 8",
+                        ) {
+                            if let Ok(rows) =
+                                s.query_map(params![t, like_prefix], |r| r.get::<_, String>(0))
+                            {
+                                suggestions.extend(rows.flatten());
+                            }
+                        }
+                    }
+                    // 2) добор по подстроке имени без учёта meta_type
+                    if suggestions.len() < 8 {
+                        let sub: String = short.chars().take(8).collect();
+                        let like_sub = format!("%{}%", sub);
+                        if let Ok(mut s) = conn.prepare(
+                            "SELECT full_name FROM metadata_objects \
+                             WHERE repo = 'default' AND name LIKE ?1 \
+                             ORDER BY name LIMIT 8",
+                        ) {
+                            if let Ok(rows) =
+                                s.query_map(params![like_sub], |r| r.get::<_, String>(0))
+                            {
+                                for fqn in rows.flatten() {
+                                    if !suggestions.contains(&fqn) {
+                                        suggestions.push(fqn);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    suggestions.truncate(8);
+                    json!({
+                        "error": format!("object '{}' not found in repo '{}'", full_name, ctx.repo),
+                        "did_you_mean": suggestions,
+                        "hint": "Формат '<MetaType>.<Name>': MetaType англ. (Catalog/Document/AccumulationRegister/InformationRegister/ChartOfAccounts/…), Name — точное имя из конфигурации. Список объектов типа — через MCP 1c list_metadata_objects."
+                    })
+                }
                 Err(e) => json!({
                     "error": format!("database error: {}", e)
                 }),

@@ -15,6 +15,11 @@
 // не показывал движения: тот граф моделирует ссылочные реквизиты, а
 // «документ пишет в регистр» — отдельный вид связи. Здесь он целевой и
 // не тонет среди ссылочных рёбер.
+//
+// Защита контекста: каждая сторона ограничена `CAP` именами (возвращаются
+// только имена объектов, поэтому потолок высокий — страховка от
+// патологически связанных объектов). При обрезке — `writers_truncated` /
+// `writes_to_truncated`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -22,6 +27,10 @@ use std::pin::Pin;
 use code_index_core::extension::{IndexTool, ToolContext};
 use rusqlite::params;
 use serde_json::{json, Value};
+
+/// Потолок имён на сторону (writers/writes_to). Возвращаются только имена
+/// объектов — поэтому высокий; защита от патологических случаев.
+const CAP: i64 = 500;
 
 pub struct GetRegisterWritersTool;
 
@@ -38,8 +47,9 @@ impl IndexTool for GetRegisterWritersTool {
          'Document.РеализацияТоваровУслуг') возвращает в 'writes_to' список \
          регистров, в которые он пишет. Один вызов закрывает оба направления — \
          тип объекта определять заранее не нужно. Точнее разбора кода проведения \
-         (источник — декларативный состав движений документа). For BSL/1C \
-         repositories only."
+         (источник — декларативный состав движений документа). Каждая сторона \
+         ограничена 500 именами (при обрезке — writers_truncated/writes_to_truncated). \
+         For BSL/1C repositories only."
     }
 
     fn input_schema(&self) -> Value {
@@ -79,7 +89,7 @@ impl IndexTool for GetRegisterWritersTool {
             let conn = storage.conn();
 
             // writers — кто пишет в этот объект как в регистр (to_object = object).
-            let writers = match query_recorders(conn, &object, Side::Writers) {
+            let (writers, writers_truncated) = match query_recorders(conn, &object, Side::Writers) {
                 Ok(v) => v,
                 Err(e) => {
                     return crate::tools::wrap_error(json!({
@@ -89,20 +99,23 @@ impl IndexTool for GetRegisterWritersTool {
             };
             // writes_to — в какие регистры пишет этот объект как документ
             // (from_object = object).
-            let writes_to = match query_recorders(conn, &object, Side::WritesTo) {
-                Ok(v) => v,
-                Err(e) => {
-                    return crate::tools::wrap_error(json!({
-                        "error": format!("database error (writes_to): {}", e)
-                    }))
-                }
-            };
+            let (writes_to, writes_to_truncated) =
+                match query_recorders(conn, &object, Side::WritesTo) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return crate::tools::wrap_error(json!({
+                            "error": format!("database error (writes_to): {}", e)
+                        }))
+                    }
+                };
 
             crate::tools::wrap_with_meta(
                 json!({
                     "object": object,
                     "writers": writers,
+                    "writers_truncated": writers_truncated,
                     "writes_to": writes_to,
+                    "writes_to_truncated": writes_to_truncated,
                 }),
                 Vec::new(),
             )
@@ -118,31 +131,37 @@ enum Side {
     WritesTo,
 }
 
-/// Выбрать встречную сторону recorder-рёбер для объекта.
+/// Выбрать встречную сторону recorder-рёбер для объекта, не более CAP штук.
 /// Writers  → from_object WHERE to_object = object.
 /// WritesTo → to_object   WHERE from_object = object.
+/// Возвращает (имена, truncated).
 fn query_recorders(
     conn: &rusqlite::Connection,
     object: &str,
     side: Side,
-) -> rusqlite::Result<Vec<String>> {
+) -> rusqlite::Result<(Vec<String>, bool)> {
     let sql = match side {
         Side::Writers => {
             "SELECT DISTINCT from_object FROM data_links \
              WHERE repo = ?1 AND link_kind = 'recorder' AND to_object = ?2 \
-             ORDER BY from_object"
+             ORDER BY from_object LIMIT ?3"
         }
         Side::WritesTo => {
             "SELECT DISTINCT to_object FROM data_links \
              WHERE repo = ?1 AND link_kind = 'recorder' AND from_object = ?2 \
-             ORDER BY to_object"
+             ORDER BY to_object LIMIT ?3"
         }
     };
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params!["default", object], |r| r.get::<_, String>(0))?;
+    // CAP+1 — чтобы отличить «ровно CAP» от «есть ещё».
+    let rows = stmt.query_map(params!["default", object, CAP + 1], |r| r.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
-    Ok(out)
+    let truncated = out.len() as i64 > CAP;
+    if truncated {
+        out.truncate(CAP as usize);
+    }
+    Ok((out, truncated))
 }

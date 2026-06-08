@@ -388,6 +388,7 @@ fn update_data_links_for_object(conn: &rusqlite::Connection, xml_path: &Path) ->
             Err(e) => tracing::warn!("update_data_links_for_object {}: {}", xml_path.display(), e),
         }
     }
+    backfill_data_link_keys(conn)?;
     conn.execute("COMMIT", [])?;
     Ok(())
 }
@@ -969,6 +970,7 @@ fn index_data_links(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()>
         }
     }
     drop(stmt);
+    backfill_data_link_keys(conn)?;
     conn.execute("COMMIT", [])?;
 
     tracing::info!(
@@ -1171,6 +1173,7 @@ fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection) -> Result<
         }
     }
     drop(stmt);
+    backfill_data_link_keys(conn)?;
     conn.execute("COMMIT", [])?;
 
     tracing::info!(
@@ -1237,6 +1240,7 @@ fn index_role_rights(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()
         }
     }
     drop(stmt);
+    backfill_role_right_keys(conn)?;
     conn.execute("COMMIT", [])?;
 
     tracing::info!(
@@ -1245,6 +1249,48 @@ fn index_role_rights(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()
         roles,
         roots.len()
     );
+    Ok(())
+}
+
+/// Заполняет `data_links.to_object_key = lower(to_object)` для строк с пустым
+/// ключом. SQLite `lower()` кириллицу не берёт — считаем в Rust. Идемпотентно и
+/// инкремент-безопасно: трогает только свежевставленные строки (`to_object_key=''`),
+/// уже заполненные пропускает. Вызывать в той же транзакции после INSERT-ов.
+fn backfill_data_link_keys(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let pending: Vec<(i64, String)> = {
+        let mut sel = conn.prepare(
+            "SELECT id, to_object FROM data_links \
+             WHERE repo = ?1 AND to_object_key = '' AND to_object <> ''",
+        )?;
+        let rows = sel.query_map(params![REPO_DEFAULT], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut upd = conn.prepare("UPDATE data_links SET to_object_key = ?2 WHERE id = ?1")?;
+    for (id, to_object) in pending {
+        upd.execute(params![id, to_object.to_lowercase()])?;
+    }
+    Ok(())
+}
+
+/// Заполняет `role_rights.object_name_key = lower(object_name)` для строк с
+/// пустым ключом (см. backfill_data_link_keys — та же мотивация по кириллице).
+fn backfill_role_right_keys(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let pending: Vec<(i64, String)> = {
+        let mut sel = conn.prepare(
+            "SELECT id, object_name FROM role_rights \
+             WHERE repo = ?1 AND object_name_key = '' AND object_name <> ''",
+        )?;
+        let rows = sel.query_map(params![REPO_DEFAULT], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut upd = conn.prepare("UPDATE role_rights SET object_name_key = ?2 WHERE id = ?1")?;
+    for (id, object_name) in pending {
+        upd.execute(params![id, object_name.to_lowercase()])?;
+    }
     Ok(())
 }
 
@@ -2823,5 +2869,46 @@ mod tests {
             !s_i.iter().any(|(c, e, _)| c == "A" && e == "C"),
             "A->C должно исчезнуть (больше никто не даёт)"
         );
+    }
+
+    #[test]
+    fn backfill_keys_fill_lowercase_cyrillic() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        for ddl in crate::schema::SCHEMA_EXTENSIONS {
+            conn.execute_batch(ddl).unwrap();
+        }
+        // Ребро без ключа (как сразу после INSERT) → backfill заполняет lower().
+        conn.execute(
+            "INSERT INTO data_links (repo, from_object, from_path, to_object, link_kind) \
+             VALUES ('default','A','p','Document.ЗаказКлиента','attr')",
+            [],
+        )
+        .unwrap();
+        backfill_data_link_keys(&conn).unwrap();
+        let key: String = conn
+            .query_row(
+                "SELECT to_object_key FROM data_links WHERE to_object='Document.ЗаказКлиента'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "document.заказклиента");
+
+        conn.execute(
+            "INSERT INTO role_rights (repo, role_name, object_name, right_name) \
+             VALUES ('default','Менеджер','Document.ЗаказКлиента','Read')",
+            [],
+        )
+        .unwrap();
+        backfill_role_right_keys(&conn).unwrap();
+        let rk: String = conn
+            .query_row(
+                "SELECT object_name_key FROM role_rights WHERE right_name='Read'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rk, "document.заказклиента");
     }
 }

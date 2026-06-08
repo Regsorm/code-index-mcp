@@ -44,6 +44,49 @@ fn register_regexp(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Зарегистрировать Unicode-aware `lower()`/`upper()`, перекрыв встроенные
+/// ASCII-only версии SQLite. Без этого срез по русским именам метаданных
+/// через `lower()` пуст: SQLite `lower('ЭДО')` = `'ЭДО'` (понижается только
+/// латиница), поэтому `WHERE lower(name) LIKE '%эдо%'` ничего не находит.
+/// Нормализация та же, что у `*_key`-колонок графа (Rust `String::to_lowercase`).
+fn register_unicode_case(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::{Context, FunctionFlags};
+    use rusqlite::types::ValueRef;
+
+    // Привести значение к строке (как встроенный lower/upper: NULL → NULL,
+    // текст/число/blob → текстовое представление) и сложить регистр по Unicode.
+    fn fold(ctx: &Context<'_>, upper: bool) -> rusqlite::Result<Option<String>> {
+        let s = match ctx.get_raw(0) {
+            ValueRef::Null => return Ok(None),
+            ValueRef::Text(b) | ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+            ValueRef::Integer(i) => i.to_string(),
+            ValueRef::Real(f) => f.to_string(),
+        };
+        Ok(Some(if upper {
+            s.to_uppercase()
+        } else {
+            s.to_lowercase()
+        }))
+    }
+
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_scalar_function("lower", 1, flags, |ctx| fold(ctx, false))
+        .context("Не удалось зарегистрировать Unicode lower()")?;
+    conn.create_scalar_function("upper", 1, flags, |ctx| fold(ctx, true))
+        .context("Не удалось зарегистрировать Unicode upper()")?;
+    Ok(())
+}
+
+/// Зарегистрировать все кастомные SQL-функции на соединении: оператор REGEXP
+/// + Unicode-aware `lower()`/`upper()`. Вызывается на каждом открытии БД
+/// (file / readonly / in-memory / auto), чтобы и MCP-tools, и `bsl_sql`
+/// видели одинаковую семантику.
+fn register_sql_functions(conn: &Connection) -> Result<()> {
+    register_regexp(conn)?;
+    register_unicode_case(conn)?;
+    Ok(())
+}
+
 /// Основная структура хранилища — обёртка над SQLite-соединением
 pub struct Storage {
     conn: Connection,
@@ -57,7 +100,7 @@ impl Storage {
         let conn = Connection::open(path)
             .with_context(|| format!("Не удалось открыть БД: {}", path.display()))?;
         schema::initialize(&conn).context("Ошибка инициализации схемы БД")?;
-        register_regexp(&conn)?;
+        register_sql_functions(&conn)?;
         Ok(Self { conn })
     }
 
@@ -99,7 +142,7 @@ impl Storage {
         )
         .with_context(|| format!("Не удалось открыть БД (readonly): {}", path.display()))?;
         schema::initialize_readonly(&conn).context("Ошибка инициализации readonly-схемы")?;
-        register_regexp(&conn)?;
+        register_sql_functions(&conn)?;
         Ok(Self { conn })
     }
 
@@ -107,7 +150,7 @@ impl Storage {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("Не удалось создать in-memory БД")?;
         schema::initialize(&conn).context("Ошибка инициализации схемы in-memory БД")?;
-        register_regexp(&conn)?;
+        register_sql_functions(&conn)?;
         Ok(Self { conn })
     }
 
@@ -144,7 +187,7 @@ impl Storage {
                         .context("Ошибка миграции v2 (in-memory)")?;
                     schema::migrate_v3(&memory_conn)
                         .context("Ошибка миграции v3 (in-memory)")?;
-                    register_regexp(&memory_conn)?;
+                    register_sql_functions(&memory_conn)?;
                     Ok(Self { conn: memory_conn })
                 } else {
                     // Новая БД — чистая in-memory со схемой
@@ -836,9 +879,17 @@ impl Storage {
 
     // ── Поисковые запросы ────────────────────────────────────────────────────
 
-    /// Полнотекстовый поиск функций через FTS5
+    /// Полнотекстовый поиск функций через FTS5.
+    ///
+    /// Запрос строится через [`build_fts_or_query`]: многословный запрос
+    /// (описание «расчёт цены продажи», а не точное имя) превращается в
+    /// `"слово"* OR "слово"* …` — совпадение по ЛЮБОМУ слову, префиксные термы.
+    /// Ранжирование — `bm25` с весами столбцов: имя важнее qualified_name,
+    /// тех важнее docstring, тех важнее тела. Так точные совпадения по имени
+    /// всплывают наверх, а функции, где слова лишь в теле/комментариях, идут
+    /// ниже, но не теряются (раньше неявный AND давал пусто).
     pub fn search_functions(&self, query: &str, limit: usize, language: Option<&str>) -> Result<Vec<FunctionRecord>> {
-        let safe_query = sanitize_fts_query(query);
+        let safe_query = build_fts_or_query(query);
         match language {
             Some(lang) => {
                 let mut stmt = self.conn.prepare(
@@ -848,7 +899,7 @@ impl Storage {
                      JOIN functions f ON f.id = ft.rowid
                      JOIN files fi ON fi.id = f.file_id
                      WHERE fts_functions MATCH ?1 AND fi.language = ?2
-                     ORDER BY rank
+                     ORDER BY bm25(fts_functions, 10.0, 5.0, 2.0, 1.0)
                      LIMIT ?3",
                 )?;
                 let rows = stmt.query_map(params![safe_query, lang, limit as i64], row_to_function)?;
@@ -861,7 +912,7 @@ impl Storage {
                      FROM fts_functions ft
                      JOIN functions f ON f.id = ft.rowid
                      WHERE fts_functions MATCH ?1
-                     ORDER BY rank
+                     ORDER BY bm25(fts_functions, 10.0, 5.0, 2.0, 1.0)
                      LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![safe_query, limit as i64], row_to_function)?;
@@ -870,9 +921,10 @@ impl Storage {
         }
     }
 
-    /// Полнотекстовый поиск классов через FTS5
+    /// Полнотекстовый поиск классов через FTS5. См. [`search_functions`] —
+    /// та же OR-семантика и bm25-ранжирование (столбцы: имя, docstring, тело).
     pub fn search_classes(&self, query: &str, limit: usize, language: Option<&str>) -> Result<Vec<ClassRecord>> {
-        let safe_query = sanitize_fts_query(query);
+        let safe_query = build_fts_or_query(query);
         match language {
             Some(lang) => {
                 let mut stmt = self.conn.prepare(
@@ -882,7 +934,7 @@ impl Storage {
                      JOIN classes c ON c.id = ft.rowid
                      JOIN files fi ON fi.id = c.file_id
                      WHERE fts_classes MATCH ?1 AND fi.language = ?2
-                     ORDER BY rank
+                     ORDER BY bm25(fts_classes, 10.0, 2.0, 1.0)
                      LIMIT ?3",
                 )?;
                 let rows = stmt.query_map(params![safe_query, lang, limit as i64], row_to_class)?;
@@ -895,7 +947,7 @@ impl Storage {
                      FROM fts_classes ft
                      JOIN classes c ON c.id = ft.rowid
                      WHERE fts_classes MATCH ?1
-                     ORDER BY rank
+                     ORDER BY bm25(fts_classes, 10.0, 2.0, 1.0)
                      LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![safe_query, limit as i64], row_to_class)?;
@@ -950,7 +1002,7 @@ impl Storage {
     /// берём rowid (=file_id) + путь по rank, затем строим вырезку в Rust из
     /// разжатого `text_contents`.
     pub fn search_text(&self, query: &str, limit: usize, language: Option<&str>) -> Result<Vec<(String, String)>> {
-        let safe_query = sanitize_fts_query(query);
+        let safe_query = build_fts_or_query(query);
         let hits: Vec<(i64, String)> = match language {
             Some(lang) => {
                 let mut stmt = self.conn.prepare(
@@ -1417,6 +1469,12 @@ impl Storage {
                 indexed_at: None,
                 category: None,
                 oversize: None,
+                hint: Some(
+                    "Файл не в индексе по этому пути. Путь — относительный от корня репо. \
+                     Найдите точный путь: list_files(pattern=\"**/<имя>*\") или \
+                     get_file_summary; по содержимому — grep_code(regex=…)."
+                        .to_string(),
+                ),
             }),
             Some((language, hash, lines_total, indexed_at, mtime, size, path_db)) => {
                 // Категория: text — content есть в text_files, code — content в file_contents
@@ -1462,6 +1520,7 @@ impl Storage {
                     indexed_at: Some(indexed_at),
                     category: Some(category.to_string()),
                     oversize: oversize_opt,
+                    hint: None,
                 })
             }
         }
@@ -2040,6 +2099,39 @@ fn sanitize_fts_query(query: &str) -> String {
     }
 }
 
+/// Построить FTS5-запрос для нечёткого ПОИСКА (search_function/search_class/
+/// search_text). В отличие от точного `get_*`, это нечёткий поиск по словам.
+///
+/// Запрос пользователя часто многословный — это описание («расчёт цены
+/// продажи»), а не точное имя символа. Дефолтная семантика FTS5 (неявный AND
+/// между словами) для таких запросов почти всегда даёт пусто: ни одна функция
+/// не содержит ВСЕ слова сразу (тем более что CamelCase-имя 1С — это один
+/// токен). Поэтому:
+///   * каждое слово оборачиваем как префиксный терм `"слово"*` (кавычки
+///     экранируют любые FTS-спецсимволы внутри токена, `*` — префиксное
+///     совпадение: «реализаци» → «РеализацияТоваровУслуг»-токены и т.п.);
+///   * термы соединяем через `OR` — совпадение по ЛЮБОМУ слову;
+///   * ранжирование `bm25` (на стороне вызывающего SQL) само поднимает наверх
+///     записи, где совпало больше слов и где совпадение в `name`, а не в теле.
+///
+/// Токены без алфанумерик-символов (например, одиночный `_`) отбрасываются —
+/// они дают пустой phrase и ломают FTS-парсер. Если значимых токенов не
+/// осталось — откатываемся на [`sanitize_fts_query`] (старое поведение).
+fn build_fts_or_query(query: &str) -> String {
+    let tokens: Vec<&str> = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| t.chars().any(|c| c.is_alphanumeric()))
+        .collect();
+    if tokens.is_empty() {
+        return sanitize_fts_query(query);
+    }
+    tokens
+        .iter()
+        .map(|t| format!("\"{}\"*", t))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 /// Нормализация glob-паттерна для SQLite GLOB.
 ///
 /// SQLite GLOB интерпретирует `*` как «любая последовательность символов»,
@@ -2218,6 +2310,44 @@ fn row_to_variable(row: &rusqlite::Row<'_>) -> rusqlite::Result<VariableRecord> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_lower_upper_handles_cyrillic() {
+        // Встроенный SQLite lower() понижает только латиницу; наш override
+        // должен складывать регистр и у кириллицы — иначе срез по русским
+        // именам метаданных через lower() пуст (баг bsl_sql на УТ-11).
+        let st = Storage::open_in_memory().unwrap();
+        let conn = st.conn();
+
+        let lo: String = conn.query_row("SELECT lower('ЭДО')", [], |r| r.get(0)).unwrap();
+        assert_eq!(lo, "эдо");
+
+        let up: String = conn
+            .query_row("SELECT upper('заказклиента')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(up, "ЗАКАЗКЛИЕНТА");
+
+        // Смешанная строка: латиница тоже понижается, NULL остаётся NULL.
+        let mixed: String = conn
+            .query_row("SELECT lower('ЭДО_v2_ABC')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mixed, "эдо_v2_abc");
+        let is_null: bool = conn
+            .query_row("SELECT lower(NULL) IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert!(is_null);
+
+        // Главный сценарий бага: LIKE по lower() находит русское имя.
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT 'Документ.ЭлектронныйДокумент' AS name) \
+                 WHERE lower(name) LIKE '%электронный%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1);
+    }
 
     /// Вспомогательный FileRecord для тестов
     fn make_file(path: &str) -> FileRecord {
@@ -2484,6 +2614,70 @@ mod tests {
         let results = storage.search_functions("tree-sitter-python", 10, None)
             .expect("поиск с дефисом не должен падать");
         assert_eq!(results.len(), 1, "должна найтись функция с дефисом в docstring");
+    }
+
+    #[test]
+    fn test_build_fts_or_query() {
+        // Один токен — префиксный терм.
+        assert_eq!(build_fts_or_query("один"), "\"один\"*");
+        // Многословный — OR между префиксными термами.
+        assert_eq!(build_fts_or_query("цены продажи"), "\"цены\"* OR \"продажи\"*");
+        // Разделители (дефис, скобки) → отдельные токены, не ломают FTS.
+        assert_eq!(build_fts_or_query("a-b c"), "\"a\"* OR \"b\"* OR \"c\"*");
+        // Мусор без алфанумерики → откат на sanitize_fts_query (старое поведение).
+        assert_eq!(build_fts_or_query("__"), sanitize_fts_query("__"));
+    }
+
+    #[test]
+    fn test_fts_multiword_or() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+        let fid = storage.upsert_file(&make_file("/src/sales.bsl")).unwrap();
+        let funcs = vec![
+            FunctionRecord {
+                id: None,
+                file_id: fid,
+                name: "РассчитатьЦенуПродажи".to_string(),
+                qualified_name: None,
+                line_start: 1,
+                line_end: 3,
+                args: None,
+                return_type: None,
+                docstring: Some("Расчёт цены продажи для реализации товаров".to_string()),
+                body: "// цены продажи\nПроцедура РассчитатьЦенуПродажи() КонецПроцедуры".to_string(),
+                is_async: false,
+                node_hash: "mw1".to_string(),
+                ..Default::default()
+            },
+            FunctionRecord {
+                id: None,
+                file_id: fid,
+                name: "ОчиститьКэш".to_string(),
+                qualified_name: None,
+                line_start: 5,
+                line_end: 6,
+                args: None,
+                return_type: None,
+                docstring: Some("Очистка кэша".to_string()),
+                body: "Процедура ОчиститьКэш() КонецПроцедуры".to_string(),
+                is_async: false,
+                node_hash: "mw2".to_string(),
+                ..Default::default()
+            },
+        ];
+        storage.insert_functions(&funcs).unwrap();
+
+        // Многословный запрос-описание: раньше неявный AND давал пусто, теперь
+        // OR по словам находит функцию по совпадению в имени/теле/docstring.
+        let r = storage
+            .search_functions("цены продажи реализация", 10, None)
+            .expect("многословный поиск");
+        assert!(
+            r.iter().any(|f| f.name == "РассчитатьЦенуПродажи"),
+            "многословный запрос должен найти РассчитатьЦенуПродажи, нашлось: {:?}",
+            r.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        // Релевантная функция всплывает первой (bm25 + совпадения по словам).
+        assert_eq!(r[0].name, "РассчитатьЦенуПродажи");
     }
 
     #[test]

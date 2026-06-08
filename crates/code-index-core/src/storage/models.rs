@@ -219,6 +219,10 @@ pub struct StatFileResult {
     /// Поле появляется только для code-файлов (Phase 2) — для text всегда отсутствует.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oversize: Option<bool>,
+    /// Подсказка при `exists=false` — куда идти за точным путём
+    /// (модель часто бьётся в несуществующий путь по нескольку раз).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// Один матч `grep_text` — строка в text-файле, удовлетворяющая regex.

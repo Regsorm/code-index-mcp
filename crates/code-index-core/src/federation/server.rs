@@ -151,7 +151,7 @@ async fn handle_get_callers(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_callers(entry, p.function_name, p.language).await)
+    ok_json(tools::get_callers(entry, p.function_name, p.language, p.limit).await)
 }
 
 async fn handle_get_callees(
@@ -162,7 +162,7 @@ async fn handle_get_callees(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_callees(entry, p.function_name, p.language).await)
+    ok_json(tools::get_callees(entry, p.function_name, p.language, p.limit).await)
 }
 
 async fn handle_find_symbol(
@@ -184,7 +184,7 @@ async fn handle_get_imports(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_imports(entry, p.file_id, p.module, p.language).await)
+    ok_json(tools::get_imports(entry, p.file_id, p.module, p.language, p.limit).await)
 }
 
 async fn handle_get_file_summary(
@@ -270,11 +270,13 @@ async fn handle_grep_body(
         Ok(e) => e,
         Err(r) => return r,
     };
+    // `query` — алиас для `regex` (см. GrepBodyParams).
+    let regex = p.regex.clone().or_else(|| p.query.clone());
     ok_json(
         tools::grep_body(
             entry,
             p.pattern,
-            p.regex,
+            regex,
             p.language,
             p.limit,
             p.path_glob,
@@ -327,10 +329,20 @@ async fn handle_grep_text(
         Ok(e) => e,
         Err(r) => return r,
     };
+    // `query` — алиас для `regex` (см. GrepTextParams).
+    let regex = match p.regex.clone().or_else(|| p.query.clone()) {
+        Some(r) if !r.trim().is_empty() => r,
+        _ => {
+            return ok_json(
+                "{\"error\": \"grep_text: укажите regex= (синтаксис crate regex), не query=.\"}"
+                    .to_string(),
+            )
+        }
+    };
     ok_json(
         tools::grep_text(
             entry,
-            p.regex,
+            regex,
             p.path_glob,
             p.language,
             p.limit,
@@ -348,10 +360,20 @@ async fn handle_grep_code(
         Ok(e) => e,
         Err(r) => return r,
     };
+    // `query` — алиас для `regex` (см. GrepCodeParams).
+    let regex = match p.regex.clone().or_else(|| p.query.clone()) {
+        Some(r) if !r.trim().is_empty() => r,
+        _ => {
+            return ok_json(
+                "{\"error\": \"grep_code: укажите regex= (синтаксис crate regex), не query=.\"}"
+                    .to_string(),
+            )
+        }
+    };
     ok_json(
         tools::grep_code(
             entry,
-            p.regex,
+            regex,
             p.path_glob,
             p.language,
             p.limit,

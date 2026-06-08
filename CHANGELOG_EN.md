@@ -5,6 +5,32 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.22.0] — 2026-06-08
+
+**Cyrillic in `bsl_sql` and graph tools (case-insensitive search over Russian names) + fuzzy word-based FTS for functions/classes + lighter search payload + `sections` parameter for `get_object_profile`.**
+
+### Fixed
+
+- **SQLite `lower()`/`upper()` now handle Cyrillic.** The built-in SQLite functions fold case for Latin only, so in `bsl_sql` a query `WHERE lower(name) LIKE '%эдо%'` over Russian metadata names returned nothing and the agent fell back to enumeration. We register Unicode-aware `lower`/`upper` (Rust `String::to_lowercase`/`to_uppercase`) overriding the built-ins on every DB-open path (`register_sql_functions` next to `register_regexp`). Verified on production UT-11: `lower('ЭДО')='эдо'`, the slice `WHERE lower(name) LIKE '%эдо%'` over `metadata_objects` — 0 → 336 objects.
+
+### Added
+
+- **Case-insensitive reverse lookup over Cyrillic in `find_references`.** Columns `data_links.to_object_key` (= `lower(to_object)`) and `role_rights.object_name_key` (= `lower(object_name)`), computed in Rust (SQLite `lower()` does not fold Cyrillic), plus indexes `idx_dl_to_key` / `idx_rr_object_key`. `find_references` (`data_refs` / `role_rights`) finds references to an object regardless of the Russian name's case. Backfilled on (incremental) graph population.
+- **`sections` parameter for `get_object_profile`** — `['structure'|'forms'|'modules'|'data_links']` narrows the response (cost lever: `['structure']` returns only attributes/tabular sections/dimensions/resources, without forms, modules and links).
+
+### Changed
+
+- **Fuzzy word-based FTS for `search_function`/`search_class`.** OR between query words, prefix terms, bm25 ranking (name outweighs `qualified_name`/docstring/body). Accepts a multi-word description ("расчёт цены продажи реализация"), no single exact identifier required; on 0 matches — a `hint` field. Query normalization — `sanitize_fts_query`.
+- **Lighter `search_function`/`search_class` payload** — without function/class bodies: only name, `qualified_name`, path, line range, signature, truncated docstring (200 chars), `override_*`. Previously up to 20 results with full bodies bloated the response to tens of thousands of characters.
+- **Compact `get_file_summary` map** for files with > 120 functions — names + lines + `override_type` without signatures/docstrings (guard against bloat on large modules).
+- **`grep_text`/`grep_code`: `regex` is now optional** (can search via the `query` alias); grep-tool parameters forwarded through federation in lockstep.
+
+### Compatibility
+
+- **BSL index schema: added `*_key` columns** (`data_links.to_object_key`, `role_rights.object_name_key`) with `DEFAULT ''` + indexes — additive, existing queries unaffected. On older indexes the keys are backfilled on the new binary's first start.
+- The `lower()`/`upper()` override changes behavior only for Cyrillic (Latin — as before); internal queries and FTS are untouched.
+- Workspace version 0.21.0 → **0.22.0** (minor — new functionality + a fix).
+
 ## [0.21.0] — 2026-06-07
 
 **1C data-graph expansion and per-object "impact map" (reverse links + code usage + role rights) + text-file storage moved to a compressed format (`migrate_v5`).**
