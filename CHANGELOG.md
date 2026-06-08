@@ -3,6 +3,21 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.23.0] — 2026-06-08
+
+**Универсальный граф вызовов: рекурсивный путь `find_path` и дерево `get_call_tree` по таблице `calls` (любой язык). BSL-специфичный `find_path` переименован в `find_path_bsl`.**
+
+### Добавлено
+
+- **MCP-tool `find_path(repo, from, to, max_depth=5, language?)`** — кратчайший путь в графе вызовов от функции `from` до `to` (итеративный cycle-safe BFS по уникальным узлам таблицы `calls`, `max_depth` в [1..10]). Универсальный, любой язык — раньше рекурсивный обход пути был только в BSL-расширении (`proc_call_graph`), теперь есть и для ядра (`code-index`). Возвращает `{from, to, found, path: [{caller, callee, line}], max_depth}`. На пустом результате — `hint`.
+- **MCP-tool `get_call_tree(repo, root, direction='callees', max_depth=3, max_nodes=200, language?)`** — дерево вызовов от функции `root` на глубину `max_depth`. `direction`: `callees`/`down` (что вызывает root вглубь) или `callers`/`up` (кто вызывает root). Раньше из ядра был доступен только один уровень (`get_callers`/`get_callees`). Возвращает плоский список рёбер `[{caller, callee, line, depth}]` и вложенное дерево `{name, children}`. При достижении `max_nodes` — `truncated=true`.
+- Federation-routes `/federate/find_path` и `/federate/get_call_tree`; типы `CallEdge`/`CallTreeEdge` в `storage::models`; storage-методы `find_call_path` (итеративный cycle-safe BFS по УНИКАЛЬНЫМ узлам — каждый узел разворачивается раз, без взрыва на циклах/кратных рёбрах) и `get_call_tree` (recursive CTE), seek по `idx_calls_caller`/`idx_calls_callee`. Юнит-тесты на прямое ребро, два прыжка, предел глубины, фильтр по языку, направления дерева и обрезку по `max_nodes`.
+
+### Совместимость
+
+- **BSL-tool `find_path` переименован в `find_path_bsl`** (модуль `find_path_bsl.rs`, структура `FindPathBslTool`). Поведение и параметры (`from`, `to`, `max_depth`, по `proc_call_graph` с `call_type`) не изменились — только имя. Имя `find_path` теперь занято универсальным tool'ом ядра. Клиенты, вызывавшие BSL `find_path` напрямую, должны перейти на `find_path_bsl`.
+- На сборке `bsl-indexer` в federation-режиме `tools/list` возвращает на 2 инструмента больше (универсальные `find_path` + `get_call_tree`); набор BSL-tools по числу не изменился (переименование).
+
 ## [0.22.0] — 2026-06-08
 
 **Кириллица в `bsl_sql` и графовых tools (регистронезависимый поиск по русским именам) + нечёткий пословный FTS-поиск функций/классов + облегчённый payload поиска + параметр `sections` у `get_object_profile`.**

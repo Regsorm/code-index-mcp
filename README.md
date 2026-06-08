@@ -135,7 +135,7 @@ cargo build --release -p bsl-indexer --features enrichment   # extra build with 
 
 Binaries:
 * `target/release/code-index[.exe]` — main binary (no 1C support).
-* `target/release/bsl-indexer[.exe]` — full 1C support (XML metadata parsers, BSL call graph, data-links graph, MCP tools `get_object_structure` / `get_form_handlers` / `find_path` / `search_terms` / `get_data_links` / `find_data_path` / `get_register_writers`, optional LLM enrichment under cargo feature `enrichment`).
+* `target/release/bsl-indexer[.exe]` — full 1C support (XML metadata parsers, BSL call graph, data-links graph, MCP tools `get_object_structure` / `get_form_handlers` / `find_path_bsl` / `search_terms` / `get_data_links` / `find_data_path` / `get_register_writers`, optional LLM enrichment under cargo feature `enrichment`).
 
 GitHub Releases publish 6 ready artifacts per tag: `code-index` × {Win, Linux, macOS} + `bsl-indexer` × {Win, Linux, macOS}.
 
@@ -292,6 +292,8 @@ For a shared HTTP process:
 | `get_class` | Get class by exact name |
 | `get_callers` | Who calls this function? |
 | `get_callees` | What does this function call? |
+| `find_path` | **(v0.23.0)** Shortest path in the call graph between two functions `from`→`to` (iterative cycle-safe BFS over unique `calls` nodes, `max_depth=5`, any language). Returns path edges `[{caller, callee, line}]` |
+| `get_call_tree` | **(v0.23.0)** Call tree from a `root` function up to `max_depth` (default 3). `direction`: `callees`/`down` (downstream) or `callers`/`up`. Flat edge list `[{caller, callee, line, depth}]` + nested `{name, children}` tree; `max_nodes` cap |
 | `find_symbol` | Search everywhere (functions, classes, variables, imports) |
 | `get_imports` | Imports by module or file |
 | `get_file_summary` | Complete file map without reading source |
@@ -331,7 +333,7 @@ When BSL repos are present in `daemon.toml` (`language = "bsl"`), 5 BSL-specific
 | `get_object_structure` | Full structure of a 1C metadata object by `full_name` (`Document.SalesInvoice`): attributes with 1C-notation types, tabular sections with columns, register dimensions/resources; `enum_values` for enumerations; `predefined` for objects with predefined items (catalogs, charts of accounts). Base sections (`attributes`/`dimensions`/`resources`/`tabular_sections`) are always present (empty as `[]`) |
 | `get_form_handlers` | Managed-form event handlers by `(owner_full_name, form_name)`. For typical document form returns ~120 `(event, handler)` pairs |
 | `get_event_subscriptions` | All event subscriptions from `EventSubscriptions/*.xml`, optional filter by handler module. Event names normalized to Russian (`OnWrite`→`ПриЗаписи`); filter accepts both Russian and the English platform enum |
-| `find_path` | Call-chain between two procedures via `proc_call_graph` (recursive CTE, max_depth=3) |
+| `find_path_bsl` | Call-chain between two procedures via `proc_call_graph` (recursive CTE, max_depth=3). BSL-specific variant of the universal `find_path` — `proc_call_graph` carries `call_type` and procedure keys |
 | `search_terms` | FTS search by business terms enriched per procedure by an LLM (after `bsl-indexer enrich`) |
 | `get_data_links` | **Data-links graph (v0.10.0):** what an object references / what references it, via reference-typed attributes, register dimensions and tabular-section attributes (`data_links` table). `direction=out\|in\|both`, `depth=1..4`. Replaces a series of `get_object_structure` calls when tracing relations. Targets like `*CatalogRef`/`*AnyRef`/`*DefinedType.X` are generalized refs (terminal, not expanded) |
 | `find_data_path` | **Data-links graph (v0.10.0):** chain of reference links from one object to another (BFS over `data_links`, like `find_path` but for data, not calls) |
