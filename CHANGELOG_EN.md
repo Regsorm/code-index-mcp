@@ -7,10 +7,11 @@ Versioning — [SemVer](https://semver.org/).
 
 ## [0.26.0] — 2026-06-10
 
-**Bulk mode for `get_object_structure`: structures of several objects in one call.**
+**Bulk mode for tools: structures/bodies of several objects in one call (`get_object_structure`, `get_function`, `get_class`).**
 
 ### Added
 
+- **`names: [...]` parameters in `get_function` and `get_class`** — bodies of several functions/classes in one call instead of a series. Response is `{results: [...]}` in request order (each element is `{result: [...records...], hint?}` without the internal `_meta`); a missing name yields an empty `result` + `hint` in its slot and does not fail the batch. Single `name` unchanged (backward compatible). `find_symbol` intentionally untouched (stays single — it has its own `NameParams`). Candidates chosen by series statistics of a real run (`get_function` is 2nd by groupable calls after `get_object_structure`). Heavy `bsl_sql`/`get_object_profile` are NOT made bulk: high reuse would bury their expensive per-object cache in a blob (needs a dissolving layer — separate task).
 - **`full_names: [...]` parameter in `get_object_structure`** — request the structure of several objects in a single call instead of a series of single ones. Response is `{results: [...]}` in request order; a missing object yields `error` + `did_you_mean` in its own slot and does not fail the rest of the batch. Single `full_name` works as before (backward compatible). Why: on tasks like "structures of these N documents/catalogs/registers" the model groups independent objects into one call — fewer round-trips, less history re-reading (the main token cost). Elements are processed in a sequential loop on one connection (`get_object_structure` is a cheap indexed SELECT, parallelism is unnecessary). Probe on ut-test (Opus, headless): the model adopts the bulk mode on its own from the tool description — in 3/3 tasks it sent `full_names` as a batch (4 documents / 5 catalogs / 3 registers) without any hint about the parameter format.
 
 ### Tests

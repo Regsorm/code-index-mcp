@@ -114,6 +114,24 @@ pub struct NameParams {
     pub path_glob: Option<String>,
 }
 
+/// Параметры для get_function/get_class с поддержкой МАССОВОГО режима:
+/// одиночное `name` ИЛИ список `names` (структуры нескольких символов одним
+/// вызовом → {results:[...]}). find_symbol на это не переводим — у него свой
+/// одиночный NameParams.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MultiNameParams {
+    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    pub repo: String,
+    /// Имя ОДНОГО символа. Для нескольких — `names`.
+    pub name: Option<String>,
+    /// Список имён для МАССОВОГО запроса одним вызовом (вместо серии одиночных).
+    /// Ответ — {results:[...]} в порядке запроса. Передавайте либо `name`, либо `names`.
+    pub names: Option<Vec<String>>,
+    pub language: Option<String>,
+    /// Glob по path (Phase 1, post-filter).
+    pub path_glob: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FunctionNameParams {
     /// Алиас репозитория (из --path alias=dir при запуске сервера).
@@ -737,26 +755,68 @@ impl CodeIndexServer {
         tools::search_class(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "Тело функции по ТОЧНОМУ имени (с исходником). Уникальное имя → одно тело. НЕуникальное (совпадений > порога) → тела опускаются, возвращаются локации + hint: уточните path_glob к нужному файлу. Навигация «где символ» без тел — find_symbol; поиск по словам — search_function. Возвращает JSON-массив FunctionRecord (или облегчённые локации при множестве).")]
-    async fn get_function(&self, Parameters(p): Parameters<NameParams>) -> String {
+    #[tool(description = "Тело функции по ТОЧНОМУ имени (с исходником). Уникальное имя → одно тело. НЕуникальное (совпадений > порога) → тела опускаются, возвращаются локации + hint: уточните path_glob к нужному файлу. Навигация «где символ» без тел — find_symbol; поиск по словам — search_function. Возвращает JSON-массив FunctionRecord (или облегчённые локации при множестве). МАССОВЫЙ РЕЖИМ: для тел НЕСКОЛЬКИХ функций передайте их списком в 'names' ОДНИМ вызовом вместо серии одиночных — ответ {results:[...]} в порядке запроса.")]
+    async fn get_function(&self, Parameters(p): Parameters<MultiNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
                 &self.clients, &entry.ip, entry.port, "get_function", &p,
             ).await;
         }
-        tools::get_function(entry, p.name, p.path_glob).await
+        if let Some(names) = p.names {
+            let mut results = Vec::with_capacity(names.len());
+            for nm in names {
+                let one = tools::get_function(entry, nm, p.path_glob.clone()).await;
+                let mut v = serde_json::from_str::<serde_json::Value>(&one)
+                    .unwrap_or(serde_json::Value::String(one));
+                // tools::* оборачивают ответ в {_meta, result(, hint)}. В массив кладём
+                // элемент без служебного _meta (иначе N копий мусора в ответе модели).
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("_meta");
+                }
+                results.push(v);
+            }
+            return serde_json::json!({ "results": results }).to_string();
+        }
+        match p.name {
+            Some(nm) => tools::get_function(entry, nm, p.path_glob).await,
+            None => serde_json::json!({
+                "error": "missing parameter: передайте 'name' (строка) или 'names' (массив строк)"
+            })
+            .to_string(),
+        }
     }
 
-    #[tool(description = "Тело класса/структуры по ТОЧНОМУ имени (с исходником). НЕуникальное имя (совпадений > порога) → тела опускаются, локации + hint, уточните path_glob. Навигация без тел — find_symbol; поиск по словам — search_class. Возвращает JSON-массив ClassRecord (или локации при множестве).")]
-    async fn get_class(&self, Parameters(p): Parameters<NameParams>) -> String {
+    #[tool(description = "Тело класса/структуры по ТОЧНОМУ имени (с исходником). НЕуникальное имя (совпадений > порога) → тела опускаются, локации + hint, уточните path_glob. Навигация без тел — find_symbol; поиск по словам — search_class. Возвращает JSON-массив ClassRecord (или локации при множестве). МАССОВЫЙ РЕЖИМ: для тел НЕСКОЛЬКИХ классов передайте их списком в 'names' ОДНИМ вызовом вместо серии одиночных — ответ {results:[...]} в порядке запроса.")]
+    async fn get_class(&self, Parameters(p): Parameters<MultiNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
             return crate::federation::dispatcher::dispatch_remote(
                 &self.clients, &entry.ip, entry.port, "get_class", &p,
             ).await;
         }
-        tools::get_class(entry, p.name, p.path_glob).await
+        if let Some(names) = p.names {
+            let mut results = Vec::with_capacity(names.len());
+            for nm in names {
+                let one = tools::get_class(entry, nm, p.path_glob.clone()).await;
+                let mut v = serde_json::from_str::<serde_json::Value>(&one)
+                    .unwrap_or(serde_json::Value::String(one));
+                // tools::* оборачивают ответ в {_meta, result(, hint)}. В массив кладём
+                // элемент без служебного _meta (иначе N копий мусора в ответе модели).
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("_meta");
+                }
+                results.push(v);
+            }
+            return serde_json::json!({ "results": results }).to_string();
+        }
+        match p.name {
+            Some(nm) => tools::get_class(entry, nm, p.path_glob).await,
+            None => serde_json::json!({
+                "error": "missing parameter: передайте 'name' (строка) или 'names' (массив строк)"
+            })
+            .to_string(),
+        }
     }
 
     #[tool(description = "Найти вызывателей функции (callers) в указанном репо. limit — cap (default 200); на «горячих» функциях ответ обрезается с {truncated,total,limit}. Возвращает JSON-массив CallRecord.")]
