@@ -116,6 +116,57 @@ async fn get_object_structure_validates_full_name() {
     );
 }
 
+#[tokio::test]
+async fn get_object_structure_batch_full_names() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        for (fqn, mt, nm) in [
+            ("Catalog.Контрагенты", "Catalog", "Контрагенты"),
+            (
+                "Document.РеализацияТоваровУслуг",
+                "Document",
+                "РеализацияТоваровУслуг",
+            ),
+        ] {
+            s.conn()
+                .execute(
+                    "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![REPO, fqn, mt, nm, nm],
+                )
+                .unwrap();
+        }
+    }
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "full_names": [
+                "Catalog.Контрагенты",
+                "Document.РеализацияТоваровУслуг",
+                "Catalog.НетТакого"
+            ]
+        }),
+    )
+    .await;
+    let results = res["results"]
+        .as_array()
+        .expect("массовый режим должен вернуть массив results");
+    assert_eq!(results.len(), 3, "три запрошенных объекта — три результата по порядку");
+    assert_eq!(results[0]["meta_type"].as_str(), Some("Catalog"));
+    assert_eq!(results[0]["name"].as_str(), Some("Контрагенты"));
+    assert_eq!(results[1]["meta_type"].as_str(), Some("Document"));
+    // несуществующий объект → свой слот с error + did_you_mean, не валит весь батч
+    assert!(
+        results[2]["error"].is_string(),
+        "несуществующий объект должен дать error в своём слоте: {:?}",
+        results[2]
+    );
+    assert!(results[2]["did_you_mean"].is_array());
+}
+
 // ── get_form_handlers ─────────────────────────────────────────────────────
 
 #[tokio::test]
