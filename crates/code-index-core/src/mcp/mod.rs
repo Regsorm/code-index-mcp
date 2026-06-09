@@ -715,7 +715,7 @@ fn collect_extension_tools(
 
 #[tool_router]
 impl CodeIndexServer {
-    #[tool(description = "Нечёткий FTS-поиск функций по СЛОВАМ: OR между словами запроса, префиксные термы, ранжирование bm25 (имя важнее qualified_name/docstring/тела). Принимает и точное имя, и описание из нескольких слов ('расчёт цены продажи реализация') — не требует одного точного идентификатора. Для ТОЧНОГО имени символа — get_function; для regex по коду — grep_code. path_glob — фильтр по пути (`src/**/*.py`). Возвращает JSON-массив FunctionRecord; при 0 совпадений — поле hint с подсказкой.")]
+    #[tool(description = "Нечёткий FTS-поиск функций по СЛОВАМ (bm25, OR между словами, префиксные термы): имя важнее qualified_name/docstring. Принимает и точное имя, и описание из слов ('расчёт цены продажи реализация'). Выдача БЕЗ тел — только локации (имя/путь/строки/сигнатура/обрезанный docstring). Тело конкретной функции — get_function; локации по ТОЧНОМУ имени — find_symbol; regex по коду — grep_code. path_glob — фильтр по пути. При 0 совпадений — hint.")]
     async fn search_function(&self, Parameters(p): Parameters<SearchParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -726,7 +726,7 @@ impl CodeIndexServer {
         tools::search_function(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "Нечёткий FTS-поиск классов по СЛОВАМ: OR между словами, префиксные термы, ранжирование bm25 (имя важнее docstring/тела). Принимает описание из нескольких слов. Для ТОЧНОГО имени — get_class. path_glob — фильтр по пути. Возвращает JSON-массив ClassRecord; при 0 совпадений — поле hint.")]
+    #[tool(description = "Нечёткий FTS-поиск классов/структур по СЛОВАМ (bm25): имя важнее docstring. Выдача БЕЗ тел — только локации (имя/путь/строки/bases). Тело конкретного класса — get_class; локации по ТОЧНОМУ имени — find_symbol. path_glob — фильтр по пути. При 0 совпадений — hint.")]
     async fn search_class(&self, Parameters(p): Parameters<SearchParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -737,7 +737,7 @@ impl CodeIndexServer {
         tools::search_class(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "Найти функцию по точному имени в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-массив FunctionRecord.")]
+    #[tool(description = "Тело функции по ТОЧНОМУ имени (с исходником). Уникальное имя → одно тело. НЕуникальное (совпадений > порога) → тела опускаются, возвращаются локации + hint: уточните path_glob к нужному файлу. Навигация «где символ» без тел — find_symbol; поиск по словам — search_function. Возвращает JSON-массив FunctionRecord (или облегчённые локации при множестве).")]
     async fn get_function(&self, Parameters(p): Parameters<NameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -748,7 +748,7 @@ impl CodeIndexServer {
         tools::get_function(entry, p.name, p.path_glob).await
     }
 
-    #[tool(description = "Найти класс по точному имени в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-массив ClassRecord.")]
+    #[tool(description = "Тело класса/структуры по ТОЧНОМУ имени (с исходником). НЕуникальное имя (совпадений > порога) → тела опускаются, локации + hint, уточните path_glob. Навигация без тел — find_symbol; поиск по словам — search_class. Возвращает JSON-массив ClassRecord (или локации при множестве).")]
     async fn get_class(&self, Parameters(p): Parameters<NameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -803,7 +803,7 @@ impl CodeIndexServer {
         tools::get_call_tree(entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language).await
     }
 
-    #[tool(description = "Универсальный поиск символа по точному имени в указанном репо. path_glob — опциональный фильтр по пути. Возвращает JSON-объект {functions, classes, variables, imports}.")]
+    #[tool(description = "Навигация: ГДЕ определён символ по ТОЧНОМУ имени — локации функций/классов/переменных/импортов БЕЗ тел (как search_*). Тело конкретного — get_function/get_class. path_glob — фильтр по пути. Возвращает {functions, classes, variables, imports} (облегчённые: имя/путь/строки/сигнатура).")]
     async fn find_symbol(&self, Parameters(p): Parameters<NameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
