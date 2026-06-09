@@ -109,6 +109,9 @@ enum TextTarget {
     TypeValue,
     /// Текст `<xr:Item>` внутри `<RegisterRecords>` — имя регистра-приёмника.
     RegisterRef,
+    /// Значение свойства проведения документа (Posting / RegisterRecordsDeletion
+    /// и т.п.); имя свойства лежит в `cur_posting_prop`.
+    PostingProp,
 }
 
 /// Распарсить содержимое XML объекта в список рёбер связей данных.
@@ -229,6 +232,9 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                             });
                         }
                     }
+                    // PostingProp в парсере связей данных не возникает
+                    // (свойства проведения обрабатывает parse_object_structure_xml).
+                    TextTarget::PostingProp => {}
                     TextTarget::None => {}
                 }
                 text_target = TextTarget::None;
@@ -405,6 +411,12 @@ pub struct ObjectStructure {
     /// Имена предопределённых элементов (Catalog/ChartOfAccounts/ChartOf*),
     /// из соседнего `<Объект>/Ext/Predefined.xml`. Порядок из XML.
     pub predefined: Vec<String>,
+    /// Свойства проведения документа из корневого `<Properties>`:
+    /// (имя свойства, значение). Например `("Posting","Allow")`,
+    /// `("RegisterRecordsDeletion","AutoDeleteOff")`. Только у Document;
+    /// у прочих объектов пусто. Источник — теги `Posting` / `RealTimePosting`
+    /// / `RegisterRecordsDeletion` / `RegisterRecordsWritingOnPost`.
+    pub posting: Vec<(String, String)>,
 }
 
 impl ObjectStructure {
@@ -416,6 +428,7 @@ impl ObjectStructure {
             && self.tabular_sections.is_empty()
             && self.enum_values.is_empty()
             && self.predefined.is_empty()
+            && self.posting.is_empty()
     }
 
     /// Сериализовать в JSON для `attributes_json` (пустые секции опускаем).
@@ -471,6 +484,17 @@ impl ObjectStructure {
                 ),
             );
         }
+        // WS-1: posting — свойства проведения документа (только у Document).
+        // Объект {имя_свойства: значение}, чтобы агент видел поведение при
+        // проведении/отмене (RegisterRecordsDeletion=AutoDeleteOff и т.п.)
+        // без ухода в XML.
+        if !self.posting.is_empty() {
+            let mut pm = serde_json::Map::new();
+            for (k, v) in &self.posting {
+                pm.insert(k.clone(), Value::String(v.clone()));
+            }
+            map.insert("posting".into(), Value::Object(pm));
+        }
         Value::Object(map)
     }
 
@@ -495,6 +519,13 @@ impl ObjectStructure {
         }
         merge_names(&mut self.enum_values, &other.enum_values);
         merge_names(&mut self.predefined, &other.predefined);
+        // posting: свойства проведения из other, которых ещё нет по имени
+        // (base-приоритет — свойство документа обычно живёт в base-конфиге).
+        for (k, v) in &other.posting {
+            if !self.posting.iter().any(|(ek, _)| ek == k) {
+                self.posting.push((k.clone(), v.clone()));
+            }
+        }
     }
 }
 
@@ -603,6 +634,8 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
     let mut field: Option<(String, Option<String>, Vec<String>)> = None;
     let mut in_type = false;
     let mut text_target = TextTarget::None;
+    // WS-1: имя свойства проведения, чей текст сейчас разбираем (Posting и т.п.).
+    let mut cur_posting_prop: Option<String> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -623,6 +656,16 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                             }
                         } else if expecting_tabular_name {
                             text_target = TextTarget::TabularName;
+                        }
+                    }
+                    // WS-1: свойства проведения документа в корневом <Properties>.
+                    // Ловим только вне реквизита (field.is_none()) — эти теги
+                    // платформенно-уникальны и не встречаются внутри <Attribute>.
+                    "Posting" | "RealTimePosting" | "RegisterRecordsDeletion"
+                    | "RegisterRecordsWritingOnPost" => {
+                        if field.is_none() {
+                            cur_posting_prop = Some(local.clone());
+                            text_target = TextTarget::PostingProp;
                         }
                     }
                     _ => {
@@ -665,6 +708,13 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                         if let Some((_, _, types)) = field.as_mut() {
                             if !txt.is_empty() {
                                 types.push(txt);
+                            }
+                        }
+                    }
+                    TextTarget::PostingProp => {
+                        if let Some(prop) = cur_posting_prop.take() {
+                            if !txt.is_empty() {
+                                out.posting.push((prop, txt));
                             }
                         }
                     }
@@ -1123,6 +1173,70 @@ mod tests {
         assert!(obj.get("dimensions").unwrap().as_array().unwrap().is_empty());
         // enum_values НЕ эмитится для не-перечисления.
         assert!(!obj.contains_key("enum_values"));
+    }
+
+    #[test]
+    fn parses_document_posting_properties() {
+        // WS-1: корневые свойства проведения документа → секция "posting".
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Document uuid="root">
+    <Properties>
+      <Name>РеализацияТоваровУслуг</Name>
+      <Posting>Allow</Posting>
+      <RealTimePosting>Deny</RealTimePosting>
+      <RegisterRecordsDeletion>AutoDeleteOff</RegisterRecordsDeletion>
+      <RegisterRecordsWritingOnPost>WriteSelected</RegisterRecordsWritingOnPost>
+    </Properties>
+    <ChildObjects>
+      <Attribute uuid="a1"><Properties><Name>Контрагент</Name>
+        <Type><v8:Type>cfg:CatalogRef.Контрагенты</v8:Type></Type>
+      </Properties></Attribute>
+    </ChildObjects>
+  </Document>
+</MetaDataObject>"#;
+        let st = parse_object_structure_xml(xml).unwrap();
+        // 4 свойства проведения; реквизит шапки в posting не попал.
+        assert_eq!(st.posting.len(), 4);
+        let get = |k: &str| {
+            st.posting
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("Posting"), Some("Allow"));
+        assert_eq!(get("RealTimePosting"), Some("Deny"));
+        assert_eq!(get("RegisterRecordsDeletion"), Some("AutoDeleteOff"));
+        assert_eq!(get("RegisterRecordsWritingOnPost"), Some("WriteSelected"));
+        // Реквизит Контрагент распарсился отдельно, не в posting.
+        assert_eq!(st.attributes.len(), 1);
+        assert_eq!(st.attributes[0].name, "Контрагент");
+        // to_json: секция posting присутствует объектом {имя: значение}.
+        let j = st.to_json();
+        let posting = j.get("posting").unwrap().as_object().unwrap();
+        assert_eq!(
+            posting.get("RegisterRecordsDeletion").unwrap(),
+            "AutoDeleteOff"
+        );
+    }
+
+    #[test]
+    fn to_json_omits_posting_for_non_document() {
+        // У объекта без свойств проведения (справочник) секции posting нет.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Catalog uuid="root">
+    <Properties><Name>Контрагенты</Name></Properties>
+    <ChildObjects>
+      <Attribute uuid="a1"><Properties><Name>ИНН</Name>
+        <Type><v8:Type>xs:string</v8:Type></Type>
+      </Properties></Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>"#;
+        let st = parse_object_structure_xml(xml).unwrap();
+        assert!(st.posting.is_empty());
+        assert!(!st.to_json().as_object().unwrap().contains_key("posting"));
     }
 
     #[test]
