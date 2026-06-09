@@ -176,8 +176,12 @@ fn visit_node(
                 }
             }
         }
-        "call_statement" => {
-            visit_call_statement(node, ctx, current_func);
+        "method_call" => {
+            record_method_call(node, ctx, current_func);
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                visit_node(child, ctx, current_func, depth + 1);
+            }
         }
         _ => {
             // Рекурсивно обходим остальные узлы
@@ -268,13 +272,11 @@ fn visit_proc_or_func(
         override_target,
     });
 
-    // Рекурсивно обходим тело для извлечения вызовов
+    // Рекурсивно обходим тело для извлечения вызовов (method_call в любых
+    // выражениях: присваивания, условия, аргументы, операторы-вызовы).
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "call_statement" => {
-                visit_call_statement(child, ctx, Some(&func_name));
-            }
             "proc_declaration" | "func_declaration" | "argument_list" | "annotation" | "export" => {
                 // Не рекурсируем в определения и служебные узлы
             }
@@ -285,60 +287,51 @@ fn visit_proc_or_func(
     }
 }
 
-/// Рекурсивный обход тела функции для поиска call_statement
+/// Рекурсивный обход тела процедуры/функции для извлечения вызовов.
+/// Ловит КАЖДЫЙ узел `method_call` — это реальный вызов `Имя(args)` в грамматике
+/// onescript; встречается и как оператор-вызов (внутри call_statement), и внутри
+/// любых выражений (присваивания, условия, аргументы). Имя вызываемой процедуры/
+/// функции — первый `identifier` внутри method_call (для `Модуль.Функция()` это
+/// `Функция`: левый `Модуль` лежит в соседнем member_access, не в method_call).
+/// TASK-1: раньше ловился только call_statement → вызовы функций в выражениях
+/// (основная масса обращений к общим модулям) терялись, граф вызовов был почти пуст.
 fn visit_body_for_calls(
     node: tree_sitter::Node,
     ctx: &mut VisitContext,
     current_func: Option<&str>,
     depth: usize,
 ) {
-    if depth > 60 {
+    if depth > 80 {
         return;
     }
-    match node.kind() {
-        "call_statement" => {
-            visit_call_statement(node, ctx, current_func);
-        }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                visit_body_for_calls(child, ctx, current_func, depth + 1);
-            }
-        }
+    if node.kind() == "method_call" {
+        record_method_call(node, ctx, current_func);
+    }
+    // Всегда обходим детей: вложенные вызовы в аргументах (Ф(Г(х))) и любые
+    // подвыражения тела.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_body_for_calls(child, ctx, current_func, depth + 1);
     }
 }
 
-/// Обработать call_statement — вызов процедуры/метода
-fn visit_call_statement(
+/// Записать ребро вызова из узла `method_call`. callee — первый `identifier`
+/// (имя вызываемой процедуры/функции, БЕЗ префикса модуля), caller — имя
+/// процедуры-контейнера. Используется и для вызовов в теле процедуры
+/// (visit_body_for_calls), и для кода модуля верхнего уровня (visit_node).
+fn record_method_call(
     node: tree_sitter::Node,
     ctx: &mut VisitContext,
     current_func: Option<&str>,
 ) {
-    let source = ctx.source;
-    let line = node.start_position().row + 1;
-    let caller = current_func.unwrap_or("<module>").to_string();
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "method_call" => {
-                // method_call: identifier + call_args
-                // Первый identifier — имя вызываемой функции/процедуры
-                if let Some(ident) = find_child_by_kind(child, "identifier") {
-                    let callee = node_text(ident, source).to_string();
-                    if !callee.is_empty() {
-                        ctx.calls.push(ParsedCall { caller: caller.clone(), callee, line });
-                    }
-                }
-            }
-            "member_access" => {
-                // member_access: объект.Метод(...) — берём полный текст
-                let callee = node_text(child, source).to_string();
-                if !callee.is_empty() {
-                    ctx.calls.push(ParsedCall { caller: caller.clone(), callee, line });
-                }
-            }
-            _ => {}
+    if let Some(ident) = find_child_by_kind(node, "identifier") {
+        let callee = node_text(ident, ctx.source).to_string();
+        if !callee.is_empty() {
+            ctx.calls.push(ParsedCall {
+                caller: current_func.unwrap_or("<module>").to_string(),
+                callee,
+                line: node.start_position().row + 1,
+            });
         }
     }
 }
@@ -436,9 +429,21 @@ mod tests {
     #[test]
     fn test_parse_bsl_calls() {
         let parser = BslParser::new();
-        let source = "Процедура Тест()\n    Сообщить(\"Привет\");\n    ОбщийМодуль.МетодМодуля();\nКонецПроцедуры";
+        let source = "Процедура Тест()\n    Сообщить(\"Привет\");\n    Рез = ОбщегоНазначения.ЗначениеРеквизита(Объект);\n    ОбщийМодуль.МетодМодуля();\nКонецПроцедуры";
         let result = parser.parse(source, "test.bsl").unwrap();
-        assert!(result.calls.len() >= 1);
+        let names: Vec<&str> = result.calls.iter().map(|c| c.callee.as_str()).collect();
+        // Неквалифицированный вызов-оператор.
+        assert!(names.contains(&"Сообщить"), "Сообщить не найден: {:?}", names);
+        // TASK-1 (главный кейс): вызов ФУНКЦИИ в ВЫРАЖЕНИИ через общий модуль.
+        // Раньше терялся целиком (ловился только call_statement).
+        assert!(names.contains(&"ЗначениеРеквизита"), "вызов функции в выражении не найден: {:?}", names);
+        // Квалифицированный вызов-процедура (call_statement).
+        assert!(names.contains(&"МетодМодуля"), "МетодМодуля не найден: {:?}", names);
+        // callee — имя метода без префикса модуля, цепочки с точкой быть не должно.
+        assert!(!names.iter().any(|c| c.contains('.')), "callee с точкой: {:?}", names);
+        // Имена модулей-приёмников не должны попадать в callee как «вызовы».
+        assert!(!names.contains(&"ОбщегоНазначения") && !names.contains(&"ОбщийМодуль"),
+            "имя модуля ошибочно записано как вызов: {:?}", names);
     }
 
     #[test]
