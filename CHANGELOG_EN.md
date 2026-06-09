@@ -5,6 +5,30 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.25.0] — 2026-06-09
+
+**Document posting properties in `get_object_structure`; BSL call-graph accuracy; token trimming on hot names; false `indexing` status removed.**
+
+### Added
+
+- **`posting` section in `get_object_structure`/`get_object_profile`** — document posting properties from the root `<Properties>`: `Posting`, `RealTimePosting`, `RegisterRecordsDeletion`, `RegisterRecordsWritingOnPost`. Documents only (other objects have no such section). Previously these properties were not indexed — an agent could not learn the posting/unposting movement behaviour and fell back to guessing (on 1C-Trade business questions: "what happens to register records on unposting?" → assumption instead of fact). Live smoke on ut-test: `Document.РеализацияТоваровУслуг` → `posting: {Posting: Allow, RealTimePosting: Deny, RegisterRecordsDeletion: AutoDeleteOff, RegisterRecordsWritingOnPost: WriteSelected}`.
+
+### Fixed
+
+- **BSL call graph now captures function calls inside expressions.** `get_callers`/`get_callees` silently returned a handful of edges instead of thousands: the parser walker caught only `call_statement` (a procedure call as a statement), while function calls inside expressions (`Result = Module.Func(...)` — `method_call` nodes inside assignment/condition/arguments) were lost entirely. Rewrote `visit_body_for_calls` + `visit_node` (helper `record_method_call`). On ut-test (1C-Trade 11.5): `get_callers(ЗначениеРеквизитаОбъекта)` 1 → 4560 edges; `proc_call_graph` direct 458011 → 790835.
+- **False `indexing` status from the daemon's `path_status`.** Previously `std::fs::canonicalize()` was called on EVERY request — FS-dependent, and under the load of reindexing neighbouring repos it mismatched, reporting a false `indexing` on a ready repo. Now an FS-free match by normalized key (symmetric to `/health`): exact match or the nearest parent — the longest tracked-key prefix.
+
+### Changed (context trimming on large repos)
+
+- **Location cap (`LOCATION_CAP=50`)** in `find_symbol`/`get_function`/`get_class`: on a super-hot name (352 definitions of `ОбработкаПроведения`) the location payload drops 32K → 5.3K tokens (−84%); on truncation — `{truncated, total, shown}`. A unique name + `path_glob` still returns the body.
+- **`get_call_tree` deduplication** (`expanded: HashSet`): a node with many parents is expanded once (repeat → `{name, repeated:true}`). callers depth=5: 178K → 8.4K tokens (−95%).
+- **`grep_body` on 0 matches** now hints: for a compound name `Object.Field` use a short anchor (just `Object` or just `Field`) or a regex with flexible whitespace (`Object\s*\.\s*Field`) — the identifier may be split by formatting or live inside query text.
+- Tool descriptions in `mcp/mod.rs` synced with behaviour: `search_*`/`find_symbol` return locations without bodies; `get_function`/`get_class` on multiple matches omit bodies and ask to narrow `path_glob`.
+
+### Tests
+
+- Entire workspace green (265 tests, 0 failed). New unit tests: parsing the `posting` section, absence of the section for non-documents. Full ut-test reindex (57102 files) + live MCP smoke confirmed `posting` and the call graph.
+
 ## [0.24.0] — 2026-06-08
 
 **Per-repo pool of read-only connections in `serve`: requests to one repo are no longer serialized behind a single mutex.**
