@@ -70,18 +70,28 @@ async fn path_status(
     State(app): State<Arc<AppState>>,
     Query(q): Query<PathQuery>,
 ) -> impl IntoResponse {
-    let target = canonical_path(&q.path);
+    let target_key = normalize_path_key(&q.path);
     let tracked = app.state.tracked_paths().await;
 
-    // Пытаемся сопоставить запрошенный путь с одним из отслеживаемых.
+    // FS-free сопоставление по нормализованному ключу (симметрично /health,
+    // которая сравнивает ключи мапы напрямую). Старый код звал
+    // std::fs::canonicalize() на КАЖДЫЙ запрос: он FS-зависим и под нагрузкой
+    // реиндексации соседних репо промахивался, отдавая ложный «indexing».
     let matched = tracked
-        .into_iter()
-        .find(|p| paths_equal(p, &target))
+        .iter()
+        .find(|p| normalize_path_key(&p.to_string_lossy()) == target_key)
+        .cloned()
         .or_else(|| {
-            // Если точного совпадения нет — возможно пользователь запрашивает
-            // вложенный путь (например файл внутри проекта). Находим ближайший
-            // родитель из отслеживаемых.
-            app_parent(&target, &app.state)
+            // Вложенный путь (файл внутри проекта): ближайший родитель —
+            // самый длинный tracked-ключ, являющийся префиксом target.
+            tracked
+                .iter()
+                .filter(|p| {
+                    let k = normalize_path_key(&p.to_string_lossy());
+                    target_key == k || target_key.starts_with(&format!("{k}\\"))
+                })
+                .max_by_key(|p| p.to_string_lossy().len())
+                .cloned()
         });
 
     match matched {
@@ -97,7 +107,7 @@ async fn path_status(
         }
         None => {
             let resp = PathStatusResponse {
-                path: target,
+                path: PathBuf::from(&q.path),
                 status: PathStatus::NotStarted,
                 progress: None,
                 error: Some(
@@ -108,14 +118,6 @@ async fn path_status(
             (StatusCode::OK, Json(resp)).into_response()
         }
     }
-}
-
-fn app_parent(target: &std::path::Path, state: &DaemonState) -> Option<PathBuf> {
-    // Синхронный fallback: берём snapshot отслеживаемых путей и ищем ближайшего
-    // родителя. Функция вызывается из async-контекста, поэтому state обращаемся
-    // через blocking — но tracked_paths уже async, так что отдадим пустой путь.
-    let _ = (target, state);
-    None
 }
 
 async fn reload(State(app): State<Arc<AppState>>) -> impl IntoResponse {
@@ -180,16 +182,30 @@ async fn stop(State(app): State<Arc<AppState>>) -> impl IntoResponse {
 
 // ── Вспомогательное ──────────────────────────────────────────────────────────
 
-fn canonical_path(input: &str) -> PathBuf {
-    std::path::Path::new(input)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(input))
+/// FS-free нормализация пути в ключ сравнения: убрать расширенный префикс
+/// `\\?\`, унифицировать разделители в `\`, срезать хвостовой `\`, привести к
+/// нижнему регистру (Windows — регистронезависимая ФС). Без обращения к ФС:
+/// детерминированно и не зависит от состояния диска. Заменяет прежние
+/// `canonical_path`/`paths_equal`, которые звали `std::fs::canonicalize()` на
+/// каждый `path-status` и под нагрузкой реиндексации промахивались (ложный
+/// «indexing», хотя /health уже показывал ready).
+fn normalize_path_key(input: &str) -> String {
+    let s = input.strip_prefix(r"\\?\").unwrap_or(input);
+    s.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
-fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
-    let ca = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
-    let cb = b.canonicalize().unwrap_or_else(|_| b.to_path_buf());
-    ca == cb
+#[cfg(test)]
+mod normalize_tests {
+    use super::normalize_path_key;
+    #[test]
+    fn extended_prefix_and_separators_and_case() {
+        let a = normalize_path_key(r"\\?\C:\RepoUT-test");
+        let b = normalize_path_key("C:/RepoUT-test");
+        let c = normalize_path_key(r"c:\repout-test\");
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_eq!(a, r"c:\repout-test");
+    }
 }
 
 // Возвращает фактически используемые клиентом заголовки для удобного разбора
