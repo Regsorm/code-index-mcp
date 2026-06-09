@@ -5,6 +5,18 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.26.0] — 2026-06-10
+
+**Bulk mode for `get_object_structure`: structures of several objects in one call.**
+
+### Added
+
+- **`full_names: [...]` parameter in `get_object_structure`** — request the structure of several objects in a single call instead of a series of single ones. Response is `{results: [...]}` in request order; a missing object yields `error` + `did_you_mean` in its own slot and does not fail the rest of the batch. Single `full_name` works as before (backward compatible). Why: on tasks like "structures of these N documents/catalogs/registers" the model groups independent objects into one call — fewer round-trips, less history re-reading (the main token cost). Elements are processed in a sequential loop on one connection (`get_object_structure` is a cheap indexed SELECT, parallelism is unnecessary). Probe on ut-test (Opus, headless): the model adopts the bulk mode on its own from the tool description — in 3/3 tasks it sent `full_names` as a batch (4 documents / 5 catalogs / 3 registers) without any hint about the parameter format.
+
+### Tests
+
+- New integration test `get_object_structure_batch_full_names` (3 objects: 2 exist + 1 missing — order, structure, graceful error in slot). `bsl-extension` green (17 tests, 0 failed). Live MCP smoke (ut-test) confirmed the bulk mode.
+
 ## [0.25.0] — 2026-06-09
 
 **Document posting properties in `get_object_structure`; BSL call-graph accuracy; token trimming on hot names; false `indexing` status removed.**
