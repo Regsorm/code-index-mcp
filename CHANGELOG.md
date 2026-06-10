@@ -3,6 +3,18 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.27.0] — 2026-06-10
+
+**Массовый режим исполняется параллельно: элементы `names[]`/`full_names[]` обрабатываются конкуррентно, а не циклом.**
+
+### Изменено
+
+- **Mass-mode `get_function`/`get_class`/`get_object_structure` исполняется ПАРАЛЛЕЛЬНО.** Раньше — последовательный цикл с `await` на каждом элементе (а в `get_object_structure` — `map` на одном соединении). Теперь каждый элемент берёт своё read-only соединение из `StoragePool` и исполняется в `spawn_blocking` — синхронный rusqlite не блокирует общий async-runtime, параллелизм естественно ограничен семафором пула (`pool_size`, default 4). Формат ответа НЕ менялся: `{results:[...]}` строго в порядке запроса, пер-элементные `{error}` сохранены (битый элемент не валит батч), `_meta` с элементов срезается как раньше. Одиночные `name`/`full_name` — путь без изменений. Внутри: общий хелпер `mcp::tools::mass_map` (checkout из пула + `spawn_blocking` + сборка по порядку), из `get_function`/`get_class` выделены sync-ядра `get_function_with`/`get_class_with`, в bsl-extension замыкание `resolve_one` стало свободной fn. Смок на живом serve (`oleg`, КА 1.1, локально): батч 4 тяжёлых объектов — 3.0 мс против 19.7 мс суммы одиночных.
+
+### Тесты
+
+- `mass_map_runs_concurrently_and_preserves_order` (4 элемента по 100 мс на пуле из 4 соединений — wall < 250 мс, порядок цел), `mass_map_on_single_pool_stays_correct` (пул из 1 — деградация до последовательного без потери корректности), `get_object_structure_batch_non_string_element` (нестроковый элемент → `{error}` на своей позиции), `get_object_structure_batch_empty_list`. `cargo test`: code-index-core 267 + bsl-extension 19, 0 failed.
+
 ## [0.26.0] — 2026-06-10
 
 **Массовый режим инструментов: структуры/тела нескольких объектов одним вызовом (`get_object_structure`, `get_function`, `get_class`).**

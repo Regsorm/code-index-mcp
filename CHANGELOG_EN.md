@@ -5,6 +5,18 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.27.0] — 2026-06-10
+
+**Bulk mode now runs in parallel: `names[]`/`full_names[]` elements are processed concurrently instead of in a loop.**
+
+### Changed
+
+- **Mass-mode `get_function`/`get_class`/`get_object_structure` executes IN PARALLEL.** Previously — a sequential loop with `await` per element (and in `get_object_structure` — a `map` over a single connection). Now each element checks out its own read-only connection from the `StoragePool` and runs in `spawn_blocking` — synchronous rusqlite no longer blocks the shared async runtime, and parallelism is naturally bounded by the pool semaphore (`pool_size`, default 4). The response format is UNCHANGED: `{results:[...]}` strictly in request order, per-element `{error}` preserved (a broken element does not fail the batch), `_meta` stripped from elements as before. Single `name`/`full_name` path untouched. Internals: shared helper `mcp::tools::mass_map` (pool checkout + `spawn_blocking` + ordered assembly), sync cores `get_function_with`/`get_class_with` extracted from `get_function`/`get_class`, the `resolve_one` closure in bsl-extension became a free fn. Live serve smoke (`oleg`, local KA 1.1 repo): a batch of 4 heavy objects — 3.0 ms vs 19.7 ms as the sum of singles.
+
+### Tests
+
+- `mass_map_runs_concurrently_and_preserves_order` (4 elements × 100 ms on a 4-connection pool — wall < 250 ms, order intact), `mass_map_on_single_pool_stays_correct` (pool of 1 — degrades to sequential without losing correctness), `get_object_structure_batch_non_string_element` (non-string element → `{error}` in its slot), `get_object_structure_batch_empty_list`. `cargo test`: code-index-core 267 + bsl-extension 19, 0 failed.
+
 ## [0.26.0] — 2026-06-10
 
 **Bulk mode for tools: structures/bodies of several objects in one call (`get_object_structure`, `get_function`, `get_class`).**
