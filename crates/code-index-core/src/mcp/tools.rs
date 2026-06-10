@@ -154,6 +154,48 @@ macro_rules! acquire_storage {
     };
 }
 
+/// Конкуррентное исполнение mass-mode (`names[]`/`full_names[]`): на каждый
+/// элемент — checkout соединения из пула + `spawn_blocking` (rusqlite синхронный,
+/// блокировать общий async-runtime нельзя). Параллелизм естественно ограничен
+/// семафором пула (`max_size`). Порядок результатов = порядок `items`: задачи
+/// запускаются конкуррентно, а handles собираются последовательно.
+pub async fn mass_map<T, R, F>(
+    pool: &std::sync::Arc<crate::storage::StoragePool>,
+    items: Vec<T>,
+    f: F,
+) -> Vec<Result<R, String>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: Fn(&crate::storage::Storage, T) -> R + Send + Sync + 'static,
+{
+    let f = std::sync::Arc::new(f);
+    let handles: Vec<_> = items
+        .into_iter()
+        .map(|it| {
+            let pool = pool.clone();
+            let f = f.clone();
+            tokio::spawn(async move {
+                let storage = pool
+                    .get()
+                    .await
+                    .map_err(|e| format!("storage pool: {}", e))?;
+                tokio::task::spawn_blocking(move || f(&storage, it))
+                    .await
+                    .map_err(|e| format!("task join: {}", e))
+            })
+        })
+        .collect();
+    let mut out = Vec::with_capacity(handles.len());
+    for h in handles {
+        out.push(match h.await {
+            Ok(r) => r,
+            Err(e) => Err(format!("task join: {}", e)),
+        });
+    }
+    out
+}
+
 fn to_json<T: serde::Serialize>(value: &T) -> String {
     match serde_json::to_string(value) {
         Ok(s) => s,
@@ -431,6 +473,16 @@ pub async fn get_function(
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    get_function_with(&storage, name, path_glob)
+}
+
+/// Sync-ядро get_function: вся работа на уже взятом соединении. Вызывается
+/// inline одиночным путём и из `spawn_blocking` массовым (`mass_map`).
+pub fn get_function_with(
+    storage: &crate::storage::Storage,
+    name: String,
+    path_glob: Option<String>,
+) -> String {
     match storage.get_function_by_name(&name) {
         Ok(mut r) => {
             if let Some(ref g) = path_glob {
@@ -438,9 +490,9 @@ pub async fn get_function(
                     Ok(m) => m,
                     Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
                 };
-                r.retain(|fr| matches_with(&matcher, &lookup_path(&storage, fr.file_id)));
+                r.retain(|fr| matches_with(&matcher, &lookup_path(storage, fr.file_id)));
             }
-            let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
+            let deps = collect_paths_via(storage, &r, |fr| fr.file_id);
             // Горячее имя (много одноимённых определений): тела опускаем — иначе ответ
             // раздувается телами всех совпадений до сотен K токенов. Возвращаем локации.
             if r.len() > MULTI_DEF_THRESHOLD {
@@ -448,7 +500,7 @@ pub async fn get_function(
                 let hits: Vec<serde_json::Value> = r
                     .iter()
                     .take(LOCATION_CAP)
-                    .map(|fr| function_search_hit(fr, &lookup_path(&storage, fr.file_id)))
+                    .map(|fr| function_search_hit(fr, &lookup_path(storage, fr.file_id)))
                     .collect();
                 let extra = serde_json::json!({
                     "hint": HINT_GET_MULTI,
@@ -456,10 +508,10 @@ pub async fn get_function(
                     "shown": hits.len(),
                     "truncated": total > hits.len(),
                 });
-                return wrap_with_meta_extra(&storage, &hits, deps, Some(extra));
+                return wrap_with_meta_extra(storage, &hits, deps, Some(extra));
             }
             let hint = if r.is_empty() { Some(HINT_GET_EMPTY) } else { None };
-            wrap_with_meta_hint(&storage, &r, deps, hint)
+            wrap_with_meta_hint(storage, &r, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"get_function: {}\"}}", e),
     }
@@ -472,6 +524,15 @@ pub async fn get_class(
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    get_class_with(&storage, name, path_glob)
+}
+
+/// Sync-ядро get_class — зеркало [`get_function_with`].
+pub fn get_class_with(
+    storage: &crate::storage::Storage,
+    name: String,
+    path_glob: Option<String>,
+) -> String {
     match storage.get_class_by_name(&name) {
         Ok(mut r) => {
             if let Some(ref g) = path_glob {
@@ -479,15 +540,15 @@ pub async fn get_class(
                     Ok(m) => m,
                     Err(e) => return format!("{{\"error\": \"path_glob: {}\"}}", e),
                 };
-                r.retain(|cr| matches_with(&matcher, &lookup_path(&storage, cr.file_id)));
+                r.retain(|cr| matches_with(&matcher, &lookup_path(storage, cr.file_id)));
             }
-            let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            let deps = collect_paths_via(storage, &r, |cr| cr.file_id);
             if r.len() > MULTI_DEF_THRESHOLD {
                 let total = r.len();
                 let hits: Vec<serde_json::Value> = r
                     .iter()
                     .take(LOCATION_CAP)
-                    .map(|cr| class_search_hit(cr, &lookup_path(&storage, cr.file_id)))
+                    .map(|cr| class_search_hit(cr, &lookup_path(storage, cr.file_id)))
                     .collect();
                 let extra = serde_json::json!({
                     "hint": HINT_GET_MULTI,
@@ -495,10 +556,10 @@ pub async fn get_class(
                     "shown": hits.len(),
                     "truncated": total > hits.len(),
                 });
-                return wrap_with_meta_extra(&storage, &hits, deps, Some(extra));
+                return wrap_with_meta_extra(storage, &hits, deps, Some(extra));
             }
             let hint = if r.is_empty() { Some(HINT_GET_EMPTY) } else { None };
-            wrap_with_meta_hint(&storage, &r, deps, hint)
+            wrap_with_meta_hint(storage, &r, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"get_class: {}\"}}", e),
     }
@@ -1407,4 +1468,56 @@ pub async fn health(server: &CodeIndexServer) -> String {
         "repos": repos,
     });
     to_json(&obj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{PoolConfig, Storage, StoragePool};
+    use std::time::{Duration, Instant};
+
+    /// Главное свойство mass_map: элементы исполняются КОНКУРРЕНТНО (каждый со
+    /// своим соединением из пула), а порядок результатов = порядку items.
+    /// 4 элемента по 100мс на пуле из 4 соединений обязаны уложиться сильно
+    /// быстрее последовательных 400мс.
+    #[tokio::test]
+    async fn mass_map_runs_concurrently_and_preserves_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        Storage::open_file(&db_path).unwrap(); // создать файл + схему
+
+        let cfg = PoolConfig {
+            max_size: 4,
+            cache_kib: 4096,
+            busy_timeout_ms: 1000,
+        };
+        let pool = StoragePool::open_file_readonly(&db_path, cfg).unwrap();
+
+        let start = Instant::now();
+        let rows = mass_map(&pool, vec![0usize, 1, 2, 3], |_st, it| {
+            std::thread::sleep(Duration::from_millis(100));
+            it
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        let values: Vec<usize> = rows.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(values, vec![0, 1, 2, 3], "порядок = порядку items");
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "4×100мс заняли {}мс — mass_map исполняет последовательно (ожидалась параллель)",
+            elapsed.as_millis()
+        );
+    }
+
+    /// Пул из одного соединения (StoragePool::single) — деградация до
+    /// последовательного исполнения, но корректность и порядок сохраняются.
+    #[tokio::test]
+    async fn mass_map_on_single_pool_stays_correct() {
+        let storage = Storage::open_in_memory().unwrap();
+        let pool = StoragePool::single(storage);
+        let rows = mass_map(&pool, vec!["a".to_string(), "b".to_string()], |_st, it| it).await;
+        let values: Vec<String> = rows.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(values, vec!["a".to_string(), "b".to_string()]);
+    }
 }

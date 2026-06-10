@@ -721,6 +721,29 @@ fn collect_extension_tools(
     out
 }
 
+/// Сборка ответа массового режима get_function/get_class из результатов
+/// `tools::mass_map`: порядок элементов = порядок имён в запросе, ошибка
+/// отдельного элемента — `{error}` на его позиции, не валит весь батч.
+fn mass_rows_to_results(rows: Vec<Result<String, String>>) -> String {
+    let results: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| match row {
+            Ok(one) => {
+                let mut v = serde_json::from_str::<serde_json::Value>(&one)
+                    .unwrap_or(serde_json::Value::String(one));
+                // tools::* оборачивают ответ в {_meta, result(, hint)}. В массив кладём
+                // элемент без служебного _meta (иначе N копий мусора в ответе модели).
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("_meta");
+                }
+                v
+            }
+            Err(e) => serde_json::json!({ "error": e }),
+        })
+        .collect();
+    serde_json::json!({ "results": results }).to_string()
+}
+
 // ── MCP tools ──────────────────────────────────────────────────────────────
 //
 // В каждом data-handler:
@@ -764,19 +787,22 @@ impl CodeIndexServer {
             ).await;
         }
         if let Some(names) = p.names {
-            let mut results = Vec::with_capacity(names.len());
-            for nm in names {
-                let one = tools::get_function(entry, nm, p.path_glob.clone()).await;
-                let mut v = serde_json::from_str::<serde_json::Value>(&one)
-                    .unwrap_or(serde_json::Value::String(one));
-                // tools::* оборачивают ответ в {_meta, result(, hint)}. В массив кладём
-                // элемент без служебного _meta (иначе N копий мусора в ответе модели).
-                if let Some(o) = v.as_object_mut() {
-                    o.remove("_meta");
-                }
-                results.push(v);
+            // Массовый режим — конкуррентно: каждый элемент берёт своё соединение
+            // из пула и исполняется в spawn_blocking (tools::mass_map). Статус
+            // папки проверяется один раз на весь батч.
+            if let Some(json) = tools::check_path_status(entry).await {
+                return json;
             }
-            return serde_json::json!({ "results": results }).to_string();
+            if names.is_empty() {
+                return serde_json::json!({ "results": [] }).to_string();
+            }
+            let pool = entry.storage_pool().clone();
+            let glob = p.path_glob.clone();
+            let rows = tools::mass_map(&pool, names, move |st, nm| {
+                tools::get_function_with(st, nm, glob.clone())
+            })
+            .await;
+            return mass_rows_to_results(rows);
         }
         match p.name {
             Some(nm) => tools::get_function(entry, nm, p.path_glob).await,
@@ -796,19 +822,20 @@ impl CodeIndexServer {
             ).await;
         }
         if let Some(names) = p.names {
-            let mut results = Vec::with_capacity(names.len());
-            for nm in names {
-                let one = tools::get_class(entry, nm, p.path_glob.clone()).await;
-                let mut v = serde_json::from_str::<serde_json::Value>(&one)
-                    .unwrap_or(serde_json::Value::String(one));
-                // tools::* оборачивают ответ в {_meta, result(, hint)}. В массив кладём
-                // элемент без служебного _meta (иначе N копий мусора в ответе модели).
-                if let Some(o) = v.as_object_mut() {
-                    o.remove("_meta");
-                }
-                results.push(v);
+            // Массовый режим — конкуррентно, зеркало get_function (см. выше).
+            if let Some(json) = tools::check_path_status(entry).await {
+                return json;
             }
-            return serde_json::json!({ "results": results }).to_string();
+            if names.is_empty() {
+                return serde_json::json!({ "results": [] }).to_string();
+            }
+            let pool = entry.storage_pool().clone();
+            let glob = p.path_glob.clone();
+            let rows = tools::mass_map(&pool, names, move |st, nm| {
+                tools::get_class_with(st, nm, glob.clone())
+            })
+            .await;
+            return mass_rows_to_results(rows);
         }
         match p.name {
             Some(nm) => tools::get_class(entry, nm, p.path_glob).await,
