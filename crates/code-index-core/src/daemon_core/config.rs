@@ -66,6 +66,12 @@ pub struct DaemonFileConfig {
     /// См. [`ToolsSection`].
     #[serde(default)]
     pub tools: ToolsSection,
+
+    /// Опциональная секция `[mcp]` — какие инструменты публикуют массовый
+    /// режим (`names[]`/`full_names[]`). Пустой список (или отсутствие секции)
+    /// → массовый режим выключен у всех (дефолт с v0.28.0). См. [`McpSection`].
+    #[serde(default)]
+    pub mcp: McpSection,
 }
 
 /// Дефолтный hardcoded-лимит размера code-файла, content которого сохраняется
@@ -153,6 +159,35 @@ pub struct ToolsSection {
     /// ограничение не применяется (все зарегистрированные tools доступны).
     #[serde(default)]
     pub enabled: Vec<String>,
+}
+
+/// Секция `[mcp]` — управление массовым режимом инструментов (v0.28.0).
+///
+/// Массовый режим (`names[]` у `get_function`/`get_class`, `full_names[]` у
+/// `get_object_structure`) даёт модели запросить несколько объектов одним
+/// вызовом. Бенчмарк (ut-test, 10 задач) показал, что выигрыш по токенам
+/// **не доказан**: пачка front-load'ит данные и провоцирует over-fetch, а на
+/// «горячих» именах `get_function`/`get_class` ответ раздувается неограниченно.
+/// Поэтому с v0.28.0 массовый режим **по умолчанию выключен у всех** —
+/// `mass_mode_tools` пуст. Включается точечно, по именам инструментов:
+///
+/// ```toml
+/// [mcp]
+/// # модель сама решит, пользоваться ли; нет в списке → сервер не предлагает.
+/// mass_mode_tools = ["get_object_structure"]
+/// ```
+///
+/// Семантика белого списка: инструмент **в списке** публикует plural-параметр
+/// в `tools/list` (модель видит и может батчить); **не в списке** — сервер
+/// убирает plural-параметр из схемы и отбивает `tools/call` с ним
+/// (`-32602 Invalid params`). Имена — короткие (`get_function`, не
+/// `mcp__...`). Имена вне набора массовых инструментов игнорируются с warning.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpSection {
+    /// Белый список инструментов, которым разрешён массовый режим. Пусто или
+    /// отсутствует → массовый режим выключен у всех (дефолт).
+    #[serde(default)]
+    pub mass_mode_tools: Vec<String>,
 }
 
 /// Секция `[enrichment]` из конфига демона.
@@ -658,5 +693,25 @@ mod tests {
         "#;
         let cfg = parse_str(text).unwrap();
         assert!(cfg.tools.enabled.is_empty());
+    }
+
+    #[test]
+    fn mcp_mass_mode_default_empty() {
+        // Нет секции [mcp] → массовый режим выключен у всех (дефолт v0.28.0).
+        let cfg: DaemonFileConfig = parse_str("").unwrap();
+        assert!(cfg.mcp.mass_mode_tools.is_empty());
+    }
+
+    #[test]
+    fn parses_mcp_mass_mode_tools() {
+        let text = r#"
+            [mcp]
+            mass_mode_tools = ["get_object_structure"]
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(
+            cfg.mcp.mass_mode_tools,
+            vec!["get_object_structure".to_string()]
+        );
     }
 }

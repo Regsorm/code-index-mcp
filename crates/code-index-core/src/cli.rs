@@ -30,6 +30,17 @@ fn tools_whitelist_from_daemon_cfg(config: Option<&Path>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Извлечь `daemon_cfg.mcp.mass_mode_tools` (моно-ветка `Commands::Serve`, где
+/// `build_repo_entries` грузит конфиг внутри и наружу не отдаёт). При ошибке
+/// чтения — пустой Vec, то есть массовый режим выключен у всех (дефолт).
+/// Дальнейшая логика — в [`CodeIndexServer::apply_mass_mode_tools`].
+fn mass_mode_tools_from_daemon_cfg(config: Option<&Path>) -> Vec<String> {
+    config
+        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
+        .map(|cfg| cfg.mcp.mass_mode_tools)
+        .unwrap_or_default()
+}
+
 #[derive(Parser)]
 #[command(name = "code-index", version, about = "Высокопроизводительный индексатор кода с MCP-протоколом")]
 struct Cli {
@@ -590,7 +601,8 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                     local_languages,
                     serve_cfg.pool.resolve(),
                 )?
-                .apply_tools_whitelist(&daemon_cfg.tools.enabled);
+                .apply_tools_whitelist(&daemon_cfg.tools.enabled)
+                .apply_mass_mode_tools(&daemon_cfg.mcp.mass_mode_tools);
                 let federate_router = federation::server::federate_router(server.clone());
                 let allowed = std::sync::Arc::new(federation::whitelist::build(&serve_cfg));
 
@@ -655,9 +667,9 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             // конфиг нужно отдельно загрузить — `build_repo_entries` его
             // внутри парсит, но наружу не отдаёт. При `--path` без `--config`
             // helper вернёт пустой список → фильтр выключен.
-            let server = server.apply_tools_whitelist(&tools_whitelist_from_daemon_cfg(
-                config.as_deref(),
-            ));
+            let server = server
+                .apply_tools_whitelist(&tools_whitelist_from_daemon_cfg(config.as_deref()))
+                .apply_mass_mode_tools(&mass_mode_tools_from_daemon_cfg(config.as_deref()));
             let bind_host = host.unwrap_or_else(|| "127.0.0.1".to_string());
 
             // Если запуск с --config — подписываемся на изменения daemon.toml,

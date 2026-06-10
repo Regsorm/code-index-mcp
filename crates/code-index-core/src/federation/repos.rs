@@ -158,6 +158,7 @@ mod tests {
             indexer: Default::default(),
             cache_targets: Vec::new(),
             tools: Default::default(),
+            mcp: Default::default(),
         }
     }
 

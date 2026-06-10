@@ -309,6 +309,18 @@ pub struct ExtensionToolParams {
 /// для них `RepoEntry.is_local=false`, tool-handler форвардит запрос
 /// в `clients` по `ip`.
 ///
+/// Инструменты с массовым режимом и их plural-параметр (`tool`, `plural`).
+/// Управляется белым списком `daemon.toml [mcp].mass_mode_tools`: инструмент
+/// **в списке** публикует plural-параметр (модель видит/может батчить);
+/// **не в списке** — `list_tools` убирает параметр из схемы, `call_tool`
+/// отбивает вызов с ним. Пустой список (дефолт v0.28.0) → массовый режим
+/// выключен у всех. Причина дефолта-выкл — см. [`crate::daemon_core::config::McpSection`].
+pub(crate) const MASS_MODE_PARAMS: &[(&str, &str)] = &[
+    ("get_function", "names"),
+    ("get_class", "names"),
+    ("get_object_structure", "full_names"),
+];
+
 /// Поверх жёстко прописанных core-tools (макрос `#[tool_router]`) сервер
 /// держит набор «extension-tools» — MCP-инструментов, поставляемых
 /// активными `LanguageProcessor`-ами. Их подбор зависит от того, какие
@@ -352,6 +364,12 @@ pub struct CodeIndexServer {
     /// `tools/list` (из системного промпта/CLAUDE.md) — фильтр в `list_tools`
     /// её не остановит, без проверки в `call_tool` это уйдёт в router.
     pub allowed_tools: Arc<Option<BTreeSet<String>>>,
+    /// Белый список инструментов, публикующих массовый режим (`names[]`/
+    /// `full_names[]`). Пустой (дефолт с v0.28.0) → массовый режим выключен у
+    /// всех: `list_tools` убирает plural-параметр из схемы, `call_tool`
+    /// отбивает вызов с ним. Управляется `daemon.toml [mcp].mass_mode_tools`.
+    /// Перечень массовых инструментов — [`MASS_MODE_PARAMS`].
+    pub mass_mode_tools: Arc<BTreeSet<String>>,
 }
 
 impl CodeIndexServer {
@@ -372,6 +390,7 @@ impl CodeIndexServer {
             registry: Arc::new(None),
             peer: Arc::new(Mutex::new(None)),
             allowed_tools: Arc::new(None),
+            mass_mode_tools: Arc::new(BTreeSet::new()),
         }
     }
 
@@ -395,6 +414,7 @@ impl CodeIndexServer {
             registry: Arc::new(Some(registry)),
             peer: Arc::new(Mutex::new(None)),
             allowed_tools: Arc::new(None),
+            mass_mode_tools: Arc::new(BTreeSet::new()),
         }
     }
 
@@ -459,6 +479,7 @@ impl CodeIndexServer {
             registry: Arc::new(registry),
             peer: Arc::new(Mutex::new(None)),
             allowed_tools: Arc::new(None),
+            mass_mode_tools: Arc::new(BTreeSet::new()),
         })
     }
 
@@ -575,6 +596,43 @@ impl CodeIndexServer {
             allowed.len(),
         );
         self.with_allowed_tools(Some(allowed))
+    }
+
+    /// Builder: белый список инструментов с массовым режимом
+    /// (`names[]`/`full_names[]`). Пустой набор (дефолт) → массовый режим
+    /// выключен у всех. См. [`MASS_MODE_PARAMS`] и [`Self::apply_mass_mode_tools`].
+    pub fn with_mass_mode_tools(mut self, tools: BTreeSet<String>) -> Self {
+        self.mass_mode_tools = Arc::new(tools);
+        self
+    }
+
+    /// Применить белый список массового режима из `daemon.toml [mcp].mass_mode_tools`.
+    /// Пустой список → массовый режим выключен у всех (дефолт). Имена вне
+    /// набора массовых инструментов ([`MASS_MODE_PARAMS`]) игнорируются с
+    /// warning. Единственная точка интеграции с `[mcp]` для обеих веток serve.
+    pub fn apply_mass_mode_tools(self, names: &[String]) -> Self {
+        if names.is_empty() {
+            tracing::info!(
+                "[mcp].mass_mode_tools пуст — массовый режим выключен у всех инструментов"
+            );
+            return self.with_mass_mode_tools(BTreeSet::new());
+        }
+        let known: BTreeSet<&str> = MASS_MODE_PARAMS.iter().map(|(n, _)| *n).collect();
+        let unknown: Vec<&String> = names.iter().filter(|n| !known.contains(n.as_str())).collect();
+        if !unknown.is_empty() {
+            tracing::warn!(
+                "[mcp].mass_mode_tools содержит имена без массового режима (опечатка?): {:?}. \
+                 Массовый режим есть только у: {:?}",
+                unknown,
+                known
+            );
+        }
+        let set: BTreeSet<String> = names.iter().cloned().collect();
+        tracing::info!(
+            "[mcp].mass_mode_tools активен: массовый режим включён для {:?}",
+            set
+        );
+        self.with_mass_mode_tools(set)
     }
 
     /// Проверить, какие имена из whitelist'а НЕ соответствуют ни одному
@@ -1079,6 +1137,16 @@ impl ServerHandler for CodeIndexServer {
         if let Some(allowed) = self.allowed_tools.as_ref().as_ref() {
             tools.retain(|t| allowed.contains(t.name.as_ref()));
         }
+        // Массовый режим: инструмент не в `[mcp].mass_mode_tools` → убираем его
+        // plural-параметр (`names`/`full_names`) из схемы, чтобы модель не
+        // видела опцию пачки. Дефолт — пустой список → выключено у всех.
+        for (name, plural) in MASS_MODE_PARAMS {
+            if !self.mass_mode_tools.contains(*name) {
+                if let Some(tool) = tools.iter_mut().find(|t| t.name.as_ref() == *name) {
+                    strip_mass_mode_param(tool, plural);
+                }
+            }
+        }
         // Стабильный порядок (как у tool_router::list_all): по имени.
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(ListToolsResult {
@@ -1107,6 +1175,34 @@ impl ServerHandler for CodeIndexServer {
                     ),
                     None,
                 ));
+            }
+        }
+        // 0b. Массовый режим выключен для этого инструмента? Отбиваем вызов с
+        // plural-параметром (`names`/`full_names`). Дублирует стрип схемы в
+        // `list_tools` (двойная защита: модель может прислать параметр из
+        // памяти/системного промпта, минуя `tools/list`). Одиночный
+        // `name`/`full_name` всегда проходит.
+        if let Some((_, plural)) = MASS_MODE_PARAMS
+            .iter()
+            .find(|(n, _)| *n == request.name.as_ref())
+        {
+            if !self.mass_mode_tools.contains(request.name.as_ref()) {
+                let has_plural = request
+                    .arguments
+                    .as_ref()
+                    .and_then(|m| m.get(*plural))
+                    .map(|v| !v.is_null())
+                    .unwrap_or(false);
+                if has_plural {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "массовый режим ('{}') для tool '{}' выключен — добавьте его в \
+                             [mcp].mass_mode_tools (daemon.toml) либо передайте одиночный параметр",
+                            plural, request.name
+                        ),
+                        None,
+                    ));
+                }
             }
         }
         // 1. Сначала core-tools — они есть всегда.
@@ -1223,6 +1319,31 @@ impl ServerHandler for CodeIndexServer {
     }
 }
 
+/// Убрать из инструмента plural-параметр массового режима (`names`/`full_names`)
+/// и обрезать фразу про массовый режим из описания — когда инструмента нет в
+/// белом списке `[mcp].mass_mode_tools`. После этого модель не видит опцию
+/// пачки в `tools/list`. Plural-параметры массовых инструментов опциональны,
+/// поэтому из `required` они не удаляются (их там и нет), но на всякий случай
+/// фильтруем и `required`.
+fn strip_mass_mode_param(tool: &mut Tool, plural: &str) {
+    let mut schema = tool.input_schema.as_ref().clone();
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties") {
+        props.remove(plural);
+    }
+    if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
+        req.retain(|v| v.as_str() != Some(plural));
+    }
+    tool.input_schema = Arc::new(schema);
+    // Фраза «МАССОВ…» всегда в конце описаний массовых инструментов —
+    // обрезаем хвост, чтобы описание не обещало недоступную опцию.
+    if let Some(desc) = tool.description.as_ref() {
+        if let Some(idx) = desc.find("МАССОВ") {
+            let trimmed = desc[..idx].trim_end().to_string();
+            tool.description = Some(std::borrow::Cow::Owned(trimmed));
+        }
+    }
+}
+
 /// Конвертация `IndexTool` (наш trait) в `rmcp::model::Tool` (формат для
 /// `tools/list`). `input_schema` ожидаем как JSON-объект; если пришло не
 /// объект — оборачиваем в пустой объект, чтобы не сломать клиент.
@@ -1241,6 +1362,104 @@ fn extension_tool_to_rmcp(t: &dyn IndexTool) -> Tool {
     tool.description = Some(Cow::Owned(t.description().to_string()));
     tool.input_schema = Arc::new(schema_obj);
     tool
+}
+
+// ── Тесты массового режима ([mcp].mass_mode_tools, v0.28.0) ────────────────
+
+#[cfg(test)]
+mod mass_mode_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn tool_with_plural(name: &str, plural: &str, desc: &str) -> Tool {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string"},
+                "name": {"type": "string"},
+                plural: {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["repo"]
+        });
+        let map = match schema {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        let mut t = Tool::default();
+        t.name = Cow::Owned(name.to_string());
+        t.description = Some(Cow::Owned(desc.to_string()));
+        t.input_schema = Arc::new(map);
+        t
+    }
+
+    #[test]
+    fn strip_removes_plural_keeps_single_and_trims_desc() {
+        let mut t = tool_with_plural(
+            "get_function",
+            "names",
+            "Тело функции по точному имени. МАССОВЫЙ РЕЖИМ: передайте список в 'names'.",
+        );
+        strip_mass_mode_param(&mut t, "names");
+        let props = t
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(!props.contains_key("names"), "plural удалён");
+        assert!(props.contains_key("name"), "одиночный параметр цел");
+        let desc = t.description.as_ref().unwrap();
+        assert!(!desc.contains("МАССОВ"), "фраза обрезана: {desc}");
+        assert!(desc.contains("Тело функции"), "полезная часть описания цела");
+    }
+
+    #[test]
+    fn strip_full_names_for_object_structure() {
+        let mut t = tool_with_plural(
+            "get_object_structure",
+            "full_names",
+            "Структура объекта. МАССОВЫЙ РЕЖИМ: передайте 'full_names'.",
+        );
+        strip_mass_mode_param(&mut t, "full_names");
+        let props = t
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(!props.contains_key("full_names"));
+    }
+
+    #[test]
+    fn apply_empty_disables_all() {
+        let server = CodeIndexServer::with_repos(Default::default()).apply_mass_mode_tools(&[]);
+        assert!(
+            server.mass_mode_tools.is_empty(),
+            "пустой список → массовый режим выключен у всех"
+        );
+    }
+
+    #[test]
+    fn apply_allowlist_sets_membership() {
+        let server = CodeIndexServer::with_repos(Default::default())
+            .apply_mass_mode_tools(&["get_object_structure".to_string()]);
+        assert!(server.mass_mode_tools.contains("get_object_structure"));
+        assert!(!server.mass_mode_tools.contains("get_function"));
+    }
+
+    #[test]
+    fn default_server_has_mass_mode_off() {
+        // Конструктор по умолчанию — массовый режим выключен (дефолт v0.28.0).
+        let server = CodeIndexServer::with_repos(Default::default());
+        assert!(server.mass_mode_tools.is_empty());
+    }
+
+    #[test]
+    fn mass_mode_params_cover_three_tools() {
+        let names: BTreeSet<&str> = MASS_MODE_PARAMS.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains("get_function"));
+        assert!(names.contains("get_class"));
+        assert!(names.contains("get_object_structure"));
+        assert_eq!(MASS_MODE_PARAMS.len(), 3);
+    }
 }
 
 // ── Тесты conditional registration ────────────────────────────────────────
