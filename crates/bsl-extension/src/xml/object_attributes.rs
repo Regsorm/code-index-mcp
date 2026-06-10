@@ -620,6 +620,105 @@ pub fn parse_predefined_xml(content: &str) -> Vec<String> {
 }
 
 /// Распарсить содержимое XML объекта в полную структуру.
+/// Лёгкий парс ШАПКИ объекта: `meta_type` (корневой тег под `MetaDataObject`),
+/// имя (`<Name>` в `<Properties>`) и синоним (`<Synonym>` ru-представление).
+/// Прерывается на `<ChildObjects>` — свойства объекта идут ДО состава, читать
+/// дальше незачем. Используется проходом `index_object_synonyms`, который
+/// покрывает ВСЕ типы объектов (включая CommonModule/Constant/… без структуры
+/// реквизитов, не входящие в `OBJECT_FOLDERS`). Возвращает `None`, если корневой
+/// тег/имя не распознаны. Синоним: приоритет у `<v8:lang>ru`, иначе первый
+/// непустой `<v8:content>`.
+pub fn parse_object_header_xml(content: &str) -> Option<(String, String, Option<String>)> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut depth = 0i32;
+    let mut meta_type: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut synonym: Option<String> = None;
+
+    // Состояние парса ПЕРВОГО <Synonym> объекта (синоним самого объекта).
+    let mut in_synonym = false;
+    let mut synonym_done = false;
+    let mut cur_lang: Option<String> = None;
+    let mut want_lang = false;
+    let mut want_content = false;
+    let mut want_name = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
+                // Корневой дочерний тег MetaDataObject (depth 2) — это meta_type.
+                if meta_type.is_none() && depth == 2 && local != "MetaDataObject" {
+                    meta_type = Some(local.clone());
+                }
+                // Состав объекта начался — свойства (Name/Synonym) уже позади.
+                if local == "ChildObjects" {
+                    break;
+                }
+                if local == "Name" && name.is_none() && !in_synonym {
+                    want_name = true;
+                } else if local == "Synonym" && !synonym_done && !in_synonym {
+                    in_synonym = true;
+                } else if in_synonym && local == "lang" {
+                    want_lang = true;
+                } else if in_synonym && local == "content" {
+                    want_content = true;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let txt = t
+                    .unescape()
+                    .map(|s| s.into_owned())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if want_name {
+                    if !txt.is_empty() {
+                        name = Some(txt);
+                    }
+                    want_name = false;
+                } else if want_lang {
+                    cur_lang = if txt.is_empty() { None } else { Some(txt) };
+                    want_lang = false;
+                } else if want_content {
+                    if !txt.is_empty() {
+                        if cur_lang.as_deref() == Some("ru") {
+                            synonym = Some(txt); // ru имеет приоритет
+                        } else if synonym.is_none() {
+                            synonym = Some(txt); // иначе — первое непустое
+                        }
+                    }
+                    cur_lang = None;
+                    want_content = false;
+                }
+            }
+            Ok(Event::End(e)) => {
+                depth -= 1;
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
+                if local == "Synonym" && in_synonym {
+                    in_synonym = false;
+                    synonym_done = true;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+        if meta_type.is_some() && name.is_some() && synonym_done {
+            break;
+        }
+    }
+
+    match (meta_type, name) {
+        (Some(mt), Some(nm)) => Some((mt, nm, synonym)),
+        _ => None,
+    }
+}
+
 pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
     let mut reader = Reader::from_str(content);
     reader.config_mut().trim_text(true);
@@ -840,6 +939,49 @@ fn ru_ref_kind(kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_header_extracts_meta_type_name_synonym_and_stops_at_childobjects() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <Catalog uuid="abc">
+    <Properties>
+      <Name>Контрагенты</Name>
+      <Synonym>
+        <v8:item><v8:lang>ru</v8:lang><v8:content>Контрагенты (партнёры)</v8:content></v8:item>
+      </Synonym>
+      <Comment/>
+    </Properties>
+    <ChildObjects>
+      <Attribute><Properties><Name>Поле</Name>
+        <Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>НЕ ЭТОТ</v8:content></v8:item></Synonym>
+      </Properties></Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>"#;
+        let (mt, name, syn) = parse_object_header_xml(xml).expect("header");
+        assert_eq!(mt, "Catalog");
+        assert_eq!(name, "Контрагенты");
+        // Синоним именно ОБЪЕКТА, не вложенного реквизита (break на ChildObjects).
+        assert_eq!(syn.as_deref(), Some("Контрагенты (партнёры)"));
+    }
+
+    #[test]
+    fn parse_header_ru_priority_and_absent_synonym() {
+        // en идёт перед ru — ru должен победить.
+        let xml = r#"<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core"><CommonModule><Properties><Name>ОбщийМодуль1</Name><Synonym><v8:item><v8:lang>en</v8:lang><v8:content>Common</v8:content></v8:item><v8:item><v8:lang>ru</v8:lang><v8:content>Общий модуль</v8:content></v8:item></Synonym></Properties></CommonModule></MetaDataObject>"#;
+        let (mt, name, syn) = parse_object_header_xml(xml).expect("header");
+        assert_eq!(mt, "CommonModule");
+        assert_eq!(name, "ОбщийМодуль1");
+        assert_eq!(syn.as_deref(), Some("Общий модуль"));
+
+        // Объект без <Synonym> → synonym None (но meta_type/name есть).
+        let xml2 = r#"<MetaDataObject><Constant><Properties><Name>Конст1</Name></Properties></Constant></MetaDataObject>"#;
+        let (mt2, name2, syn2) = parse_object_header_xml(xml2).expect("header2");
+        assert_eq!(mt2, "Constant");
+        assert_eq!(name2, "Конст1");
+        assert_eq!(syn2, None);
+    }
 
     #[test]
     fn merge_from_unions_base_and_extension() {

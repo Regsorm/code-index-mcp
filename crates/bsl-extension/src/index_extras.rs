@@ -32,7 +32,8 @@ use crate::xml::metadata_refs::{
     parse_functional_option_location_file, parse_role_rights_file, parse_subsystem_content_file,
 };
 use crate::xml::object_attributes::{
-    parse_object_attributes_file, parse_object_structure_file, ObjectStructure,
+    parse_object_attributes_file, parse_object_header_xml, parse_object_structure_file,
+    ObjectStructure,
 };
 use crate::xml::object_uuid::{extract_form_uuid_from_file, extract_object_uuid_from_file};
 
@@ -98,6 +99,14 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // index_metadata_objects (выполняется выше), — делает UPDATE по full_name.
     if let Err(e) = index_object_attributes(repo_root, conn) {
         tracing::warn!("object_attributes: {}", e);
+    }
+    // Синонимы (русские представления) ВСЕХ объектов — отдельный лёгкий проход
+    // по корневым XML всех папок типов. Покрывает и объекты без структуры
+    // реквизитов (CommonModule/Constant/CommonPicture/FunctionalOption/…),
+    // которых нет в OBJECT_FOLDERS. UPDATE по full_name; зависит от строк,
+    // созданных index_metadata_objects.
+    if let Err(e) = index_object_synonyms(repo_root, conn) {
+        tracing::warn!("object_synonyms: {}", e);
     }
     if let Err(e) = index_metadata_forms(repo_root, conn) {
         tracing::warn!("metadata_forms: {}", e);
@@ -1544,6 +1553,68 @@ fn index_object_attributes(repo_root: &Path, conn: &rusqlite::Connection) -> Res
         filled,
         sub_roots.len()
     );
+    Ok(())
+}
+
+/// Заполнить `metadata_objects.synonym` для ВСЕХ объектов (вариант B): отдельный
+/// лёгкий проход по корневым XML всех папок типов в каждой sub-config. В отличие
+/// от `index_object_attributes` (только OBJECT_FOLDERS — объекты со структурой),
+/// покрывает и CommonModule/Constant/CommonPicture/FunctionalOption/… Берёт лишь
+/// шапку (meta_type/name/synonym) — `parse_object_header_xml` прерывается на
+/// `<ChildObjects>`, поэтому дёшев. UPDATE по full_name: записи уже созданы
+/// `index_metadata_objects`; для отсутствующих UPDATE — no-op. base-приоритет
+/// (sub_roots: base первым → его synonym не перетирается расширением).
+fn index_object_synonyms(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let sub_roots = sub_config_roots(repo_root);
+    if sub_roots.is_empty() {
+        return Ok(());
+    }
+    let mut syn: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for sub_root in &sub_roots {
+        let type_dirs = match std::fs::read_dir(sub_root) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for td in type_dirs.filter_map(|e| e.ok()) {
+            let tdir = td.path();
+            if !tdir.is_dir() {
+                continue;
+            }
+            let files = match std::fs::read_dir(&tdir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for f in files.filter_map(|e| e.ok()) {
+                let p = f.path();
+                if !p.is_file() || p.extension().and_then(|x| x.to_str()) != Some("xml") {
+                    continue;
+                }
+                let content = match std::fs::read_to_string(&p) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if let Some((mt, nm, Some(s))) = parse_object_header_xml(&content) {
+                    if !s.is_empty() {
+                        syn.entry(format!("{}.{}", mt, nm)).or_insert(s);
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    let mut stmt = conn.prepare(
+        "UPDATE metadata_objects SET synonym = ? WHERE repo = ? AND full_name = ?",
+    )?;
+    let mut filled = 0usize;
+    for (full_name, synonym) in &syn {
+        filled += stmt.execute(params![synonym, REPO_DEFAULT, full_name])?;
+    }
+    drop(stmt);
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!("object_synonyms: заполнен synonym у {} объектов", filled);
     Ok(())
 }
 
