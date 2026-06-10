@@ -29,7 +29,7 @@ use std::time::Duration;
 use code_index_core::extension::{IndexTool, ToolContext};
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params_from_iter, ErrorCode};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 /// Таймаут одного запроса. По истечении вызывается sqlite3_interrupt —
 /// текущий/следующий шаг возвращает SQLITE_INTERRUPT, запрос обрывается.
@@ -78,7 +78,7 @@ impl IndexTool for BslSqlTool {
          Пример (перехваты расширений): SELECT f.name, f.override_type, f.override_target, \
          fl.path FROM functions f JOIN files fl ON fl.id=f.file_id WHERE f.override_type \
          IS NOT NULL LIMIT 100. Blob-колонки (zstd-контент) отдаются как {_blob_bytes: N}, \
-         текст брать через get_function/grep_body/read_file. For BSL/1C repositories only."
+         текст брать через get_function/grep_body/read_file. \n         Формат результата: {columns:[имена], rows:[[значения по порядку columns], ...], row_count, truncated, limit}; \n         rows COLUMNAR — массивы значений по позициям columns, имена колонок не дублируются (экономия контекста). \n         For BSL/1C repositories only."
     }
 
     fn input_schema(&self) -> Value {
@@ -289,8 +289,10 @@ fn parse_params(v: Option<&Value>) -> Result<Vec<SqlValue>, String> {
     Ok(out)
 }
 
-/// Выполнить prepared-запрос и собрать до `limit` строк как JSON-объекты
-/// {колонка: значение}. Возвращает (имена колонок, строки, truncated).
+/// Выполнить prepared-запрос и собрать до `limit` строк в COLUMNAR-формате:
+/// каждая строка — массив значений `[v0, v1, …]` в порядке `columns` (имена
+/// колонок НЕ дублируются в каждой строке — экономия контекста на широких
+/// результатах). Возвращает (имена колонок, строки-массивы, truncated).
 fn collect_rows(
     stmt: &mut rusqlite::Statement<'_>,
     bound: Vec<SqlValue>,
@@ -309,12 +311,11 @@ fn collect_rows(
             truncated = true;
             break;
         }
-        let mut obj = Map::with_capacity(col_count);
+        let mut arr = Vec::with_capacity(col_count);
         for i in 0..col_count {
-            let value = valueref_to_json(row.get_ref(i)?);
-            obj.insert(columns[i].clone(), value);
+            arr.push(valueref_to_json(row.get_ref(i)?));
         }
-        out.push(Value::Object(obj));
+        out.push(Value::Array(arr));
     }
 
     Ok((columns, out, truncated))
@@ -393,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_rows_returns_json_objects() {
+    fn collect_rows_returns_columnar_arrays() {
         let conn = mem_db();
         let mut stmt = conn
             .prepare("SELECT full_name, meta_type FROM metadata_objects ORDER BY full_name")
@@ -403,8 +404,9 @@ mod tests {
         assert_eq!(cols, vec!["full_name".to_string(), "meta_type".to_string()]);
         assert_eq!(rows.len(), 2);
         assert!(!truncated);
-        assert_eq!(rows[0]["full_name"], json!("Catalog.Контрагенты"));
-        assert_eq!(rows[0]["meta_type"], json!("Catalog"));
+        // COLUMNAR: строка — массив значений по позициям columns (без имён колонок).
+        assert_eq!(rows[0][0], json!("Catalog.Контрагенты"));
+        assert_eq!(rows[0][1], json!("Catalog"));
     }
 
     #[test]
@@ -425,7 +427,7 @@ mod tests {
         let (_, rows, _) =
             collect_rows(&mut stmt, vec![SqlValue::Text("Document".into())], 100).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["full_name"], json!("Document.Реализация"));
+        assert_eq!(rows[0][0], json!("Document.Реализация"));
     }
 
     #[test]
