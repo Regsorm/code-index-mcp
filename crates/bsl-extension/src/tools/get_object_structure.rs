@@ -52,6 +52,11 @@ impl IndexTool for GetObjectStructureTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Список полных имён для МАССОВОГО запроса. Применяй ТОЛЬКО когда заведомо нужен весь набор (см. описание инструмента); если отбираешь релевантные — по одному 'full_name'. Ответ — {results:[...]} в том же порядке."
+                },
+                "sections": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["attributes", "tabular_sections", "dimensions", "resources", "posting", "enum_values", "predefined"] },
+                    "description": "Узкая выборка секций структуры (как sections у get_object_profile): вернуть ТОЛЬКО указанные ключи. Без параметра — все секции. Рычаг экономии контекста: ['posting'] (поведение проведения, ~0.2 КБ вместо полного объекта), ['attributes'] (только реквизиты шапки без табличных частей), ['tabular_sections'], ['dimensions','resources'] (для регистров)."
                 }
             },
             "required": ["repo"]
@@ -68,6 +73,11 @@ impl IndexTool for GetObjectStructureTool {
         ctx: ToolContext<'a>,
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
+            // Узкая выборка секций (sections): без параметра — все секции.
+            let sections: Option<Vec<String>> = args
+                .get("sections")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
             // Массовый режим (full_names) приоритетен; иначе одиночный full_name.
             let result_value = if let Some(arr) = args.get("full_names").and_then(|v| v.as_array())
             {
@@ -93,9 +103,10 @@ impl IndexTool for GetObjectStructureTool {
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
                 let repo_label = ctx.repo.to_string();
+                let sections_c = sections.clone();
                 let rows =
                     code_index_core::mcp::tools::mass_map(ctx.storage, items, move |st, fqn| {
-                        resolve_one(st.conn(), &repo_label, &fqn)
+                        resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref())
                     })
                     .await;
                 for (pos, row) in positions.into_iter().zip(rows) {
@@ -114,7 +125,7 @@ impl IndexTool for GetObjectStructureTool {
                         }));
                     }
                 };
-                resolve_one(storage.conn(), ctx.repo, fqn)
+                resolve_one(storage.conn(), ctx.repo, fqn, sections.as_deref())
             } else {
                 json!({
                     "error": "missing parameter: передайте 'full_name' (строка) или 'full_names' (массив строк)"
@@ -129,7 +140,26 @@ impl IndexTool for GetObjectStructureTool {
 /// {error, did_you_mean}). Свободная fn, а не замыкание: одиночный путь зовёт
 /// её inline, массовый — из spawn_blocking со своим соединением из пула
 /// (mass_map). `repo_label` — алиас репо, только для текста ошибки.
-fn resolve_one(conn: &rusqlite::Connection, repo_label: &str, full_name: &str) -> Value {
+/// Сузить структуру до запрошенных секций (узкая выборка `sections`). None или
+/// пустой список → без изменений. Фильтрует ключи верхнего уровня
+/// `attributes_json` (attributes/dimensions/resources/tabular_sections/posting/
+/// enum_values/predefined) — рычаг гигиены контекста.
+fn apply_sections(value: Value, sections: Option<&[String]>) -> Value {
+    match (sections, value) {
+        (Some(secs), Value::Object(mut map)) if !secs.is_empty() => {
+            map.retain(|k, _| secs.iter().any(|s| s == k));
+            Value::Object(map)
+        }
+        (_, v) => v,
+    }
+}
+
+fn resolve_one(
+    conn: &rusqlite::Connection,
+    repo_label: &str,
+    full_name: &str,
+    sections: Option<&[String]>,
+) -> Value {
     let row = conn.query_row(
         "SELECT meta_type, name, synonym, attributes_json \
                      FROM metadata_objects WHERE repo = ? AND full_name = ?",
@@ -150,6 +180,7 @@ fn resolve_one(conn: &rusqlite::Connection, repo_label: &str, full_name: &str) -
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .unwrap_or(Value::Null);
+            let attrs_value = apply_sections(attrs_value, sections);
             json!({
                 "full_name": full_name,
                 "meta_type": meta_type,
@@ -212,5 +243,34 @@ fn resolve_one(conn: &rusqlite::Connection, repo_label: &str, full_name: &str) -
         Err(e) => json!({
             "error": format!("database error: {}", e)
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_sections_filters_top_level_keys() {
+        let v = json!({
+            "attributes": [1, 2],
+            "tabular_sections": [3],
+            "posting": { "Posting": "Allow" },
+            "dimensions": []
+        });
+        // None → без изменений.
+        assert_eq!(apply_sections(v.clone(), None), v);
+        // Пустой список → без изменений.
+        let empty: Vec<String> = vec![];
+        assert_eq!(apply_sections(v.clone(), Some(&empty)), v);
+        // Только запрошенные ключи (['posting']) остаются.
+        let only = vec!["posting".to_string()];
+        let filtered = apply_sections(v.clone(), Some(&only));
+        let obj = filtered.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
+        assert!(obj.contains_key("posting"));
+        assert!(!obj.contains_key("attributes"));
+        // Не-объект (Null) → без изменений (ненайденный объект отдаёт error-Value).
+        assert_eq!(apply_sections(Value::Null, Some(&only)), Value::Null);
     }
 }
