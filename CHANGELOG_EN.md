@@ -5,6 +5,27 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.28.0] — 2026-06-10
+
+**Bulk mode (`names[]`/`full_names[]`) is OFF by default; enabled via the `[mcp].mass_mode_tools` allowlist in `daemon.toml`.**
+
+### Changed (default behavior)
+
+- **Bulk mode is now opt-in and off by default for all tools.** A benchmark on ut-test (10 business tasks, Opus, ci arm with the new tools vs baseline) showed the promised token savings from batching **do not hold**: total input tokens went up (+37% on the run) while turns barely changed. Mechanism: a batch *front-loads* data (all targets land on the first turn and are re-read on every subsequent one), provokes over-fetch (the model pulls more targets than it would sequentially with an early stop), and on "hot" (non-unique) names `get_function`/`get_class` the response inflates without bound. Tokens are the dominant cost on a subscription, so bulk mode is disabled by default.
+  - Controlled by a new `daemon.toml` section:
+    ```toml
+    [mcp]
+    # a tool in the list advertises its plural param (the model decides whether to batch);
+    # not in the list -> the server does not offer batching. Empty/absent -> off for all.
+    mass_mode_tools = ["get_object_structure"]
+    ```
+  - A tool **in the list** advertises `names[]`/`full_names[]` in `tools/list` (model can batch). **Not in the list** — the server strips the plural param from the schema (`list_tools`) and rejects `tools/call` carrying it (`-32602 Invalid params`, double protection).
+  - **Compatibility:** single `name`/`full_name` works as before. This is a behavior change vs 0.26.0/0.27.0, where bulk mode was on for all three tools. To restore the old behavior — `mass_mode_tools = ["get_object_structure", "get_function", "get_class"]`.
+
+### Tests
+
+- `strip_mass_mode_param` (removes the plural param from the schema + trims the description), `apply_mass_mode_tools` (empty list → off; allowlist → membership), parsing of `[mcp].mass_mode_tools` and the empty default. `cargo test`: code-index-core green.
+
 ## [0.27.0] — 2026-06-10
 
 **Bulk mode now runs in parallel: `names[]`/`full_names[]` elements are processed concurrently instead of in a loop.**
