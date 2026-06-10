@@ -70,121 +70,53 @@ impl IndexTool for GetObjectStructureTool {
         ctx: ToolContext<'a>,
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
-            let storage = match ctx.storage.get().await {
-                Ok(s) => s,
-                Err(e) => {
-                    return crate::tools::wrap_error(serde_json::json!({
-                        "error": format!("storage pool: {}", e)
-                    }));
-                }
-            };
-            let conn = storage.conn();
-
-            // Обработка ОДНОГО объекта по full_name → Value (структура либо
-            // {error, did_you_mean}). Вынесено в замыкание, чтобы массовый режим
-            // (full_names=[...]) переиспользовал ту же логику без дублирования.
-            let resolve_one = |full_name: &str| -> Value {
-                let row = conn.query_row(
-                    "SELECT meta_type, name, synonym, attributes_json \
-                     FROM metadata_objects WHERE repo = ? AND full_name = ?",
-                    params!["default", full_name],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                            r.get::<_, Option<String>>(3)?,
-                        ))
-                    },
-                );
-
-                match row {
-                    Ok((meta_type, name, synonym, attrs)) => {
-                        let attrs_value = attrs
-                            .as_deref()
-                            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                            .unwrap_or(Value::Null);
-                        json!({
-                            "full_name": full_name,
-                            "meta_type": meta_type,
-                            "name": name,
-                            "synonym": synonym,
-                            "attributes": attrs_value,
-                        })
-                    }
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        // fuzzy-подсказка: объект не найден — предложим похожие по
-                        // префиксу имени. Ловит опечатки в середине слова, напр.
-                        // 'Document.РеализацияТоваровИУслуг' → 'РеализацияТоваровУслуг'
-                        // (префикс 'Реализ' совпадает). Слабое место #5 прогона УТ-11.
-                        let (mtype, short) = match full_name.split_once('.') {
-                            Some((t, n)) => (Some(t.to_string()), n.to_string()),
-                            None => (None, full_name.to_string()),
-                        };
-                        let prefix: String = short.chars().take(6).collect();
-                        let like_prefix = format!("{}%", prefix);
-                        let mut suggestions: Vec<String> = Vec::new();
-                        // 1) тот же meta_type + префикс имени
-                        if let Some(ref t) = mtype {
-                            if let Ok(mut s) = conn.prepare(
-                                "SELECT full_name FROM metadata_objects \
-                                 WHERE repo = 'default' AND meta_type = ?1 AND name LIKE ?2 \
-                                 ORDER BY name LIMIT 8",
-                            ) {
-                                if let Ok(rows) =
-                                    s.query_map(params![t, like_prefix], |r| r.get::<_, String>(0))
-                                {
-                                    suggestions.extend(rows.flatten());
-                                }
-                            }
-                        }
-                        // 2) добор по подстроке имени без учёта meta_type
-                        if suggestions.len() < 8 {
-                            let sub: String = short.chars().take(8).collect();
-                            let like_sub = format!("%{}%", sub);
-                            if let Ok(mut s) = conn.prepare(
-                                "SELECT full_name FROM metadata_objects \
-                                 WHERE repo = 'default' AND name LIKE ?1 \
-                                 ORDER BY name LIMIT 8",
-                            ) {
-                                if let Ok(rows) =
-                                    s.query_map(params![like_sub], |r| r.get::<_, String>(0))
-                                {
-                                    for fqn in rows.flatten() {
-                                        if !suggestions.contains(&fqn) {
-                                            suggestions.push(fqn);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        suggestions.truncate(8);
-                        json!({
-                            "error": format!("object '{}' not found in repo '{}'", full_name, ctx.repo),
-                            "did_you_mean": suggestions,
-                            "hint": "Формат '<MetaType>.<Name>': MetaType англ. (Catalog/Document/AccumulationRegister/InformationRegister/ChartOfAccounts/…), Name — точное имя из конфигурации. Список объектов типа — через MCP 1c list_metadata_objects."
-                        })
-                    }
-                    Err(e) => json!({
-                        "error": format!("database error: {}", e)
-                    }),
-                }
-            };
-
             // Массовый режим (full_names) приоритетен; иначе одиночный full_name.
-            let result_value = if let Some(arr) =
-                args.get("full_names").and_then(|v| v.as_array())
+            let result_value = if let Some(arr) = args.get("full_names").and_then(|v| v.as_array())
             {
-                let results: Vec<Value> = arr
+                // Конкуррентно: каждый элемент берёт своё соединение из пула и
+                // исполняется в spawn_blocking (mass_map). Нестроковые элементы
+                // получают {error} на своей позиции без обращения к пулу.
+                let mut results: Vec<Value> = arr
                     .iter()
                     .map(|v| match v.as_str() {
-                        Some(fqn) => resolve_one(fqn),
-                        None => json!({ "error": "full_names: каждый элемент должен быть строкой" }),
+                        Some(_) => Value::Null, // заполнится результатом ниже
+                        None => {
+                            json!({ "error": "full_names: каждый элемент должен быть строкой" })
+                        }
                     })
                     .collect();
+                let positions: Vec<usize> = arr
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| v.as_str().map(|_| i))
+                    .collect();
+                let items: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                let repo_label = ctx.repo.to_string();
+                let rows =
+                    code_index_core::mcp::tools::mass_map(ctx.storage, items, move |st, fqn| {
+                        resolve_one(st.conn(), &repo_label, &fqn)
+                    })
+                    .await;
+                for (pos, row) in positions.into_iter().zip(rows) {
+                    results[pos] = match row {
+                        Ok(v) => v,
+                        Err(e) => json!({ "error": e }),
+                    };
+                }
                 json!({ "results": results })
             } else if let Some(fqn) = args.get("full_name").and_then(|v| v.as_str()) {
-                resolve_one(fqn)
+                let storage = match ctx.storage.get().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return crate::tools::wrap_error(serde_json::json!({
+                            "error": format!("storage pool: {}", e)
+                        }));
+                    }
+                };
+                resolve_one(storage.conn(), ctx.repo, fqn)
             } else {
                 json!({
                     "error": "missing parameter: передайте 'full_name' (строка) или 'full_names' (массив строк)"
@@ -192,5 +124,95 @@ impl IndexTool for GetObjectStructureTool {
             };
             crate::tools::wrap_with_meta(result_value, Vec::new())
         })
+    }
+}
+
+/// Обработка ОДНОГО объекта по full_name → Value (структура либо
+/// {error, did_you_mean}). Свободная fn, а не замыкание: одиночный путь зовёт
+/// её inline, массовый — из spawn_blocking со своим соединением из пула
+/// (mass_map). `repo_label` — алиас репо, только для текста ошибки.
+fn resolve_one(conn: &rusqlite::Connection, repo_label: &str, full_name: &str) -> Value {
+    let row = conn.query_row(
+        "SELECT meta_type, name, synonym, attributes_json \
+                     FROM metadata_objects WHERE repo = ? AND full_name = ?",
+        params!["default", full_name],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        },
+    );
+
+    match row {
+        Ok((meta_type, name, synonym, attrs)) => {
+            let attrs_value = attrs
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or(Value::Null);
+            json!({
+                "full_name": full_name,
+                "meta_type": meta_type,
+                "name": name,
+                "synonym": synonym,
+                "attributes": attrs_value,
+            })
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            // fuzzy-подсказка: объект не найден — предложим похожие по
+            // префиксу имени. Ловит опечатки в середине слова, напр.
+            // 'Document.РеализацияТоваровИУслуг' → 'РеализацияТоваровУслуг'
+            // (префикс 'Реализ' совпадает). Слабое место #5 прогона УТ-11.
+            let (mtype, short) = match full_name.split_once('.') {
+                Some((t, n)) => (Some(t.to_string()), n.to_string()),
+                None => (None, full_name.to_string()),
+            };
+            let prefix: String = short.chars().take(6).collect();
+            let like_prefix = format!("{}%", prefix);
+            let mut suggestions: Vec<String> = Vec::new();
+            // 1) тот же meta_type + префикс имени
+            if let Some(ref t) = mtype {
+                if let Ok(mut s) = conn.prepare(
+                    "SELECT full_name FROM metadata_objects \
+                                 WHERE repo = 'default' AND meta_type = ?1 AND name LIKE ?2 \
+                                 ORDER BY name LIMIT 8",
+                ) {
+                    if let Ok(rows) =
+                        s.query_map(params![t, like_prefix], |r| r.get::<_, String>(0))
+                    {
+                        suggestions.extend(rows.flatten());
+                    }
+                }
+            }
+            // 2) добор по подстроке имени без учёта meta_type
+            if suggestions.len() < 8 {
+                let sub: String = short.chars().take(8).collect();
+                let like_sub = format!("%{}%", sub);
+                if let Ok(mut s) = conn.prepare(
+                    "SELECT full_name FROM metadata_objects \
+                                 WHERE repo = 'default' AND name LIKE ?1 \
+                                 ORDER BY name LIMIT 8",
+                ) {
+                    if let Ok(rows) = s.query_map(params![like_sub], |r| r.get::<_, String>(0)) {
+                        for fqn in rows.flatten() {
+                            if !suggestions.contains(&fqn) {
+                                suggestions.push(fqn);
+                            }
+                        }
+                    }
+                }
+            }
+            suggestions.truncate(8);
+            json!({
+                "error": format!("object '{}' not found in repo '{}'", full_name, repo_label),
+                "did_you_mean": suggestions,
+                "hint": "Формат '<MetaType>.<Name>': MetaType англ. (Catalog/Document/AccumulationRegister/InformationRegister/ChartOfAccounts/…), Name — точное имя из конфигурации. Список объектов типа — через MCP 1c list_metadata_objects."
+            })
+        }
+        Err(e) => json!({
+            "error": format!("database error: {}", e)
+        }),
     }
 }

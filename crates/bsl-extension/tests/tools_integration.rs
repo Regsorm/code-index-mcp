@@ -167,6 +167,56 @@ async fn get_object_structure_batch_full_names() {
     assert!(results[2]["did_you_mean"].is_array());
 }
 
+#[tokio::test]
+async fn get_object_structure_batch_non_string_element() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params![REPO, "Catalog.Контрагенты", "Catalog", "Контрагенты", "Контрагенты"],
+            )
+            .unwrap();
+    }
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "full_names": ["Catalog.Контрагенты", 42, "Catalog.Контрагенты"]
+        }),
+    )
+    .await;
+    let results = res["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["meta_type"].as_str(), Some("Catalog"));
+    // нестроковый элемент → {error} строго на своей позиции, соседи не страдают
+    assert!(
+        results[1]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("строкой"),
+        "нестроковый элемент должен дать error на своей позиции: {:?}",
+        results[1]
+    );
+    assert_eq!(results[2]["meta_type"].as_str(), Some("Catalog"));
+}
+
+#[tokio::test]
+async fn get_object_structure_batch_empty_list() {
+    let (_tmp, storage) = fresh_storage();
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_names": []}),
+    )
+    .await;
+    let results = res["results"].as_array().expect("пустой батч → пустой results");
+    assert!(results.is_empty());
+}
+
 // ── get_form_handlers ─────────────────────────────────────────────────────
 
 #[tokio::test]
