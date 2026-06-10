@@ -5,6 +5,28 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.29.0] — 2026-06-10
+
+**Synonyms for ALL metadata objects; narrow `sections` selection in `get_object_structure`; columnar `bsl_sql` result format.**
+
+### Added
+
+- **Synonyms (Russian presentations) for ALL metadata objects.** A new lightweight indexing pass `index_object_synonyms` fills `metadata_objects.synonym` for every object type — including `CommonModule`/`Constant`/`CommonPicture`/`FunctionalOption` and other types without an attribute structure that are not part of `OBJECT_FOLDERS` (previously only objects with a structure had a synonym). The `parse_object_header_xml` parser reads only the root XML header (meta_type/Name/Synonym) and stops at `<ChildObjects>` — the pass is cheap. `v8:lang=ru` takes priority, otherwise the first non-empty presentation; the base configuration's synonym is not overwritten by an extension. Why: the synonym is a mechanical bridge "Russian presentation ↔ English identifier" for meaning-based search without LLM enrichment.
+- **`sections` parameter in `get_object_structure`** — narrow selection of structure sections (like `sections` in `get_object_profile`): return ONLY the requested keys out of `attributes`/`tabular_sections`/`dimensions`/`resources`/`posting`/`enum_values`/`predefined`. Without the parameter — all sections (backward compatible). Works in both single (`full_name`) and mass (`full_names`) mode. A context-economy lever: `["posting"]` — posting behavior at ~0.2 KB instead of the full object; `["attributes"]` — header attributes without tabular sections; `["dimensions","resources"]` — for registers.
+
+### Changed
+
+- **`bsl_sql`: columnar result format.** `rows` are now arrays of values positioned by `columns` instead of JSON objects `{column: value}` — column names are not duplicated in every row, saving context on wide result sets. The format is explicitly described in the tool description.
+- **Softened mass-mode wording** in the descriptions of `get_function`/`get_class`/`get_object_structure` and the `names`/`full_names` parameters: batch ONLY when the whole set is definitely needed and one element's result cannot make the rest unnecessary; when filtering candidates — one at a time with early stopping; "when in doubt — one at a time". Encodes the ut-test benchmark conclusion from 0.28.0 (token front-loading and over-fetch caused by unconditional batching). Relevant for configurations with `[mcp].mass_mode_tools` enabled.
+
+### Documentation
+
+- `docs/operations.md` — indexer administration procedures (adding a repo to daemon.toml+serve.toml, daemon config hot-reload, restart/rebuild, "MCP not responding" diagnostics), moved out of session rules.
+
+### Tests
+
+- `parse_object_header_xml` (ru synonym priority, break at `<ChildObjects>`, object without a synonym), `apply_sections_filters_top_level_keys` (None/empty list/non-object — unchanged), columnar `collect_rows_*` tests. Full workspace green.
+
 ## [0.28.0] — 2026-06-10
 
 **Bulk mode (`names[]`/`full_names[]`) is OFF by default; enabled via the `[mcp].mass_mode_tools` allowlist in `daemon.toml`.**
