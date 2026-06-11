@@ -5,6 +5,27 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.30.0] — 2026-06-11
+
+**Mechanical term enrichment at index time (no LLM) + trigram FTS: `search_terms` works on production-size configurations for the first time. Smart `bsl_sql` errors.**
+
+### Added
+
+- **Mechanical filling of `procedure_enrichment.terms` at index time** — new `terms.rs` module and the `index_procedure_terms` pass (+ per-file incremental). Terms for every procedure are built from four cheap sources: words of the procedure name (CamelCase/underscore/script-change split: УточнитьДанныеПоШтрихкоду → "уточнить данные по штрихкоду"), words of the owner object name (from the module path), the owner object's SYNONYM from `metadata_objects.synonym` (a mechanical bridge between the Russian presentation and the English identifier), and the comment above the procedure. No LLM: 259,414 procedures of UT-11 get enriched within a fraction of the 63-second full rebuild. Signature `mech:v1`; rows written by the LLM `enrich` pass (different signature) are not overwritten. Ё is folded to Е at write time.
+- **Trigram FTS tokenizer for terms** (`tokenize='trigram'` instead of unicode61) — word forms and substrings of 3+ characters work ("штрихкод" matches "ПоШтрихкоду"), case and ё/е are irrelevant. Existing databases migrate automatically (`ensure_trigram_tokenizer`: drop + rebuild from the content table on DDL mismatch).
+- **Smart `bsl_sql` errors** — on `no such column/table` the response is extended with `did_you_mean` (Levenshtein), `column_exists_in_tables` (which tables actually contain the column — catches the meta_type/module_type confusion) and the columns of the tables referenced by the query. The error becomes self-correcting within the same turn (benchmark finding: a bare error cost the agent an extra reconnaissance turn).
+
+### Changed
+
+- **`search_terms` reworked for mechanical terms**: a multi-word query without explicit operators is rewritten server-side into an OR of words (implicit AND on short terms almost always returned 0 — a benchmark finding), words shorter than 3 characters are dropped, ё is folded to е, and the rewritten query is visible in the response (`fts_query`). New description ("FIRST choice for finding functionality", how to query), two contextual hints on an empty result.
+- **Fixed the repo filter in `search_terms`** — the routing alias was bound instead of `'default'` (as in all other BSL tools): the tool returned nothing even with a populated table. The bug stayed invisible while the table was empty.
+- **Missing-parameter error texts** of `get_function`/`get_class`/`get_object_structure` no longer suggest `names`/`full_names`: with mass-mode disabled the hint led the model into a rejected call (benchmark observation).
+
+### Tests
+
+- Units for `terms.rs` (Cyrillic/Latin/acronym/digit splitting, ё→е, object from path, comments), `index_procedure_terms` (mechanics + LLM protection + incremental with cleanup), `ensure_trigram_tokenizer` (migration + substring matches), OR-rewrite and ё in `search_terms` (integration), `enrich_prepare_error` (column and table cases). Full workspace green.
+- E2E benchmarks on ut-test (10 business tasks, Opus headless): the "where is feature X" spiral case is solved by a single `search_terms` call instead of ~22 lexical attempts; the no-`bsl_sql` arm confirmed its value (+33% turns, +19% cost without it).
+
 ## [0.29.0] — 2026-06-10
 
 **Synonyms for ALL metadata objects; narrow `sections` selection in `get_object_structure`; columnar `bsl_sql` result format.**
