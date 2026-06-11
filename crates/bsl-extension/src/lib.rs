@@ -19,6 +19,7 @@ pub mod index_extras;
 pub mod module_constants;
 pub mod processor;
 pub mod schema;
+pub mod terms;
 pub mod tools;
 pub mod xml;
 

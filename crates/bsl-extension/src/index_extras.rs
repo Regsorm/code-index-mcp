@@ -108,6 +108,12 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     if let Err(e) = index_object_synonyms(repo_root, conn) {
         tracing::warn!("object_synonyms: {}", e);
     }
+    // Механические термы процедур (имя + объект + синоним + комментарий) —
+    // после синонимов (использует metadata_objects.synonym) и после core-
+    // индексации (читает functions/files). Без LLM, секунды на конфигурацию.
+    if let Err(e) = index_procedure_terms(repo_root, conn) {
+        tracing::warn!("procedure_terms: {}", e);
+    }
     if let Err(e) = index_metadata_forms(repo_root, conn) {
         tracing::warn!("metadata_forms: {}", e);
     }
@@ -623,6 +629,7 @@ pub fn run_incremental_extras(
     for p in &bsl_paths {
         update_call_graph_direct_for_file(repo_root, conn, p)?;
         update_code_usages_for_file(repo_root, conn, p)?;
+        update_procedure_terms_for_file(repo_root, conn, p)?;
     }
     // Слой extension_override зависит от functions.override_* (обновляется
     // core-индексатором при правке .bsl) — полный пересбор дёшев (один SELECT).
@@ -1618,6 +1625,169 @@ fn index_object_synonyms(repo_root: &Path, conn: &rusqlite::Connection) -> Resul
     Ok(())
 }
 
+/// Полный проход механического обогащения термов (без LLM): для каждой
+/// процедуры из `functions` собрать `terms` (слова имени + слова объекта +
+/// синоним объекта + комментарий над процедурой) и записать в
+/// `procedure_enrichment` с подписью `mech:v1`. Строки с ДРУГОЙ подписью
+/// (LLM-enrich) не трогаются: свои строки предварительно сносятся, вставка —
+/// `ON CONFLICT DO NOTHING`. Комментарии читаются с диска (один read на файл,
+/// файлы сгруппированы по пути). См. `crate::terms`.
+fn index_procedure_terms(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    use crate::terms::{
+        build_terms, extract_leading_comment, object_from_module_path, MECH_SIGNATURE,
+    };
+
+    // Синонимы объектов: full_name → synonym (один SELECT на репо).
+    let mut syn: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT full_name, synonym FROM metadata_objects \
+             WHERE repo = ?1 AND synonym IS NOT NULL AND synonym != ''",
+        )?;
+        let rows = stmt.query_map(params![REPO_DEFAULT], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows.flatten() {
+            syn.insert(row.0, row.1);
+        }
+    }
+
+    // Все BSL-процедуры, сгруппированные по файлу (ORDER BY path).
+    let procs: Vec<(String, String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT fl.path, f.name, COALESCE(f.line_start, 0) FROM functions f \
+             JOIN files fl ON fl.id = f.file_id \
+             WHERE fl.path LIKE '%.bsl' ORDER BY fl.path, f.line_start",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        rows.flatten().collect()
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM procedure_enrichment WHERE repo = ?1 AND signature LIKE 'mech:%'",
+        params![REPO_DEFAULT],
+    )?;
+    let mut ins = conn.prepare(
+        "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(repo, proc_key) DO NOTHING",
+    )?;
+
+    let mut cur_path = String::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut filled = 0usize;
+    for (path, name, line_start) in &procs {
+        if *path != cur_path {
+            cur_path = path.clone();
+            lines = std::fs::read_to_string(repo_root.join(path.replace('\\', "/")))
+                .map(|c| c.lines().map(String::from).collect())
+                .unwrap_or_default();
+        }
+        let comment = extract_leading_comment(&lines, (*line_start).max(0) as usize);
+        let object = object_from_module_path(path);
+        let synonym = object
+            .as_ref()
+            .and_then(|(mt, nm)| syn.get(&format!("{}.{}", mt, nm)))
+            .map(String::as_str);
+        let terms = build_terms(
+            name,
+            object.as_ref().map(|(_, nm)| nm.as_str()),
+            synonym,
+            comment.as_deref(),
+        );
+        if terms.is_empty() {
+            continue;
+        }
+        let proc_key = format!("{}::{}", path, name);
+        filled += ins.execute(params![REPO_DEFAULT, proc_key, terms, MECH_SIGNATURE, now])?;
+    }
+    drop(ins);
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!("procedure_terms: механически обогащено {} процедур", filled);
+    Ok(())
+}
+
+/// Per-file обновление механических термов для одного `.bsl`: снести свои
+/// (`mech:%`) строки файла и пересобрать по текущему состоянию `functions`
+/// (или просто снести, если файл удалён). LLM-строки не трогаются.
+fn update_procedure_terms_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    bsl_path: &Path,
+) -> Result<()> {
+    use crate::terms::{
+        build_terms, extract_leading_comment, object_from_module_path, MECH_SIGNATURE,
+    };
+
+    let rel = rel_path(repo_root, bsl_path);
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM procedure_enrichment \
+         WHERE repo = ?1 AND signature LIKE 'mech:%' AND proc_key LIKE ?2 || '::%'",
+        params![REPO_DEFAULT, &rel],
+    )?;
+    if bsl_path.is_file() {
+        let procs: Vec<(String, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT f.name, COALESCE(f.line_start, 0) FROM functions f \
+                 JOIN files fl ON fl.id = f.file_id WHERE fl.path = ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![&rel], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.flatten().collect()
+        };
+        if !procs.is_empty() {
+            let lines: Vec<String> = std::fs::read_to_string(bsl_path)
+                .map(|c| c.lines().map(String::from).collect())
+                .unwrap_or_default();
+            let object = object_from_module_path(&rel);
+            let synonym: Option<String> = object.as_ref().and_then(|(mt, nm)| {
+                conn.query_row(
+                    "SELECT synonym FROM metadata_objects WHERE repo = ?1 AND full_name = ?2",
+                    params![REPO_DEFAULT, format!("{}.{}", mt, nm)],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+            });
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut ins = conn.prepare(
+                "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(repo, proc_key) DO NOTHING",
+            )?;
+            for (name, line_start) in &procs {
+                let comment = extract_leading_comment(&lines, (*line_start).max(0) as usize);
+                let terms = build_terms(
+                    name,
+                    object.as_ref().map(|(_, nm)| nm.as_str()),
+                    synonym.as_deref(),
+                    comment.as_deref(),
+                );
+                if terms.is_empty() {
+                    continue;
+                }
+                let proc_key = format!("{}::{}", rel, name);
+                ins.execute(params![REPO_DEFAULT, proc_key, terms, MECH_SIGNATURE, now])?;
+            }
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
 fn index_metadata_forms(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
     // Ищем `Form.xml` в любом дочернем `Forms/<Name>/[Ext/]Form.xml`.
     // Имя владельца восстанавливается из пути: ищем сегмент под
@@ -2127,6 +2297,212 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "повторный run не должен плодить дубликаты");
+    }
+
+    /// Мини-репо для тестов механических термов: общий модуль с синонимом
+    /// и процедурой с комментарием. files/functions заполняются вручную
+    /// (как будто core-парсер уже отработал — extras его не запускают).
+    fn write_terms_fixture(repo: &Path, storage: &Storage) {
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <CommonModule>РаботаСоШтрихкодами</CommonModule>
+</ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("CommonModules").join("РаботаСоШтрихкодами.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <CommonModule>
+    <Properties>
+      <Name>РаботаСоШтрихкодами</Name>
+      <Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Работа со штрихкодами</v8:content></v8:item></Synonym>
+    </Properties>
+  </CommonModule>
+</MetaDataObject>"#,
+        );
+        write(
+            &repo
+                .join("CommonModules")
+                .join("РаботаСоШтрихкодами")
+                .join("Ext")
+                .join("Module.bsl"),
+            "// Уточняет данные номенклатуры по штрихкоду.\n\
+             &НаСервере\n\
+             Процедура УточнитьДанныеПоШтрихкоду() Экспорт\n\
+             КонецПроцедуры\n",
+        );
+        let conn = storage.conn();
+        conn.execute(
+            "INSERT INTO files (path, content_hash, language) \
+             VALUES ('CommonModules/РаботаСоШтрихкодами/Ext/Module.bsl', 'h', 'bsl')",
+            [],
+        )
+        .unwrap();
+        let fid: i64 = conn
+            .query_row("SELECT id FROM files WHERE language='bsl'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO functions (file_id, name, line_start) \
+             VALUES (?, 'УточнитьДанныеПоШтрихкоду', 3)",
+            params![fid],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mechanical_terms_include_name_synonym_and_comment() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut storage = fresh_storage(&tmp);
+        write_terms_fixture(&repo, &storage);
+
+        run_index_extras(&repo, &mut storage).unwrap();
+
+        let (terms, sig): (String, String) = storage
+            .conn()
+            .query_row(
+                "SELECT terms, signature FROM procedure_enrichment \
+                 WHERE repo = ?1 AND proc_key = ?2",
+                params![
+                    REPO_DEFAULT,
+                    "CommonModules/РаботаСоШтрихкодами/Ext/Module.bsl::УточнитьДанныеПоШтрихкоду"
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(terms.contains("уточнить данные по штрихкоду"), "слова имени: {terms}");
+        assert!(terms.contains("работа со штрихкодами"), "синоним объекта: {terms}");
+        assert!(terms.contains("уточняет данные номенклатуры"), "комментарий: {terms}");
+        assert_eq!(sig, crate::terms::MECH_SIGNATURE);
+
+        // FTS (trigram): словоформа и подстрока находят процедуру.
+        for q in ["штрихкод", "уточн", "работа со штрихкодами"] {
+            let hits: i64 = storage
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM fts_procedure_enrichment WHERE terms MATCH ?1",
+                    params![q],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(hits >= 1, "FTS должен находить '{q}'");
+        }
+    }
+
+    #[test]
+    fn mechanical_terms_dont_touch_llm_rows() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut storage = fresh_storage(&tmp);
+        write_terms_fixture(&repo, &storage);
+        // Существующая LLM-запись той же процедуры.
+        storage
+            .conn()
+            .execute(
+                "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+                 VALUES (?1, ?2, 'llm-термины, бережно сохранить', 'openai_compatible:m', 1)",
+                params![
+                    REPO_DEFAULT,
+                    "CommonModules/РаботаСоШтрихкодами/Ext/Module.bsl::УточнитьДанныеПоШтрихкоду"
+                ],
+            )
+            .unwrap();
+
+        run_index_extras(&repo, &mut storage).unwrap();
+
+        let (terms, sig): (String, String) = storage
+            .conn()
+            .query_row(
+                "SELECT terms, signature FROM procedure_enrichment \
+                 WHERE repo = ?1 AND proc_key = ?2",
+                params![
+                    REPO_DEFAULT,
+                    "CommonModules/РаботаСоШтрихкодами/Ext/Module.bsl::УточнитьДанныеПоШтрихкоду"
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(terms, "llm-термины, бережно сохранить", "LLM-строка не перетёрта");
+        assert_eq!(sig, "openai_compatible:m");
+    }
+
+    #[test]
+    fn incremental_terms_update_and_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut storage = fresh_storage(&tmp);
+        write_terms_fixture(&repo, &storage);
+        run_index_extras(&repo, &mut storage).unwrap();
+
+        let bsl_abs = repo
+            .join("CommonModules")
+            .join("РаботаСоШтрихкодами")
+            .join("Ext")
+            .join("Module.bsl");
+
+        // Файл «изменился»: добавилась процедура (в functions и на диске).
+        write(
+            &bsl_abs,
+            "// Уточняет данные номенклатуры по штрихкоду.\n\
+             &НаСервере\n\
+             Процедура УточнитьДанныеПоШтрихкоду() Экспорт\n\
+             КонецПроцедуры\n\
+             \n\
+             // Печатает этикетку со штрихкодом.\n\
+             Процедура НапечататьЭтикетку() Экспорт\n\
+             КонецПроцедуры\n",
+        );
+        {
+            let conn = storage.conn();
+            let fid: i64 = conn
+                .query_row("SELECT id FROM files WHERE language='bsl'", [], |r| r.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO functions (file_id, name, line_start) \
+                 VALUES (?, 'НапечататьЭтикетку', 7)",
+                params![fid],
+            )
+            .unwrap();
+        }
+        run_incremental_extras(&repo, &mut storage, &[bsl_abs.clone()], &[]).unwrap();
+
+        let count: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM procedure_enrichment WHERE repo = ?1 AND signature LIKE 'mech:%'",
+                params![REPO_DEFAULT],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "после инкремента — термы обеих процедур");
+        let terms: String = storage
+            .conn()
+            .query_row(
+                "SELECT terms FROM procedure_enrichment WHERE repo = ?1 AND proc_key LIKE '%НапечататьЭтикетку'",
+                params![REPO_DEFAULT],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(terms.contains("напечатать этикетку"), "{terms}");
+        assert!(terms.contains("печатает этикетку"), "{terms}");
+
+        // Файл удалён → mech-строки файла зачищены.
+        std::fs::remove_file(&bsl_abs).unwrap();
+        run_incremental_extras(&repo, &mut storage, &[], &[bsl_abs]).unwrap();
+        let after: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM procedure_enrichment WHERE repo = ?1 AND signature LIKE 'mech:%'",
+                params![REPO_DEFAULT],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 0, "после удаления файла mech-строки зачищены");
     }
 
     #[test]
