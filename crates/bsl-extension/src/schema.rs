@@ -218,15 +218,19 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     // FTS-индекс, исходник в `procedure_enrichment`. Триггеры ниже
     // синхронизируют изменения автоматически.
     //
-    // tokenize='unicode61 remove_diacritics 1' — разумный default
-    // для русского + английского текста (Ё→е, кириллица учитывается
-    // как буквы), без специфики порфера БСП.
+    // tokenize='trigram' (с 0.30.0; раньше unicode61) — substring-поиск и
+    // словоформы без стемминга: запрос 'уточн' находит «УточнитьДанные»,
+    // «Штрихкоду» матчится по подстроке «штрихкод». Кириллица фолдится
+    // регистронезависимо (проверено на SQLite 3.45). Ограничение триграмм:
+    // запрос короче 3 символов не матчится. Цена — FTS-индекс ~3× толще
+    // unicode61, на термах (не полнотекст) это десятки МБ на конфигурацию.
+    // Миграция существующих БД — `ensure_trigram_tokenizer` (drop+rebuild).
     "
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_procedure_enrichment USING fts5(
         terms,
         content='procedure_enrichment',
         content_rowid='id',
-        tokenize='unicode61 remove_diacritics 1'
+        tokenize='trigram'
     );
     ",
 
@@ -450,6 +454,40 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
 pub fn migrate_extensions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     ensure_column(conn, "data_links", "to_object_key", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "role_rights", "object_name_key", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_trigram_tokenizer(conn)?;
+    Ok(())
+}
+
+/// Миграция 0.30.0: FTS-индекс термов на trigram-токенайзер. У существующей
+/// БД `CREATE VIRTUAL TABLE IF NOT EXISTS` токенайзер не поменяет — проверяем
+/// DDL в sqlite_master и при несовпадении пересоздаём таблицу + rebuild из
+/// content-таблицы (`procedure_enrichment`). Триггеры живут на
+/// content-таблице и пересоздания не требуют. На свежей БД (FTS ещё нет) —
+/// no-op: создаст `SCHEMA_EXTENSIONS` сразу с trigram.
+fn ensure_trigram_tokenizer(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    use rusqlite::OptionalExtension;
+    let ddl: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='fts_procedure_enrichment'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(ddl) = ddl {
+        if !ddl.contains("trigram") {
+            conn.execute_batch(
+                "DROP TABLE fts_procedure_enrichment;
+                 CREATE VIRTUAL TABLE fts_procedure_enrichment USING fts5(
+                     terms,
+                     content='procedure_enrichment',
+                     content_rowid='id',
+                     tokenize='trigram'
+                 );
+                 INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment) VALUES('rebuild');",
+            )?;
+            tracing::info!("fts_procedure_enrichment: мигрирован на trigram-токенайзер");
+        }
+    }
     Ok(())
 }
 
@@ -668,6 +706,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(new_hits, 1, "новое значение должно появиться в FTS");
+    }
+
+    #[test]
+    fn migrate_to_trigram_rebuilds_fts() {
+        // Эмуляция БД, созданной до 0.30.0: FTS на unicode61. После
+        // migrate_extensions токенайзер должен стать trigram, индекс —
+        // пересобраться из content-таблицы (substring-поиск работает).
+        let conn = Connection::open_in_memory().unwrap();
+        for ddl in SCHEMA_EXTENSIONS {
+            conn.execute_batch(ddl).unwrap();
+        }
+        conn.execute_batch(
+            "DROP TABLE fts_procedure_enrichment;
+             CREATE VIRTUAL TABLE fts_procedure_enrichment USING fts5(
+                 terms, content='procedure_enrichment', content_rowid='id',
+                 tokenize='unicode61 remove_diacritics 1');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+             VALUES ('ut', 'A.bsl::P', 'уточнить данные по штрихкоду', 'mech:v1', 0)",
+            [],
+        )
+        .unwrap();
+        // На unicode61 substring НЕ матчится.
+        let pre: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_procedure_enrichment WHERE terms MATCH '\"трихкод\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(pre, 0, "unicode61 не должен находить подстроку");
+
+        migrate_extensions(&conn).unwrap();
+
+        let ddl: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='fts_procedure_enrichment'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ddl.contains("trigram"), "после миграции токенайзер trigram: {ddl}");
+        // Substring и словоформа находятся; индекс пересобран из content-таблицы.
+        for q in ["трихкод", "штрихкоду", "УТОЧНИТЬ"] {
+            let hits: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fts_procedure_enrichment WHERE terms MATCH ?1",
+                    [q],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(hits, 1, "trigram должен находить '{q}'");
+        }
+        // Повторный вызов — no-op (идемпотентность).
+        migrate_extensions(&conn).unwrap();
     }
 
     #[test]
