@@ -57,7 +57,9 @@ impl IndexTool for BslSqlTool {
          ВАЖНО: каждый репо — отдельная БД, колонка repo во всех BSL-таблицах всегда \
          'default' — фильтровать по repo НЕ нужно. \
          Ключевые таблицы: metadata_objects(full_name, meta_type, name, synonym, \
-         attributes_json), metadata_forms(owner_full_name, form_name, handlers_json), \
+         attributes_json), metadata_forms(owner_full_name, form_name, handlers_json; \
+         ФОРМАТ: owner_full_name = '<PluralFolder>.<Name>' вида 'Documents.ЗаказКлиента' \
+         — папка во множ. числе, как в metadata_modules.object_name), \
          metadata_modules(full_name, object_name, module_type, object_id, property_id, \
          config_version, code_path, extension_name; ФОРМАТ значений: object_name = \
          '<PluralFolder>.<Name>' вида 'Documents.ЗаказКлиента' (папка во множ. числе!), \

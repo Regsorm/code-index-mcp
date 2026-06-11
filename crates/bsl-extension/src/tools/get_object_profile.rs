@@ -160,7 +160,7 @@ fn assemble_profile(
     name: &str,
     sections: &[String],
 ) -> rusqlite::Result<Value> {
-    let folder = meta_type_to_folder(meta_type);
+    let folder = crate::tools::meta_type_to_folder(meta_type);
     // Выбор секций: пустой список → все (обратная совместимость). Иначе — только
     // запрошенные (рычаг удешевления: ['structure'] вернёт лишь реквизиты/ТЧ).
     let all = sections.is_empty();
@@ -371,44 +371,10 @@ fn collect_col(conn: &rusqlite::Connection, sql: &str, object: &str) -> rusqlite
     Ok(out)
 }
 
-/// singular meta_type → имя папки выгрузки (plural), под которым хранятся
-/// формы (`owner_full_name`) и модули (`full_name`). Возвращает `None` для
-/// типов без форм/модулей (Constant и т.п. могут не иметь — тогда формы/модули
-/// просто пусты). Покрывает все типы, у которых бывают формы или модули.
-fn meta_type_to_folder(meta_type: &str) -> Option<String> {
-    let folder = match meta_type {
-        "Catalog" => "Catalogs",
-        "Document" => "Documents",
-        "DocumentJournal" => "DocumentJournals",
-        "Enum" => "Enums",
-        "Report" => "Reports",
-        "DataProcessor" => "DataProcessors",
-        "InformationRegister" => "InformationRegisters",
-        "AccumulationRegister" => "AccumulationRegisters",
-        "AccountingRegister" => "AccountingRegisters",
-        "CalculationRegister" => "CalculationRegisters",
-        "ChartOfCharacteristicTypes" => "ChartsOfCharacteristicTypes",
-        "ChartOfAccounts" => "ChartsOfAccounts",
-        "ChartOfCalculationTypes" => "ChartsOfCalculationTypes",
-        "ExchangePlan" => "ExchangePlans",
-        "BusinessProcess" => "BusinessProcesses",
-        "Task" => "Tasks",
-        "SettingsStorage" => "SettingsStorages",
-        "CommonForm" => "CommonForms",
-        "Constant" => "Constants",
-        "FilterCriterion" => "FilterCriteria",
-        "Sequence" => "Sequences",
-        // Незнакомый тип — эвристика 1С «+s» (Document→Documents, Report→Reports);
-        // покрывает регулярные случаи, нерегулярные (ChartOf*) перечислены явно выше.
-        other if !other.is_empty() => return Some(format!("{}s", other)),
-        _ => return None,
-    };
-    Some(folder.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::meta_type_to_folder;
 
     #[test]
     fn folder_mapping_handles_regular_and_irregular() {

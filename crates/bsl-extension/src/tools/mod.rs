@@ -61,3 +61,38 @@ pub(crate) fn wrap_with_meta(result: Value, dependent_files: Vec<String>) -> Val
 pub(crate) fn wrap_error(error_value: Value) -> Value {
     wrap_with_meta(error_value, Vec::new())
 }
+
+/// singular meta_type → имя папки выгрузки (plural), под которым хранятся
+/// формы (`metadata_forms.owner_full_name`) и модули (`metadata_modules.full_name`).
+/// Возвращает `None` для пустого типа. Покрывает все типы, у которых бывают
+/// формы или модули; общий хелпер get_object_profile и get_form_handlers.
+pub(crate) fn meta_type_to_folder(meta_type: &str) -> Option<String> {
+    let folder = match meta_type {
+        "Catalog" => "Catalogs",
+        "Document" => "Documents",
+        "DocumentJournal" => "DocumentJournals",
+        "Enum" => "Enums",
+        "Report" => "Reports",
+        "DataProcessor" => "DataProcessors",
+        "InformationRegister" => "InformationRegisters",
+        "AccumulationRegister" => "AccumulationRegisters",
+        "AccountingRegister" => "AccountingRegisters",
+        "CalculationRegister" => "CalculationRegisters",
+        "ChartOfCharacteristicTypes" => "ChartsOfCharacteristicTypes",
+        "ChartOfAccounts" => "ChartsOfAccounts",
+        "ChartOfCalculationTypes" => "ChartsOfCalculationTypes",
+        "ExchangePlan" => "ExchangePlans",
+        "BusinessProcess" => "BusinessProcesses",
+        "Task" => "Tasks",
+        "SettingsStorage" => "SettingsStorages",
+        "CommonForm" => "CommonForms",
+        "Constant" => "Constants",
+        "FilterCriterion" => "FilterCriteria",
+        "Sequence" => "Sequences",
+        // Незнакомый тип — эвристика 1С «+s» (Document→Documents, Report→Reports);
+        // покрывает регулярные случаи, нерегулярные (ChartOf*) перечислены явно выше.
+        other if !other.is_empty() => return Some(format!("{}s", other)),
+        _ => return None,
+    };
+    Some(folder.to_string())
+}
