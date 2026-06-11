@@ -59,7 +59,9 @@ impl IndexTool for BslSqlTool {
          Ключевые таблицы: metadata_objects(full_name, meta_type, name, synonym, \
          attributes_json), metadata_forms(owner_full_name, form_name, handlers_json), \
          metadata_modules(full_name, object_name, module_type, object_id, property_id, \
-         config_version, code_path, extension_name), event_subscriptions(name, event, \
+         config_version, code_path, extension_name; ФОРМАТ значений: object_name = \
+         '<PluralFolder>.<Name>' вида 'Documents.ЗаказКлиента' (папка во множ. числе!), \
+         full_name = object_name + '.<ModuleType>'), event_subscriptions(name, event, \
          handler_module, handler_proc, sources_json), proc_call_graph(caller_proc_key, \
          callee_proc_name, callee_proc_key, call_type), data_links(from_object, from_path, \
          to_object, link_kind, is_composite, is_universal), role_rights(role_name, object_name, right_name), \
