@@ -163,9 +163,20 @@ C:/tools/code-index/code-index.exe index C:/RepoUT
 
 ## Ребилд индексатора
 
+**СНАЧАЛА определи тип правки — от него зависит, трогать ли daemon:**
+
+| Что менялось в коде | Что перезапускать | Переиндексация |
+|---|---|---|
+| **Только MCP-слой выдачи** (тексты hint'ов, формат ответа tool'а, описания инструментов в `mcp/mod.rs`/`tools.rs`, новые/изменённые tool'ы) | **ТОЛЬКО `serve` + `mcp-cache-ci`.** `daemon` НЕ трогать. | НЕ нужна — индекс на диске не меняется |
+| **Парсер / схема SQLite / логика индексации** (`xml/*`, `index_extras.rs`, `schema.rs`, `terms.rs`) | `daemon` + `serve` + `mcp-cache-ci` | Нужна (`index --force` или дельта-скан daemon) |
+
+**Почему это важно (инцидент 0.33, 2026-06-11):** при рестарте `daemon` сбрасывает runtime-статус ВСЕХ путей в `not_started` и заново идёт по очереди со сверкой mtime (даже без изменений файлов). Гейт `bail_if_not_ready` не пускает запросы к пути, пока сверка до него не дошла — на 8 BSL-репо это десятки минут ожидания НА ПУСТОМ МЕСТЕ, если правка была только в выдаче. Для MCP-правок: подменил бинарник → `supervisor_restart code-index-serve` + `supervisor_restart mcp-cache-ci`, и индекс сразу `ready` (serve открывает готовую SQLite мгновенно).
+
+Live-smoke MCP-правки можно делать на ЛЮБОМ уже `ready` репо нужного языка (для BSL — `dev`/`wms`), не дожидаясь конкретного.
+
 При пересборке бинарника (`cargo build --release`) — если изменилась схема SQLite или логика парсера, после рестарта daemon сделает полную переиндексацию всех путей.
 
-**Порядок:**
+**Порядок (для правок парсера/схемы):**
 1. Остановить daemon: `C:/tools/code-index/daemon-ctl.bat stop` (или `kill` из `daemon.pid`)
 2. Остановить MCP serve (процесс на порту 8011) — через mcp-supervisor либо `tasklist | grep code-index` + `taskkill`
 3. `cd C:/MCP-Servers/code-index && cargo build --release`

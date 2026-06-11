@@ -225,6 +225,14 @@ impl IndexTool for BslSqlTool {
                             }
                         }
                     }
+                    // 0.33: пустая выборка — куда идти дальше. Если запрос искал
+                    // ПРОЦЕДУРУ (таблицы functions/proc_call_graph/procedure_enrichment)
+                    // и не нашёл — зовём в search_terms (модель устойчиво ходит в
+                    // bsl_sql LIKE по имени, а обработчик живёт в общем модуле БСП под
+                    // другим именем — точный SQL промахивается; находка бенча 11.06).
+                    if row_count == 0 && payload.get("hint").is_none() {
+                        payload["hint"] = json!(empty_result_hint(sql));
+                    }
                     crate::tools::wrap_with_meta(payload, Vec::new())
                 }
                 Err(e) => {
@@ -340,6 +348,32 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// LIMIT при подзапросах чаще всего последний). Формы `LIMIT N` и
 /// `LIMIT M, N`/`LIMIT N OFFSET M` — берём первое число после LIMIT, этого
 /// достаточно для эвристики «строк ровно столько, сколько просили».
+/// Подсказка при пустой (0 строк) выборке bsl_sql. Если запрос обращался к
+/// таблицам процедур — зовём в search_terms (точный SQL по имени промахивается,
+/// когда обработчик в общем модуле БСП назван иначе). Иначе — общий мягкий hint
+/// (частая причина пустоты — регистрозависимость кириллицы в LIKE/=).
+fn empty_result_hint(sql: &str) -> &'static str {
+    let lower = sql.to_lowercase();
+    let searched_proc = lower.contains("functions")
+        || lower.contains("procedure_enrichment")
+        || lower.contains("proc_call_graph");
+    if searched_proc {
+        "0 строк — но это, скорее всего, НЕ значит «такого нет». LIKE по name ищет ТОЧНОЕ вхождение \
+         подстроки с учётом регистра (SQLite lower() кириллицу НЕ сворачивает) — он промахивается, \
+         если имя в коде в другой словоформе/регистре или обработчик вынесен в общий модуль БСП под \
+         иным именем. ▸ search_terms(query=…) идёт по ДРУГОМУ, триграммному FTS-индексу: ловит \
+         словоформы и подстроки от 3 символов, регистр и ё/е неважны, ранжирует по числу совпавших \
+         слов; термы = слова имени процедуры + СИНОНИМ объекта-владельца + комментарий. То есть \
+         search_terms находит ровно то, что LIKE структурно пропускает. Дай ему 1-3 слова по смыслу."
+    } else {
+        "0 строк (запрос валиден, ничего не найдено). Проверьте фильтры/точность имён. \
+         NB: LIKE/= по name ищет точное вхождение с учётом регистра (SQLite lower() кириллицу не \
+         сворачивает) — частая причина пустоты. ▸ Если искали процедуру/функционал по СМЫСЛУ — \
+         search_terms(query=…) идёт по триграммному индексу (словоформы, регистр/ё неважны, подстроки \
+         ≥3) и находит то, что точный LIKE пропускает; термы = имя процедуры + синоним владельца + комментарий."
+    }
+}
+
 fn sql_limit_value(sql: &str) -> Option<u64> {
     let tokens: Vec<&str> = sql
         .split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ';')
@@ -623,6 +657,25 @@ mod tests {
             collect_rows(&mut stmt, vec![SqlValue::Text("Document".into())], 100).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], json!("Document.Реализация"));
+    }
+
+    #[test]
+    fn empty_result_hint_routes_proc_queries_to_search_terms() {
+        // Запрос к таблицам процедур → зовёт в search_terms.
+        for q in [
+            "SELECT name FROM functions WHERE name LIKE '%Цены%'",
+            "SELECT * FROM proc_call_graph WHERE caller_proc_key='x'",
+            "SELECT terms FROM procedure_enrichment WHERE proc_key='y'",
+        ] {
+            let h = empty_result_hint(q);
+            assert!(h.contains("search_terms"), "proc-запрос должен звать в search_terms");
+            assert!(h.contains("триграмм"), "должна быть триграммная аргументация (выгода)");
+        }
+        // Запрос к метаданным/связям → общий hint (тоже упоминает search_terms,
+        // но как «если искали процедуру», а не как основной совет).
+        let generic = empty_result_hint("SELECT * FROM data_links WHERE link_kind='owner'");
+        assert!(generic.contains("ничего не найдено"));
+        assert!(generic.contains("регистр"));
     }
 
     #[test]

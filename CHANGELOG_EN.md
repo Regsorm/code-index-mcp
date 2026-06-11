@@ -5,6 +5,17 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.33.0] — 2026-06-11
+
+**Empty procedure search on a BSL repo now hints at search_terms — for search_function, grep_body, grep_code, find_symbol.**
+
+### Added
+
+- **An empty procedure-search result on a BSL repo now hints at `search_terms`** — across `search_function`, `grep_body`, `grep_code` and `find_symbol`. Per-call analysis of the 11.06 benchmark (10 business tasks on UT-11) showed the model reflexively picks exact search (by name or text) for "find a procedure by meaning" and never reaches `search_terms` (0 calls per run), while the residual empty calls are exactly its niche (handlers living in common modules: prefixing, default values, exchange conflicts — grep over the object's own modules returns 0 because the code lives in an SSL module wired via an event subscription). A live test03 run showed three consecutive empty `grep_body` calls (steps 17/20/21), none of which pointed to `search_terms` — so the hint is attached to EVERY empty response of these tools, not just `search_function`. Same trick that worked in 0.31 (hints break chains of blind retries). Non-BSL repos keep the old hints; `search_class`/`grep_text` were left untouched (terms index procedures, not classes or xml/text).
+- **An empty `bsl_sql` result set (0 rows) hints too.** A live run showed Opus reflexively prefers `bsl_sql` (LIKE over `metadata_objects`/`functions`) for "find a procedure by meaning" rather than search_function/grep, and never switches to search_terms. So on `row_count == 0`: if the query touched procedure tables (`functions`/`proc_call_graph`/`procedure_enrichment`) the hint points to `search_terms`; otherwise a generic hint (check filters; Cyrillic in `LIKE`/`=` is case-sensitive — SQLite `lower()` doesn't fold it). This covers the exact point where the model got stuck (test03 steps 10/14 — empty `bsl_sql` over `functions` with no further direction).
+- **Known limitation:** the hint fires on an EMPTY result. If exact search returns a non-empty but irrelevant "noise" set (e.g. `search_function` on a frequent word yields dozens of namesake matches) the hint does not appear, since the tool cannot judge relevance (the model does). This case is partially covered by mentioning `search_terms` in the tools' descriptions.
+- **Effect note:** across several live runs on Opus (test03/test05) the model never went to `search_terms` — it solved the task via `bsl_sql` over object synonyms (the same semantic bridge the terms provide). The hints are correct and harmless, may help other models/strategies, but were not a "silver bullet" on Opus — no behavioral effect was observed.
+
 ## [0.32.0] — 2026-06-11
 
 **New object-structure sections (owners/value_types/properties/enum_synonyms/commands + attribute synonym/required), owner and functional_option_content edges in data_links, roles in metadata_objects, `{a,b}` brace alternates in path_glob, LIMIT hint in bsl_sql. Fixed "—" types for DefinedType.**

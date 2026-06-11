@@ -814,7 +814,7 @@ fn mass_rows_to_results(rows: Vec<Result<String, String>>) -> String {
 
 #[tool_router]
 impl CodeIndexServer {
-    #[tool(description = "Нечёткий FTS-поиск функций по СЛОВАМ (bm25, OR между словами, префиксные термы): имя важнее qualified_name/docstring. Принимает и точное имя, и описание из слов ('расчёт цены продажи реализация'). Выдача БЕЗ тел — только локации (имя/путь/строки/сигнатура/обрезанный docstring). Тело конкретной функции — get_function; локации по ТОЧНОМУ имени — find_symbol; regex по коду — grep_code. path_glob — фильтр по пути. При 0 совпадений — hint.")]
+    #[tool(description = "Нечёткий FTS-поиск функций по СЛОВАМ (bm25, OR между словами, префиксные термы): имя важнее qualified_name/docstring. Принимает и точное имя, и описание из слов ('расчёт цены продажи реализация'). Выдача БЕЗ тел — только локации (имя/путь/строки/сигнатура/обрезанный docstring). Тело конкретной функции — get_function; локации по ТОЧНОМУ имени — find_symbol; regex по коду — grep_code. path_glob — фильтр по пути. При 0 совпадений — hint; на BSL-репо он подсказывает search_terms (поиск процедур по смысловым термам).")]
     async fn search_function(&self, Parameters(p): Parameters<SearchParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {

@@ -49,6 +49,23 @@ pub(crate) const IMPORTS_DEFAULT_LIMIT: usize = 200;
 pub(crate) const HINT_SEARCH_EMPTY: &str = "0 совпадений. Это нечёткий FTS-поиск по словам (OR между словами) в имени/docstring/теле. \
 Для ТОЧНОГО имени символа — get_function/get_class/find_symbol. Для произвольного regex по коду — grep_code(regex=…). \
 Для текста xml/md/yaml — grep_text(regex=…). Попробуйте меньше слов или синонимы.";
+/// search_function вернул 0 на BSL-репо — дополнительно подсказываем search_terms
+/// (термы есть только у BSL; по находке бенча 11.06 модель до него сама не доходит).
+pub(crate) const HINT_SEARCH_EMPTY_BSL: &str = "0 совпадений. search_function ищет по словам, реально встречающимся \
+в имени/docstring/теле функции — он промахивается, если функционал назван по-английски, а ты ищешь русским смыслом, \
+либо словоформа не совпала. ▸ search_terms(query=…) идёт по ДРУГОМУ индексу — триграммному FTS по обогащённым термам, \
+куда механически добавлен СИНОНИМ объекта-владельца (русское представление ↔ английский идентификатор) и комментарий; \
+словоформы/регистр/ё неважны. Поэтому search_terms находит процедуру по смыслу там, где search_function по словам пуст. \
+Дай ему 1-3 слова. Для ТОЧНОГО имени — get_function/find_symbol; regex по коду — grep_code(regex=…).";
+
+/// Выбор hint'а пустого search_function по языку репо (search_terms есть только на BSL).
+pub(crate) fn search_empty_hint(language: Option<&str>) -> &'static str {
+    if language == Some("bsl") {
+        HINT_SEARCH_EMPTY_BSL
+    } else {
+        HINT_SEARCH_EMPTY
+    }
+}
 /// get_function / get_class по точному имени вернул 0.
 pub(crate) const HINT_GET_EMPTY: &str = "0 символов с таким ТОЧНЫМ именем (регистр игнорируется). \
 Для нечёткого поиска по словам — search_function('<слова>') / search_class('<слова>'); универсально (функции+классы+переменные+импорты) — find_symbol('<имя>').";
@@ -107,6 +124,49 @@ pub(crate) const HINT_GREP_TEXT_EMPTY: &str = "0 совпадений в text-ф
 /// search_text вернул 0 совпадений.
 pub(crate) const HINT_SEARCH_TEXT_EMPTY: &str = "0 совпадений в text-файлах. Это нечёткий FTS-поиск по словам. \
 Для regex по тексту — grep_text(regex=…); для кода — grep_code(regex=…)/grep_body.";
+
+// ── BSL-варианты пустых hint'ов поиска процедур (бенч 11.06) ────────────────
+// Пустой поиск процедуры по имени/тексту на BSL-репо часто означает, что код
+// живёт в общем модуле БСП и привязан подпиской — точный поиск его не находит.
+// Хвост `▸ search_terms…` приклеен к каждому такому пустому ответу (НЕ только
+// первому: hint выдаётся всякий раз, когда результат пуст), чтобы оборвать
+// серию слепых grep'ов (наблюдение test03: ходы 17/20/21 ушли вслепую, т.к.
+// пустой grep_body не звал в search_terms). std::concat! требует литералы —
+// поэтому хвост выписан в каждой константе целиком (без внешних крейтов).
+pub(crate) const HINT_GREP_CODE_EMPTY_BSL: &str = "0 совпадений. Параметр называется regex= (синтаксис crate regex), не query=. \
+Поиск по ВСЕМУ коду файла. Только по телам функций/классов — grep_body; по xml/md/yaml/json — grep_text. \
+Проверьте language=/path_glob= (oversize-файлы пропускаются). \
+▸ grep ищет ТОЧНЫЙ текст в файлах — он пуст, если слово в другой форме/регистре или код в общем модуле БСП. \
+search_terms(query=…) идёт по ДРУГОМУ, триграммному FTS-индексу (словоформы, регистр/ё неважны, подстроки ≥3) \
+по обогащённым термам = имя процедуры + СИНОНИМ объекта-владельца + комментарий — находит по смыслу то, что точный grep пропускает. Дай 1-3 слова.";
+pub(crate) const HINT_GREP_BODY_EMPTY_BSL: &str = "0 совпадений в телах функций/классов. \
+Для module-level кода, комментариев и идентификаторов ВНЕ тел — grep_code(regex=…); по xml/md/yaml — grep_text. \
+Параметры: pattern= (подстрока) или regex= (regexp). Проверьте language=. \
+СОСТАВНОЕ имя (Объект.Поле): в коде и особенно в тексте запроса 1С части и точка бывают разорваны \
+переносами/пробелами/символом | — возьмите КОРОТКИЙ якорь (только Объект ИЛИ только Поле) либо \
+regex с гибким пробелом, напр. Объект\\s*\\.\\s*Поле. Тексты запросов внутри строк — это тоже тело, \
+ищите по одному слову, не по всей цепочке. \
+▸ grep_body ищет ТОЧНЫЙ текст в телах — он пуст, если слово в другой форме/регистре или код в общем модуле БСП. \
+search_terms(query=…) идёт по ДРУГОМУ, триграммному FTS-индексу (словоформы, регистр/ё неважны, подстроки ≥3) \
+по обогащённым термам = имя процедуры + СИНОНИМ объекта-владельца + комментарий — находит по смыслу то, что точный grep пропускает. Дай 1-3 слова.";
+pub(crate) const HINT_FIND_SYMBOL_EMPTY_BSL: &str = "Символ не найден среди функций/классов/переменных/импортов (точное имя, регистр игнорируется). \
+Для нечёткого поиска по словам — search_function/search_class; по коду — grep_code(regex=…). \
+▸ find_symbol ищет ТОЧНОЕ имя символа — он пуст, если функционал назван иначе/в другой словоформе или код в общем модуле БСП. \
+search_terms(query=…) идёт по ДРУГОМУ, триграммному FTS-индексу (словоформы, регистр/ё неважны, подстроки ≥3) \
+по обогащённым термам = имя процедуры + СИНОНИМ объекта-владельца + комментарий — находит по смыслу то, что точное имя пропускает. Дай 1-3 слова.";
+
+/// Выбор hint'а пустого grep_code по языку репо.
+pub(crate) fn grep_code_empty_hint(language: Option<&str>) -> &'static str {
+    if language == Some("bsl") { HINT_GREP_CODE_EMPTY_BSL } else { HINT_GREP_CODE_EMPTY }
+}
+/// Выбор hint'а пустого grep_body по языку репо.
+pub(crate) fn grep_body_empty_hint(language: Option<&str>) -> &'static str {
+    if language == Some("bsl") { HINT_GREP_BODY_EMPTY_BSL } else { HINT_GREP_BODY_EMPTY }
+}
+/// Выбор hint'а пустого find_symbol по языку репо.
+pub(crate) fn find_symbol_empty_hint(language: Option<&str>) -> &'static str {
+    if language == Some("bsl") { HINT_FIND_SYMBOL_EMPTY_BSL } else { HINT_FIND_SYMBOL_EMPTY }
+}
 
 /// Сериализовать `ToolUnavailable` в JSON-строку.
 pub fn format_unavailable(value: ToolUnavailable) -> String {
@@ -433,7 +493,9 @@ pub async fn search_function(
                 r.truncate(want);
             }
             let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
-            let hint = if r.is_empty() { Some(HINT_SEARCH_EMPTY) } else { None };
+            // W-бенч 11.06: на BSL-репо пустой результат ведёт в search_terms.
+            let hint =
+                if r.is_empty() { Some(search_empty_hint(entry.language.as_deref())) } else { None };
             // Поисковая выдача БЕЗ тел функций: только имя/путь/строки/сигнатура +
             // обрезанный docstring. Полные тела 20 результатов раздували ответ до
             // 20-45K символов (слабое место прогона УТ-11). Тело — get_function.
@@ -823,7 +885,7 @@ pub async fn find_symbol(
                 && r.classes.is_empty()
                 && r.variables.is_empty()
                 && r.imports.is_empty();
-            let hint = if empty { Some(HINT_FIND_SYMBOL_EMPTY) } else { None };
+            let hint = if empty { Some(find_symbol_empty_hint(entry.language.as_deref())) } else { None };
             // Навигационная выдача БЕЗ тел (как search_function/search_class): локации символа.
             // Тело конкретного — get_function/get_class. Иначе на горячем имени find_symbol
             // раздувался телами всех совпадений (десятки-сотни K токенов).
@@ -1256,7 +1318,8 @@ pub async fn grep_body(
                 "limit": want,
                 "truncated": truncated,
             });
-            let hint = if shown == 0 { Some(HINT_GREP_BODY_EMPTY) } else { None };
+            let hint =
+                if shown == 0 { Some(grep_body_empty_hint(entry.language.as_deref())) } else { None };
             wrap_with_meta_hint(&storage, &payload, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
@@ -1451,7 +1514,8 @@ pub async fn grep_code(
                 "limit": want,
                 "truncated": truncated,
             });
-            let hint = if shown == 0 { Some(HINT_GREP_CODE_EMPTY) } else { None };
+            let hint =
+                if shown == 0 { Some(grep_code_empty_hint(entry.language.as_deref())) } else { None };
             wrap_with_meta_hint(&storage, &payload, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"grep_code: {}\"}}", e),
@@ -1511,6 +1575,30 @@ mod tests {
     use super::*;
     use crate::storage::{PoolConfig, Storage, StoragePool};
     use std::time::{Duration, Instant};
+
+    /// На BSL-репо пустые поиски процедур (search_function, grep_body, grep_code,
+    /// find_symbol) подсказывают search_terms; на прочих языках — старый hint.
+    #[test]
+    fn search_empty_hint_mentions_search_terms_only_for_bsl() {
+        // search_function
+        assert!(search_empty_hint(Some("bsl")).contains("search_terms"));
+        assert!(!search_empty_hint(Some("rust")).contains("search_terms"));
+        assert!(!search_empty_hint(None).contains("search_terms"));
+        assert_eq!(search_empty_hint(Some("rust")), HINT_SEARCH_EMPTY);
+        // grep_body / grep_code / find_symbol — то же правило (бенч test03:
+        // слепые grep_body на BSL должны звать в search_terms).
+        for h in [
+            grep_body_empty_hint(Some("bsl")),
+            grep_code_empty_hint(Some("bsl")),
+            find_symbol_empty_hint(Some("bsl")),
+        ] {
+            assert!(h.contains("search_terms"), "BSL grep/find hint должен звать search_terms");
+        }
+        assert_eq!(grep_body_empty_hint(Some("rust")), HINT_GREP_BODY_EMPTY);
+        assert_eq!(grep_code_empty_hint(None), HINT_GREP_CODE_EMPTY);
+        assert_eq!(find_symbol_empty_hint(Some("python")), HINT_FIND_SYMBOL_EMPTY);
+        assert!(!HINT_GREP_BODY_EMPTY.contains("search_terms"));
+    }
 
     /// Главное свойство mass_map: элементы исполняются КОНКУРРЕНТНО (каждый со
     /// своим соединением из пула), а порядок результатов = порядку items.
