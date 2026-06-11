@@ -3,6 +3,28 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [0.31.0] — 2026-06-11
+
+**Фикс «слепого» `get_form_handlers`, фильтр `source` и отказ на неизвестные параметры в `get_event_subscriptions`, hint'ы на пустых ответах графовых и файловых инструментов.**
+
+### Исправлено
+
+- **`get_form_handlers` не находил НИ ОДНОЙ формы на боевых конфигурациях.** Инструмент искал точным сравнением `owner_full_name = 'Document.X'` (как в его же документации), а в БД значения хранятся в формате папки выгрузки — `'Documents.X'` (множественное число; на УТ-11 1350 строк в plural, 0 в singular). Теперь принимаются оба формата: точный матч, при промахе — повтор с конвертацией `<Singular>.<Name>` → `<PluralFolder>.<Name>` (общий хелпер `meta_type_to_folder`, вынесен из `get_object_profile`); в ответе — реально сматченный ключ БД.
+- **Текст ошибки битого regex в `grep_body`/`grep_code`** читался как «Invalid parameter name: regex parse error…» (артефакт маппинга ошибки компиляции в `rusqlite::Error::InvalidParameterName`) и сбивал агента на поиск «неверного имени параметра». Теперь `UserFunctionError`: «grep_body: regex parse error…».
+
+### Добавлено
+
+- **`get_event_subscriptions`: фильтр `source`** — подписки по объекту-источнику. Принимает `'Document.ЗаказКлиента'`, `'DocumentObject.ЗаказКлиента'` или короткое имя `'ЗаказКлиента'`; регистр не важен; тип `Document` автоматически матчит `DocumentObject` из `sources_json`.
+- **`get_event_subscriptions`: неизвестные параметры отклоняются** с перечнем допустимых фильтров. Раньше `object=…` молча игнорировался, и инструмент отдавал ВСЕ подписки (~52K токенов в контекст агента вместо указания на ошибку).
+- **Умная ошибка `get_form_handlers`**: форма не найдена, но владелец существует → в ответе `available_forms` (реальные формы владельца); владельца нет → hint про формат owner и проверку через `get_object_structure`/`bsl_sql`.
+- **Hint'ы на пустых ответах** (раньше — голый `{"result":[]}`, модель повторяла тот же вызов): `get_callers`/`get_callees` (имя должно быть точным, без скобок и владельца; пусто также если вызовов реально нет), `list_files` (pattern — glob от корня репо), `get_imports` (file_id: нет import-конструкций — для BSL норма; module: это ИМЯ импортируемого модуля, не путь к файлу).
+
+### Изменено
+
+- **`get_event_subscriptions`: default limit 200 → 50.** Безфильтровый вызов на УТ-11 отдавал ~52K токенов; `truncated`+`total` в ответе подсказывают сузить фильтр или дослать больший limit. MAX_LIMIT (2000) не менялся.
+- Hint пустого `get_function`/`get_class` упоминает и `search_class` (раньше — только `search_function`).
+- `bsl_sql` description: задокументирован формат `metadata_forms.owner_full_name` = `'<PluralFolder>.<Name>'` (`'Documents.ЗаказКлиента'`) — по аналогии с `metadata_modules.object_name`.
+
 ## [0.30.0] — 2026-06-11
 
 **Механическое обогащение термов при индексации (без LLM) + триграммный FTS: `search_terms` впервые рабочий на боевых конфигурациях. Умные ошибки `bsl_sql`.**

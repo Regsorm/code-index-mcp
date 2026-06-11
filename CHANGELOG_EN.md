@@ -5,6 +5,28 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.31.0] — 2026-06-11
+
+**Fixed the "blind" `get_form_handlers`, `source` filter and unknown-parameter rejection in `get_event_subscriptions`, hints on empty responses of graph and file tools.**
+
+### Fixed
+
+- **`get_form_handlers` could not find ANY form on production configurations.** The tool matched `owner_full_name = 'Document.X'` exactly (as its own docs suggested), while the DB stores values in export-folder format — `'Documents.X'` (plural; on UT-11: 1350 rows plural, 0 singular). Both formats are now accepted: exact match first, then retry with `<Singular>.<Name>` → `<PluralFolder>.<Name>` conversion (shared `meta_type_to_folder` helper, extracted from `get_object_profile`); the response echoes the actually matched DB key.
+- **Broken-regex error text in `grep_body`/`grep_code`** read as "Invalid parameter name: regex parse error…" (an artifact of mapping the compile error into `rusqlite::Error::InvalidParameterName`) and misled the agent into hunting for a "wrong parameter name". Now `UserFunctionError`: "grep_body: regex parse error…".
+
+### Added
+
+- **`get_event_subscriptions`: `source` filter** — subscriptions by source object. Accepts `'Document.ЗаказКлиента'`, `'DocumentObject.ЗаказКлиента'` or the short name `'ЗаказКлиента'`; case-insensitive; type `Document` automatically matches `DocumentObject` from `sources_json`.
+- **`get_event_subscriptions`: unknown parameters are rejected** with the list of valid filters. Previously `object=…` was silently ignored and the tool dumped ALL subscriptions (~52K tokens into the agent context instead of pointing out the mistake).
+- **Smart `get_form_handlers` error**: form not found but owner exists → response carries `available_forms` (the owner's real forms); owner missing → hint about the owner format and how to verify via `get_object_structure`/`bsl_sql`.
+- **Hints on empty responses** (previously a bare `{"result":[]}` — the model kept repeating the same call): `get_callers`/`get_callees` (the name must be exact, no parentheses or owner; empty also means genuinely no calls), `list_files` (pattern is a glob from the repo root), `get_imports` (file_id: no import statements — normal for BSL; module: it is the NAME of the imported module, not a file path).
+
+### Changed
+
+- **`get_event_subscriptions`: default limit 200 → 50.** A filterless call on UT-11 returned ~52K tokens; `truncated`+`total` in the response suggest narrowing the filter or requesting a larger limit. MAX_LIMIT (2000) unchanged.
+- The empty-result hint of `get_function`/`get_class` now mentions `search_class` too (previously only `search_function`).
+- `bsl_sql` description: documented the `metadata_forms.owner_full_name` format = `'<PluralFolder>.<Name>'` (`'Documents.ЗаказКлиента'`) — same convention as `metadata_modules.object_name`.
+
 ## [0.30.0] — 2026-06-11
 
 **Mechanical term enrichment at index time (no LLM) + trigram FTS: `search_terms` works on production-size configurations for the first time. Smart `bsl_sql` errors.**
