@@ -229,14 +229,17 @@ async fn get_form_handlers_returns_array() {
     .to_string();
     {
         let s = storage.get().await.unwrap();
+        // Боевой формат хранения — папка выгрузки (plural): 'Documents.X'.
         s.conn()
             .execute(
                 "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
                  VALUES (?, ?, ?, ?)",
-                params![REPO, "Document.Реализация", "ФормаДокумента", handlers_json],
+                params![REPO, "Documents.Реализация", "ФормаДокумента", handlers_json],
             )
             .unwrap();
     }
+    // Запрос в singular-формате ('Document.X') должен найти строку через
+    // нормализацию meta_type_to_folder.
     let res = run_tool(
         &GetFormHandlersTool,
         &storage,
@@ -251,6 +254,79 @@ async fn get_form_handlers_returns_array() {
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["event"].as_str(), Some("ПриОткрытии"));
     assert_eq!(arr[1]["handler"].as_str(), Some("ОбработатьЗакрытие"));
+    assert_eq!(
+        res["owner_full_name"].as_str(),
+        Some("Documents.Реализация"),
+        "в ответе — реально сматченный ключ БД"
+    );
+
+    // Plural-формат принимается как есть.
+    let res2 = run_tool(
+        &GetFormHandlersTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "owner_full_name": "Documents.Реализация",
+            "form_name": "ФормаДокумента"
+        }),
+    )
+    .await;
+    assert_eq!(
+        res2["handlers"].as_array().map(|a| a.len()),
+        Some(2),
+        "plural-формат тоже находит форму"
+    );
+}
+
+#[tokio::test]
+async fn get_form_handlers_unknown_form_lists_available() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        for form in &["ФормаДокумента", "ФормаСписка"] {
+            s.conn()
+                .execute(
+                    "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+                     VALUES (?, ?, ?, '[]')",
+                    params![REPO, "Documents.Реализация", form],
+                )
+                .unwrap();
+        }
+    }
+    // Форма не существует → error + available_forms с реальными формами владельца.
+    let res = run_tool(
+        &GetFormHandlersTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "owner_full_name": "Document.Реализация",
+            "form_name": "НетТакойФормы"
+        }),
+    )
+    .await;
+    assert!(res["error"].as_str().unwrap_or("").contains("form not found"));
+    let available: Vec<&str> = res["available_forms"]
+        .as_array()
+        .expect("available_forms — массив")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(available, vec!["ФормаДокумента", "ФормаСписка"]);
+
+    // Владелец не существует → error + hint про формат, без available_forms.
+    let res2 = run_tool(
+        &GetFormHandlersTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "owner_full_name": "Document.НетТакого",
+            "form_name": "ФормаДокумента"
+        }),
+    )
+    .await;
+    assert!(res2["error"].as_str().unwrap_or("").contains("form not found"));
+    assert!(res2["hint"].as_str().unwrap_or("").contains("Document.X"));
+    assert!(res2["available_forms"].is_null());
 }
 
 // ── get_event_subscriptions ───────────────────────────────────────────────
@@ -305,6 +381,74 @@ async fn get_event_subscriptions_filters_by_handler_module() {
     )
     .await;
     assert_eq!(res["count"].as_u64(), Some(2), "filter ModX → 2 совпадения");
+}
+
+#[tokio::test]
+async fn get_event_subscriptions_filters_by_source() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        for (name, sources) in &[
+            ("SubZakaz", r#"["cfg:DocumentObject.ЗаказКлиента"]"#),
+            ("SubVariant", r#"["cfg:CatalogObject.ВариантыОтчетов"]"#),
+            (
+                "SubMulti",
+                r#"["cfg:CatalogObject.Контрагенты","cfg:DocumentObject.ЗаказКлиента"]"#,
+            ),
+        ] {
+            s.conn()
+                .execute(
+                    "INSERT INTO event_subscriptions (repo, name, event, handler_module, handler_proc, sources_json) \
+                     VALUES (?, ?, 'ПередЗаписью', 'M', 'P', ?)",
+                    params![REPO, name, sources],
+                )
+                .unwrap();
+        }
+    }
+    // Полное имя в singular-формате → матчит DocumentObject-источник.
+    let res = run_tool(
+        &GetEventSubscriptionsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "source": "Document.ЗаказКлиента"}),
+    )
+    .await;
+    assert_eq!(res["count"].as_u64(), Some(2), "ЗаказКлиента в двух подписках");
+    assert_eq!(res["total"].as_u64(), Some(2));
+
+    // Короткое имя (без типа) — тот же результат, регистр игнорируется.
+    let res2 = run_tool(
+        &GetEventSubscriptionsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "source": "заказклиента"}),
+    )
+    .await;
+    assert_eq!(res2["count"].as_u64(), Some(2));
+
+    // Несуществующий источник → пусто.
+    let res3 = run_tool(
+        &GetEventSubscriptionsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "source": "Document.НетТакого"}),
+    )
+    .await;
+    assert_eq!(res3["count"].as_u64(), Some(0));
+}
+
+#[tokio::test]
+async fn get_event_subscriptions_rejects_unknown_param() {
+    let (_tmp, storage) = fresh_storage();
+    let res = run_tool(
+        &GetEventSubscriptionsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "object": "ЗаказКлиента"}),
+    )
+    .await;
+    let err = res["error"].as_str().unwrap_or("");
+    assert!(err.contains("object"), "ошибка называет неизвестный параметр: {}", err);
+    assert!(
+        res["hint"].as_str().unwrap_or("").contains("source"),
+        "hint перечисляет допустимые фильтры"
+    );
 }
 
 // ── find_path_bsl ───────────────────────────────────────────────────────────
