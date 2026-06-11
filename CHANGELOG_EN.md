@@ -5,6 +5,33 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.32.0] — 2026-06-11
+
+**New object-structure sections (owners/value_types/properties/enum_synonyms/commands + attribute synonym/required), owner and functional_option_content edges in data_links, roles in metadata_objects, `{a,b}` brace alternates in path_glob, LIMIT hint in bsl_sql. Fixed "—" types for DefinedType.**
+
+### Added
+
+- **`get_object_structure`: five new structure sections** (driven by the 747-question 1C:Professional run on UT-11):
+  - `owners` — owners of a subordinate catalog from `<Owners>` (`Catalog.ЭквайринговыеТерминалы` → `Catalog.ДоговорыЭквайринга`);
+  - `value_types` — value type of a chart of characteristic types / constant from the root `<Type>`: for a CCT this is the list of available analytics dimensions (`СтатьиДоходов` → 8 types);
+  - `properties` — whitelisted scalar header properties: information-register periodicity/write mode (`ЦеныНоменклатуры25` → `Periodicity=Second`), accumulation register kind, document numbering, catalog hierarchy/code lengths;
+  - `enum_synonyms` — UI labels of enum values as a separate map, the `enum_values` format is unchanged (`ЗакупкаПоИмпорту` → "Импорт"; 814 labels on `ХозяйственныеОперации`);
+  - `commands` — object commands `[{name, synonym?}]` from `<ChildObjects>/<Command>`: "create on basis", print forms, etc.
+- **Attributes in `attributes_json` now carry `synonym` (UI label, ru-priority) and `required`** (`<FillChecking>ShowError`): "which field is mandatory in X" is now answerable without XML.
+- **`data_links`: two new edge kinds** — `owner` (subordinate catalog → its owner) and `functional_option_content` (functional option → objects in its `<Content>`; `ИспользоватьЛимитыРасходаДенежныхСредств` → 3 objects).
+- **Roles in `metadata_objects`**: `Role` added to the known metadata types — 1288 UT-11 roles with synonyms are reachable via `bsl_sql`/synonym search.
+- **`{a,b}` brace alternates in `path_glob`/`pattern`** (`grep_code`/`grep_text`/`grep_body`/`list_files`): SQLite GLOB has no alternation, so `**/*.{bsl,xml}` silently returned nothing — the pattern is now expanded into an OR group of GLOB conditions (`expand_glob_braces`, up to 64 variants, no nesting — same as globset).
+- **`bsl_sql`: a hint when the row count equals the LIMIT from the query text** — "the output may be cut by your SQL LIMIT" (previously the agent took a truncated result for a complete one).
+
+### Fixed
+
+- **DefinedType attribute types were reported as "—"** in object structure: a `DefinedType` is serialized in the export as `<v8:TypeSet>`, while the parser only matched `:Type` tags. Now `ИНН` → `ОпределяемыйТип.ИНН`.
+
+### Tests
+
+- Units: parsing of owners/TypeSet/properties/FillChecking/synonyms/value_types/enum_synonyms/commands, `expand_glob_braces` (cartesian product, nesting/unclosed brace — literal), `sql_limit_value`. Full workspace green.
+- Smoke on live UT-11 (ut-test, 57,102 files): 11/11 checks green; full force reindex — 2 min 23 s (stop the services during reindex — SQLite contention slows it down by an order of magnitude).
+
 ## [0.31.0] — 2026-06-11
 
 **Fixed the "blind" `get_form_handlers`, `source` filter and unknown-parameter rejection in `get_event_subscriptions`, hints on empty responses of graph and file tools.**

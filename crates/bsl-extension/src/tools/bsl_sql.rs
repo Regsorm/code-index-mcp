@@ -71,10 +71,14 @@ impl IndexTool for BslSqlTool {
          фильтровать по точному object_ref='Document.X' — SQLite lower() НЕ лоуэркейсит кириллицу, \
          object_ref_key уже в нижнем регистре для поиска из приложения), procedure_enrichment(proc_key, \
          terms, signature), direct_edge_files(caller, callee, source_file). \
-         link_kind в data_links: объектные attr/tabular_attr/register_dim/recorder/owner; \
+         link_kind в data_links: объектные attr/tabular_attr/register_dim/recorder/owner \
+         (owner: подчинённый справочник → владелец); \
          конфиг-уровень subsystem_content/exchange_plan_content/defined_type_content/\
-         functional_option_location (from_object соответственно Subsystem.X/ExchangePlan.X/\
-         DefinedType.X/FunctionalOption.X). Core-таблицы \
+         functional_option_location/functional_option_content (from_object соответственно \
+         Subsystem.X/ExchangePlan.X/DefinedType.X/FunctionalOption.X; *_content у ФО — \
+         состав опции). В attributes_json у реквизитов есть synonym/required (когда заданы), \
+         у объектов — секции owners/value_types/properties/enum_synonyms/commands \
+         (commands — команды объекта: [{name, synonym?}]). Core-таблицы \
          (без колонки repo): files(path, language, lines_total, mtime, file_size), \
          functions(file_id, name, qualified_name, line_start, line_end, args, return_type, \
          body, override_type, override_target), classes, imports, calls, variables. \
@@ -198,16 +202,30 @@ impl IndexTool for BslSqlTool {
             match result {
                 Ok((columns, rows, truncated)) => {
                     let row_count = rows.len();
-                    crate::tools::wrap_with_meta(
-                        json!({
-                            "columns": columns,
-                            "rows": rows,
-                            "row_count": row_count,
-                            "truncated": truncated,
-                            "limit": limit,
-                        }),
-                        Vec::new(),
-                    )
+                    let mut payload = json!({
+                        "columns": columns,
+                        "rows": rows,
+                        "row_count": row_count,
+                        "truncated": truncated,
+                        "limit": limit,
+                    });
+                    // W5 (0.32): SQL `LIMIT N` в тексте запроса обрезает молча —
+                    // `truncated` считается только от лимита инструмента. Если
+                    // строк ровно N, предупреждаем: возможно, есть ещё.
+                    if !truncated {
+                        if let Some(n) = sql_limit_value(sql) {
+                            if row_count as u64 == n {
+                                payload["hint"] = json!(format!(
+                                    "строк ровно LIMIT {} из текста запроса — выдача, \
+                                     возможно, обрезана вашим SQL LIMIT (truncated отражает \
+                                     только лимит инструмента); поднимите LIMIT в SQL или \
+                                     передайте параметр limit",
+                                    n
+                                ));
+                            }
+                        }
+                    }
+                    crate::tools::wrap_with_meta(payload, Vec::new())
                 }
                 Err(e) => {
                     let interrupted = matches!(
@@ -316,6 +334,26 @@ fn levenshtein(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+/// W5: значение `LIMIT N` из ТЕКСТА запроса (последнее вхождение — внешний
+/// LIMIT при подзапросах чаще всего последний). Формы `LIMIT N` и
+/// `LIMIT M, N`/`LIMIT N OFFSET M` — берём первое число после LIMIT, этого
+/// достаточно для эвристики «строк ровно столько, сколько просили».
+fn sql_limit_value(sql: &str) -> Option<u64> {
+    let tokens: Vec<&str> = sql
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ';')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut last: Option<u64> = None;
+    for w in tokens.windows(2) {
+        if w[0].eq_ignore_ascii_case("limit") {
+            if let Ok(n) = w[1].trim_end_matches(',').parse::<u64>() {
+                last = Some(n);
+            }
+        }
+    }
+    last
 }
 
 /// Имена таблиц, упомянутых в запросе после FROM/JOIN (без regex: токенизация
@@ -585,6 +623,22 @@ mod tests {
             collect_rows(&mut stmt, vec![SqlValue::Text("Document".into())], 100).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], json!("Document.Реализация"));
+    }
+
+    #[test]
+    fn sql_limit_value_finds_last_limit() {
+        // W5: простые формы.
+        assert_eq!(sql_limit_value("SELECT 1 FROM t LIMIT 30"), Some(30));
+        assert_eq!(sql_limit_value("select 1 from t limit 30;"), Some(30));
+        assert_eq!(sql_limit_value("SELECT 1 FROM t LIMIT 10 OFFSET 5"), Some(10));
+        // Подзапрос: берём последний LIMIT (внешний).
+        assert_eq!(
+            sql_limit_value("SELECT * FROM (SELECT 1 FROM t LIMIT 100) LIMIT 7"),
+            Some(7)
+        );
+        // Без LIMIT — None; LIMIT с параметром — не число, None.
+        assert_eq!(sql_limit_value("SELECT 1 FROM t"), None);
+        assert_eq!(sql_limit_value("SELECT 1 FROM t LIMIT ?1"), None);
     }
 
     #[test]

@@ -407,6 +407,66 @@ pub fn parse_functional_option_location_file(path: &Path) -> Result<Option<(Stri
     }
 }
 
+/// W1: извлечь СОСТАВ функциональной опции из `<Content>` —
+/// канонические имена включаемых объектов (`<xr:Object>Document.X</xr:Object>`).
+/// Реквизиты в составе (`Catalog.X.Attribute.Y`) усечь до объекта нельзя —
+/// отдаём как есть (потребитель видит точную гранулярность включения).
+pub fn parse_functional_option_content_xml(content: &str) -> Result<Vec<String>> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_content = false;
+    let mut expect_obj = false;
+    let mut out: Vec<String> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
+                if local == "Content" {
+                    in_content = true;
+                } else if in_content && local == "Object" {
+                    expect_obj = true;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if expect_obj {
+                    let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    let txt = txt.trim().to_string();
+                    if !txt.is_empty() {
+                        out.push(txt);
+                    }
+                    expect_obj = false;
+                }
+            }
+            Ok(Event::End(e)) => {
+                if local_name(&String::from_utf8_lossy(e.name().as_ref())) == "Content" {
+                    in_content = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "functional option XML: ошибка парсинга на позиции {}: {}",
+                    reader.buffer_position(),
+                    e
+                ))
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(out)
+}
+
+/// Файловая обёртка `parse_functional_option_content_xml`.
+pub fn parse_functional_option_content_file(path: &Path) -> Result<Vec<String>> {
+    match read_to_string_opt(path)? {
+        Some(c) => parse_functional_option_content_xml(&c),
+        None => Ok(Vec::new()),
+    }
+}
+
 pub fn parse_role_rights_file(path: &Path) -> Result<Vec<RoleRight>> {
     match read_to_string_opt(path)? {
         Some(c) => parse_role_rights_xml(&c),
@@ -448,6 +508,35 @@ mod tests {
         let xml = r#"<MetaDataObject><Subsystem><Properties><Name>X</Name>
           <Content/></Properties><ChildObjects/></Subsystem></MetaDataObject>"#;
         assert!(parse_subsystem_content_xml(xml).unwrap().is_empty());
+    }
+
+    #[test]
+    fn functional_option_content_collects_objects() {
+        // W1: <Content> ФО — включаемые объекты (и реквизиты — как есть).
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:xr="http://v8.1c.ru/8.3/xcf/readable">
+  <FunctionalOption><Properties><Name>ИспользоватьЛимиты</Name>
+    <Location>Constant.ИспользоватьЛимиты</Location>
+    <Content>
+      <xr:Object>Document.ЛимитыРасходаДенежныхСредств</xr:Object>
+      <xr:Object>AccumulationRegister.ЛимитыРасходаДенежныхСредств</xr:Object>
+      <xr:Object>Document.ЗаявкаНаРасходованиеДенежныхСредств.Attribute.СверхЛимита</xr:Object>
+    </Content>
+  </Properties></FunctionalOption>
+</MetaDataObject>"#;
+        let items = parse_functional_option_content_xml(xml).unwrap();
+        assert_eq!(
+            items,
+            vec![
+                "Document.ЛимитыРасходаДенежныхСредств".to_string(),
+                "AccumulationRegister.ЛимитыРасходаДенежныхСредств".to_string(),
+                "Document.ЗаявкаНаРасходованиеДенежныхСредств.Attribute.СверхЛимита".to_string(),
+            ]
+        );
+        // Пустой состав — пустой список.
+        let empty = r#"<MetaDataObject><FunctionalOption><Properties><Name>ФО</Name>
+          <Location>Constant.ФО</Location><Content/></Properties></FunctionalOption></MetaDataObject>"#;
+        assert!(parse_functional_option_content_xml(empty).unwrap().is_empty());
     }
 
     #[test]

@@ -29,7 +29,8 @@ use crate::xml::forms::parse_form_file;
 use crate::code_usages::extract_code_usages;
 use crate::xml::metadata_refs::{
     parse_defined_type_targets_file, parse_exchange_plan_content_file,
-    parse_functional_option_location_file, parse_role_rights_file, parse_subsystem_content_file,
+    parse_functional_option_content_file, parse_functional_option_location_file,
+    parse_role_rights_file, parse_subsystem_content_file,
 };
 use crate::xml::object_attributes::{
     parse_object_attributes_file, parse_object_header_xml, parse_object_structure_file,
@@ -1017,7 +1018,8 @@ fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection) -> Result<
     conn.execute("BEGIN", [])?;
     conn.execute(
         "DELETE FROM data_links WHERE repo = ?1 AND link_kind IN \
-         ('subsystem_content','exchange_plan_content','defined_type_content','functional_option_location')",
+         ('subsystem_content','exchange_plan_content','defined_type_content',\
+          'functional_option_location','functional_option_content')",
         params![REPO_DEFAULT],
     )?;
     let mut stmt = conn.prepare(
@@ -1182,6 +1184,27 @@ fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection) -> Result<
                         Ok(None) => {}
                         Err(e) => {
                             tracing::warn!("functional_option_location {}: {}", path.display(), e)
+                        }
+                    }
+                    // W1: состав опции (<Content>) → рёбра functional_option_content
+                    // (ФО → включаемый объект/реквизит).
+                    match parse_functional_option_content_file(&path) {
+                        Ok(items) => {
+                            for to_object in items {
+                                stmt.execute(params![
+                                    REPO_DEFAULT,
+                                    &from_object,
+                                    "",
+                                    &to_object,
+                                    "functional_option_content",
+                                    0_i64,
+                                    0_i64
+                                ])?;
+                                total += 1;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("functional_option_content {}: {}", path.display(), e)
                         }
                     }
                 }

@@ -109,6 +109,18 @@ enum TextTarget {
     TypeValue,
     /// Текст `<xr:Item>` внутри `<RegisterRecords>` — имя регистра-приёмника.
     RegisterRef,
+    /// Текст `<xr:Item>` внутри `<Owners>` — владелец подчинённого справочника.
+    OwnerRef,
+    /// W13: `<v8:Type>`/`<v8:TypeSet>` внутри КОРНЕВОГО `<Type>` (ПВХ/константа).
+    RootTypeValue,
+    /// W11: `<v8:lang>` внутри `<Synonym>` текущего поля.
+    FieldSynLang,
+    /// W11: `<v8:content>` внутри `<Synonym>` текущего поля.
+    FieldSynContent,
+    /// W9: `<FillChecking>` текущего поля (ShowError → required).
+    FieldFillChecking,
+    /// W8: скалярное свойство шапки из белого списка (имя — в `cur_header_prop`).
+    HeaderProp,
     /// Значение свойства проведения документа (Posting / RegisterRecordsDeletion
     /// и т.п.); имя свойства лежит в `cur_posting_prop`.
     PostingProp,
@@ -134,6 +146,8 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
     let mut in_type = false;
     // Внутри <RegisterRecords> — список регистров, в которые пишет документ.
     let mut in_register_records = false;
+    // Внутри <Owners> — список владельцев подчинённого справочника.
+    let mut in_owners = false;
     let mut text_target = TextTarget::None;
 
     loop {
@@ -175,6 +189,14 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                         // Текст <xr:Item> — каноническое имя регистра-приёмника.
                         text_target = TextTarget::RegisterRef;
                     }
+                    "Owners" => {
+                        // Владельцы подчинённого справочника: <xr:Item> внутри —
+                        // полные имена объектов-владельцев (Catalog.X и т.п.).
+                        in_owners = true;
+                    }
+                    "Item" if in_owners => {
+                        text_target = TextTarget::OwnerRef;
+                    }
                     _ => {
                         // Различаем контейнер <Type> и элемент <v8:Type>.
                         // local_name у обоих == "Type" — смотрим сырое имя.
@@ -182,8 +204,10 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                             if field.is_some() {
                                 in_type = true;
                             }
-                        } else if raw.ends_with(":Type") {
-                            // <v8:Type> — собрать его текст как значение типа.
+                        } else if raw.ends_with(":Type") || raw.ends_with(":TypeSet") {
+                            // <v8:Type> — значение типа. <v8:TypeSet> — тип-набор
+                            // (cfg:DefinedType.X): до 0.32 не ловился → тип «—»
+                            // и потеря ребра DefinedType (W2).
                             if field.is_some() && in_type {
                                 text_target = TextTarget::TypeValue;
                             }
@@ -232,10 +256,23 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                             });
                         }
                     }
-                    // PostingProp в парсере связей данных не возникает
-                    // (свойства проведения обрабатывает parse_object_structure_xml).
-                    TextTarget::PostingProp => {}
-                    TextTarget::None => {}
+                    TextTarget::OwnerRef => {
+                        // Подчинённый справочник → владелец: ребро owner.
+                        // Цель уже каноническая (Catalog.X / ExchangePlan.X).
+                        if !txt.is_empty() {
+                            out.push(DataLinkEdge {
+                                from_path: String::new(),
+                                to_object: txt,
+                                link_kind: "owner",
+                                is_composite: false,
+                                is_universal: false,
+                            });
+                        }
+                    }
+                    // Прочие цели (свойства шапки/проведения, синонимы,
+                    // FillChecking, корневой Type) в парсере связей данных не
+                    // возникают — их обрабатывает parse_object_structure_xml.
+                    _ => {}
                 }
                 text_target = TextTarget::None;
             }
@@ -254,6 +291,9 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                     }
                     "RegisterRecords" => {
                         in_register_records = false;
+                    }
+                    "Owners" => {
+                        in_owners = false;
                     }
                     _ => {
                         if raw == "Type" {
@@ -390,6 +430,11 @@ pub struct StructField {
     /// Тип в 1С-нотации: `Строка`, `Число`, `СправочникСсылка.Номенклатура`,
     /// составной — через ` | `. Пустой тип → `—`.
     pub type_str: String,
+    /// Синоним (ru) реквизита — UI-подпись поля (W11). None, если не задан
+    /// или совпадает с именем (не дублируем).
+    pub synonym: Option<String>,
+    /// Обязательность заполнения: `<FillChecking>ShowError</FillChecking>` (W9).
+    pub required: bool,
 }
 
 /// Табличная часть: имя + её реквизиты.
@@ -417,6 +462,24 @@ pub struct ObjectStructure {
     /// у прочих объектов пусто. Источник — теги `Posting` / `RealTimePosting`
     /// / `RegisterRecordsDeletion` / `RegisterRecordsWritingOnPost`.
     pub posting: Vec<(String, String)>,
+    /// Владельцы подчинённого справочника (`<Owners>` в `<Properties>`),
+    /// канонические имена (`Catalog.Партнеры`). Пусто у неподчинённых. W6.
+    pub owners: Vec<String>,
+    /// Тип значения характеристик ПВХ / тип константы — корневой `<Type>`
+    /// в `<Properties>` (W13). 1С-нотация (`СправочникСсылка.Организации`).
+    /// Для ПВХ это список ДОСТУПНЫХ АНАЛИТИК.
+    pub value_types: Vec<String>,
+    /// Скалярные свойства шапки объекта по белому списку (W8):
+    /// периодичность/режим записи ИР, вид регистра накопления, нумерация
+    /// документа, иерархия/длины кодов справочника. (имя, значение).
+    pub properties: Vec<(String, String)>,
+    /// Синонимы (ru) значений перечисления (W11): (имя_значения, синоним).
+    /// Только значения, у которых синоним задан и отличается от имени.
+    pub enum_synonyms: Vec<(String, String)>,
+    /// Команды объекта (W4): (имя, синоним-UI-подпись). Синоним — Some
+    /// только когда задан и отличается от имени. Из `<Command>` в
+    /// `<ChildObjects>` («Создать на основании», печатные формы и т.п.).
+    pub commands: Vec<(String, Option<String>)>,
 }
 
 impl ObjectStructure {
@@ -429,11 +492,30 @@ impl ObjectStructure {
             && self.enum_values.is_empty()
             && self.predefined.is_empty()
             && self.posting.is_empty()
+            && self.owners.is_empty()
+            && self.value_types.is_empty()
+            && self.properties.is_empty()
+            && self.commands.is_empty()
     }
 
     /// Сериализовать в JSON для `attributes_json` (пустые секции опускаем).
     pub fn to_json(&self) -> Value {
-        let field = |f: &StructField| json!({ "name": f.name, "type": f.type_str });
+        // W9/W11: synonym и required — только когда несут информацию
+        // (синоним отличен от имени; required=true), чтобы не раздувать блоб.
+        let field = |f: &StructField| {
+            let mut m = serde_json::Map::new();
+            m.insert("name".into(), Value::String(f.name.clone()));
+            m.insert("type".into(), Value::String(f.type_str.clone()));
+            if let Some(s) = &f.synonym {
+                if !s.is_empty() && s != &f.name {
+                    m.insert("synonym".into(), Value::String(s.clone()));
+                }
+            }
+            if f.required {
+                m.insert("required".into(), Value::Bool(true));
+            }
+            Value::Object(m)
+        };
         // B1: базовые секции эмитятся ВСЕГДА (пустые → []), чтобы агент
         // отличал «секции нет» от «инструмент её не отдаёт» и не уходил в XML.
         let ts: Vec<Value> = self
@@ -495,6 +577,64 @@ impl ObjectStructure {
             }
             map.insert("posting".into(), Value::Object(pm));
         }
+        // W6: owners — владельцы подчинённого справочника (если есть).
+        if !self.owners.is_empty() {
+            map.insert(
+                "owners".into(),
+                Value::Array(
+                    self.owners
+                        .iter()
+                        .map(|v| Value::String(v.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        // W13: value_types — тип значения характеристик ПВХ / константы.
+        if !self.value_types.is_empty() {
+            map.insert(
+                "value_types".into(),
+                Value::Array(
+                    self.value_types
+                        .iter()
+                        .map(|v| Value::String(v.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        // W8: properties — скалярные свойства шапки (периодичность ИР,
+        // режим записи, нумерация документа и т.п.) из белого списка.
+        if !self.properties.is_empty() {
+            let mut pm = serde_json::Map::new();
+            for (k, v) in &self.properties {
+                pm.insert(k.clone(), Value::String(v.clone()));
+            }
+            map.insert("properties".into(), Value::Object(pm));
+        }
+        // W11: enum_synonyms — UI-подписи значений перечисления
+        // (отдельной картой, чтобы не ломать формат enum_values: [имена]).
+        if !self.enum_synonyms.is_empty() {
+            let mut em = serde_json::Map::new();
+            for (k, v) in &self.enum_synonyms {
+                em.insert(k.clone(), Value::String(v.clone()));
+            }
+            map.insert("enum_synonyms".into(), Value::Object(em));
+        }
+        // W4: commands — команды объекта (имя + UI-подпись, если отличается).
+        if !self.commands.is_empty() {
+            let cs: Vec<Value> = self
+                .commands
+                .iter()
+                .map(|(name, syn)| {
+                    let mut cm = serde_json::Map::new();
+                    cm.insert("name".into(), Value::String(name.clone()));
+                    if let Some(s) = syn {
+                        cm.insert("synonym".into(), Value::String(s.clone()));
+                    }
+                    Value::Object(cm)
+                })
+                .collect();
+            map.insert("commands".into(), Value::Array(cs));
+        }
         Value::Object(map)
     }
 
@@ -519,11 +659,30 @@ impl ObjectStructure {
         }
         merge_names(&mut self.enum_values, &other.enum_values);
         merge_names(&mut self.predefined, &other.predefined);
+        merge_names(&mut self.owners, &other.owners);
+        merge_names(&mut self.value_types, &other.value_types);
         // posting: свойства проведения из other, которых ещё нет по имени
         // (base-приоритет — свойство документа обычно живёт в base-конфиге).
         for (k, v) in &other.posting {
             if !self.posting.iter().any(|(ek, _)| ek == k) {
                 self.posting.push((k.clone(), v.clone()));
+            }
+        }
+        // W8/W11: те же правила base-приоритета для свойств шапки и синонимов.
+        for (k, v) in &other.properties {
+            if !self.properties.iter().any(|(ek, _)| ek == k) {
+                self.properties.push((k.clone(), v.clone()));
+            }
+        }
+        for (k, v) in &other.enum_synonyms {
+            if !self.enum_synonyms.iter().any(|(ek, _)| ek == k) {
+                self.enum_synonyms.push((k.clone(), v.clone()));
+            }
+        }
+        // W4: команды расширения, которых нет в base (union по имени).
+        for (k, v) in &other.commands {
+            if !self.commands.iter().any(|(ek, _)| ek == k) {
+                self.commands.push((k.clone(), v.clone()));
             }
         }
     }
@@ -726,15 +885,36 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
     let mut out = ObjectStructure::default();
     let mut buf = Vec::new();
 
+    // Текущее разбираемое поле (реквизит/измерение/ресурс/значение enum).
+    struct FieldBuild {
+        kind: String,
+        name: Option<String>,
+        types: Vec<String>,
+        /// W11: синоним (ru-приоритет).
+        synonym: Option<String>,
+        /// W9: FillChecking == ShowError.
+        required: bool,
+    }
+
     // Индекс текущей табличной части (Some, пока мы внутри <TabularSection>).
     let mut cur_tab: Option<usize> = None;
     let mut expecting_tabular_name = false;
-    // Текущее разбираемое поле: (kind, name, types).
-    let mut field: Option<(String, Option<String>, Vec<String>)> = None;
+    let mut field: Option<FieldBuild> = None;
     let mut in_type = false;
     let mut text_target = TextTarget::None;
     // WS-1: имя свойства проведения, чей текст сейчас разбираем (Posting и т.п.).
     let mut cur_posting_prop: Option<String> = None;
+    // W6: внутри <Owners> — список владельцев подчинённого справочника.
+    let mut in_owners = false;
+    // W8: имя свойства шапки из белого списка, чей текст сейчас разбираем.
+    let mut cur_header_prop: Option<String> = None;
+    // W13: внутри корневого <Type> (тип значения характеристик ПВХ/константы).
+    let mut in_root_type = false;
+    // Внутри <StandardAttributes> — стандартные атрибуты не разбираем.
+    let mut in_std_attrs = false;
+    // W11: внутри <Synonym> текущего поля; последний прочитанный <v8:lang>.
+    let mut in_field_syn = false;
+    let mut syn_lang: Option<String> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -745,12 +925,20 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                     "TabularSection" => {
                         expecting_tabular_name = true;
                     }
-                    "Attribute" | "Dimension" | "Resource" | "EnumValue" => {
-                        field = Some((local, None, Vec::new()));
+                    // W4: Command разбирается тем же накопителем — у него те же
+                    // <Name> и <Synonym>; типы/FillChecking у команд не встречаются.
+                    "Attribute" | "Dimension" | "Resource" | "EnumValue" | "Command" => {
+                        field = Some(FieldBuild {
+                            kind: local,
+                            name: None,
+                            types: Vec::new(),
+                            synonym: None,
+                            required: false,
+                        });
                     }
                     "Name" => {
-                        if let Some((_, name, _)) = field.as_ref() {
-                            if name.is_none() {
+                        if let Some(f) = field.as_ref() {
+                            if f.name.is_none() {
                                 text_target = TextTarget::FieldName;
                             }
                         } else if expecting_tabular_name {
@@ -767,13 +955,56 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                             text_target = TextTarget::PostingProp;
                         }
                     }
+                    // W6: владельцы подчинённого справочника.
+                    "Owners" => {
+                        in_owners = true;
+                    }
+                    "Item" if in_owners => {
+                        text_target = TextTarget::OwnerRef;
+                    }
+                    "StandardAttributes" => {
+                        in_std_attrs = true;
+                    }
+                    // W11: синоним поля (у ТЧ и корня свои Synonym — field=None).
+                    "Synonym" if field.is_some() => {
+                        in_field_syn = true;
+                        syn_lang = None;
+                    }
+                    // W9: обязательность заполнения поля.
+                    "FillChecking" if field.is_some() => {
+                        text_target = TextTarget::FieldFillChecking;
+                    }
+                    // W8: скалярные свойства шапки из белого списка — вне
+                    // реквизитов и стандартных атрибутов (там одноимённые теги).
+                    "InformationRegisterPeriodicity" | "WriteMode" | "RegisterType"
+                    | "NumberType" | "NumberLength" | "NumberPeriodicity"
+                    | "CheckUnique" | "Autonumbering" | "Hierarchical"
+                    | "CodeLength" | "DescriptionLength" | "Numerator" => {
+                        if field.is_none() && !in_std_attrs {
+                            cur_header_prop = Some(local.clone());
+                            text_target = TextTarget::HeaderProp;
+                        }
+                    }
                     _ => {
                         if raw == "Type" {
                             if field.is_some() {
                                 in_type = true;
+                            } else if !in_std_attrs {
+                                // W13: корневой <Type> — тип значения
+                                // характеристик ПВХ / тип константы.
+                                in_root_type = true;
                             }
-                        } else if raw.ends_with(":Type") && field.is_some() && in_type {
-                            text_target = TextTarget::TypeValue;
+                        } else if raw.ends_with(":Type") || raw.ends_with(":TypeSet") {
+                            // <v8:TypeSet> — тип-набор (cfg:DefinedType.X), W2.
+                            if field.is_some() && in_type {
+                                text_target = TextTarget::TypeValue;
+                            } else if in_root_type {
+                                text_target = TextTarget::RootTypeValue;
+                            }
+                        } else if in_field_syn && raw.ends_with(":lang") {
+                            text_target = TextTarget::FieldSynLang;
+                        } else if in_field_syn && raw.ends_with(":content") {
+                            text_target = TextTarget::FieldSynContent;
                         }
                     }
                 }
@@ -787,9 +1018,9 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                 let txt = txt.trim().to_string();
                 match text_target {
                     TextTarget::FieldName => {
-                        if let Some((_, name, _)) = field.as_mut() {
+                        if let Some(f) = field.as_mut() {
                             if !txt.is_empty() {
-                                *name = Some(txt);
+                                f.name = Some(txt);
                             }
                         }
                     }
@@ -804,9 +1035,9 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                         }
                     }
                     TextTarget::TypeValue => {
-                        if let Some((_, _, types)) = field.as_mut() {
+                        if let Some(f) = field.as_mut() {
                             if !txt.is_empty() {
-                                types.push(txt);
+                                f.types.push(txt);
                             }
                         }
                     }
@@ -814,6 +1045,45 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                         if let Some(prop) = cur_posting_prop.take() {
                             if !txt.is_empty() {
                                 out.posting.push((prop, txt));
+                            }
+                        }
+                    }
+                    // W6: владелец подчинённого справочника → секция owners.
+                    TextTarget::OwnerRef => {
+                        if !txt.is_empty() {
+                            out.owners.push(txt);
+                        }
+                    }
+                    // W13: тип значения характеристик / тип константы.
+                    TextTarget::RootTypeValue => {
+                        if !txt.is_empty() {
+                            out.value_types.push(pretty_one_type(&txt));
+                        }
+                    }
+                    // W11: синоним поля — ru-приоритет, иначе первый попавшийся.
+                    TextTarget::FieldSynLang => {
+                        syn_lang = Some(txt);
+                    }
+                    TextTarget::FieldSynContent => {
+                        if let Some(f) = field.as_mut() {
+                            if !txt.is_empty()
+                                && (syn_lang.as_deref() == Some("ru") || f.synonym.is_none())
+                            {
+                                f.synonym = Some(txt);
+                            }
+                        }
+                    }
+                    // W9: FillChecking=ShowError → поле обязательно к заполнению.
+                    TextTarget::FieldFillChecking => {
+                        if let Some(f) = field.as_mut() {
+                            f.required = txt == "ShowError";
+                        }
+                    }
+                    // W8: скалярное свойство шапки из белого списка.
+                    TextTarget::HeaderProp => {
+                        if let Some(prop) = cur_header_prop.take() {
+                            if !txt.is_empty() {
+                                out.properties.push((prop, txt));
                             }
                         }
                     }
@@ -828,18 +1098,32 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = local_name(&raw);
                 match local.as_str() {
-                    "Attribute" | "Dimension" | "Resource" | "EnumValue" => {
-                        if let Some((kind, Some(name), types)) = field.take() {
-                            if !name.is_empty() {
-                                if kind == "EnumValue" {
-                                    // B2: значение перечисления — только имя, без типа.
+                    "Attribute" | "Dimension" | "Resource" | "EnumValue" | "Command" => {
+                        if let Some(fb) = field.take() {
+                            if let Some(name) = fb.name.filter(|n| !n.is_empty()) {
+                                if fb.kind == "EnumValue" {
+                                    // B2: значение перечисления — имя; синоним
+                                    // (W11) — отдельной картой enum_synonyms.
+                                    if let Some(s) = fb.synonym {
+                                        if !s.is_empty() && s != name {
+                                            out.enum_synonyms.push((name.clone(), s));
+                                        }
+                                    }
                                     out.enum_values.push(name);
+                                } else if fb.kind == "Command" {
+                                    // W4: команда объекта — имя + синоним
+                                    // (только когда отличается от имени).
+                                    let syn =
+                                        fb.synonym.filter(|s| !s.is_empty() && s != &name);
+                                    out.commands.push((name, syn));
                                 } else {
                                     let f = StructField {
                                         name,
-                                        type_str: pretty_types(&types),
+                                        type_str: pretty_types(&fb.types),
+                                        synonym: fb.synonym,
+                                        required: fb.required,
                                     };
-                                    match kind.as_str() {
+                                    match fb.kind.as_str() {
                                         "Dimension" => out.dimensions.push(f),
                                         "Resource" => out.resources.push(f),
                                         _ => match cur_tab {
@@ -855,9 +1139,19 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                     "TabularSection" => {
                         cur_tab = None;
                     }
+                    "Owners" => {
+                        in_owners = false;
+                    }
+                    "Synonym" => {
+                        in_field_syn = false;
+                    }
+                    "StandardAttributes" => {
+                        in_std_attrs = false;
+                    }
                     _ => {
                         if raw == "Type" {
                             in_type = false;
+                            in_root_type = false;
                         }
                     }
                 }
@@ -983,20 +1277,24 @@ mod tests {
         assert_eq!(syn2, None);
     }
 
+    /// Тестовый конструктор поля без синонима/обязательности.
+    fn sf(name: &str, type_str: &str) -> StructField {
+        StructField {
+            name: name.into(),
+            type_str: type_str.into(),
+            synonym: None,
+            required: false,
+        }
+    }
+
     #[test]
     fn merge_from_unions_base_and_extension() {
         // base: Контрагент + ТЧ Товары{Номенклатура}.
         let mut base = ObjectStructure {
-            attributes: vec![StructField {
-                name: "Контрагент".into(),
-                type_str: "СправочникСсылка.Контрагенты".into(),
-            }],
+            attributes: vec![sf("Контрагент", "СправочникСсылка.Контрагенты")],
             tabular_sections: vec![StructTabular {
                 name: "Товары".into(),
-                attributes: vec![StructField {
-                    name: "Номенклатура".into(),
-                    type_str: "СправочникСсылка.Номенклатура".into(),
-                }],
+                attributes: vec![sf("Номенклатура", "СправочникСсылка.Номенклатура")],
             }],
             ..Default::default()
         };
@@ -1004,12 +1302,12 @@ mod tests {
         // новый реквизит УОП_Поле, и доп. реквизит в ТЧ Товары.
         let ext = ObjectStructure {
             attributes: vec![
-                StructField { name: "Контрагент".into(), type_str: "ПроизвольнаяСсылка".into() },
-                StructField { name: "УОП_Поле".into(), type_str: "Дата".into() },
+                sf("Контрагент", "ПроизвольнаяСсылка"),
+                sf("УОП_Поле", "Дата"),
             ],
             tabular_sections: vec![StructTabular {
                 name: "Товары".into(),
-                attributes: vec![StructField { name: "УОП_ТЧПоле".into(), type_str: "Число".into() }],
+                attributes: vec![sf("УОП_ТЧПоле", "Число")],
             }],
             ..Default::default()
         };
@@ -1234,6 +1532,271 @@ mod tests {
         let attr = edges.iter().find(|e| e.from_path == "Контрагент").unwrap();
         assert_eq!(attr.link_kind, "attr");
         assert_eq!(attr.to_object, "Catalog.Контрагенты");
+    }
+
+    #[test]
+    fn parses_catalog_owners() {
+        // W6: <Owners> подчинённого справочника → рёбра owner (подчинённый →
+        // владелец) в графе данных и секция owners в структуре объекта.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core"
+                xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Catalog uuid="root">
+    <Properties>
+      <Name>ЗадачиПроектов</Name>
+      <Owners>
+        <xr:Item xsi:type="xr:MDObjectRef">Catalog.Претензии</xr:Item>
+        <xr:Item xsi:type="xr:MDObjectRef">Catalog.СделкиСКлиентами</xr:Item>
+      </Owners>
+    </Properties>
+    <ChildObjects>
+      <Attribute uuid="a1">
+        <Properties><Name>Исполнитель</Name>
+          <Type><v8:Type>cfg:CatalogRef.Пользователи</v8:Type></Type>
+        </Properties>
+      </Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>"#;
+        // Граф данных: рёбра owner с пустым from_path.
+        let edges = parse_object_attributes_xml(xml).unwrap();
+        let owners: Vec<_> = edges.iter().filter(|e| e.link_kind == "owner").collect();
+        assert_eq!(owners.len(), 2, "два владельца: {:?}", edges);
+        let targets: Vec<&str> = owners.iter().map(|e| e.to_object.as_str()).collect();
+        assert!(targets.contains(&"Catalog.Претензии"));
+        assert!(targets.contains(&"Catalog.СделкиСКлиентами"));
+        assert!(owners.iter().all(|e| e.from_path.is_empty()));
+        assert!(owners.iter().all(|e| !e.is_composite && !e.is_universal));
+        // Обычный реквизит не путается с владельцами.
+        let attr = edges.iter().find(|e| e.from_path == "Исполнитель").unwrap();
+        assert_eq!(attr.link_kind, "attr");
+
+        // Структура объекта: секция owners в attributes_json.
+        let st = parse_object_structure_xml(xml).unwrap();
+        assert_eq!(st.owners, vec!["Catalog.Претензии", "Catalog.СделкиСКлиентами"]);
+        let js = st.to_json();
+        let arr: Vec<&str> = js["owners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(arr, vec!["Catalog.Претензии", "Catalog.СделкиСКлиентами"]);
+    }
+
+    #[test]
+    fn parses_defined_type_typeset() {
+        // W2: тип реквизита, сериализованный как <v8:TypeSet>cfg:DefinedType.X
+        // (а не <v8:Type>), должен давать тип «ОпределяемыйТип.X» в структуре
+        // и ребро *DefinedType.X в графе данных (раньше: тип «—», ребра нет).
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Catalog uuid="root">
+    <Properties><Name>Организации</Name></Properties>
+    <ChildObjects>
+      <Attribute uuid="a1">
+        <Properties><Name>ИНН</Name>
+          <Type><v8:TypeSet>cfg:DefinedType.ИНН</v8:TypeSet></Type>
+        </Properties>
+      </Attribute>
+      <Attribute uuid="a2">
+        <Properties><Name>ДокументОснование</Name>
+          <Type><v8:TypeSet>cfg:DefinedType.ОснованиеСчетФактураВыданный</v8:TypeSet></Type>
+        </Properties>
+      </Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>"#;
+        // Структура: тип читается, не «—».
+        let st = parse_object_structure_xml(xml).unwrap();
+        let inn = st.attributes.iter().find(|f| f.name == "ИНН").unwrap();
+        assert_eq!(inn.type_str, "ОпределяемыйТип.ИНН");
+        // Граф данных: ребро на DefinedType-терминал (universal).
+        let edges = parse_object_attributes_xml(xml).unwrap();
+        let e = edges.iter().find(|e| e.from_path == "ИНН").unwrap();
+        assert_eq!(e.to_object, "*DefinedType.ИНН");
+        assert!(e.is_universal);
+        let e2 = edges.iter().find(|e| e.from_path == "ДокументОснование").unwrap();
+        assert_eq!(e2.to_object, "*DefinedType.ОснованиеСчетФактураВыданный");
+    }
+
+    #[test]
+    fn parses_header_props_fill_checking_synonyms_and_value_types() {
+        // W8: свойства шапки (периодичность ИР, режим записи); W9: FillChecking
+        // → required; W11: синонимы реквизитов и значений enum; W13: корневой
+        // <Type> ПВХ → value_types. Стандартные атрибуты не подмешиваются.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core"
+                xmlns:xr="http://v8.1c.ru/8.3/xcf/readable">
+  <InformationRegister uuid="root">
+    <Properties>
+      <Name>ЦеныНоменклатуры25</Name>
+      <Type>
+        <v8:Type>cfg:CatalogRef.Организации</v8:Type>
+        <v8:TypeSet>cfg:DefinedType.ИНН</v8:TypeSet>
+      </Type>
+      <InformationRegisterPeriodicity>Second</InformationRegisterPeriodicity>
+      <WriteMode>RecorderSubordinate</WriteMode>
+      <StandardAttributes>
+        <xr:StandardAttribute name="Active">
+          <xr:FillChecking>ShowError</xr:FillChecking>
+          <xr:Synonym>
+            <v8:item><v8:lang>ru</v8:lang><v8:content>Активность</v8:content></v8:item>
+          </xr:Synonym>
+        </xr:StandardAttribute>
+      </StandardAttributes>
+    </Properties>
+    <ChildObjects>
+      <Dimension uuid="d1">
+        <Properties><Name>Номенклатура</Name>
+          <Synonym>
+            <v8:item><v8:lang>en</v8:lang><v8:content>Product</v8:content></v8:item>
+            <v8:item><v8:lang>ru</v8:lang><v8:content>Товар</v8:content></v8:item>
+          </Synonym>
+          <Type><v8:Type>cfg:CatalogRef.Номенклатура</v8:Type></Type>
+          <FillChecking>ShowError</FillChecking>
+        </Properties>
+      </Dimension>
+      <Resource uuid="r1">
+        <Properties><Name>Цена</Name>
+          <Type><v8:Type>xs:decimal</v8:Type></Type>
+          <FillChecking>DontCheck</FillChecking>
+        </Properties>
+      </Resource>
+      <EnumValue uuid="e1">
+        <Properties><Name>ЗакупкаПоИмпорту</Name>
+          <Synonym>
+            <v8:item><v8:lang>ru</v8:lang><v8:content>Ввоз из ЕАЭС</v8:content></v8:item>
+          </Synonym>
+        </Properties>
+      </EnumValue>
+    </ChildObjects>
+  </InformationRegister>
+</MetaDataObject>"#;
+        let st = parse_object_structure_xml(xml).unwrap();
+        // W8: свойства шапки по белому списку.
+        assert!(st
+            .properties
+            .contains(&("InformationRegisterPeriodicity".into(), "Second".into())));
+        assert!(st.properties.contains(&("WriteMode".into(), "RecorderSubordinate".into())));
+        // W13: корневой Type → value_types (включая TypeSet/DefinedType).
+        assert_eq!(
+            st.value_types,
+            vec!["СправочникСсылка.Организации", "ОпределяемыйТип.ИНН"]
+        );
+        // W9 + W11: измерение — required, ru-синоним при двух языках.
+        let dim = &st.dimensions[0];
+        assert_eq!(dim.name, "Номенклатура");
+        assert!(dim.required);
+        assert_eq!(dim.synonym.as_deref(), Some("Товар"));
+        // DontCheck — не required.
+        let res = &st.resources[0];
+        assert!(!res.required);
+        // W11: синоним значения перечисления — в enum_synonyms.
+        assert_eq!(st.enum_values, vec!["ЗакупкаПоИмпорту"]);
+        assert_eq!(
+            st.enum_synonyms,
+            vec![("ЗакупкаПоИмпорту".to_string(), "Ввоз из ЕАЭС".to_string())]
+        );
+        // Стандартные атрибуты не попали ни в поля, ни в свойства.
+        assert!(st.attributes.is_empty());
+
+        // JSON: required/synonym у поля, секции properties/value_types/enum_synonyms.
+        let js = st.to_json();
+        assert_eq!(js["dimensions"][0]["required"], true);
+        assert_eq!(js["dimensions"][0]["synonym"], "Товар");
+        assert!(js["resources"][0].get("required").is_none());
+        assert_eq!(js["properties"]["WriteMode"], "RecorderSubordinate");
+        assert_eq!(js["enum_synonyms"]["ЗакупкаПоИмпорту"], "Ввоз из ЕАЭС");
+    }
+
+    #[test]
+    fn owners_absent_for_regular_catalog() {
+        // Справочник без <Owners> (или с <Owners/>) — секции owners нет.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Catalog uuid="root">
+    <Properties>
+      <Name>Партнеры</Name>
+      <Owners/>
+    </Properties>
+    <ChildObjects>
+      <Attribute uuid="a1">
+        <Properties><Name>Менеджер</Name>
+          <Type><v8:Type>cfg:CatalogRef.Пользователи</v8:Type></Type>
+        </Properties>
+      </Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>"#;
+        let edges = parse_object_attributes_xml(xml).unwrap();
+        assert!(edges.iter().all(|e| e.link_kind != "owner"));
+        let st = parse_object_structure_xml(xml).unwrap();
+        assert!(st.owners.is_empty());
+        assert!(st.to_json().get("owners").is_none());
+    }
+
+    #[test]
+    fn parses_object_commands() {
+        // W4: команды объекта из <ChildObjects>/<Command> — имя + синоним.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Document uuid="root">
+    <Properties>
+      <Name>ЗаказКлиента</Name>
+    </Properties>
+    <ChildObjects>
+      <Attribute uuid="a1">
+        <Properties><Name>Контрагент</Name>
+          <Type><v8:Type>cfg:CatalogRef.Контрагенты</v8:Type></Type>
+        </Properties>
+      </Attribute>
+      <Command uuid="c1">
+        <Properties>
+          <Name>СчетаПокупателям</Name>
+          <Synonym>
+            <v8:item>
+              <v8:lang>ru</v8:lang>
+              <v8:content>Счета покупателям (заказ)</v8:content>
+            </v8:item>
+          </Synonym>
+          <Group>NavigationPanelSeeAlso</Group>
+          <CommandParameterType/>
+          <ModifiesData>false</ModifiesData>
+        </Properties>
+      </Command>
+      <Command uuid="c2">
+        <Properties>
+          <Name>ОткрытьШтрихкоды</Name>
+          <Synonym/>
+        </Properties>
+      </Command>
+    </ChildObjects>
+  </Document>
+</MetaDataObject>"#;
+        let st = parse_object_structure_xml(xml).unwrap();
+        assert_eq!(
+            st.commands,
+            vec![
+                (
+                    "СчетаПокупателям".to_string(),
+                    Some("Счета покупателям (заказ)".to_string())
+                ),
+                ("ОткрытьШтрихкоды".to_string(), None),
+            ]
+        );
+        // Команда не попала в реквизиты, реквизит — не в команды.
+        assert_eq!(st.attributes.len(), 1);
+        assert_eq!(st.attributes[0].name, "Контрагент");
+        // JSON-сериализация: массив объектов {name, synonym?}.
+        let j = st.to_json();
+        let cs = j.get("commands").unwrap().as_array().unwrap();
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs[0]["name"], "СчетаПокупателям");
+        assert_eq!(cs[0]["synonym"], "Счета покупателям (заказ)");
+        assert_eq!(cs[1]["name"], "ОткрытьШтрихкоды");
+        assert!(cs[1].get("synonym").is_none());
     }
 
     #[test]

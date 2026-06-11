@@ -16,8 +16,9 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     // ── metadata_objects ──────────────────────────────────────────────────
     // Один объект конфигурации 1С: справочник, документ, регистр и т.д.
     // `meta_type` — категория (Catalog / Document / InformationRegister / ...);
-    // `attributes_json` — реквизиты, табличные части, ресурсы, измерения
-    // в виде структурированного JSON (форма извлекается xml::configuration).
+    // `attributes_json` — реквизиты, табличные части, ресурсы, измерения,
+    // команды объекта (commands, W4) и пр. секции в виде структурированного
+    // JSON (форма извлекается xml::configuration).
     //
     // `(repo, full_name)` уникален в пределах одного репо: full_name —
     // канонический идентификатор вида `Catalog.Контрагенты`.
@@ -300,7 +301,8 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     //   * `tabular_attr`  — ссылочный реквизит табличной части.
     //   * `register_dim`  — измерение регистра.
     //   * `recorder`      — движение: документ → регистр (этап 2).
-    //   * `owner`         — подчинённый справочник → владелец (этап 2).
+    //   * `owner`         — подчинённый справочник → владелец (W6, 0.32):
+    //     `from_object` = подчинённый, `to_object` = владелец, from_path пуст.
     //   ── связи конфигурационного уровня (xml::metadata_refs, этап 3.1) ──
     //   * `subsystem_content`          — подсистема → объект её состава.
     //     `from_object` = `Subsystem.<Имя>` (листовое имя подсистемы).
@@ -308,6 +310,8 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     //     `from_object` = `ExchangePlan.<Имя>`.
     //   * `defined_type_content`       — определяемый тип → конкретный тип.
     //     `from_object` = `DefinedType.<Имя>`.
+    //   * `functional_option_content`  — ФО → объект/реквизит её состава
+    //     (`<Content>`, W1). `from_object` = `FunctionalOption.<Имя>`.
     //   * `functional_option_location` — ФО → объект хранения значения
     //     (константа/ресурс регистра). `from_object` = `FunctionalOption.<Имя>`,
     //     `from_path` — полный путь хранения из `<Location>`.

@@ -79,6 +79,9 @@ const KNOWN_META_TYPES: &[&str] = &[
     "Style",
     "Language",
     "SessionParameter",
+    // W10 (0.32): роли — чтобы право искалось по русскому UI-названию
+    // (синоним подтянет index_object_synonyms из Roles/<Имя>.xml).
+    "Role",
     "CommonForm",
     "CommonCommand",
     "CommandGroup",

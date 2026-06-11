@@ -799,8 +799,15 @@ impl Storage {
         ];
         let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(g) = path_glob {
-            conds.push("fi.path GLOB ?".to_string());
-            params_dyn.push(Box::new(normalize_glob(g)));
+            // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
+            let variants = expand_glob_braces(g);
+            conds.push(format!(
+                "({})",
+                vec!["fi.path GLOB ?"; variants.len()].join(" OR ")
+            ));
+            for v in variants {
+                params_dyn.push(Box::new(normalize_glob(&v)));
+            }
         }
         if let Some(l) = language {
             conds.push("fi.language = ?".to_string());
@@ -1716,8 +1723,15 @@ impl Storage {
         let mut conds: Vec<String> = Vec::new();
         let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(g) = pattern {
-            conds.push("path GLOB ?".to_string());
-            params_dyn.push(Box::new(normalize_glob(g)));
+            // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
+            let variants = expand_glob_braces(g);
+            conds.push(format!(
+                "({})",
+                vec!["path GLOB ?"; variants.len()].join(" OR ")
+            ));
+            for v in variants {
+                params_dyn.push(Box::new(normalize_glob(&v)));
+            }
         }
         if let Some(p) = path_prefix {
             conds.push("path LIKE ?".to_string());
@@ -1948,8 +1962,15 @@ impl Storage {
         let mut conds: Vec<String> = vec!["tc.content_blob IS NOT NULL".to_string()];
         let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(g) = path_glob {
-            conds.push("fi.path GLOB ?".to_string());
-            params_dyn.push(Box::new(normalize_glob(g)));
+            // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
+            let variants = expand_glob_braces(g);
+            conds.push(format!(
+                "({})",
+                vec!["fi.path GLOB ?"; variants.len()].join(" OR ")
+            ));
+            for v in variants {
+                params_dyn.push(Box::new(normalize_glob(&v)));
+            }
         }
         if let Some(l) = language {
             conds.push("fi.language = ?".to_string());
@@ -2048,12 +2069,19 @@ impl Storage {
         };
 
         // Доп. условия для общей секции (применяются и к functions, и к classes)
+        // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
+        let glob_variants: Vec<String> = path_glob
+            .map(|g| expand_glob_braces(g).iter().map(|v| normalize_glob(v)).collect())
+            .unwrap_or_default();
         let mut extra_conds: Vec<String> = Vec::new();
         if language.is_some() {
             extra_conds.push("fi.language = ?".to_string());
         }
-        if path_glob.is_some() {
-            extra_conds.push("fi.path GLOB ?".to_string());
+        if !glob_variants.is_empty() {
+            extra_conds.push(format!(
+                "({})",
+                vec!["fi.path GLOB ?"; glob_variants.len()].join(" OR ")
+            ));
         }
         let extra_clause_str = if extra_conds.is_empty() {
             String::new()
@@ -2064,14 +2092,13 @@ impl Storage {
         // Параметры дублируются на functions и classes секции UNION'а.
         // Собираем сразу финальный вектор без хитрых клонов Box<dyn ToSql>.
         let lang_norm: Option<String> = language.map(|s| s.to_string());
-        let glob_norm: Option<String> = path_glob.map(normalize_glob);
         let mut full_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         for _ in 0..2 {
             full_params.push(Box::new(body_param.clone()));
             if let Some(ref l) = lang_norm {
                 full_params.push(Box::new(l.clone()));
             }
-            if let Some(ref g) = glob_norm {
+            for g in &glob_variants {
                 full_params.push(Box::new(g.clone()));
             }
         }
@@ -2320,6 +2347,41 @@ pub(crate) fn normalize_glob(pattern: &str) -> String {
         s = s.replace("**", "*");
     }
     s
+}
+
+/// Раскрытие brace-альтернатив `{a,b}` в набор паттернов (W12-mini).
+///
+/// SQLite GLOB не поддерживает альтернацию — паттерн `**/*.{bsl,xml}` молча
+/// не находил ничего. Раскрываем в несколько паттернов, которые вызывающая
+/// сторона соединяет через `OR`: `*/*.bsl`, `*/*.xml`.
+///
+/// Несколько групп — декартово произведение (cap 64 вариантов). Вложенные
+/// группы `{a,{b,c}}` не поддерживаются (как и в globset) — паттерн
+/// возвращается как есть. Без braces — единственный исходный паттерн.
+pub(crate) fn expand_glob_braces(pattern: &str) -> Vec<String> {
+    const CAP: usize = 64;
+    if let Some(open) = pattern.find('{') {
+        if let Some(close_rel) = pattern[open..].find('}') {
+            let close = open + close_rel;
+            let inner = &pattern[open + 1..close];
+            if !inner.is_empty() && !inner.contains('{') {
+                let prefix = &pattern[..open];
+                let suffix = &pattern[close + 1..];
+                let mut out: Vec<String> = Vec::new();
+                for alt in inner.split(',') {
+                    let combined = format!("{}{}{}", prefix, alt, suffix);
+                    for expanded in expand_glob_braces(&combined) {
+                        out.push(expanded);
+                        if out.len() > CAP {
+                            return vec![pattern.to_string()];
+                        }
+                    }
+                }
+                return out;
+            }
+        }
+    }
+    vec![pattern.to_string()]
 }
 
 /// Слайс контента по диапазону строк (1-based, inclusive) + применение
@@ -3072,6 +3134,30 @@ mod tests {
         assert_eq!(normalize_glob("src/**/file.rs"), "src/*/file.rs");
         assert_eq!(normalize_glob("***/foo"), "*/foo");
         assert_eq!(normalize_glob("*.py"), "*.py");
+    }
+
+    #[test]
+    fn test_expand_glob_braces() {
+        // Одна группа.
+        assert_eq!(
+            expand_glob_braces("**/*.{bsl,xml}"),
+            vec!["**/*.bsl", "**/*.xml"]
+        );
+        // Без braces — паттерн как есть.
+        assert_eq!(expand_glob_braces("*.py"), vec!["*.py"]);
+        // Две группы — декартово произведение.
+        assert_eq!(
+            expand_glob_braces("{src,tests}/*.{rs,toml}"),
+            vec!["src/*.rs", "src/*.toml", "tests/*.rs", "tests/*.toml"]
+        );
+        // Одиночная альтернатива.
+        assert_eq!(expand_glob_braces("a/{b}/c"), vec!["a/b/c"]);
+        // Вложенность не поддерживается — литерально.
+        assert_eq!(expand_glob_braces("{a,{b,c}}"), vec!["{a,{b,c}}"]);
+        // Пустая группа — литерально.
+        assert_eq!(expand_glob_braces("a{}b"), vec!["a{}b"]);
+        // Незакрытая скобка — литерально.
+        assert_eq!(expand_glob_braces("a{b,c"), vec!["a{b,c"]);
     }
 
     #[test]

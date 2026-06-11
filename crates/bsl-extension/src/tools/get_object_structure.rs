@@ -28,8 +28,14 @@ impl IndexTool for GetObjectStructureTool {
     fn description(&self) -> &str {
         "Возвращает полную структуру объекта конфигурации 1С по полному имени \
          ('Catalog.Контрагенты', 'Document.РеализацияТоваровУслуг'): реквизиты с типами, \
-         табличные части, измерения/ресурсы регистров; 'enum_values' для перечислений; \
-         'predefined' для объектов с предопределёнными элементами. Базовые секции \
+         табличные части, измерения/ресурсы регистров; 'enum_values' для перечислений \
+         (+'enum_synonyms' — UI-подписи значений); 'predefined' для объектов с \
+         предопределёнными элементами; 'owners' — владельцы подчинённого справочника; \
+         'value_types' — тип значения характеристик ПВХ (доступные аналитики) / константы; \
+         'properties' — свойства шапки (периодичность ИР, режим записи, нумерация документа, \
+         иерархия); 'commands' — команды объекта (имя + UI-подпись: «Создать на основании», \
+         печатные формы и т.п.). У реквизитов есть 'synonym' (UI-подпись) и 'required' \
+         (обязательность заполнения), когда они заданы. Базовые секции \
          (attributes/dimensions/resources/tabular_sections) присутствуют всегда (пустые — []). \
          Это единственный источник структуры объекта — XML объектов НЕ индексируется как \
          текст, не ищите его через list_files/grep_text. For BSL/1C repositories only. \
@@ -55,7 +61,7 @@ impl IndexTool for GetObjectStructureTool {
                 },
                 "sections": {
                     "type": "array",
-                    "items": { "type": "string", "enum": ["attributes", "tabular_sections", "dimensions", "resources", "posting", "enum_values", "predefined"] },
+                    "items": { "type": "string", "enum": ["attributes", "tabular_sections", "dimensions", "resources", "posting", "enum_values", "predefined", "owners", "value_types", "properties", "enum_synonyms", "commands"] },
                     "description": "Узкая выборка секций структуры (как sections у get_object_profile): вернуть ТОЛЬКО указанные ключи. Без параметра — все секции. Рычаг экономии контекста: ['posting'] (поведение проведения, ~0.2 КБ вместо полного объекта), ['attributes'] (только реквизиты шапки без табличных частей), ['tabular_sections'], ['dimensions','resources'] (для регистров)."
                 }
             },
