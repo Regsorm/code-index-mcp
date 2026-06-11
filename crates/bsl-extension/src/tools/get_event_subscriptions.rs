@@ -18,10 +18,47 @@ use std::pin::Pin;
 use code_index_core::extension::{IndexTool, ToolContext};
 use serde_json::{json, Value};
 
-/// Потолок строк по умолчанию.
-const DEFAULT_LIMIT: i64 = 200;
+/// Потолок строк по умолчанию. Занижен с 200 до 50: безфильтровый вызов с 200
+/// подписками (каждая с sources) раздувал ответ до ~52K токенов; truncated+total
+/// в ответе подсказывают сузить фильтр или дослать больший limit.
+const DEFAULT_LIMIT: i64 = 50;
 /// Жёсткий максимум (защита от выгрузки всех подписок в контекст).
 const MAX_LIMIT: i64 = 2000;
+
+/// Допустимые параметры tool'а — неизвестные ключи отклоняются с подсказкой
+/// (агент передавал object=… и молча получал ВСЕ подписки вместо фильтра).
+const KNOWN_PARAMS: &[&str] = &["repo", "handler_module", "event", "source", "limit"];
+
+/// Совпадает ли подписка с фильтром source по её источникам
+/// (sources — JSON-массив строк вида "cfg:DocumentObject.ЗаказКлиента").
+/// Принимает 'Document.ЗаказКлиента', 'DocumentObject.ЗаказКлиента' или
+/// короткое имя 'ЗаказКлиента'; регистр не учитывается (Unicode).
+fn source_matches(sources: &Value, filter: &str) -> bool {
+    let filter = filter.trim().trim_start_matches("cfg:");
+    let (f_type, f_name) = match filter.split_once('.') {
+        Some((t, n)) => (Some(t.to_lowercase()), n.to_lowercase()),
+        None => (None, filter.to_lowercase()),
+    };
+    let Some(arr) = sources.as_array() else {
+        return false;
+    };
+    arr.iter().filter_map(|v| v.as_str()).any(|entry| {
+        let entry = entry.trim_start_matches("cfg:");
+        let (e_type, e_name) = match entry.split_once('.') {
+            Some((t, n)) => (t.to_lowercase(), n.to_lowercase()),
+            None => (String::new(), entry.to_lowercase()),
+        };
+        if e_name != f_name {
+            return false;
+        }
+        match &f_type {
+            None => true,
+            // 'Document' матчит 'DocumentObject' (в sources тип хранится
+            // с суффиксом Object), точное совпадение — тоже.
+            Some(ft) => e_type == *ft || e_type == format!("{}object", ft),
+        }
+    })
+}
 
 pub struct GetEventSubscriptionsTool;
 
@@ -32,8 +69,9 @@ impl IndexTool for GetEventSubscriptionsTool {
 
     fn description(&self) -> &str {
         "Возвращает список подписок на события 1С: name, event, handler_module, \
-         handler_proc, sources. Опциональные фильтры: handler_module, event. \
-         Ответ ограничен limit (default 200, max 2000); при превышении рядом — \
+         handler_proc, sources. Опциональные фильтры: handler_module, event, \
+         source (объект-источник: 'Document.ЗаказКлиента' или короткое имя). \
+         Ответ ограничен limit (default 50, max 2000); при превышении рядом — \
          total и truncated=true (сузьте фильтр или дошлите больший limit). \
          For BSL/1C repositories only."
     }
@@ -54,10 +92,14 @@ impl IndexTool for GetEventSubscriptionsTool {
                     "type": "string",
                     "description": "Опционально: фильтр по событию. Принимает русское имя ('ПриЗаписи', 'ОбработкаПроведения') либо английское ('OnWrite', 'Posting') — нормализуется автоматически"
                 },
+                "source": {
+                    "type": "string",
+                    "description": "Опционально: фильтр по объекту-источнику подписки. Принимает 'Document.ЗаказКлиента', 'DocumentObject.ЗаказКлиента' или короткое имя 'ЗаказКлиента'"
+                },
                 "limit": {
                     "type": "integer",
-                    "description": "Потолок строк (default 200, max 2000). При превышении — первые limit + total + truncated=true.",
-                    "default": 200,
+                    "description": "Потолок строк (default 50, max 2000). При превышении — первые limit + total + truncated=true.",
+                    "default": 50,
                     "minimum": 1
                 }
             },
@@ -75,6 +117,23 @@ impl IndexTool for GetEventSubscriptionsTool {
         ctx: ToolContext<'a>,
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
+            // Неизвестные параметры → ошибка с перечнем допустимых (а не
+            // молчаливое игнорирование с выгрузкой всех подписок в контекст).
+            if let Some(obj) = args.as_object() {
+                let unknown: Vec<&str> = obj
+                    .keys()
+                    .map(|k| k.as_str())
+                    .filter(|k| !KNOWN_PARAMS.contains(k))
+                    .collect();
+                if !unknown.is_empty() {
+                    return crate::tools::wrap_error(json!({
+                        "error": format!("неизвестные параметры: {}", unknown.join(", ")),
+                        "hint": "Допустимые фильтры: handler_module (модуль-обработчик), \
+                                 event (событие, рус./англ.), source (объект-источник, \
+                                 например 'Document.ЗаказКлиента' или короткое имя), limit.",
+                    }));
+                }
+            }
             let handler_module = args
                 .get("handler_module")
                 .and_then(|v| v.as_str())
@@ -90,6 +149,13 @@ impl IndexTool for GetEventSubscriptionsTool {
                 .get("event")
                 .and_then(|v| v.as_str())
                 .map(|s| crate::xml::event_subscriptions::event_to_russian(s).to_string());
+            // Фильтр по объекту-источнику: применяется в Rust после выборки
+            // (sources_json — JSON-массив, SQL LIKE по нему ловит ложные
+            // подстроки; подписок в репо сотни, полный проход дёшев).
+            let source = args
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let limit: i64 = args
                 .get("limit")
                 .and_then(|v| v.as_i64())
@@ -134,7 +200,9 @@ impl IndexTool for GetEventSubscriptionsTool {
             };
 
             // Берём limit+1, чтобы отличить «ровно limit» от «есть ещё».
-            let lim_plus = limit + 1;
+            // С фильтром source SQL-LIMIT снимается (LIMIT -1 = без предела в
+            // SQLite): фильтрация идёт после выборки, обрезать раньше нельзя.
+            let lim_plus = if source.is_some() { -1 } else { limit + 1 };
             let data_sql = format!(
                 "SELECT name, event, handler_module, handler_proc, sources_json \
                  FROM event_subscriptions WHERE {} ORDER BY name LIMIT ?",
@@ -171,6 +239,11 @@ impl IndexTool for GetEventSubscriptionsTool {
                                     .as_deref()
                                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
                                     .unwrap_or(Value::Array(Vec::new()));
+                                if let Some(ref f) = source {
+                                    if !source_matches(&sources_v, f) {
+                                        continue;
+                                    }
+                                }
                                 out.push(json!({
                                     "name": name,
                                     "event": event,
@@ -194,12 +267,16 @@ impl IndexTool for GetEventSubscriptionsTool {
                 }
             }
 
-            let truncated = out.len() as i64 > limit;
+            let full_len = out.len() as i64;
+            let truncated = full_len > limit;
             if truncated {
                 out.truncate(limit as usize);
             }
-            // total: при обрезке — отдельный COUNT по тому же WHERE; иначе len.
-            let total = if truncated {
+            // total: с source выборка была полной — total известен из full_len;
+            // без source при обрезке — отдельный COUNT по тому же WHERE.
+            let total = if source.is_some() {
+                full_len
+            } else if truncated {
                 let count_sql = format!(
                     "SELECT COUNT(*) FROM event_subscriptions WHERE {}",
                     where_sql
@@ -222,5 +299,34 @@ impl IndexTool for GetEventSubscriptionsTool {
                 Vec::new(),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_matches;
+    use serde_json::json;
+
+    #[test]
+    fn source_filter_matches_all_accepted_forms() {
+        let sources = json!(["cfg:DocumentObject.ЗаказКлиента", "cfg:CatalogObject.Контрагенты"]);
+        // Singular-тип, тип с суффиксом Object, короткое имя, cfg-префикс, регистр.
+        assert!(source_matches(&sources, "Document.ЗаказКлиента"));
+        assert!(source_matches(&sources, "DocumentObject.ЗаказКлиента"));
+        assert!(source_matches(&sources, "ЗаказКлиента"));
+        assert!(source_matches(&sources, "cfg:Document.ЗаказКлиента"));
+        assert!(source_matches(&sources, "documentobject.заказклиента"));
+        assert!(source_matches(&sources, "Catalog.Контрагенты"));
+    }
+
+    #[test]
+    fn source_filter_rejects_mismatches() {
+        let sources = json!(["cfg:DocumentObject.ЗаказКлиента"]);
+        // Чужое имя, чужой тип при совпавшем имени, не-массив.
+        assert!(!source_matches(&sources, "Document.ЗаказПоставщику"));
+        assert!(!source_matches(&sources, "Catalog.ЗаказКлиента"));
+        assert!(!source_matches(&json!(null), "ЗаказКлиента"));
+        // Имя — подстрока, а не точное совпадение → не матчится.
+        assert!(!source_matches(&sources, "Заказ"));
     }
 }
