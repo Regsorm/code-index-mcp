@@ -128,7 +128,7 @@ impl IndexTool for GetObjectStructureTool {
                 resolve_one(storage.conn(), ctx.repo, fqn, sections.as_deref())
             } else {
                 json!({
-                    "error": "missing parameter: передайте 'full_name' (строка) или 'full_names' (массив строк)"
+                    "error": "missing parameter: передайте 'full_name' — полное имя вида '<MetaType>.<Name>' (строка)"
                 })
             };
             crate::tools::wrap_with_meta(result_value, Vec::new())

@@ -865,7 +865,7 @@ impl CodeIndexServer {
         match p.name {
             Some(nm) => tools::get_function(entry, nm, p.path_glob).await,
             None => serde_json::json!({
-                "error": "missing parameter: передайте 'name' (строка) или 'names' (массив строк)"
+                "error": "missing parameter: передайте 'name' — точное имя символа (строка)"
             })
             .to_string(),
         }
@@ -898,7 +898,7 @@ impl CodeIndexServer {
         match p.name {
             Some(nm) => tools::get_class(entry, nm, p.path_glob).await,
             None => serde_json::json!({
-                "error": "missing parameter: передайте 'name' (строка) или 'names' (массив строк)"
+                "error": "missing parameter: передайте 'name' — точное имя символа (строка)"
             })
             .to_string(),
         }
