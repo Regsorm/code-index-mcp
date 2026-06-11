@@ -34,8 +34,11 @@ fn register_regexp(conn: &Connection) -> Result<()> {
             let re = match cached.as_ref() {
                 Some((p, re)) if *p == pattern => re,
                 _ => {
+                    // UserFunctionError, не InvalidParameterName: последний печатался
+                    // как «Invalid parameter name: regex parse error…» и сбивал
+                    // агента (выглядело как неверное ИМЯ параметра, а не regex).
                     let new_re = regex::Regex::new(&pattern)
-                        .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
                     *cached = Some((pattern, new_re));
                     &cached.as_ref().unwrap().1
                 }
