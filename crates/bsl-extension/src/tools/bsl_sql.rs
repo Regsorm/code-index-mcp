@@ -161,9 +161,15 @@ impl IndexTool for BslSqlTool {
             let mut stmt = match conn.prepare(sql) {
                 Ok(s) => s,
                 Err(e) => {
-                    return crate::tools::wrap_error(json!({
-                        "error": format!("SQL prepare error: {}", e)
-                    }));
+                    // Схема жёсткая и известна — обогащаем ошибку prepare
+                    // фактическими колонками таблиц запроса + did_you_mean,
+                    // чтобы агент исправился тем же ходом (находка бенча
+                    // 2026-06-11: голое «no such column» стоит хода разведки).
+                    return crate::tools::wrap_error(enrich_prepare_error(
+                        conn,
+                        sql,
+                        &e.to_string(),
+                    ));
                 }
             };
 
@@ -289,6 +295,123 @@ fn parse_params(v: Option<&Value>) -> Result<Vec<SqlValue>, String> {
     Ok(out)
 }
 
+/// Расстояние Левенштейна (классическое DP) — для did_you_mean по именам
+/// колонок/таблиц. Имена короткие (< 40 символов), квадратичная сложность
+/// не существенна.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Имена таблиц, упомянутых в запросе после FROM/JOIN (без regex: токенизация
+/// по пробелам/скобкам, идентификатор — ASCII-буквы/цифры/подчёркивание).
+fn tables_in_query(sql: &str) -> Vec<String> {
+    let toks: Vec<String> = sql
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';'))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for w in toks.windows(2) {
+        let kw = w[0].to_ascii_lowercase();
+        if kw == "from" || kw == "join" {
+            let ident: String =
+                w[1].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if !ident.is_empty() && !out.contains(&ident) {
+                out.push(ident);
+            }
+        }
+    }
+    out
+}
+
+/// Обогатить ошибку prepare схемной подсказкой. Для «no such column/table»:
+/// фактические колонки таблиц запроса (PRAGMA table_info), `did_you_mean`
+/// по Левенштейну и список таблиц, где такая колонка реально существует.
+/// Прочие ошибки prepare возвращаются как есть.
+fn enrich_prepare_error(conn: &rusqlite::Connection, sql: &str, err: &str) -> Value {
+    let base = format!("SQL prepare error: {}", err);
+
+    // Недостающий идентификатор из текста ошибки SQLite; alias-префикс ('mm.')
+    // отрезаем — модель назвала колонку, alias для подсказки не важен.
+    let missing = ["no such column: ", "no such table: "]
+        .iter()
+        .find_map(|m| err.split(m).nth(1))
+        .and_then(|s| s.split_whitespace().next())
+        .map(|s| s.rsplit('.').next().unwrap_or(s).to_string());
+    let Some(missing) = missing else {
+        return json!({ "error": base });
+    };
+
+    let columns_of = |t: &str| -> Vec<String> {
+        conn.prepare(&format!("PRAGMA table_info({})", t))
+            .ok()
+            .and_then(|mut st| {
+                st.query_map([], |r| r.get::<_, String>(1))
+                    .ok()
+                    .map(|rows| rows.flatten().collect())
+            })
+            .unwrap_or_default()
+    };
+
+    let all_tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'fts_%'")
+        .ok()
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+
+    if err.contains("no such table") {
+        // Подсказка по таблицам: ближайшие имена из всей БД.
+        let mut cand: Vec<(usize, &String)> =
+            all_tables.iter().map(|t| (levenshtein(&missing, t), t)).collect();
+        cand.sort();
+        let dym: Vec<&String> = cand.iter().take(3).map(|(_, t)| *t).collect();
+        return json!({ "error": base, "did_you_mean": dym, "tables": all_tables });
+    }
+
+    // no such column: колонки таблиц запроса + где колонка реально живёт.
+    let mut schema = serde_json::Map::new();
+    let mut candidates: Vec<String> = Vec::new();
+    for t in tables_in_query(sql) {
+        let cols = columns_of(&t);
+        if !cols.is_empty() {
+            candidates.extend(cols.iter().cloned());
+            schema.insert(t, json!(cols));
+        }
+    }
+    let found_in: Vec<&String> = all_tables
+        .iter()
+        .filter(|t| columns_of(t).iter().any(|c| c == &missing))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    let mut cand: Vec<(usize, &String)> =
+        candidates.iter().map(|c| (levenshtein(&missing, c), c)).collect();
+    cand.sort();
+    let dym: Vec<&String> = cand.iter().filter(|(d, _)| *d <= 6).take(3).map(|(_, c)| *c).collect();
+    json!({
+        "error": base,
+        "did_you_mean": dym,
+        "column_exists_in_tables": found_in,
+        "query_tables_columns": schema
+    })
+}
+
 /// Выполнить prepared-запрос и собрать до `limit` строк в COLUMNAR-формате:
 /// каждая строка — массив значений `[v0, v1, …]` в порядке `columns` (имена
 /// колонок НЕ дублируются в каждой строке — экономия контекста на широких
@@ -391,6 +514,36 @@ mod tests {
         let sql = "WITH c AS (SELECT id FROM metadata_objects) DELETE FROM metadata_objects WHERE id IN (SELECT id FROM c)";
         let stmt = conn.prepare(sql).unwrap();
         assert!(!stmt.readonly(), "WITH ... DELETE не должен считаться read-only");
+    }
+
+    #[test]
+    fn enrich_error_suggests_column_and_table() {
+        let conn = mem_db();
+        // Перепутанная колонка: meta_type не из metadata_modules (там module_type).
+        let sql = "SELECT mm.meta_type FROM metadata_modules mm";
+        let err = conn.prepare(sql).unwrap_err().to_string();
+        let v = enrich_prepare_error(&conn, sql, &err);
+        let dym: Vec<&str> =
+            v["did_you_mean"].as_array().unwrap().iter().filter_map(|x| x.as_str()).collect();
+        assert!(dym.contains(&"module_type"), "did_you_mean: {dym:?}");
+        // Колонка meta_type реально живёт в metadata_objects.
+        let hosts: Vec<&str> = v["column_exists_in_tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert!(hosts.contains(&"metadata_objects"), "hosts: {hosts:?}");
+        // Колонки таблицы запроса приложены.
+        assert!(v["query_tables_columns"]["metadata_modules"].is_array());
+
+        // Несуществующая таблица → ближайшие имена таблиц.
+        let sql2 = "SELECT * FROM metadata_object";
+        let err2 = conn.prepare(sql2).unwrap_err().to_string();
+        let v2 = enrich_prepare_error(&conn, sql2, &err2);
+        let dym2: Vec<&str> =
+            v2["did_you_mean"].as_array().unwrap().iter().filter_map(|x| x.as_str()).collect();
+        assert!(dym2.contains(&"metadata_objects"), "did_you_mean: {dym2:?}");
     }
 
     #[test]
