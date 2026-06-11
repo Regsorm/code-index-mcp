@@ -31,11 +31,20 @@ impl IndexTool for SearchTermsTool {
     }
 
     fn description(&self) -> &str {
-        "Ищет процедуры 1С по бизнес-терминам, ранее извлечённым LLM-обогащением \
-         (см. `bsl-indexer enrich`). Использует FTS5 на колонке terms, поддерживает \
-         FTS-синтаксис: AND, OR, NOT, \"точная фраза\", префикс*. Возвращает массив \
-         {proc_key, terms, signature, score} с наилучшим совпадением сверху. Если в \
-         репо ещё ни одна процедура не обогащена — возвращает пустой массив. \
+        "ПЕРВЫЙ выбор для поиска «где в конфигурации реализован функционал X»: ищет \
+         процедуры 1С по словам, а не по точному написанию идентификатора. Термы \
+         заполняются механически при индексации: слова имени процедуры \
+         (CamelCase-сплит: УточнитьДанныеПоШтрихкоду → уточнить данные по штрихкоду), \
+         имя и СИНОНИМ объекта-владельца (русское представление ↔ английский \
+         идентификатор), комментарий над процедурой. КАК СПРАШИВАТЬ: 1-3 ключевых \
+         слова или корень слова — 'штрихкод', 'резерв склад', 'расчет цен'. Слова \
+         объединяются по ИЛИ, лучшие совпадения (больше слов совпало) — сверху; НЕ \
+         нужно угадывать точную фразу. Словоформы и подстроки от 3 символов работают \
+         (триграммы: 'штрихкод' найдёт 'ПоШтрихкоду'), регистр и ё/е не важны. Явный \
+         FTS-синтаксис (AND/OR/NOT/\"фраза\") тоже поддержан. Возвращает {proc_key, \
+         terms, score}; proc_key = '<путь>::<имя процедуры>' — тело дальше брать \
+         через get_function. Точное написание символа известно → \
+         get_function/find_symbol; regex по коду → grep_body/grep_code. \
          For BSL/1C repositories only."
     }
 
@@ -81,6 +90,34 @@ impl IndexTool for SearchTermsTool {
                     }));
                 }
             };
+            // Серверное переписывание запроса (поймано бенчем 2026-06-10):
+            // многословный запрос без явных операторов в FTS5 — неявный AND,
+            // на коротких термах почти всегда 0 совпадений. Переписываем в OR
+            // по словам (BM25 поднимет строки с бОльшим числом совпадений) +
+            // свёртка ё→е (термы нормализованы так же, см. terms::fold_text).
+            // Явный FTS-синтаксис (AND/OR/NOT/кавычки/скобки/префикс*)
+            // пропускаем как есть, только с ё→е.
+            let has_ops = query.contains(" AND ")
+                || query.contains(" OR ")
+                || query.contains(" NOT ")
+                || query.contains('"')
+                || query.contains('(')
+                || query.contains('*');
+            let fts_query = if has_ops {
+                query.replace('ё', "е").replace('Ё', "Е")
+            } else {
+                // Слова короче 3 символов триграммами не ищутся — отбрасываем.
+                let words: Vec<String> = crate::terms::fold_text(&query)
+                    .split_whitespace()
+                    .filter(|w| w.chars().count() >= 3)
+                    .map(|w| format!("\"{}\"", w))
+                    .collect();
+                if words.is_empty() {
+                    crate::terms::fold_text(&query)
+                } else {
+                    words.join(" OR ")
+                }
+            };
             let limit: i64 = args
                 .get("limit")
                 .and_then(|v| v.as_i64())
@@ -122,7 +159,9 @@ impl IndexTool for SearchTermsTool {
                     }))
                 }
             };
-            let rows_iter = stmt.query_map(params![ctx.repo, &query, limit], |r| {
+            // Репо-колонка в per-repo БД всегда 'default' (см. index_extras::REPO_DEFAULT);
+            // ctx.repo — алиас маршрутизации, в данных его нет (как во всех BSL-tools).
+            let rows_iter = stmt.query_map(params!["default", &fts_query, limit], |r| {
                 Ok(json!({
                     "proc_key": r.get::<_, String>(0)?,
                     "terms": r.get::<_, Option<String>>(1)?,
@@ -148,7 +187,9 @@ impl IndexTool for SearchTermsTool {
             // E1: пустой результат + пустая таблица обогащения → подсказка,
             // что enrich не запускался (иначе пусто читается как «нет совпадений»,
             // и агент зря тратит вызов вместо grep_body/search_function).
-            let mut result = json!({ "query": query, "results": rows });
+            // fts_query показываем для прозрачности: агент видит, как его
+            // запрос был переписан (OR-семантика), и может скорректироваться.
+            let mut result = json!({ "query": query, "fts_query": fts_query, "results": rows });
             if result["results"]
                 .as_array()
                 .map(|a| a.is_empty())
@@ -157,15 +198,23 @@ impl IndexTool for SearchTermsTool {
                 let enriched: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM procedure_enrichment WHERE repo = ?1",
-                        params![ctx.repo],
+                        params!["default"],
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
                 if enriched == 0 {
                     result["hint"] = json!(
-                        "Таблица обогащения пуста — `bsl-indexer enrich` не запускался \
-                         для этого репо. search_terms ищет только по обогащённым termам; \
-                         для поиска по коду используйте grep_body/grep_code/search_function/get_function."
+                        "Таблица термов пуста — репо ещё не переиндексировано версией с \
+                         механическим обогащением (0.30.0+). Нужна полная переиндексация \
+                         (`bsl-indexer index <path> --force`); до неё используйте \
+                         grep_body/grep_code/search_function/get_function."
+                    );
+                } else {
+                    result["hint"] = json!(
+                        "0 совпадений. Триграммный поиск: запрос должен быть ≥3 символов; \
+                         попробуйте другую словоформу/корень слова ('провед' вместо \
+                         'проведение'), синоним понятия или OR-комбинацию. Точное имя \
+                         символа → find_symbol/get_function."
                     );
                 }
             }

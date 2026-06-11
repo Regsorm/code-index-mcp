@@ -424,6 +424,41 @@ async fn seed_enrichment(storage: &Arc<StoragePool>) {
 }
 
 #[tokio::test]
+async fn search_terms_multiword_rewritten_to_or() {
+    // Многословный запрос без операторов — серверный OR-rewrite (фикс по
+    // бенчу 2026-06-10: неявный AND давал 0 на коротких термах). Слова
+    // «склад» и «журнал» лежат в РАЗНЫХ записях — AND дал бы 0, OR находит обе.
+    let (_tmp, storage) = fresh_storage();
+    seed_enrichment(&storage).await;
+
+    let res = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "склад журнал недостижимое"}),
+    )
+    .await;
+    assert_eq!(res["fts_query"].as_str(), Some("\"склад\" OR \"журнал\" OR \"недостижимое\""));
+    let keys: Vec<&str> = res["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["proc_key"].as_str())
+        .collect();
+    assert_eq!(keys.len(), 2, "OR должен найти обе записи: {keys:?}");
+    assert!(keys.contains(&"Продажи.СоздатьЗаказ"));
+    assert!(keys.contains(&"Логирование.Записать"));
+
+    // Ё в запросе сворачивается: «учёт» ищется как «учет».
+    let res_yo = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "учёт"}),
+    )
+    .await;
+    assert_eq!(res_yo["fts_query"].as_str(), Some("\"учет\""));
+}
+
+#[tokio::test]
 async fn search_terms_finds_by_simple_word() {
     let (_tmp, storage) = fresh_storage();
     seed_enrichment(&storage).await;
