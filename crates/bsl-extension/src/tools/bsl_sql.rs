@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use code_index_core::extension::{IndexTool, ToolContext};
 use rusqlite::types::{Value as SqlValue, ValueRef};
-use rusqlite::{params_from_iter, ErrorCode};
+use rusqlite::{params, params_from_iter, ErrorCode};
 use serde_json::{json, Value};
 
 /// Таймаут одного запроса. По истечении вызывается sqlite3_interrupt —
@@ -196,6 +196,16 @@ impl IndexTool for BslSqlTool {
                 handle.interrupt();
             });
 
+            // Текстовые параметры пригодятся термовому fallback'у при пустой
+            // выборке (bound уходит в collect_rows по значению).
+            let text_params: Vec<String> = bound
+                .iter()
+                .filter_map(|v| match v {
+                    SqlValue::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+
             let result = collect_rows(&mut stmt, bound, limit);
             timer.abort();
 
@@ -231,7 +241,20 @@ impl IndexTool for BslSqlTool {
                     // bsl_sql LIKE по имени, а обработчик живёт в общем модуле БСП под
                     // другим именем — точный SQL промахивается; находка бенча 11.06).
                     if row_count == 0 && payload.get("hint").is_none() {
-                        payload["hint"] = json!(empty_result_hint(sql));
+                        // Эксперимент 12.06: модель не идёт в search_terms даже по
+                        // hint'у (5 живых прогонов 11.06) — поэтому при пустой
+                        // выборке по таблицам процедур термовый поиск выполняется
+                        // автоматически здесь же, выдача — в terms_fallback.
+                        // Без hint'а: имя поля и структура самодокументируются.
+                        let fb = if searched_proc_tables(sql) {
+                            terms_fallback_for_sql(conn, sql, &text_params)
+                        } else {
+                            None
+                        };
+                        match fb {
+                            Some(fb) => payload["terms_fallback"] = fb,
+                            None => payload["hint"] = json!(empty_result_hint(sql)),
+                        }
                     }
                     crate::tools::wrap_with_meta(payload, Vec::new())
                 }
@@ -353,11 +376,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// когда обработчик в общем модуле БСП назван иначе). Иначе — общий мягкий hint
 /// (частая причина пустоты — регистрозависимость кириллицы в LIKE/=).
 fn empty_result_hint(sql: &str) -> &'static str {
-    let lower = sql.to_lowercase();
-    let searched_proc = lower.contains("functions")
-        || lower.contains("procedure_enrichment")
-        || lower.contains("proc_call_graph");
-    if searched_proc {
+    if searched_proc_tables(sql) {
         "0 строк — но это, скорее всего, НЕ значит «такого нет». LIKE по name ищет ТОЧНОЕ вхождение \
          подстроки с учётом регистра (SQLite lower() кириллицу НЕ сворачивает) — он промахивается, \
          если имя в коде в другой словоформе/регистре или обработчик вынесен в общий модуль БСП под \
@@ -372,6 +391,98 @@ fn empty_result_hint(sql: &str) -> &'static str {
          search_terms(query=…) идёт по триграммному индексу (словоформы, регистр/ё неважны, подстроки \
          ≥3) и находит то, что точный LIKE пропускает; термы = имя процедуры + синоним владельца + комментарий."
     }
+}
+
+/// Запрос обращался к таблицам процедур (functions/proc_call_graph/
+/// procedure_enrichment) — значит, искали процедуру/функционал.
+fn searched_proc_tables(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    lower.contains("functions")
+        || lower.contains("procedure_enrichment")
+        || lower.contains("proc_call_graph")
+}
+
+/// Эксперимент 12.06: при пустой выборке по таблицам процедур термовый поиск
+/// (тот же SQL, что у tool'а search_terms) выполняется автоматически в этом же
+/// вызове — модель получает выдачу термов сразу, без второго хода (за 5 живых
+/// прогонов 11.06 модели не вызвали search_terms ни разу даже по прямому hint'у).
+/// Слова берём из строковых литералов SQL ('%ПоШтрихкоду%' → «по штрихкоду») и
+/// текстовых params; CamelCase-сплит и нормализация — те же, что у термов
+/// (terms::split_identifier: нижний регистр, ё→е, wildcard'ы % и _ отпадают как
+/// не-буквенные). None — слов ≥3 символов не нашлось или термы пусты; тогда
+/// поведение прежнее (только hint).
+fn terms_fallback_for_sql(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    text_params: &[String],
+) -> Option<Value> {
+    let mut words: Vec<String> = Vec::new();
+    for lit in sql_string_literals(sql) {
+        words.extend(crate::terms::split_identifier(&lit));
+    }
+    for p in text_params {
+        words.extend(crate::terms::split_identifier(p));
+    }
+    // Триграммы короче 3 символов не ищутся; дубли схлопываем.
+    words.retain(|w| w.chars().count() >= 3);
+    words.sort();
+    words.dedup();
+    if words.is_empty() {
+        return None;
+    }
+    let fts_query =
+        words.iter().map(|w| format!("\"{}\"", w)).collect::<Vec<_>>().join(" OR ");
+    let mut stmt = conn
+        .prepare(
+            "SELECT pe.proc_key, pe.signature, fts.rank
+             FROM fts_procedure_enrichment fts
+             JOIN procedure_enrichment pe ON pe.id = fts.rowid
+             WHERE pe.repo = 'default' AND fts.terms MATCH ?1
+             ORDER BY fts.rank
+             LIMIT 10",
+        )
+        .ok()?; // таблиц обогащения нет / старый индекс → молча без fallback
+    let rows: Vec<Value> = stmt
+        .query_map(params![&fts_query], |r| {
+            Ok(json!({
+                "proc_key": r.get::<_, String>(0)?,
+                "signature": r.get::<_, Option<String>>(1)?,
+                "score": r.get::<_, f64>(2)?,
+            }))
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    if rows.is_empty() {
+        None
+    } else {
+        Some(json!({ "fts_query": fts_query, "results": rows }))
+    }
+}
+
+/// Строковые литералы SQL: содержимое '…' с учётом экранированной кавычки ''.
+fn sql_string_literals(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            let mut lit = String::new();
+            while let Some(c2) = chars.next() {
+                if c2 == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        lit.push('\'');
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                } else {
+                    lit.push(c2);
+                }
+            }
+            out.push(lit);
+        }
+    }
+    out
 }
 
 fn sql_limit_value(sql: &str) -> Option<u64> {
@@ -708,5 +819,74 @@ mod tests {
     fn valueref_blob_returns_length_marker() {
         let v = valueref_to_json(ValueRef::Blob(&[1, 2, 3, 4]));
         assert_eq!(v, json!({ "_blob_bytes": 4 }));
+    }
+
+    #[test]
+    fn sql_string_literals_extracts_and_unescapes() {
+        // Обычные литералы, включая wildcards LIKE.
+        assert_eq!(
+            sql_string_literals("SELECT * FROM functions WHERE name LIKE '%ПоШтрихкоду%'"),
+            vec!["%ПоШтрихкоду%"]
+        );
+        // Несколько литералов + экранированная кавычка ''.
+        assert_eq!(
+            sql_string_literals("WHERE a = 'один' AND b = 'д''ва'"),
+            vec!["один", "д'ва"]
+        );
+        // Без литералов — пусто.
+        assert!(sql_string_literals("SELECT 1 FROM t WHERE id = ?1").is_empty());
+    }
+
+    #[test]
+    fn searched_proc_tables_detects_procedure_queries() {
+        assert!(searched_proc_tables("SELECT * FROM functions WHERE name LIKE '%X%'"));
+        assert!(searched_proc_tables("select count(*) from PROC_CALL_GRAPH"));
+        assert!(searched_proc_tables("SELECT terms FROM procedure_enrichment"));
+        assert!(!searched_proc_tables("SELECT * FROM metadata_objects"));
+        assert!(!searched_proc_tables("SELECT * FROM data_links"));
+    }
+
+    #[test]
+    fn terms_fallback_finds_procs_by_sql_literals() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+             VALUES ('default', 'ОбщегоНазначения.bsl::НайтиПоШтрихкоду', \
+                     'найти по штрихкоду, поиск номенклатуры', 'mech:v1', 0)",
+            [],
+        )
+        .unwrap();
+        // Точный LIKE промахнулся (другая словоформа) → fallback находит по термам.
+        let fb = terms_fallback_for_sql(
+            &conn,
+            "SELECT name FROM functions WHERE name LIKE '%ПоискПоШтрихкодам%'",
+            &[],
+        )
+        .expect("fallback должен вернуть выдачу");
+        let results = fb["results"].as_array().unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0]["proc_key"].as_str().unwrap().contains("НайтиПоШтрихкоду"));
+        // Текстовые params тоже участвуют в термах.
+        let fb2 = terms_fallback_for_sql(
+            &conn,
+            "SELECT name FROM functions WHERE name LIKE ?1",
+            &["%штрихкод%".to_string()],
+        );
+        assert!(fb2.is_some());
+    }
+
+    #[test]
+    fn terms_fallback_none_when_no_words_or_no_match() {
+        let conn = mem_db();
+        // Термов в БД нет вообще → None (поведение прежнее, только hint).
+        assert!(terms_fallback_for_sql(
+            &conn,
+            "SELECT name FROM functions WHERE name LIKE '%Штрихкод%'",
+            &[],
+        )
+        .is_none());
+        // Слов ≥3 символов не нашлось → None ещё до запроса.
+        assert!(terms_fallback_for_sql(&conn, "SELECT name FROM functions WHERE id = 5", &[])
+            .is_none());
     }
 }

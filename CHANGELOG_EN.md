@@ -5,6 +5,20 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.34.0] — 2026-06-12
+
+**Automatic terms fallback in `bsl_sql`: an empty result over procedure tables now returns `search_terms` output right away, not just a hint.**
+
+### Added
+
+- **`bsl_sql`: `terms_fallback` field on empty results over procedure tables** (`functions` / `proc_call_graph` / `procedure_enrichment`). Models ignore the v0.33 hints (5 live runs — 0 `search_terms` calls), so on `row_count == 0` the terms search now runs automatically inside the same call: words are taken from SQL string literals (`'%ПоШтрихкоду%'` → "по штрихкоду") and text `params`, normalized the same way as terms (`split_identifier`: CamelCase split, lowercase, ё→е, words ≥3 chars), then the same trigram FTS query as `search_terms` (OR over words, LIMIT 10). Response: `terms_fallback = {fts_query, results: [{proc_key, signature, score}]}`. The model uses data "in hand" as a regular result — live run test03: an empty `IN ('ХранилищеОбщихНастроек', …)` → fallback returned `ОбщегоНазначенияВызовСервера::ХранилищеСистемныхНастроекСохранить/Загрузить/Удалить`, and the model put them into the report as fact (the hint in the same run was ignored again).
+- **Trigger boundary:** only BSL repos with populated enrichment tables (no terms / old index → silently no fallback, previous behavior); queries not touching procedure tables (e.g. `metadata_objects`) — previous hint. When the fallback fires, no hint is added — the structure is self-documenting; when it doesn't, the v0.33 hints stay as they were. On exam-style questions (196, rerun 2026-06-12) the fallback is neutral — it never fired; its niche is searching code by meaning.
+- **Known limitation:** the `signature` field in `results` is the enrichment mechanism fingerprint (`mech:v1`), not the procedure signature.
+
+### Tests
+
+- Unit tests: `sql_string_literals` (escaped `''`, wildcards), `searched_proc_tables`, `terms_fallback_for_sql` (hits via literals and via text params; `None` without terms / without words ≥3 chars).
+
 ## [0.33.0] — 2026-06-11
 
 **Empty procedure search on a BSL repo now hints at search_terms — for search_function, grep_body, grep_code, find_symbol.**
