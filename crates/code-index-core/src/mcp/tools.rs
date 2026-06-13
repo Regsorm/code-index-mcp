@@ -1554,7 +1554,7 @@ pub async fn health(server: &CodeIndexServer) -> String {
         Some(_) => serde_json::json!({ "status": "online" }),
         None => serde_json::json!({
             "status": "offline",
-            "message": "Демон не запущен (runtime-info отсутствует)",
+            "message": client::daemon_unavailable_hint(),
         }),
     };
 

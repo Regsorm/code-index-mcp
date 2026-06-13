@@ -13,14 +13,48 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Базовый URL запущенного демона. `Err` если runtime-info файл не найден.
 pub fn base_url() -> Result<String> {
-    let info = runner::read_runtime_info()
-        .ok_or_else(|| anyhow!("Демон не запущен (runtime-info файл отсутствует)"))?;
+    let info =
+        runner::read_runtime_info().ok_or_else(|| anyhow!("{}", daemon_unavailable_hint()))?;
     Ok(info.base_url())
 }
 
 /// Прочитать runtime-info без ошибки (Some если демон запущен).
 pub fn runtime_info() -> Option<RuntimeInfo> {
     runner::read_runtime_info()
+}
+
+/// Диагностическое сообщение, когда демон не найден через runtime-info.
+///
+/// Самая частая причина (issue #1, подтверждено воспроизведением) — НЕ «демон не
+/// запущен», а РАССИНХРОН `CODE_INDEX_HOME` между процессом `serve` и демоном:
+/// они находят друг друга только через `$CODE_INDEX_HOME/daemon.json`, и если у
+/// `serve` переменная не задана или указывает в другую папку, runtime-info не
+/// читается, хотя демон жив. На Linux/macOS GUI-клиенты (VS Code, Continue, Cline)
+/// не наследуют `~/.bashrc`, поэтому `serve`, запущенный клиентом с пустым `env`,
+/// не видит `CODE_INDEX_HOME` из шелла. Поэтому сообщение явно называет ожидаемый
+/// путь и куда смотреть.
+pub fn daemon_unavailable_hint() -> String {
+    match super::paths::runtime_info_file() {
+        Ok(path) => format!(
+            "Демон не найден: отсутствует runtime-info файл {}. \
+             CODE_INDEX_HOME = {}. \
+             Проверьте: (1) демон запущен — `code-index daemon run`; \
+             (2) демон и этот процесс используют ОДИН CODE_INDEX_HOME. \
+             Частая причина: GUI-клиент (VS Code/Continue/Cline) на Linux/macOS не читает ~/.bashrc, \
+             поэтому serve не видит CODE_INDEX_HOME из шелла — задайте его тем же абсолютным путём, \
+             что у демона, в секции \"env\" MCP-конфигурации клиента.",
+            path.display(),
+            std::env::var(super::paths::HOME_ENV).unwrap_or_else(|_| "<не задана>".to_string()),
+        ),
+        Err(_) => format!(
+            "Демон не найден: переменная окружения {} не задана для этого процесса. \
+             Задайте её тем же абсолютным путём, что у демона. Для GUI-клиентов \
+             (VS Code/Continue/Cline) на Linux/macOS — в секции \"env\" MCP-конфигурации, \
+             т.к. ~/.bashrc к ним не применяется. Пример: \"env\": {{ \"{}\": \"/home/you/code-index\" }}.",
+            super::paths::HOME_ENV,
+            super::paths::HOME_ENV,
+        ),
+    }
 }
 
 fn async_client() -> Result<reqwest::Client> {
