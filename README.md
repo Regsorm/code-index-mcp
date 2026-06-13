@@ -261,9 +261,8 @@ Add to `.mcp.json` in your project root. For `stdio`:
 {
   "mcpServers": {
     "code-index": {
-      "type": "stdio",
-      "command": "/path/to/code-index",
-      "args": ["serve", "--path", "."]
+      "command": "npx",
+      "args": ["-y", "@regsorm/code-index-mcp", "serve", "--path", "."]
     }
   }
 }

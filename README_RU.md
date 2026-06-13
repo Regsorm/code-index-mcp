@@ -263,9 +263,8 @@ code-index serve --transport http --port 8011 --config /etc/code-index/daemon.to
 {
   "mcpServers": {
     "code-index": {
-      "type": "stdio",
-      "command": "/path/to/code-index",
-      "args": ["serve", "--path", "."]
+      "command": "npx",
+      "args": ["-y", "@regsorm/code-index-mcp", "serve", "--path", "."]
     }
   }
 }
