@@ -215,7 +215,15 @@ Portable layout: one folder for everything (binary + config + runtime files). Po
    code-index daemon stop
    ```
 
-If `CODE_INDEX_HOME` is not set, the daemon falls back to `%APPDATA%\code-index\daemon.toml` for config and `%LOCALAPPDATA%\code-index\` for runtime files (on Linux/macOS the XDG-standard equivalents).
+`CODE_INDEX_HOME` is **required** — there is no fallback. If it is unset, both `daemon` and `serve` exit with an error explaining how to set it.
+
+> **Troubleshooting — "daemon not running / runtime-info missing" even though the daemon IS running.**
+>
+> The `serve` process and the daemon find each other only through `$CODE_INDEX_HOME/daemon.json`. If `serve` sees a different (or empty) `CODE_INDEX_HOME` than the daemon, it looks for `daemon.json` in the wrong place and reports the daemon as offline — while it is actually alive.
+>
+> The most common cause on Linux/macOS: **GUI MCP clients (VS Code, Continue, Cline) do not read `~/.bashrc` / `~/.zshrc`**, so a `serve` they launch with an empty `env` never sees the `CODE_INDEX_HOME` you exported in your shell. Meanwhile the daemon, started from a terminal, does — so they end up pointing at different folders.
+>
+> **Fix:** set `CODE_INDEX_HOME` explicitly in the `env` section of the client's MCP config, using the **same absolute path** the daemon uses (`$HOME` is not expanded there — use a real path). Restart the client and verify with `code-index daemon status`.
 
 ### One-shot indexing (no daemon)
 
