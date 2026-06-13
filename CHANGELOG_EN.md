@@ -5,6 +5,15 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.34.1] — 2026-06-13
+
+**Diagnostic message when the daemon is unreachable + fix of incorrect `CODE_INDEX_HOME` docs (issue #1).**
+
+### Fixed
+
+- **The "daemon not running / runtime-info missing" message now explains the real cause.** The `serve` process and the daemon find each other only through `$CODE_INDEX_HOME/daemon.json`. If `serve` has the variable unset or pointing at a different folder than the daemon, runtime-info is not read — and tools reported "daemon not running" while the daemon was alive. The message now states the expected `daemon.json` path, the current `CODE_INDEX_HOME` value, and the common cause: on Linux/macOS, GUI MCP clients (VS Code, Continue, Cline) **do not read `~/.bashrc`/`~/.zshrc`**, so a `serve` they launch with an empty `env` never sees the `CODE_INDEX_HOME` from your shell, while the daemon started from a terminal does. Fix — set `CODE_INDEX_HOME` to the same absolute path in the client's MCP config `env` section. Affects `client::base_url` (all data tools and `daemon status`) and the `health` MCP tool. Reproduced on a clean Linux box with the release binary. Issue #1 (reported by @NorfLoud).
+- **README/README_RU: removed an incorrect fallback claim.** The docs promised that with `CODE_INDEX_HOME` unset the daemon falls back to `%APPDATA%`/XDG — no such fallback exists in the code; the variable is required. Replaced with the correct statement + added a Troubleshooting section about `CODE_INDEX_HOME` mismatch.
+
 ## [0.34.0] — 2026-06-12
 
 **Automatic terms fallback in `bsl_sql`: an empty result over procedure tables now returns `search_terms` output right away, not just a hint.**
