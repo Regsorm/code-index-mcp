@@ -6,14 +6,20 @@
 // дедуплицирован и repo-scoped. Доступен только для репозиториев с
 // `language = "bsl"`.
 //
+// Ключи процедур — в формате `<rel_path>::<name>` (как caller_proc_key и
+// callee_proc_key после резолва, этап 4e). Между хопами обход идёт по
+// `COALESCE(callee_proc_key, callee_proc_name)`: по резолвленному адресу цели,
+// а где он NULL (нерезолвленный лист) — по сырому имени.
+//
 // Запрос:
-//   from = "ОбщегоНазначенияСервер.Старт"
-//   to   = "Логирование.Записать"
+//   from = "base/Documents/РеализацияТоваровУслуг/Ext/ObjectModule.bsl::ОбработкаПроведения"
+//   to   = "base/CommonModules/ОбщегоНазначения/Ext/Module.bsl::ЗначениеРеквизитаОбъекта"
 //   max_depth = 3
 //
-// Ответ — список рёбер первого найденного пути (BFS), либо пустой
-// массив если не нашли. Используется агентами 1С для анализа
-// «как процедура A может в итоге вызвать процедуру B».
+// Ответ — список рёбер первого найденного пути (BFS; каждое ребро —
+// caller/callee/callee_key/call_type), либо пустой массив если не нашли.
+// Используется агентами 1С для анализа «как процедура A может в итоге
+// вызвать процедуру B».
 
 use std::future::Future;
 use std::pin::Pin;
@@ -31,9 +37,11 @@ impl IndexTool for FindPathBslTool {
 
     fn description(&self) -> &str {
         "Ищет путь в BSL-графе вызовов от процедуры 'from' до процедуры 'to' \
-         через таблицу proc_call_graph. Возвращает первый найденный путь \
-         (BFS) длиной до max_depth (по умолчанию 3) — массив рёбер с \
-         caller/callee/call_type. Пустой массив, если пути нет. \
+         через таблицу proc_call_graph. Ключи процедур — формата \
+         '<rel_path>::<name>' (как в caller_proc_key); 'to' можно задавать и \
+         голым именем для нерезолвленных листьев. Возвращает первый найденный \
+         путь (BFS) длиной до max_depth (по умолчанию 3) — массив рёбер с \
+         caller/callee/callee_key/call_type. Пустой массив, если пути нет. \
          BSL-вариант (с call_type) универсального find_path. \
          For BSL/1C repositories only."
     }
@@ -48,11 +56,11 @@ impl IndexTool for FindPathBslTool {
                 },
                 "from": {
                     "type": "string",
-                    "description": "caller_proc_key начальной точки, например 'ОбщегоНазначенияСервер.Старт'"
+                    "description": "caller_proc_key начальной точки в формате '<rel_path>::<name>', например 'base/Documents/РеализацияТоваровУслуг/Ext/ObjectModule.bsl::ОбработкаПроведения'"
                 },
                 "to": {
                     "type": "string",
-                    "description": "callee_proc_name конечной точки, например 'Логирование.Записать'"
+                    "description": "Цель: callee_proc_key '<rel_path>::<name>' (для резолвленных) либо голое callee_proc_name (для нерезолвленных листьев)"
                 },
                 "max_depth": {
                     "type": "integer",
@@ -114,21 +122,27 @@ impl IndexTool for FindPathBslTool {
             // path_json — массив рёбер в порядке обхода. Глубина
             // (`depth`) ограничена max_depth для защиты от
             // экспоненциального взрыва на густых графах.
+            // Связь между хопами — `COALESCE(callee_proc_key, callee_proc_name)`:
+            // идём по резолвленному адресу цели (`<rel_path>::<name>`), когда он
+            // есть (заполняет этап 4e), иначе по сырому имени (нерезолвленный
+            // лист / синтетические рёбра без ключа). `from`/`to` принимают тот же
+            // ключ `<rel_path>::<name>` (предпочтительно) либо голое имя.
             let sql = "
-                WITH RECURSIVE walk(cur_callee, depth, path_json) AS (
+                WITH RECURSIVE walk(cur_link, depth, path_json) AS (
                     SELECT
-                        callee_proc_name,
+                        COALESCE(callee_proc_key, callee_proc_name),
                         1,
                         json_array(json_object(
                             'caller', caller_proc_key,
                             'callee', callee_proc_name,
+                            'callee_key', callee_proc_key,
                             'call_type', call_type
                         ))
                     FROM proc_call_graph
                     WHERE repo = ?1 AND caller_proc_key = ?2
                     UNION ALL
                     SELECT
-                        pcg.callee_proc_name,
+                        COALESCE(pcg.callee_proc_key, pcg.callee_proc_name),
                         w.depth + 1,
                         json_insert(
                             w.path_json,
@@ -136,17 +150,18 @@ impl IndexTool for FindPathBslTool {
                             json_object(
                                 'caller', pcg.caller_proc_key,
                                 'callee', pcg.callee_proc_name,
+                                'callee_key', pcg.callee_proc_key,
                                 'call_type', pcg.call_type
                             )
                         )
                     FROM walk w
                     JOIN proc_call_graph pcg
                       ON pcg.repo = ?1
-                     AND pcg.caller_proc_key = w.cur_callee
+                     AND pcg.caller_proc_key = w.cur_link
                     WHERE w.depth < ?3
                 )
                 SELECT path_json FROM walk
-                WHERE cur_callee = ?4
+                WHERE cur_link = ?4
                 ORDER BY depth ASC
                 LIMIT 1
             ";

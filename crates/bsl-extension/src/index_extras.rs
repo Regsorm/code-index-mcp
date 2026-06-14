@@ -227,11 +227,14 @@ fn update_call_graph_direct_for_file(
     use std::collections::HashSet;
     let new_set: HashSet<&(String, String)> = new.iter().collect();
 
-    // Рёбра, которые файл перестал давать → удалить из графа, если их больше
-    // не даёт ни один файл (проверка по глобальной и уже актуальной `calls`).
+    // Рёбра, которые файл перестал давать → удалить из графа. Ключ теперь
+    // привязан к файлу (`<rel>::<caller>`), поэтому ребро принадлежит ровно
+    // этому файлу и не делится с другими — удаляем безусловно, как только
+    // файл его больше не даёт. Прежняя глобальная проверка по `calls` (нужная
+    // для голых ключей, чтобы не снести ребро, которое даёт другой файл) стала
+    // не только лишней, но и неверной: при path-привязке она удержала бы
+    // мёртвое ребро файла, если одноимённую пару даёт другой модуль.
     {
-        let mut chk =
-            conn.prepare("SELECT 1 FROM calls WHERE caller = ?1 AND callee = ?2 LIMIT 1")?;
         let mut del = conn.prepare(
             "DELETE FROM proc_call_graph \
              WHERE repo = ?1 AND call_type = 'direct' \
@@ -241,18 +244,13 @@ fn update_call_graph_direct_for_file(
             if new_set.contains(e) {
                 continue;
             }
-            let still = match chk.query_row(params![&e.0, &e.1], |_| Ok(())) {
-                Ok(()) => true,
-                Err(rusqlite::Error::QueryReturnedNoRows) => false,
-                Err(err) => return Err(err.into()),
-            };
-            if !still {
-                del.execute(params![REPO_DEFAULT, &e.0, &e.1])?;
-            }
+            let caller_key = format!("{}::{}", rel, e.0);
+            del.execute(params![REPO_DEFAULT, caller_key, &e.1])?;
         }
     }
 
     // Текущие рёбра файла → в граф (существующие отсекает UNIQUE без записи).
+    // caller_proc_key привязан к файлу: `<rel>::<caller>` (как в build_call_graph).
     {
         let mut ins = conn.prepare(
             "INSERT OR IGNORE INTO proc_call_graph \
@@ -260,9 +258,45 @@ fn update_call_graph_direct_for_file(
              VALUES (?1, ?2, ?3, 'direct')",
         )?;
         for (caller, callee) in &new {
-            ins.execute(params![REPO_DEFAULT, caller, callee])?;
+            let caller_key = format!("{}::{}", rel, caller);
+            ins.execute(params![REPO_DEFAULT, caller_key, callee])?;
         }
     }
+
+    // Этап 4e (инкремент): резолв callee_proc_key для рёбер ЭТОГО файла. Та же
+    // логика, что в resolve_direct_callee_keys, но в области одного файла —
+    // через точное сравнение пути вызывателя (НЕ LIKE: путь содержит '_', а это
+    // wildcard LIKE). Ограничение: правка файла не переразрешает входящие рёбра
+    // ДРУГИХ файлов, чья цель — процедура этого файла (напр. при переименовании
+    // экспортной процедуры). Эти ключи могут устареть до полного пересбора —
+    // приемлемо (демон периодически делает полный rebuild).
+    {
+        // (а) локальный вызов в том же файле.
+        conn.execute(
+            "UPDATE proc_call_graph \
+             SET callee_proc_key = ?2 || '::' || callee_proc_name \
+             WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+               AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2 \
+               AND EXISTS (SELECT 1 FROM functions fn JOIN files fl ON fl.id = fn.file_id \
+                           WHERE fl.path = ?2 AND fn.name = proc_call_graph.callee_proc_name)",
+            params![REPO_DEFAULT, &rel],
+        )?;
+        // (б) уникальный экспорт во всей конфигурации.
+        conn.execute(
+            "UPDATE proc_call_graph \
+             SET callee_proc_key = ( \
+                 SELECT fl.path || '::' || fn.name FROM functions fn JOIN files fl ON fl.id = fn.file_id \
+                 WHERE fn.name = proc_call_graph.callee_proc_name AND fn.args LIKE '%) Экспорт%' LIMIT 1) \
+             WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+               AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2 \
+               AND (SELECT COUNT(*) FROM functions fn \
+                    WHERE fn.name = proc_call_graph.callee_proc_name AND fn.args LIKE '%) Экспорт%') = 1",
+            params![REPO_DEFAULT, &rel],
+        )?;
+    }
+
+    // Этап 4e-prune (инкремент): отсев платформенного балласта для этого файла.
+    prune_platform_balast(conn, Some(&rel))?;
 
     conn.execute("COMMIT", [])?;
     tracing::debug!(
@@ -693,16 +727,19 @@ fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     // ── direct: из core::calls ────────────────────────────────────────
     // Таблица `calls` core содержит ребра «caller имя → callee имя»
     // на уровне исходников. Преобразуем в proc_call_graph с типом
-    // `direct`. caller_proc_key — это callee (имя процедуры) из calls
-    // — увы, в core нет module-context'а у вызовов, поэтому используем
-    // голое имя. На этапе 4e (resolution) добавим попытку найти
-    // module по functions.qualified_name.
+    // `direct`. caller_proc_key — стабильный ключ вызывателя в формате
+    // `<rel_path>::<caller>` (через JOIN calls ⋈ files): тот же формат,
+    // что у procedure_enrichment.proc_key, что даёт джойн граф↔термы и
+    // разводит одноимённые процедуры из разных модулей (две
+    // `ОбработкаПроведения` больше не схлопываются в одну строку).
+    // callee_proc_name остаётся сырым именем; callee_proc_key (адрес
+    // цели) заполняет резолвер на этапе 4e.
     let direct_count = conn.execute(
         "INSERT OR IGNORE INTO proc_call_graph \
          (repo, caller_proc_key, callee_proc_name, call_type) \
-         SELECT ?, caller, callee, 'direct' \
-         FROM calls \
-         WHERE caller IS NOT NULL AND callee IS NOT NULL",
+         SELECT DISTINCT ?, f.path || '::' || c.caller, c.callee, 'direct' \
+         FROM calls c JOIN files f ON f.id = c.file_id \
+         WHERE c.caller IS NOT NULL AND c.callee IS NOT NULL",
         params![REPO_DEFAULT],
     )?;
 
@@ -805,6 +842,17 @@ fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
         params![REPO_DEFAULT],
     )?;
 
+    // ── этап 4e: резолв адреса цели (callee_proc_key) для direct-рёбер ──
+    // Полный пересбор графа → резолвим разом по всему набору рёбер (set-based,
+    // через временные таблицы). Инкремент по файлу резолвит свои рёбра сам
+    // (см. update_call_graph_direct_for_file).
+    resolve_direct_callee_keys(conn)?;
+
+    // ── этап 4e-prune: отсев платформенного балласта ──
+    // Рёбра в методы коллекций/объектов и глобальные функции платформы (цель
+    // вне кода конфигурации). Только полный набор; инкремент чистит свои рёбра.
+    prune_platform_balast(conn, None)?;
+
     conn.execute("COMMIT", [])?;
 
     tracing::info!(
@@ -815,13 +863,156 @@ fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
         override_count
     );
 
-    // TODO(этап 4e): resolution callee_proc_key через functions.qualified_name —
-    // пробуем сопоставить `callee_proc_name` с реальной процедурой по
-    // имени модуля и заполнить `callee_proc_key`.
-    // TODO(этап 4f): extension_override — нужен парсер расширения (CFE).
+    // TODO(этап 4f): extension_override — резолв override_target/имени перехватчика
+    // в `<rel_path>::<name>` (сейчас голые имена, как direct до 4e).
     // TODO(этап 4g): external_assignment — runtime-анализ переменных
     // неопределённого типа. Опционально, очень дорогая фича.
 
+    Ok(())
+}
+
+/// Этап 4e: заполнить `callee_proc_key` для direct-рёбер графа — адрес
+/// вызываемой процедуры в формате `<rel_path>::<name>` (тот же, что у
+/// `caller_proc_key` и `procedure_enrichment.proc_key`). Две безопасные
+/// ступени; всё, что статически не выводится однозначно, остаётся NULL
+/// (ложная привязка хуже честного NULL).
+///
+///   (а) **локальный вызов** — голое имя callee объявлено как процедура в том
+///       же файле, что и вызыватель (1С: безымянный вызов разрешается в
+///       локальный модуль). Адрес = `<файл вызывателя>::<callee>`.
+///   (б) **уникальный экспорт** — имя callee принадлежит ровно одной экспортной
+///       процедуре во всей конфигурации. Ядро при разборе вызова теряет
+///       квалификатор модуля (`Модуль.Метод` → `Метод`), но единственность
+///       цели снимает неоднозначность: любой вызов этого имени ведёт именно
+///       туда. Экспортность определяется по ключевому слову `Экспорт` после
+///       `)` в сигнатуре (поле `functions.args`; отдельного флага нет).
+///
+/// Неоднозначные (имя экспортно в ≥2 модулях), динамические (`Объект.Метод`
+/// по переменной) и платформенные (`Сообщить`, `СтрНайти` — цель вне кода
+/// конфигурации) остаются NULL.
+fn resolve_direct_callee_keys(conn: &rusqlite::Connection) -> Result<()> {
+    // Карта всех процедур (path, name) — для локального резолва.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_funcs;
+         CREATE TEMP TABLE tmp_pcg_funcs AS
+           SELECT fl.path AS path, fn.name AS nm
+           FROM functions fn JOIN files fl ON fl.id = fn.file_id
+           WHERE fn.name IS NOT NULL AND fn.name != '';
+         CREATE INDEX tmp_pcg_funcs_idx ON tmp_pcg_funcs(path, nm);",
+    )?;
+    // Карта уникальных экспортных имён → путь единственного носителя.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_uexp;
+         CREATE TEMP TABLE tmp_pcg_uexp AS
+           SELECT nm, MIN(path) AS path FROM (
+             SELECT fn.name AS nm, fl.path AS path
+             FROM functions fn JOIN files fl ON fl.id = fn.file_id
+             WHERE fn.name IS NOT NULL AND fn.name != '' AND fn.args LIKE '%) Экспорт%'
+           ) GROUP BY nm HAVING COUNT(*) = 1;
+         CREATE INDEX tmp_pcg_uexp_idx ON tmp_pcg_uexp(nm);",
+    )?;
+
+    // (а) локальный вызов: callee объявлен в файле вызывателя.
+    conn.execute(
+        "UPDATE proc_call_graph \
+         SET callee_proc_key = substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) \
+                               || '::' || callee_proc_name \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND EXISTS ( \
+             SELECT 1 FROM tmp_pcg_funcs t \
+             WHERE t.path = substr(proc_call_graph.caller_proc_key, 1, \
+                                   instr(proc_call_graph.caller_proc_key, '::') - 1) \
+               AND t.nm = proc_call_graph.callee_proc_name)",
+        params![REPO_DEFAULT],
+    )?;
+
+    // (б) уникальный экспорт: имя callee экспортно ровно в одном месте.
+    conn.execute(
+        "UPDATE proc_call_graph \
+         SET callee_proc_key = ( \
+             SELECT u.path || '::' || u.nm FROM tmp_pcg_uexp u \
+             WHERE u.nm = proc_call_graph.callee_proc_name) \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND callee_proc_name IN (SELECT nm FROM tmp_pcg_uexp)",
+        params![REPO_DEFAULT],
+    )?;
+
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_funcs; DROP TABLE IF EXISTS tmp_pcg_uexp;")?;
+    Ok(())
+}
+
+/// Имена-«балласт»: методы коллекций/объектов/запросов/выборок и глобальные
+/// функции платформы, чья цель лежит ВНЕ кода конфигурации. Ядро стирает
+/// приёмник вызова (`Коллекция.Добавить` → `Добавить`), поэтому такие рёбра
+/// ведут «в никуда» (callee_proc_key не резолвится) и составляют ~⅓ графа.
+/// Список курируемый и намеренно консервативный: имена методов БСП/общих
+/// модулей (`ЗначениеРеквизитаОбъекта`, `ПодсистемаСуществует`,
+/// `СообщитьПользователю`, `КодОсновногоЯзыка`…) сюда НЕ входят — они резолвятся
+/// в реальные процедуры. Дополнительная страховка от коллизий имён — в
+/// `prune_platform_balast` удаляются только рёбра с `callee_proc_key IS NULL`.
+const PLATFORM_BALAST: &[&str] = &[
+    // методы коллекций / объектов / запросов / выборок (приёмник стёрт ядром)
+    "Вставить", "Добавить", "Количество", "Найти", "Выбрать", "Следующий",
+    "Получить", "Выгрузить", "ВыгрузитьКолонку", "Записать", "НайтиСтроки",
+    "Очистить", "Удалить", "Закрыть", "ПолучитьОбъект", "Прочитать",
+    "Установить", "ПолучитьЭлементы", "НайтиПоИдентификатору", "Свойство",
+    "Метаданные", "ПолноеИмя", "УникальныйИдентификатор", "ПустаяСсылка",
+    "СоздатьНаборЗаписей",
+    // глобальные функции / процедуры платформы
+    "ЗначениеЗаполнено", "НСтр", "Тип", "ТипЗнч", "Выполнить", "СтрЗаменить",
+    "СтрШаблон", "ПодставитьПараметрыВСтроку", "Строка", "СокрЛП",
+    "СтрСоединить", "СтрНайти", "СтрДлина", "Лев", "Сред", "Прав", "Формат",
+    "ТекущаяДатаСеанса", "ПредопределенноеЗначение", "ОткрытьФорму", "Сообщить",
+    "УстановитьПривилегированныйРежим", "ПолучитьФункциональнуюОпцию",
+    "ЗаписьЖурналаРегистрации", "НачатьТранзакцию", "ЗафиксироватьТранзакцию",
+    "ОтменитьТранзакцию", "ОчиститьСообщения", "ИнформацияОбОшибке",
+    "ПодробноеПредставлениеОшибки", "ПоместитьВоВременноеХранилище",
+    "ПолучитьИзВременногоХранилища", "ВыполнитьОбработкуОповещения",
+    "ОбщийМодуль", "ЗаполнитьЗначенияСвойств", "УстановитьПараметр",
+    "ОписаниеОповещения", "ОписаниеТипов", "ПустаяСтрока",
+    // конструкторы типов (Новый X — ядро пишет callee = имя типа)
+    "Структура", "Массив", "Запрос", "Соответствие", "ТаблицаЗначений",
+    "СписокЗначений",
+];
+
+/// Удалить direct-рёбра-балласт (см. [`PLATFORM_BALAST`]). Две защиты от потери
+/// реальных рёбер: (1) удаляются только рёбра с `callee_proc_key IS NULL` —
+/// резолвленные в реальную процедуру сохраняются; (2) имя, экспортное где-либо
+/// в конфигурации, не трогается вовсе (адаптивно к УТ/БП/ЗУП). `file_scope=
+/// Some(rel)` ограничивает удаление рёбрами одного файла (инкремент), `None` —
+/// весь граф (полный пересбор).
+fn prune_platform_balast(conn: &rusqlite::Connection, file_scope: Option<&str>) -> Result<()> {
+    // Имена — статические кириллические идентификаторы без SQL-метасимволов,
+    // поэтому инлайн в IN(...) безопасен (не пользовательский ввод).
+    let in_list = PLATFORM_BALAST
+        .iter()
+        .map(|n| format!("'{}'", n))
+        .collect::<Vec<_>>()
+        .join(",");
+    // Защита от коллизий имён, адаптивная под конфигурацию: НЕ трогаем имя,
+    // которое где-либо в конфигурации экспортно (`Записать`/`Удалить`/`Получить`
+    // и т.п. могут быть и методом объекта платформы, и реальной экспортной
+    // процедурой). Стерев квалификатор, ядро делает их неотличимыми; для
+    // экспортных-в-конфиге имён это означало бы потерю реальных рёбер при
+    // неоднозначном (NULL) резолве — а потеря хуже шума. Чистая платформа
+    // (`Вставить`/`НСтр`/`Структура`…, нигде не экспортна) отсеивается.
+    let mut sql = format!(
+        "DELETE FROM proc_call_graph \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND callee_proc_name IN ({in_list}) \
+           AND callee_proc_name NOT IN ( \
+             SELECT name FROM functions \
+             WHERE name IS NOT NULL AND args LIKE '%) Экспорт%')"
+    );
+    match file_scope {
+        Some(rel) => {
+            sql.push_str(" AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2");
+            conn.execute(&sql, params![REPO_DEFAULT, rel])?;
+        }
+        None => {
+            conn.execute(&sql, params![REPO_DEFAULT])?;
+        }
+    }
     Ok(())
 }
 
@@ -3167,6 +3358,159 @@ mod tests {
         }
     }
 
+    fn set_func(conn: &rusqlite::Connection, file_id: i64, name: &str, args: &str) {
+        conn.execute(
+            "INSERT INTO functions (file_id, name, args) VALUES (?, ?, ?)",
+            params![file_id, name, args],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolves_callee_keys_local_unique_export_and_null() {
+        // Этап 4e: проверяем оба tier'а резолвера и честный NULL.
+        let tmp = TempDir::new().unwrap();
+        let mut st = fresh_storage(&tmp);
+        let conn = st.conn();
+
+        let p1 = "Documents/Реализация/Ext/ObjectModule.bsl";
+        let p2 = "Documents/Поступление/Ext/ObjectModule.bsl";
+        let util = "CommonModules/Util/Ext/Module.bsl";
+        let a = "CommonModules/A/Ext/Module.bsl";
+        let b = "CommonModules/B/Ext/Module.bsl";
+        let f1 = ensure_file(conn, p1);
+        let f2 = ensure_file(conn, p2);
+        let fu = ensure_file(conn, util);
+        let fa = ensure_file(conn, a);
+        let fb = ensure_file(conn, b);
+
+        // Процедуры: локальные (без Экспорт) + экспортные ('() Экспорт').
+        set_func(conn, f1, "ОбработкаПроведения", "()");
+        set_func(conn, f1, "МестныйПомощник", "()");
+        set_func(conn, f2, "ОбработкаПроведения", "()");
+        set_func(conn, fu, "ОбщийУникальный", "() Экспорт");
+        set_func(conn, fa, "Дубликат", "() Экспорт");
+        set_func(conn, fb, "Дубликат", "() Экспорт");
+
+        set_calls(
+            conn,
+            f1,
+            &[
+                ("ОбработкаПроведения", "МестныйПомощник"), // локальный → резолв в p1
+                ("ОбработкаПроведения", "ОбщийУникальный"), // уникальный экспорт → util
+                ("ОбработкаПроведения", "Дубликат"),       // неоднозначный экспорт → NULL
+                ("ОбработкаПроведения", "ВнешнийНеизвестный"), // не резолвится, не балласт → NULL
+            ],
+        );
+        set_calls(conn, f2, &[("ОбработкаПроведения", "ДругойМетод")]);
+
+        build_call_graph(conn).unwrap();
+
+        // 1) Одноимённые caller разведены по файлам (Шаг 1).
+        let callers: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT caller_proc_key FROM proc_call_graph \
+                 WHERE call_type='direct' ORDER BY caller_proc_key",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            callers.contains(&format!("{p1}::ОбработкаПроведения")),
+            "caller из p1 несёт путь: {callers:?}"
+        );
+        assert!(
+            callers.contains(&format!("{p2}::ОбработкаПроведения")),
+            "caller из p2 несёт путь — одноимённые НЕ схлопнуты"
+        );
+
+        // callee_proc_key для ребра из p1 по имени callee.
+        let key = |callee: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT callee_proc_key FROM proc_call_graph \
+                 WHERE call_type='direct' AND caller_proc_key=?1 AND callee_proc_name=?2",
+                params![format!("{p1}::ОбработкаПроведения"), callee],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+
+        // 2) Локальный вызов → адрес в файле вызывателя.
+        assert_eq!(key("МестныйПомощник"), Some(format!("{p1}::МестныйПомощник")));
+        // 3) Уникальный экспорт → адрес единственного носителя.
+        assert_eq!(key("ОбщийУникальный"), Some(format!("{util}::ОбщийУникальный")));
+        // 4) Неоднозначный экспорт (2 модуля) → честный NULL.
+        assert_eq!(key("Дубликат"), None, "неоднозначный экспорт не должен привязываться");
+        // 5) Нерезолвимое имя (нет такой процедуры, не балласт) → NULL, ребро на месте.
+        assert_eq!(key("ВнешнийНеизвестный"), None, "нерезолвимый вызов не привязывается");
+    }
+
+    #[test]
+    fn prunes_platform_balast_keeps_real_and_resolved() {
+        // Этап 4e-prune: балластное ребро (callee_proc_key NULL) удаляется;
+        // реальное локальное ребро остаётся; имя из списка балласта, которое
+        // РЕЗОЛВИЛОСЬ в реальную процедуру (callee_proc_key != NULL), сохраняется
+        // (защита от коллизий имён по IS NULL).
+        let tmp = TempDir::new().unwrap();
+        let mut st = fresh_storage(&tmp);
+        let conn = st.conn();
+
+        let p1 = "Documents/Реализация/Ext/ObjectModule.bsl";
+        let util = "CommonModules/Util/Ext/Module.bsl";
+        let mod_c = "CommonModules/C/Ext/Module.bsl";
+        let mod_d = "CommonModules/D/Ext/Module.bsl";
+        let f1 = ensure_file(conn, p1);
+        let fu = ensure_file(conn, util);
+        let fc = ensure_file(conn, mod_c);
+        let fd = ensure_file(conn, mod_d);
+
+        set_func(conn, f1, "ОбработкаПроведения", "()");
+        set_func(conn, f1, "МестныйПомощник", "()");
+        // Экспортная процедура с именем, СОВПАДАЮЩИМ с балластным ("Найти"), уникальна.
+        set_func(conn, fu, "Найти", "() Экспорт");
+        // Балластное имя "Записать", экспортное НЕОДНОЗНАЧНО (2 модуля) → не резолвится.
+        set_func(conn, fc, "Записать", "() Экспорт");
+        set_func(conn, fd, "Записать", "() Экспорт");
+
+        set_calls(
+            conn,
+            f1,
+            &[
+                ("ОбработкаПроведения", "Добавить"),        // балласт, не экспорт, не резолв → удалить
+                ("ОбработкаПроведения", "МестныйПомощник"), // реальное локальное → оставить
+                ("ОбработкаПроведения", "Найти"),           // балластное ИМЯ, но резолвится → оставить
+                ("ОбработкаПроведения", "Записать"),        // балласт + экспорт-коллизия, NULL → оставить
+            ],
+        );
+
+        build_call_graph(conn).unwrap();
+
+        let exists = |callee: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM proc_call_graph \
+                 WHERE call_type='direct' AND caller_proc_key=?1 AND callee_proc_name=?2",
+                params![format!("{p1}::ОбработкаПроведения"), callee],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(exists("Добавить"), 0, "балластное ребро (не экспорт, не резолв) удаляется");
+        assert_eq!(exists("МестныйПомощник"), 1, "реальное локальное ребро остаётся");
+        assert_eq!(
+            exists("Найти"),
+            1,
+            "балластное ИМЯ, резолвленное в реальную процедуру, сохраняется (IS NULL guard)"
+        );
+        assert_eq!(
+            exists("Записать"),
+            1,
+            "балластное ИМЯ, экспортное в конфиге неоднозначно (NULL), не отсеивается (collision guard)"
+        );
+    }
+
     #[test]
     fn incremental_object_xml_matches_full() {
         let cfg = r#"<?xml version="1.0"?>
@@ -3298,10 +3642,12 @@ mod tests {
 
     #[test]
     fn incremental_direct_shared_edge_survives() {
-        // Ключевое свойство per-file: ребро A->B дают ДВА файла (F1 и F2).
-        // F1 дополнительно даёт A->C. Правим F1 → у него остаётся только A->B.
-        // Ожидаем: A->B выживает (его держит F2), A->C исчезает (больше никто
-        // не даёт). Результат обязан совпасть с полным пересбором.
+        // Ключевое свойство per-file при path-привязке ключей: F1 и F2 дают
+        // РАЗНЫЕ рёбра — `F1.bsl::A->B` и `F2.bsl::A->B` (caller_proc_key несёт
+        // путь файла). F1 дополнительно даёт `F1.bsl::A->C`. Правим F1 → у него
+        // остаётся только A->B. Ожидаем: ребро F2 (`F2.bsl::A->B`) не зависит от
+        // правки F1 и выживает; `F1.bsl::A->B` остаётся; `F1.bsl::A->C` исчезает.
+        // Результат обязан совпасть с полным пересбором.
         fn setup(tmp: &TempDir, f1_edges: &[(&str, &str)]) -> (std::path::PathBuf, Storage, i64) {
             let repo = tmp.path().join("repo");
             std::fs::create_dir_all(&repo).unwrap();
@@ -3332,12 +3678,16 @@ mod tests {
             "after incremental != full rebuild (shared edge)"
         );
         assert!(
-            s_i.iter().any(|(c, e, _)| c == "A" && e == "B"),
-            "A->B должно выжить (его даёт F2)"
+            s_i.iter().any(|(c, e, _)| c == "F2.bsl::A" && e == "B"),
+            "ребро F2 (F2.bsl::A->B) не зависит от правки F1 и выживает"
         );
         assert!(
-            !s_i.iter().any(|(c, e, _)| c == "A" && e == "C"),
-            "A->C должно исчезнуть (больше никто не даёт)"
+            s_i.iter().any(|(c, e, _)| c == "F1.bsl::A" && e == "B"),
+            "F1.bsl::A->B остаётся (F1 его по-прежнему даёт)"
+        );
+        assert!(
+            !s_i.iter().any(|(_, e, _)| e == "C"),
+            "F1.bsl::A->C должно исчезнуть (F1 его больше не даёт)"
         );
     }
 
