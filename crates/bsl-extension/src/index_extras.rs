@@ -295,8 +295,19 @@ fn update_call_graph_direct_for_file(
         )?;
     }
 
+    // (в) квалифицированный вызов общего модуля (склеенный `Модуль.Метод`) —
+    // точная привязка по квалификатору, для рёбер этого файла.
+    build_common_module_methods(conn)?;
+    resolve_callee_keys_by_qualifier(conn, Some(&rel))?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_cmeth;")?;
+
+    // (г) менеджер-вызовы `Коллекция.Объект.Метод` для рёбер этого файла.
+    resolve_callee_keys_by_manager(conn, Some(&rel))?;
+
     // Этап 4e-prune (инкремент): отсев платформенного балласта для этого файла.
     prune_platform_balast(conn, Some(&rel))?;
+    // + объектные вызовы `Объект.Метод` для рёбер этого файла.
+    prune_object_method_calls(conn, Some(&rel))?;
 
     conn.execute("COMMIT", [])?;
     tracing::debug!(
@@ -848,10 +859,15 @@ fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     // (см. update_call_graph_direct_for_file).
     resolve_direct_callee_keys(conn)?;
 
+    // ── этап 4e-D: резолв менеджер-вызовов `Коллекция.Объект.Метод` ──
+    resolve_callee_keys_by_manager(conn, None)?;
+
     // ── этап 4e-prune: отсев платформенного балласта ──
     // Рёбра в методы коллекций/объектов и глобальные функции платформы (цель
     // вне кода конфигурации). Только полный набор; инкремент чистит свои рёбра.
     prune_platform_balast(conn, None)?;
+    // Объектные вызовы `Объект.Метод` (квалификатор — переменная, не модуль).
+    prune_object_method_calls(conn, None)?;
 
     conn.execute("COMMIT", [])?;
 
@@ -937,7 +953,79 @@ fn resolve_direct_callee_keys(conn: &rusqlite::Connection) -> Result<()> {
         params![REPO_DEFAULT],
     )?;
 
-    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_funcs; DROP TABLE IF EXISTS tmp_pcg_uexp;")?;
+    // (в) квалифицированный вызов общего модуля: callee хранится склеенным
+    // `Модуль.Метод`; по квалификатору точно находим файл общего модуля и его
+    // экспортный метод. Заменяет эвристику уникального экспорта для имён,
+    // экспортных в ≥2 модулях. Только вызовы с ОДНОЙ точкой (общий модуль);
+    // цепочки `Справочники.X.Метод` (менеджеры) — следующий шаг, остаются NULL.
+    build_common_module_methods(conn)?;
+    resolve_callee_keys_by_qualifier(conn, None)?;
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_funcs; \
+         DROP TABLE IF EXISTS tmp_pcg_uexp; \
+         DROP TABLE IF EXISTS tmp_pcg_cmeth;",
+    )?;
+    Ok(())
+}
+
+/// Построить temp-таблицу `tmp_pcg_cmeth` экспортных методов общих модулей:
+/// `(mname, method, path)`, где `mname` — имя общего модуля (сегмент пути после
+/// `CommonModules/`). Используется Tier C резолва (`resolve_callee_keys_by_qualifier`)
+/// и в полном пересборе, и в инкременте.
+fn build_common_module_methods(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_cmeth;\n\
+         CREATE TEMP TABLE tmp_pcg_cmeth AS\n\
+           SELECT substr(s.seg, 1, instr(s.seg, '/') - 1) AS mname,\n\
+                  fn.name AS method,\n\
+                  s.path  AS path\n\
+           FROM (SELECT id, path,\n\
+                        substr(path, instr(path,'CommonModules/')+length('CommonModules/')) AS seg\n\
+                 FROM files\n\
+                 WHERE path LIKE '%CommonModules/%/Ext/Module.bsl') s\n\
+           JOIN functions fn ON fn.file_id = s.id\n\
+           WHERE instr(s.seg, '/') > 0\n\
+             AND fn.name IS NOT NULL AND fn.name != ''\n\
+             AND fn.args LIKE '%) Экспорт%';\n\
+         CREATE INDEX tmp_pcg_cmeth_idx ON tmp_pcg_cmeth(mname, method);",
+    )?;
+    Ok(())
+}
+
+/// Tier C: резолв `callee_proc_key` по квалификатору общего модуля. callee
+/// хранится склеенным `Модуль.Метод`; берём часть до точки как имя модуля,
+/// после — как метод, и точно адресуем в файл общего модуля. Требует заранее
+/// построенной `tmp_pcg_cmeth`. Работает только для вызовов с ОДНОЙ точкой
+/// (общий модуль); цепочки `Справочники.X.Метод` пропускаются (остаются NULL).
+/// `file_scope = Some(rel)` ограничивает рёбрами одного файла (инкремент).
+fn resolve_callee_keys_by_qualifier(
+    conn: &rusqlite::Connection,
+    file_scope: Option<&str>,
+) -> Result<()> {
+    let mut sql = String::from(
+        "UPDATE proc_call_graph \
+         SET callee_proc_key = ( \
+             SELECT MIN(cm.path || '::' || cm.method) FROM tmp_pcg_cmeth cm \
+             WHERE cm.mname = substr(proc_call_graph.callee_proc_name, 1, instr(proc_call_graph.callee_proc_name,'.')-1) \
+               AND cm.method = substr(proc_call_graph.callee_proc_name, instr(proc_call_graph.callee_proc_name,'.')+1)) \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND instr(callee_proc_name,'.') > 0 \
+           AND instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') = 0 \
+           AND EXISTS ( \
+             SELECT 1 FROM tmp_pcg_cmeth cm \
+             WHERE cm.mname = substr(proc_call_graph.callee_proc_name, 1, instr(proc_call_graph.callee_proc_name,'.')-1) \
+               AND cm.method = substr(proc_call_graph.callee_proc_name, instr(proc_call_graph.callee_proc_name,'.')+1))",
+    );
+    match file_scope {
+        Some(rel) => {
+            sql.push_str(" AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2");
+            conn.execute(&sql, params![REPO_DEFAULT, rel])?;
+        }
+        None => {
+            conn.execute(&sql, params![REPO_DEFAULT])?;
+        }
+    }
     Ok(())
 }
 
@@ -996,11 +1084,17 @@ fn prune_platform_balast(conn: &rusqlite::Connection, file_scope: Option<&str>) 
     // экспортных-в-конфиге имён это означало бы потерю реальных рёбер при
     // неоднозначном (NULL) резолве — а потеря хуже шума. Чистая платформа
     // (`Вставить`/`НСтр`/`Структура`…, нигде не экспортна) отсеивается.
+    // Имя метода для сопоставления с балластом: callee хранится склеенным
+    // (`Объект.Записать`), поэтому берём часть ПОСЛЕ точки (`Записать`); у голых
+    // имён (точки нет) — имя целиком. По первой точке — для одноточечных вызовов
+    // это и есть метод; многоточечные цепочки в балласт не попадут (не страшно).
+    let meth = "substr(callee_proc_name, CASE WHEN instr(callee_proc_name,'.')>0 \
+                THEN instr(callee_proc_name,'.')+1 ELSE 1 END)";
     let mut sql = format!(
         "DELETE FROM proc_call_graph \
          WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
-           AND callee_proc_name IN ({in_list}) \
-           AND callee_proc_name NOT IN ( \
+           AND {meth} IN ({in_list}) \
+           AND {meth} NOT IN ( \
              SELECT name FROM functions \
              WHERE name IS NOT NULL AND args LIKE '%) Экспорт%')"
     );
@@ -1013,6 +1107,187 @@ fn prune_platform_balast(conn: &rusqlite::Connection, file_scope: Option<&str>) 
             conn.execute(&sql, params![REPO_DEFAULT])?;
         }
     }
+    Ok(())
+}
+
+/// Коллекции метаданных 1С — менеджеры, доступные как `Справочники.X`,
+/// `Документы.X` и т.п. Одноточечный вызов с таким префиксом — обращение к
+/// менеджеру (вызов менеджер-модуля), НЕ метод локального объекта. Прун
+/// объектных вызовов их щадит: резолв менеджер-модулей — отдельный шаг.
+const METADATA_COLLECTIONS: &[&str] = &[
+    "Справочники", "Документы", "ЖурналыДокументов", "Перечисления",
+    "Отчеты", "Обработки", "ПланыВидовХарактеристик", "ПланыСчетов",
+    "ПланыВидовРасчета", "РегистрыСведений", "РегистрыНакопления",
+    "РегистрыБухгалтерии", "РегистрыРасчета", "БизнесПроцессы", "Задачи",
+    "ПланыОбмена", "Константы", "Последовательности", "КритерииОтбора",
+    "ОпределяемыеТипы",
+    // англоязычные эквиваленты (EN-конфигурации)
+    "Catalogs", "Documents", "DocumentJournals", "Enums", "Reports",
+    "DataProcessors", "ChartsOfCharacteristicTypes", "ChartsOfAccounts",
+    "ChartsOfCalculationTypes", "InformationRegisters", "AccumulationRegisters",
+    "AccountingRegisters", "CalculationRegisters", "BusinessProcesses",
+    "Tasks", "ExchangePlans", "Constants", "Sequences",
+];
+
+/// Прун объектных вызовов (CORE B): удалить склеенные ОДНОТОЧЕЧНЫЕ рёбра
+/// `Объект.Метод`, где квалификатор — локальная переменная / объект платформы
+/// (`Запрос.Выполнить`, `Выборка.Следующий`, `НаборЗаписей.Записать`), цель
+/// которых вне кода конфигурации. Квалификатор-driven — точнее списочного
+/// балласта: знаем, что приёмник не модуль, поэтому режем даже коллизионные
+/// имена методов. ТРИ ЗАЩИТЫ, чтобы не снести реальные вызовы:
+///   1) только ОДНА точка — цепочки `Справочники.X.Метод` (менеджеры) не трогаем;
+///   2) квалификатор НЕ имя общего модуля (его резолвит Tier C);
+///   3) квалификатор НЕ коллекция метаданных (`Справочники`/`Документы`/… —
+///      вызовы менеджеров, резолв отложен).
+/// Удаляются только рёбра с `callee_proc_key IS NULL`. `file_scope=Some(rel)` —
+/// в области одного файла (инкремент).
+fn prune_object_method_calls(conn: &rusqlite::Connection, file_scope: Option<&str>) -> Result<()> {
+    // tmp_pmods — имена общих модулей (сегмент пути после CommonModules/).
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pmods;\n\
+         CREATE TEMP TABLE tmp_pmods AS\n\
+           SELECT DISTINCT substr(seg,1,instr(seg,'/')-1) AS q FROM (\n\
+             SELECT substr(path, instr(path,'CommonModules/')+length('CommonModules/')) AS seg\n\
+             FROM files WHERE path LIKE '%CommonModules/%/Ext/Module.bsl') WHERE instr(seg,'/')>0;\n\
+         CREATE INDEX tmp_pmods_idx ON tmp_pmods(q);",
+    )?;
+    // tmp_pcolls — коллекции метаданных (защита одноточечных менеджер-вызовов).
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcolls; CREATE TEMP TABLE tmp_pcolls(q TEXT);")?;
+    {
+        let mut ins = conn.prepare("INSERT INTO tmp_pcolls(q) VALUES (?1)")?;
+        for c in METADATA_COLLECTIONS {
+            ins.execute(params![c])?;
+        }
+    }
+    conn.execute_batch("CREATE INDEX tmp_pcolls_idx ON tmp_pcolls(q);")?;
+
+    let first = "substr(callee_proc_name, 1, instr(callee_proc_name,'.')-1)";
+    let single_dot = "instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') = 0";
+    // (1) ОДНОТОЧЕЧНЫЕ объектные вызовы `Объект.Метод`: первый сегмент НЕ общий
+    //     модуль и НЕ коллекция метаданных → это метод локального объекта.
+    let mut sql1 = format!(
+        "DELETE FROM proc_call_graph \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND instr(callee_proc_name,'.') > 0 AND {single_dot} \
+           AND {first} NOT IN (SELECT q FROM tmp_pmods) \
+           AND {first} NOT IN (SELECT q FROM tmp_pcolls)"
+    );
+    // (2) МНОГОТОЧЕЧНЫЕ цепочки `X.Y.Метод`, оставшиеся NULL после Tier C/D:
+    //     первый сегмент НЕ общий модуль → объектная цепочка (`Запрос.Поле.Метод`)
+    //     либо платформенный метод менеджера (`Справочники.Объект.ПустаяСсылка` —
+    //     Tier D его уже проверил и не нашёл юзер-экспорт). Цепочки общих модулей
+    //     (first = модуль) щадим. Резолвленные менеджер-вызовы тут не NULL.
+    let mut sql2 = format!(
+        "DELETE FROM proc_call_graph \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') > 0 \
+           AND {first} NOT IN (SELECT q FROM tmp_pmods)"
+    );
+    match file_scope {
+        Some(rel) => {
+            let f = " AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2";
+            sql1.push_str(f);
+            sql2.push_str(f);
+            conn.execute(&sql1, params![REPO_DEFAULT, rel])?;
+            conn.execute(&sql2, params![REPO_DEFAULT, rel])?;
+        }
+        None => {
+            conn.execute(&sql1, params![REPO_DEFAULT])?;
+            conn.execute(&sql2, params![REPO_DEFAULT])?;
+        }
+    }
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pmods; DROP TABLE IF EXISTS tmp_pcolls;")?;
+    Ok(())
+}
+
+/// Построить temp-таблицу `tmp_pcg_mmeth` экспортных методов менеджер-модулей:
+/// `(folder, object, method, path)`. folder/object извлекаем из пути
+/// `<...>/<Folder>/<Object>/Ext/ManagerModule.bsl` в Rust (в SQLite нет «последнего
+/// вхождения» для надёжного разбора двух хвостовых сегментов).
+fn build_manager_module_methods(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_mmeth; \
+         CREATE TEMP TABLE tmp_pcg_mmeth(folder TEXT, object TEXT, method TEXT, path TEXT);",
+    )?;
+    let rows: Vec<(String, String)> = {
+        let mut st = conn.prepare(
+            "SELECT fl.path, fn.name FROM functions fn JOIN files fl ON fl.id = fn.file_id \
+             WHERE fl.path LIKE '%/Ext/ManagerModule.bsl' \
+               AND fn.name IS NOT NULL AND fn.name != '' AND fn.args LIKE '%) Экспорт%'",
+        )?;
+        let v = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        v
+    };
+    {
+        let mut ins = conn
+            .prepare("INSERT INTO tmp_pcg_mmeth(folder, object, method, path) VALUES (?1,?2,?3,?4)")?;
+        for (path, method) in &rows {
+            if let Some(prefix) = path.strip_suffix("/Ext/ManagerModule.bsl") {
+                let mut segs = prefix.rsplit('/');
+                if let (Some(object), Some(folder)) = (segs.next(), segs.next()) {
+                    ins.execute(params![folder, object, method, path])?;
+                }
+            }
+        }
+    }
+    conn.execute_batch("CREATE INDEX tmp_pcg_mmeth_idx ON tmp_pcg_mmeth(folder, object, method);")?;
+    Ok(())
+}
+
+/// Построить temp-таблицу `tmp_pcg_coll` (форма-обращения → папка метаданных) из
+/// единой таблицы META_FORMS (`code_usages`). RU и EN формы ведут в одну папку.
+fn build_collection_folder_map(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_coll; CREATE TEMP TABLE tmp_pcg_coll(coll TEXT, folder TEXT);",
+    )?;
+    {
+        let mut ins = conn.prepare("INSERT INTO tmp_pcg_coll(coll, folder) VALUES (?1,?2)")?;
+        for (coll, folder) in crate::code_usages::collection_folder_pairs() {
+            ins.execute(params![coll, folder])?;
+        }
+    }
+    conn.execute_batch("CREATE INDEX tmp_pcg_coll_idx ON tmp_pcg_coll(coll);")?;
+    Ok(())
+}
+
+/// Tier D: резолв менеджер-вызовов `Коллекция.Объект.Метод` (ровно 2 точки).
+/// Коллекцию маппим в папку метаданных, ищем экспортный метод в
+/// `<Папка>/<Объект>/Ext/ManagerModule.bsl`. Платформенные методы менеджера
+/// (`ПустаяСсылка`, `НайтиПоКоду`) не экспортны в модуле → остаются NULL.
+/// `file_scope=Some(rel)` — в области одного файла (инкремент).
+fn resolve_callee_keys_by_manager(conn: &rusqlite::Connection, file_scope: Option<&str>) -> Result<()> {
+    build_manager_module_methods(conn)?;
+    build_collection_folder_map(conn)?;
+    let col = "proc_call_graph.callee_proc_name";
+    let s1 = format!("substr({col},1,instr({col},'.')-1)");
+    let rest = format!("substr({col},instr({col},'.')+1)");
+    let s2 = format!("substr({rest},1,instr({rest},'.')-1)");
+    let s3 = format!("substr({rest},instr({rest},'.')+1)");
+    let twodots = format!("(length({col})-length(replace({col},'.','')))=2");
+    let join_cond = format!("cc.coll = {s1} AND mm.object = {s2} AND mm.method = {s3}");
+    let mut sql = format!(
+        "UPDATE proc_call_graph \
+         SET callee_proc_key = ( \
+             SELECT MIN(mm.path || '::' || mm.method) \
+             FROM tmp_pcg_coll cc JOIN tmp_pcg_mmeth mm ON mm.folder = cc.folder \
+             WHERE {join_cond}) \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL AND {twodots} \
+           AND EXISTS ( \
+             SELECT 1 FROM tmp_pcg_coll cc JOIN tmp_pcg_mmeth mm ON mm.folder = cc.folder \
+             WHERE {join_cond})"
+    );
+    match file_scope {
+        Some(rel) => {
+            sql.push_str(" AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2");
+            conn.execute(&sql, params![REPO_DEFAULT, rel])?;
+        }
+        None => {
+            conn.execute(&sql, params![REPO_DEFAULT])?;
+        }
+    }
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_mmeth; DROP TABLE IF EXISTS tmp_pcg_coll;")?;
     Ok(())
 }
 
@@ -3370,7 +3645,7 @@ mod tests {
     fn resolves_callee_keys_local_unique_export_and_null() {
         // Этап 4e: проверяем оба tier'а резолвера и честный NULL.
         let tmp = TempDir::new().unwrap();
-        let mut st = fresh_storage(&tmp);
+        let st = fresh_storage(&tmp);
         let conn = st.conn();
 
         let p1 = "Documents/Реализация/Ext/ObjectModule.bsl";
@@ -3454,7 +3729,7 @@ mod tests {
         // РЕЗОЛВИЛОСЬ в реальную процедуру (callee_proc_key != NULL), сохраняется
         // (защита от коллизий имён по IS NULL).
         let tmp = TempDir::new().unwrap();
-        let mut st = fresh_storage(&tmp);
+        let st = fresh_storage(&tmp);
         let conn = st.conn();
 
         let p1 = "Documents/Реализация/Ext/ObjectModule.bsl";
@@ -3509,6 +3784,183 @@ mod tests {
             1,
             "балластное ИМЯ, экспортное в конфиге неоднозначно (NULL), не отсеивается (collision guard)"
         );
+    }
+
+    #[test]
+    fn resolves_callee_key_by_module_qualifier() {
+        // Tier C (CORE B): склеенный вызов `Модуль.Метод` резолвится точно по
+        // квалификатору общего модуля — даже если имя метода экспортно в ≥2
+        // модулях (что Tier B оставлял бы честным NULL).
+        let tmp = TempDir::new().unwrap();
+        let st = fresh_storage(&tmp);
+        let conn = st.conn();
+
+        let caller = "Documents/Реализация/Ext/ObjectModule.bsl";
+        let mod_a = "base/CommonModules/МодульА/Ext/Module.bsl";
+        let mod_b = "base/CommonModules/МодульБ/Ext/Module.bsl";
+        let fc = ensure_file(conn, caller);
+        let fa = ensure_file(conn, mod_a);
+        let fb = ensure_file(conn, mod_b);
+
+        set_func(conn, fc, "ОбработкаПроведения", "()");
+        // Одно и то же имя метода экспортно в ДВУХ общих модулях.
+        set_func(conn, fa, "ОбщийМетод", "() Экспорт");
+        set_func(conn, fb, "ОбщийМетод", "() Экспорт");
+
+        set_calls(
+            conn,
+            fc,
+            &[
+                ("ОбработкаПроведения", "МодульА.ОбщийМетод"), // → mod_a (квалификатор разводит коллизию)
+                ("ОбработкаПроведения", "МодульБ.ОбщийМетод"), // → mod_b
+                ("ОбработкаПроведения", "МодульА.НетТакого"),  // метода нет в А → NULL
+                ("ОбработкаПроведения", "ЧужойМодуль.Метод"),  // квалификатор не общий модуль → NULL
+            ],
+        );
+
+        build_call_graph(conn).unwrap();
+
+        let key = |callee: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT callee_proc_key FROM proc_call_graph \
+                 WHERE call_type='direct' AND caller_proc_key=?1 AND callee_proc_name=?2",
+                params![format!("{caller}::ОбработкаПроведения"), callee],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+
+        // Коллизия имени разрешена квалификатором — точная привязка к нужному модулю.
+        assert_eq!(key("МодульА.ОбщийМетод"), Some(format!("{mod_a}::ОбщийМетод")));
+        assert_eq!(key("МодульБ.ОбщийМетод"), Some(format!("{mod_b}::ОбщийМетод")));
+        // Метода нет в модуле, но квалификатор = реальный модуль → щадим, NULL.
+        assert_eq!(key("МодульА.НетТакого"), None, "несуществующий метод модуля не привязывается");
+        // Квалификатор — не общий модуль и не коллекция → трактуется как объектный
+        // вызов и отсеивается пруном (строки больше нет).
+        let exists_chuzhoy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM proc_call_graph \
+                 WHERE call_type='direct' AND caller_proc_key=?1 AND callee_proc_name=?2",
+                params![format!("{caller}::ОбработкаПроведения"), "ЧужойМодуль.Метод"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists_chuzhoy, 0, "вызов с неизвестным квалификатором отсеян пруном объектных вызовов");
+    }
+
+    #[test]
+    fn prunes_glued_object_method_but_keeps_resolved_module_call() {
+        // CORE B: у склеенных имён балласт отсеивается по методу-ПОСЛЕ-точки
+        // (`Объект.Добавить` → `Добавить`); реальный вызов общего модуля,
+        // резолвленный Tier C, при этом сохраняется (IS NULL guard).
+        let tmp = TempDir::new().unwrap();
+        let st = fresh_storage(&tmp);
+        let conn = st.conn();
+
+        let caller = "Documents/Реализация/Ext/ObjectModule.bsl";
+        let cmod = "base/CommonModules/ОбщегоНазначения/Ext/Module.bsl";
+        let fc = ensure_file(conn, caller);
+        let fm = ensure_file(conn, cmod);
+
+        set_func(conn, fc, "ОбработкаПроведения", "()");
+        set_func(conn, fm, "РеальныйМетод", "() Экспорт");
+
+        set_calls(
+            conn,
+            fc,
+            &[
+                ("ОбработкаПроведения", "Объект.Добавить"), // балласт по методу → удалить
+                ("ОбработкаПроведения", "ОбщегоНазначения.РеальныйМетод"), // Tier C резолв → оставить
+            ],
+        );
+
+        build_call_graph(conn).unwrap();
+
+        let exists = |callee: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM proc_call_graph \
+                 WHERE call_type='direct' AND caller_proc_key=?1 AND callee_proc_name=?2",
+                params![format!("{caller}::ОбработкаПроведения"), callee],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(exists("Объект.Добавить"), 0, "склеенный балласт отсеивается по методу-после-точки");
+        assert_eq!(
+            exists("ОбщегоНазначения.РеальныйМетод"),
+            1,
+            "резолвленный вызов общего модуля сохраняется"
+        );
+    }
+
+    #[test]
+    fn prunes_object_calls_protects_modules_collections_chains() {
+        // CORE B прун по квалификатору: режем `Объект.Метод` (квалификатор —
+        // переменная), но щадим общие модули, коллекции метаданных и цепочки.
+        let tmp = TempDir::new().unwrap();
+        let st = fresh_storage(&tmp);
+        let conn = st.conn();
+
+        let caller = "Documents/Реализация/Ext/ObjectModule.bsl";
+        let cmod = "base/CommonModules/ОбщегоНазначения/Ext/Module.bsl";
+        let fc = ensure_file(conn, caller);
+        let fm = ensure_file(conn, cmod);
+        set_func(conn, fc, "ОбработкаПроведения", "()");
+        set_func(conn, fm, "РеальныйМетод", "() Экспорт");
+        // Менеджер-модуль справочника с ЮЗЕР-экспортным методом.
+        let mgr = "base/Catalogs/Контрагенты/Ext/ManagerModule.bsl";
+        let fmgr = ensure_file(conn, mgr);
+        set_func(conn, fmgr, "СоздатьПоНаименованию", "() Экспорт");
+
+        set_calls(
+            conn,
+            fc,
+            &[
+                ("ОбработкаПроведения", "Объект.ПроизвольныйМетод"), // объект (1 точка) → удалить
+                ("ОбработкаПроведения", "Запрос.ВыполнитьПакет"),   // объект (1 точка) → удалить
+                ("ОбработкаПроведения", "Запрос.Поле.Значение"),    // объектная цепочка (2 точки) → удалить
+                ("ОбработкаПроведения", "ОбщегоНазначения.РеальныйМетод"), // модуль (Tier C) → оставить
+                ("ОбработкаПроведения", "ОбщегоНазначения.НетТакого"),     // модуль, метод не экспортен → NULL, щадим
+                ("ОбработкаПроведения", "Справочники.НайтиПоНаименованию"), // коллекция (1 точка) → щадим
+                ("ОбработкаПроведения", "Справочники.Контрагенты.СоздатьПоНаименованию"), // менеджер (Tier D) → резолв
+                ("ОбработкаПроведения", "Справочники.Контрагенты.ПустаяСсылка"), // платформенный метод менеджера → удалить
+            ],
+        );
+
+        build_call_graph(conn).unwrap();
+
+        let exists = |callee: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM proc_call_graph \
+                 WHERE call_type='direct' AND caller_proc_key=?1 AND callee_proc_name=?2",
+                params![format!("{caller}::ОбработкаПроведения"), callee],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let key = |callee: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT callee_proc_key FROM proc_call_graph \
+                 WHERE call_type='direct' AND caller_proc_key=?1 AND callee_proc_name=?2",
+                params![format!("{caller}::ОбработкаПроведения"), callee],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(exists("Объект.ПроизвольныйМетод"), 0, "объектный вызов (1 точка) отсеян");
+        assert_eq!(exists("Запрос.ВыполнитьПакет"), 0, "объектный вызов (1 точка) отсеян");
+        assert_eq!(exists("Запрос.Поле.Значение"), 0, "объектная цепочка (2 точки) отсеяна");
+        assert_eq!(exists("ОбщегоНазначения.РеальныйМетод"), 1, "общий модуль (резолв) сохранён");
+        assert_eq!(exists("ОбщегоНазначения.НетТакого"), 1, "имя общего модуля щадим даже при NULL");
+        assert_eq!(exists("Справочники.НайтиПоНаименованию"), 1, "коллекция (1 точка) сохранена");
+        assert_eq!(
+            key("Справочники.Контрагенты.СоздатьПоНаименованию"),
+            Some(format!("{mgr}::СоздатьПоНаименованию")),
+            "менеджер-вызов резолвлен в ManagerModule (Tier D)"
+        );
+        assert_eq!(exists("Справочники.Контрагенты.ПустаяСсылка"), 0, "платформенный метод менеджера отсеян");
     }
 
     #[test]
@@ -3651,7 +4103,7 @@ mod tests {
         fn setup(tmp: &TempDir, f1_edges: &[(&str, &str)]) -> (std::path::PathBuf, Storage, i64) {
             let repo = tmp.path().join("repo");
             std::fs::create_dir_all(&repo).unwrap();
-            let mut st = fresh_storage(tmp);
+            let st = fresh_storage(tmp);
             let f1 = ensure_file(st.conn(), "F1.bsl");
             let f2 = ensure_file(st.conn(), "F2.bsl");
             set_calls(st.conn(), f1, f1_edges);

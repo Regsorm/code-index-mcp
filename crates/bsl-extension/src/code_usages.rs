@@ -73,6 +73,20 @@ const META_FORMS: &[MetaForm] = &[
     MetaForm { canonical: "Constant", ru_singular: "Константа", ru_plural: "Константы", en_singular: "Constant", en_plural: "Constants", reftypes: &[] },
 ];
 
+/// Пары (форма-обращения-в-коде → имя-папки-метаданных) для резолва менеджер-
+/// вызовов `Коллекция.Объект.Метод` → `<Папка>/<Объект>/Ext/ManagerModule.bsl`
+/// (Tier D в index_extras). Обе формы обращения — RU (`Справочники`) и EN
+/// (`Catalogs`) — ведут в одну папку выгрузки (en_plural). Регистр сохраняем как
+/// в выгрузке/коде (SQLite lower() не лоуэркейсит кириллицу — сравнение точное).
+pub(crate) fn collection_folder_pairs() -> Vec<(&'static str, &'static str)> {
+    let mut v = Vec::with_capacity(META_FORMS.len() * 2);
+    for f in META_FORMS {
+        v.push((f.ru_plural, f.en_plural));
+        v.push((f.en_plural, f.en_plural));
+    }
+    v
+}
+
 /// Суффиксы EN-форм тип-ссылок (`DocumentRef`, `CatalogObject`, …). Сверх-набор:
 /// несуществующие комбинации (`CatalogRecordSet`) не навредят — они просто не
 /// встретятся в коде.
