@@ -5,6 +5,30 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.36.0] — 2026-06-14
+
+**CORE B: the call qualifier is preserved in the graph. BSL stores `callee` glued (`Module.Method`) — consistent with the other languages; precise resolution of common-module and manager-module calls. Direct-edge resolution 52% → ~80-82%, zero false bindings.**
+
+> ⚠️ **Full reindex required** (`index --force` per repo): the format of `calls.callee` (BSL) and `proc_call_graph` changed. The mtime fast-path won't pick it up. On federation — rebuild all nodes synchronously.
+
+### Changed
+
+- **CORE (engine, affects all languages): BSL no longer drops the call qualifier.** When parsing `Module.Method()` the engine previously stored only the bare method name in `calls.callee` — the qualifier `Module` lives in a sibling node of the onescript tree and was ignored, making BSL the only language that lost the receiver. BSL now glues `receiver.method` the same way Python/JS/Go/… already store `obj.method`, so the call graph is uniform across languages. Bare local calls stay a bare name. **Affects `get_callers`/`get_callees`/`find_path`/`get_call_tree` and `find_path_bsl` output for BSL: qualified calls are now shown as `Module.Method`** (like Python's `requests.get`) — more informative, but a format change for BSL queries. Non-BSL languages are untouched (verified by an A/B run on 6 languages Python/JS/TS/Java/Go/Rust — `calls` output is byte-for-byte identical).
+
+### Added
+
+- **Common-module call resolution by qualifier (Tier C).** `ОбщегоНазначения.ЗначениеРеквизитаОбъекта` → the exact address `…/CommonModules/ОбщегоНазначения/Ext/Module.bsl::ЗначениеРеквизитаОбъекта`. Removes the dependency on the "unique export" heuristic (v0.35.0): names exported in ≥2 common modules now resolve precisely via the qualifier. On full UT: 88.3% of common-module calls bound, zero false.
+- **Manager-module call resolution by chain (Tier D).** `Справочники.Номенклатура.НайтиПоКоду` → `…/Catalogs/Номенклатура/Ext/ManagerModule.bsl::НайтиПоКоду`. Collection→dump-folder mapping (`Справочники`→`Catalogs`, irregular plurals handled) from the single `META_FORMS` table. Platform manager methods (`ПустаяСсылка`, `НайтиПоКоду`) not exported in the object module correctly stay NULL. On UT: ~28k manager calls bound.
+- **Object-call pruning by qualifier.** Glued `Объект.Метод` where the qualifier is a local variable / platform object (`Запрос.Выполнить`, `Выборка.Следующий`, `НаборЗаписей.Записать`) are removed from the graph more precisely than the static ballast list: knowing the receiver isn't a module, even colliding method names are cut. Three guards against losing real edges: common modules, metadata collections (`Справочники`/`Документы`/…) and multi-dot manager chains are spared; only unresolved (`callee_proc_key IS NULL`) edges are cut. Object noise is cleaned — `get_callees`/`get_call_tree` are readable (previously drowned in `Запрос.Выполнить` leaves).
+
+### Resolution summary
+
+- Full UT (57k files): direct-edge resolution **52.1% → 82.1%**, **zero false bindings**. Federation (UT/BP-SS/BP-TDK/ZUP): **80-82%**.
+
+### Tests
+
+- BSL: `resolves_callee_key_by_module_qualifier` (Tier C — collision resolved by qualifier), `prunes_object_calls_protects_modules_collections_chains` (Tier D + prune — spares modules/collections/chains, resolves manager), updated `test_parse_bsl_calls` (gluing). 150 BSL + 277 CORE green. Multi-language A/B (Python/JS/TS/Java/Go/Rust): non-BSL graph byte-for-byte identical to the old binary.
+
 ## [0.35.0] — 2026-06-14
 
 **BSL call-graph fix: same-named procedures are split by module, call targets resolve to an address, platform ballast is pruned. CORE: call-graph edges carry the source file path.**
