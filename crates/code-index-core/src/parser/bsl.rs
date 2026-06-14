@@ -291,8 +291,8 @@ fn visit_proc_or_func(
 /// Ловит КАЖДЫЙ узел `method_call` — это реальный вызов `Имя(args)` в грамматике
 /// onescript; встречается и как оператор-вызов (внутри call_statement), и внутри
 /// любых выражений (присваивания, условия, аргументы). Имя вызываемой процедуры/
-/// функции — первый `identifier` внутри method_call (для `Модуль.Функция()` это
-/// `Функция`: левый `Модуль` лежит в соседнем member_access, не в method_call).
+/// функции — первый `identifier` внутри method_call; квалификатор (`Модуль`)
+/// лежит соседом и приклеивается в record_method_call → `Модуль.Функция`.
 /// TASK-1: раньше ловился только call_statement → вызовы функций в выражениях
 /// (основная масса обращений к общим модулям) терялись, граф вызовов был почти пуст.
 fn visit_body_for_calls(
@@ -315,8 +315,11 @@ fn visit_body_for_calls(
     }
 }
 
-/// Записать ребро вызова из узла `method_call`. callee — первый `identifier`
-/// (имя вызываемой процедуры/функции, БЕЗ префикса модуля), caller — имя
+/// Записать ребро вызова из узла `method_call`. callee — имя метода (первый
+/// `identifier` внутри method_call), СКЛЕЕННОЕ с квалификатором-receiver, если
+/// вызов идёт через точку (`Модуль.Метод` → `Модуль.Метод`). Так BSL хранит
+/// вызовы единообразно с остальными языками (Python `obj.method`, Rust
+/// `obj.method`). Голый вызов (точки нет) остаётся голым именем. caller — имя
 /// процедуры-контейнера. Используется и для вызовов в теле процедуры
 /// (visit_body_for_calls), и для кода модуля верхнего уровня (visit_node).
 fn record_method_call(
@@ -325,14 +328,33 @@ fn record_method_call(
     current_func: Option<&str>,
 ) {
     if let Some(ident) = find_child_by_kind(node, "identifier") {
-        let callee = node_text(ident, ctx.source).to_string();
-        if !callee.is_empty() {
-            ctx.calls.push(ParsedCall {
-                caller: current_func.unwrap_or("<module>").to_string(),
-                callee,
-                line: node.start_position().row + 1,
-            });
+        let method = node_text(ident, ctx.source).to_string();
+        if method.is_empty() {
+            return;
         }
+        // Квалификатор вызова `Модуль.Метод()`: в грамматике onescript левый
+        // операнд лежит СОСЕДОМ от method_call — method_call.prev_sibling() это
+        // токен `.`, а его prev_sibling() — receiver (member_access/identifier).
+        // Склеиваем `receiver.method`; если точки нет — оставляем голое имя.
+        let callee = match node.prev_sibling() {
+            Some(dot) if dot.kind() == "." => match dot.prev_sibling() {
+                Some(recv) => {
+                    let q = node_text(recv, ctx.source);
+                    if q.is_empty() {
+                        method
+                    } else {
+                        format!("{q}.{method}")
+                    }
+                }
+                None => method,
+            },
+            _ => method,
+        };
+        ctx.calls.push(ParsedCall {
+            caller: current_func.unwrap_or("<module>").to_string(),
+            callee,
+            line: node.start_position().row + 1,
+        });
     }
 }
 
@@ -432,18 +454,22 @@ mod tests {
         let source = "Процедура Тест()\n    Сообщить(\"Привет\");\n    Рез = ОбщегоНазначения.ЗначениеРеквизита(Объект);\n    ОбщийМодуль.МетодМодуля();\nКонецПроцедуры";
         let result = parser.parse(source, "test.bsl").unwrap();
         let names: Vec<&str> = result.calls.iter().map(|c| c.callee.as_str()).collect();
-        // Неквалифицированный вызов-оператор.
+        // Неквалифицированный вызов-оператор — остаётся голым именем (точки нет).
         assert!(names.contains(&"Сообщить"), "Сообщить не найден: {:?}", names);
-        // TASK-1 (главный кейс): вызов ФУНКЦИИ в ВЫРАЖЕНИИ через общий модуль.
-        // Раньше терялся целиком (ловился только call_statement).
-        assert!(names.contains(&"ЗначениеРеквизита"), "вызов функции в выражении не найден: {:?}", names);
-        // Квалифицированный вызов-процедура (call_statement).
-        assert!(names.contains(&"МетодМодуля"), "МетодМодуля не найден: {:?}", names);
-        // callee — имя метода без префикса модуля, цепочки с точкой быть не должно.
-        assert!(!names.iter().any(|c| c.contains('.')), "callee с точкой: {:?}", names);
-        // Имена модулей-приёмников не должны попадать в callee как «вызовы».
+        // Главный кейс: вызов ФУНКЦИИ в ВЫРАЖЕНИИ через общий модуль —
+        // квалификатор приклеен: `ОбщегоНазначения.ЗначениеРеквизита`.
+        assert!(names.contains(&"ОбщегоНазначения.ЗначениеРеквизита"),
+            "склеенный вызов функции в выражении не найден: {:?}", names);
+        // Квалифицированный вызов-процедура (call_statement) — тоже склеен.
+        assert!(names.contains(&"ОбщийМодуль.МетодМодуля"),
+            "склеенный МетодМодуля не найден: {:?}", names);
+        // Голый метод без модуля не должен появляться отдельно для
+        // квалифицированных вызовов (квалификатор приклеен).
+        assert!(!names.contains(&"ЗначениеРеквизита") && !names.contains(&"МетодМодуля"),
+            "квалифицированный вызов попал в callee голым: {:?}", names);
+        // Имена модулей-приёмников не должны попадать в callee как отдельные «вызовы».
         assert!(!names.contains(&"ОбщегоНазначения") && !names.contains(&"ОбщийМодуль"),
-            "имя модуля ошибочно записано как вызов: {:?}", names);
+            "имя модуля ошибочно записано как отдельный вызов: {:?}", names);
     }
 
     #[test]
