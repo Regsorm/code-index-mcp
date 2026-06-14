@@ -5,6 +5,28 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.35.0] — 2026-06-14
+
+**BSL call-graph fix: same-named procedures are split by module, call targets resolve to an address, platform ballast is pruned. CORE: call-graph edges carry the source file path.**
+
+> ⚠️ **Full reindex required** (`index --force` per repo): the data format of `proc_call_graph` and the `calls` query output changed. The mtime fast-path won't pick it up — a force reindex is needed. On federation — rebuild all nodes synchronously.
+
+### Fixed
+
+- **The call graph no longer collapses same-named procedures.** `caller_proc_key` in `proc_call_graph` is now `<rel_path>::<name>` (same as `procedure_enrichment.proc_key`) instead of a bare name — built via `JOIN calls ⋈ files`. On the full UT config, 240 modules each defining their own `ОбработкаПроведения` stopped collapsing into 2 rows → 259 distinct callers. Previously `find_path_bsl`/`bsl_sql` over the graph couldn't tell the documents apart.
+
+### Added
+
+- **`callee_proc_key`: call-target address resolver (stage 4e).** Two safe tiers: (a) local call — a bare callee name declared in the caller's own file → `<file>::<callee>`; (b) unique export — the callee name is exported in exactly one place in the configuration (detected by `Экспорт` in the signature) → that address. The core strips the module qualifier when parsing a call (`Module.Method` → `Method`), but target uniqueness removes the ambiguity. Ambiguous / dynamic (`Object.Method` via a variable) / platform → `NULL` (a false binding is worse than an honest NULL). On UT, 52% of direct edges resolve.
+- **Platform ballast pruning.** Edges into collection/object methods and platform global functions (`Вставить`/`Добавить`/`НСтр`/`Структура`…, whose target is outside configuration code) are removed from the graph (~35%; on UT 1.14M inserted → 739K). Two guards against losing real edges: only unresolved edges are removed (`callee_proc_key IS NULL`); a name that is exported anywhere in the configuration (`Записать`/`Получить`/`Удалить`…) is left untouched entirely (adaptive per UT/BP/ZUP — each computes its own export set).
+- **CORE: `get_callers`/`get_callees`/`find_path`/`get_call_tree` return the source file path of each edge** (`path`, resolved `file_id → files.path`). This distinguishes same-named functions from different files — previously the output showed a bare name + numeric `file_id` ("N indistinguishable rows"). Language-neutral, no reindex required (query layer only).
+- **`find_path_bsl`: walk by resolved address.** Between hops the link is `COALESCE(callee_proc_key, callee_proc_name)` — by the target address where present, otherwise by the raw name (unresolved leaf / synthetic edges). `from`/`to` accept `<rel_path>::<name>` (a bare name is allowed for unresolved leaves). Path edges now include `callee_key`.
+
+### Tests
+
+- BSL: `resolves_callee_keys_local_unique_export_and_null` (both tiers + honest NULL), `prunes_platform_balast_keeps_real_and_resolved` (pruning + IS NULL guard + collision guard on an exported name), `incremental_direct_shared_edge_survives` rewritten for path semantics. CORE: 277 tests green (including `get_call_tree` with `file_id` in the CTE).
+- Reindex impact measurement (honest Rust A/B on full UT, 57K files): total time 54.15s → 54.86s (+0.7s, noise), call-graph build phase 18.35s → 27.18s (+8.8s). rag-query card #1524.
+
 ## [0.34.1] — 2026-06-13
 
 **Diagnostic message when the daemon is unreachable + fix of incorrect `CODE_INDEX_HOME` docs (issue #1).**
