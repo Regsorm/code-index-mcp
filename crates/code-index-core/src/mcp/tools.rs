@@ -664,6 +664,20 @@ pub async fn get_callers(
                 r.truncate(cap);
             }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            // Обогащаем каждую запись путём файла-источника (file_id → path):
+            // различает одноимённые функции из разных модулей.
+            let enriched: Vec<serde_json::Value> = r
+                .iter()
+                .map(|cr| {
+                    serde_json::json!({
+                        "caller": cr.caller,
+                        "callee": cr.callee,
+                        "line": cr.line,
+                        "file_id": cr.file_id,
+                        "path": lookup_path(&storage, cr.file_id),
+                    })
+                })
+                .collect();
             let extra = if truncated {
                 Some(serde_json::json!({
                     "truncated": true, "total": total, "limit": cap,
@@ -675,7 +689,7 @@ pub async fn get_callers(
             } else {
                 None
             };
-            wrap_with_meta_extra(&storage, &r, deps, extra)
+            wrap_with_meta_extra(&storage, &enriched, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
     }
@@ -698,6 +712,19 @@ pub async fn get_callees(
                 r.truncate(cap);
             }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            // Обогащаем каждую запись путём файла-источника (file_id → path).
+            let enriched: Vec<serde_json::Value> = r
+                .iter()
+                .map(|cr| {
+                    serde_json::json!({
+                        "caller": cr.caller,
+                        "callee": cr.callee,
+                        "line": cr.line,
+                        "file_id": cr.file_id,
+                        "path": lookup_path(&storage, cr.file_id),
+                    })
+                })
+                .collect();
             let extra = if truncated {
                 Some(serde_json::json!({
                     "truncated": true, "total": total, "limit": cap,
@@ -708,7 +735,7 @@ pub async fn get_callees(
             } else {
                 None
             };
-            wrap_with_meta_extra(&storage, &r, deps, extra)
+            wrap_with_meta_extra(&storage, &enriched, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"get_callees: {}\"}}", e),
     }

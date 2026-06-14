@@ -1276,17 +1276,18 @@ impl Storage {
         // жёсткий предохранитель против обхода патологически больших подграфов.
         const NODE_CAP: usize = 200_000;
         let sql = if language.is_some() {
-            "SELECT c.callee, c.line FROM calls c \
+            "SELECT c.callee, c.line, c.file_id FROM calls c \
              JOIN files fi ON fi.id = c.file_id \
              WHERE c.caller = ?1 AND fi.language = ?2"
         } else {
-            "SELECT c.callee, c.line FROM calls c WHERE c.caller = ?1"
+            "SELECT c.callee, c.line, c.file_id FROM calls c WHERE c.caller = ?1"
         };
         let mut stmt = self.conn.prepare(sql)?;
         let mut visited: HashSet<String> = HashSet::new();
         visited.insert(from.to_string());
-        // parent: узел → (предшественник, номер строки ребра) для реконструкции.
-        let mut parent: HashMap<String, (String, i64)> = HashMap::new();
+        // parent: узел → (предшественник, номер строки ребра, file_id источника)
+        // для реконструкции пути и резолва пути файла.
+        let mut parent: HashMap<String, (String, i64, i64)> = HashMap::new();
         let mut queue: VecDeque<(String, i64)> = VecDeque::new();
         queue.push_back((from.to_string(), 0));
         let mut found = false;
@@ -1294,23 +1295,23 @@ impl Storage {
             if d >= depth_limit {
                 continue;
             }
-            let rows: Vec<(String, i64)> = if let Some(lang) = language {
+            let rows: Vec<(String, i64, i64)> = if let Some(lang) = language {
                 stmt.query_map(params![node, lang], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
             } else {
                 stmt.query_map(params![node], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
             };
-            for (callee, line) in rows {
+            for (callee, line, file_id) in rows {
                 if visited.contains(&callee) {
                     continue;
                 }
                 visited.insert(callee.clone());
-                parent.insert(callee.clone(), (node.clone(), line));
+                parent.insert(callee.clone(), (node.clone(), line, file_id));
                 if callee == to {
                     found = true;
                     break 'bfs;
@@ -1327,11 +1328,13 @@ impl Storage {
         // Реконструкция пути from→to по parent-указателям (обратный проход).
         let mut chain: Vec<CallEdge> = Vec::new();
         let mut cur = to.to_string();
-        while let Some((prev, line)) = parent.get(&cur) {
+        while let Some((prev, line, file_id)) = parent.get(&cur) {
+            let path = self.get_path_by_file_id(*file_id).ok().flatten();
             chain.push(CallEdge {
                 caller: prev.clone(),
                 callee: cur.clone(),
                 line: *line,
+                path,
             });
             if prev.as_str() == from {
                 break;
@@ -1379,40 +1382,53 @@ impl Storage {
         let node_anchor = if down { "c.callee" } else { "c.caller" };
         let sql = format!(
             "
-            WITH RECURSIVE tree(node, depth, caller, callee, line) AS (
-                SELECT {node_anchor}, 1, c.caller, c.callee, c.line
+            WITH RECURSIVE tree(node, depth, caller, callee, line, file_id) AS (
+                SELECT {node_anchor}, 1, c.caller, c.callee, c.line, c.file_id
                   FROM calls c{anchor_join}
                  WHERE c.{start_col} = ?1{lang_filter}
                 UNION
-                SELECT {node_recur}, t.depth + 1, c.caller, c.callee, c.line
+                SELECT {node_recur}, t.depth + 1, c.caller, c.callee, c.line, c.file_id
                   FROM tree t
                   JOIN calls c ON {join_recur}{recur_join}
                  WHERE t.depth < ?2
             )
-            SELECT caller, callee, line, depth FROM tree
+            SELECT caller, callee, line, depth, file_id FROM tree
             ORDER BY depth, caller, callee LIMIT ?3
             "
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let map_row = |r: &rusqlite::Row<'_>| {
-            Ok(CallTreeEdge {
-                caller: r.get(0)?,
-                callee: r.get(1)?,
-                line: r.get(2)?,
-                depth: r.get(3)?,
-            })
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
         };
-        let mut rows: Vec<CallTreeEdge> = if let Some(lang) = language {
+        let mut raw: Vec<(String, String, i64, i64, i64)> = if let Some(lang) = language {
             stmt.query_map(params![root, depth, fetch, lang], map_row)?
                 .collect::<rusqlite::Result<_>>()?
         } else {
             stmt.query_map(params![root, depth, fetch], map_row)?
                 .collect::<rusqlite::Result<_>>()?
         };
-        let truncated = rows.len() as i64 > cap;
+        let truncated = raw.len() as i64 > cap;
         if truncated {
-            rows.truncate(cap as usize);
+            raw.truncate(cap as usize);
         }
+        // Резолв пути файла-источника каждого ребра (различает одноимённые
+        // функции из разных файлов — то же, что в get_callers/find_path).
+        let rows: Vec<CallTreeEdge> = raw
+            .into_iter()
+            .map(|(caller, callee, line, depth, file_id)| CallTreeEdge {
+                caller,
+                callee,
+                line,
+                depth,
+                path: self.get_path_by_file_id(file_id).ok().flatten(),
+            })
+            .collect();
         Ok((rows, truncated))
     }
 

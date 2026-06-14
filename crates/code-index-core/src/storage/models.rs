@@ -78,6 +78,10 @@ pub struct CallEdge {
     pub caller: String,
     pub callee: String,
     pub line: i64,
+    /// Путь файла-источника ребра (где находится вызов). Резолвится из file_id
+    /// при выдаче — различает одноимённые функции из разных файлов.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Ребро дерева вызовов с глубиной от корня (`get_call_tree`).
@@ -87,6 +91,10 @@ pub struct CallTreeEdge {
     pub callee: String,
     pub line: i64,
     pub depth: i64,
+    /// Путь файла-источника ребра (где находится вызов). Резолвится из file_id
+    /// при выдаче — различает одноимённые функции из разных файлов.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Запись переменной
