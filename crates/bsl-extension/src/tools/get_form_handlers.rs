@@ -57,7 +57,7 @@ impl IndexTool for GetFormHandlersTool {
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
             let owner = match args.get("owner_full_name").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
+                Some(s) => crate::code_usages::normalize_object_ref(s).into_owned(),
                 None => {
                     return crate::tools::wrap_error(json!({
                         "error": "missing required parameter 'owner_full_name' (string)"

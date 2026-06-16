@@ -84,8 +84,8 @@ impl IndexTool for GetObjectProfileTool {
         ctx: ToolContext<'a>,
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
-            let full_name = match args.get("full_name").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
+            let full_name = match crate::tools::object_value(&args) {
+                Some(s) => crate::code_usages::normalize_object_ref(s).into_owned(),
                 None => {
                     return crate::tools::wrap_error(json!({
                         "error": "missing required parameter 'full_name' (string)"

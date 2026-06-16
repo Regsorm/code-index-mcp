@@ -76,8 +76,8 @@ impl IndexTool for GetRegisterWritersTool {
         ctx: ToolContext<'a>,
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
-            let object = match args.get("object").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
+            let object = match crate::tools::object_value(&args) {
+                Some(s) => crate::code_usages::normalize_object_ref(s).into_owned(),
                 None => {
                     return crate::tools::wrap_error(json!({
                         "error": "missing required parameter 'object' (string)"

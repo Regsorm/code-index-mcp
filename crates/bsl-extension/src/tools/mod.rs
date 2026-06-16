@@ -62,6 +62,24 @@ pub(crate) fn wrap_error(error_value: Value) -> Value {
     wrap_with_meta(error_value, Vec::new())
 }
 
+/// Имя объекта для single-object инструмента — берётся ЗНАЧЕНИЕ без оглядки на имя
+/// ключа. Агент мог назвать параметр `object`/`full_name`/`name`/как угодно — не
+/// важно: у такого инструмента ровно один объект, поэтому имя ключа не анализируем.
+/// Пропускаются служебные ключи (repo и общие модификаторы), первое непустое
+/// строковое значение трактуется как имя объекта.
+///
+/// НЕ применять в multi-object инструментах (`find_data_path` from/to,
+/// `get_form_handlers` owner+form_name) — там имя ключа значимо.
+pub(crate) fn object_value(args: &Value) -> Option<&str> {
+    const SERVICE: &[&str] = &[
+        "repo", "depth", "limit", "direction", "sections", "language", "max_depth",
+    ];
+    args.as_object()?
+        .iter()
+        .filter(|(k, _)| !SERVICE.contains(&k.as_str()))
+        .find_map(|(_, v)| v.as_str().filter(|s| !s.trim().is_empty()))
+}
+
 /// singular meta_type → имя папки выгрузки (plural), под которым хранятся
 /// формы (`metadata_forms.owner_full_name`) и модули (`metadata_modules.full_name`).
 /// Возвращает `None` для пустого типа. Покрывает все типы, у которых бывают

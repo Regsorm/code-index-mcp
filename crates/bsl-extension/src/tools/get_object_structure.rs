@@ -122,7 +122,7 @@ impl IndexTool for GetObjectStructureTool {
                     };
                 }
                 json!({ "results": results })
-            } else if let Some(fqn) = args.get("full_name").and_then(|v| v.as_str()) {
+            } else if let Some(fqn) = crate::tools::object_value(&args) {
                 let storage = match ctx.storage.get().await {
                     Ok(s) => s,
                     Err(e) => {
@@ -166,6 +166,17 @@ fn resolve_one(
     full_name: &str,
     sections: Option<&[String]>,
 ) -> Value {
+    // Нормализация типа метаданных: 'Документ.X' → 'Document.X' (RU/EN, регистр неважен).
+    // В metadata_objects.full_name хранится canonical (англ.) тип; без этого
+    // 'Документ.РеализацияТоваровУслуг' не находился, хотя объект есть. См. META_FORMS.
+    let normalized = match full_name.split_once('.') {
+        Some((t, n)) => match crate::code_usages::canonical_meta_type(t) {
+            Some(canon) if canon != t => std::borrow::Cow::Owned(format!("{canon}.{n}")),
+            _ => std::borrow::Cow::Borrowed(full_name),
+        },
+        None => std::borrow::Cow::Borrowed(full_name),
+    };
+    let full_name = normalized.as_ref();
     let row = conn.query_row(
         "SELECT meta_type, name, synonym, attributes_json \
                      FROM metadata_objects WHERE repo = ? AND full_name = ?",

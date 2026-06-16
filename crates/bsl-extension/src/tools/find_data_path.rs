@@ -67,7 +67,7 @@ impl IndexTool for FindDataPathTool {
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
             let from = match args.get("from").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
+                Some(s) => crate::code_usages::normalize_object_ref(s).into_owned(),
                 None => {
                     return crate::tools::wrap_error(json!({
                         "error": "missing required parameter 'from' (string)"
@@ -75,7 +75,7 @@ impl IndexTool for FindDataPathTool {
                 }
             };
             let to = match args.get("to").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
+                Some(s) => crate::code_usages::normalize_object_ref(s).into_owned(),
                 None => {
                     return crate::tools::wrap_error(json!({
                         "error": "missing required parameter 'to' (string)"

@@ -132,7 +132,10 @@ impl IndexTool for BslSqlTool {
                     }));
                 }
             };
-            let sql = sql_raw.trim();
+            // 'Документ.X' → 'Document.X' в строковых литералах: типы в индексе
+            // хранятся только по-английски, иначе литерал с русским префиксом не находит.
+            let sql_norm = crate::code_usages::normalize_sql_object_refs(sql_raw.trim());
+            let sql = sql_norm.as_str();
 
             // Префикс-guard: только SELECT/WITH (после пропуска ведущих комментариев).
             if !starts_with_select_or_with(sql) {

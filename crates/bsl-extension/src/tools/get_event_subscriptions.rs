@@ -35,6 +35,9 @@ const KNOWN_PARAMS: &[&str] = &["repo", "handler_module", "event", "source", "li
 /// короткое имя 'ЗаказКлиента'; регистр не учитывается (Unicode).
 fn source_matches(sources: &Value, filter: &str) -> bool {
     let filter = filter.trim().trim_start_matches("cfg:");
+    // 'Документ.X' → 'Document.X': источники в БД хранятся с английским типом.
+    let filter_norm = crate::code_usages::normalize_object_ref(filter);
+    let filter = filter_norm.as_ref();
     let (f_type, f_name) = match filter.split_once('.') {
         Some((t, n)) => (Some(t.to_lowercase()), n.to_lowercase()),
         None => (None, filter.to_lowercase()),

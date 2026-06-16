@@ -120,6 +120,55 @@ fn query_map() -> &'static HashMap<String, &'static str> {
     })
 }
 
+/// Канонический префикс типа метаданных по RU/EN singular-форме (регистр неважен).
+/// `Документ`/`документ`/`Document`/`document` → `Document`. None — тип неизвестен
+/// (вызывающий оставляет имя как есть). Переиспользует [`query_map`].
+pub(crate) fn canonical_meta_type(meta_type: &str) -> Option<&'static str> {
+    query_map().get(&meta_type.to_lowercase()).copied()
+}
+
+/// Нормализует ссылку на объект вида `<Тип>.<Имя>` к каноническому английскому
+/// типу: `Документ.РеализацияТоваровУслуг` → `Document.РеализацияТоваровУслуг`.
+/// В индексе типы хранятся только по-английски (`Document`/`Catalog`/…), поэтому
+/// без нормализации запрос с русским префиксом не находит ничего. Неизвестный или
+/// уже канонический тип, как и имя без точки, возвращаются без изменений.
+pub(crate) fn normalize_object_ref(name: &str) -> std::borrow::Cow<'_, str> {
+    match name.split_once('.') {
+        Some((t, rest)) => match canonical_meta_type(t) {
+            Some(canon) if canon != t => std::borrow::Cow::Owned(format!("{canon}.{rest}")),
+            _ => std::borrow::Cow::Borrowed(name),
+        },
+        None => std::borrow::Cow::Borrowed(name),
+    }
+}
+
+/// Нормализует русские типы-префиксы внутри строковых литералов произвольного SQL
+/// (для `bsl_sql`): `'Документ.X'` → `'Document.X'`, `'Документы.X'` → `'Documents.X'`
+/// (singular и plural, обе формы кавычек). В индексе типы только английские, поэтому
+/// литерал с русским префиксом ничего не находит. Замена консервативная — только по
+/// паттерну `<кавычка><РусскийТип>.`, что отсекает совпадения вне ссылок на объект.
+pub(crate) fn normalize_sql_object_refs(sql: &str) -> String {
+    static PAIRS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    let pairs = PAIRS.get_or_init(|| {
+        let mut v = Vec::new();
+        for f in META_FORMS {
+            if f.ru_singular != f.en_singular {
+                v.push((f.ru_singular.to_string(), f.en_singular.to_string()));
+            }
+            if f.ru_plural != f.en_plural {
+                v.push((f.ru_plural.to_string(), f.en_plural.to_string()));
+            }
+        }
+        v
+    });
+    let mut out = sql.to_string();
+    for (ru, en) in pairs {
+        out = out.replace(&format!("'{}.", ru), &format!("'{}.", en));
+        out = out.replace(&format!("\"{}.", ru), &format!("\"{}.", en));
+    }
+    out
+}
+
 /// lower(RU-форма тип-ссылки без точки) → канонический префикс (`ref_type`).
 fn ru_reftype_map() -> &'static HashMap<String, &'static str> {
     static M: OnceLock<HashMap<String, &'static str>> = OnceLock::new();
