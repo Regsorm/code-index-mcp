@@ -247,13 +247,25 @@ impl IndexTool for GetEventSubscriptionsTool {
                                         continue;
                                     }
                                 }
-                                out.push(json!({
+                                // При заданном source полный список источников НЕ печатаем:
+                                // мы уже знаем, что запрошенный объект в нём есть, а у глобальных
+                                // подписок (ПередЗаписью, ПриЗаписи…) sources — до сотен типов;
+                                // эхопечать раздувала ответ (80К+ → срыв лимита вывода). Отдаём
+                                // только размер. Без фильтра — полный sources, как раньше.
+                                let mut entry = json!({
                                     "name": name,
                                     "event": event,
                                     "handler_module": module,
                                     "handler_proc": proc_,
-                                    "sources": sources_v,
-                                }));
+                                });
+                                if source.is_some() {
+                                    let n = sources_v.as_array().map(|a| a.len()).unwrap_or(0);
+                                    entry["sources_count"] = json!(n);
+                                    entry["matches_source"] = json!(true);
+                                } else {
+                                    entry["sources"] = sources_v;
+                                }
+                                out.push(entry);
                             }
                             Err(e) => {
                                 return crate::tools::wrap_error(json!({
