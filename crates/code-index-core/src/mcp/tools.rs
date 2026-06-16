@@ -23,12 +23,12 @@ pub(crate) const READ_FILE_HARD_CAP_BYTES: usize = 2 * 1024 * 1024;
 /// Hard-cap: суммарный размер ответа grep_text/grep_body.
 pub(crate) const GREP_TOTAL_BYTES_CAP: usize = 1 * 1024 * 1024;
 /// Default-limit grep_text если path_glob и language не заданы.
-pub(crate) const GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT: usize = 100;
+pub(crate) const GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT: usize = 30;
 /// Default-limit grep_code по числу совпадений, если `limit` не передан.
-/// Занижен до 100 (раньше было 500 с фильтром): по статистике использования
+/// Занижен до 30 (раньше было 500 с фильтром): по статистике использования
 /// модель сама задаёт limit ~20-40, а 500 раздувал ответ вдвое против нативного
 /// Grep (head_limit 250). При обрезке в ответе выставляется `truncated=true`.
-pub(crate) const GREP_CODE_DEFAULT_LIMIT: usize = 100;
+pub(crate) const GREP_CODE_DEFAULT_LIMIT: usize = 30;
 
 /// Default-cap на размер графа вызовов (get_callers/get_callees) и списков
 /// импортов (get_imports). «Горячая» утилита вызывается из десятков тысяч мест →
@@ -1290,7 +1290,7 @@ pub async fn grep_body(
     // CHANGELOG / тестами; там байтового потолка нет, поэтому truncated выводим из
     // того, что выборка упёрлась в limit.
     let ctx = context_lines.unwrap_or(0);
-    let want = limit.unwrap_or(100);
+    let want = limit.unwrap_or(30);
     let result = if path_glob.is_some() || ctx > 0 {
         storage.grep_body_with_options(
             pattern.as_deref(),
@@ -1313,32 +1313,9 @@ pub async fn grep_body(
         Ok((matches, truncated)) => {
             let deps: Vec<String> = matches.iter().map(|m| m.file_path.clone()).collect();
             let shown = matches.len();
-            // Группировка находок по файлу: путь — один раз как ключ в `files`,
-            // не дублируется в каждой находке (тот же приём, что у grep_code, v0.14.0).
-            let mut files = serde_json::Map::new();
-            for m in &matches {
-                let mut obj = serde_json::Map::new();
-                obj.insert("name".to_string(), serde_json::Value::String(m.name.clone()));
-                obj.insert("kind".to_string(), serde_json::Value::String(m.kind.clone()));
-                obj.insert("line_start".to_string(), serde_json::json!(m.line_start));
-                obj.insert("line_end".to_string(), serde_json::json!(m.line_end));
-                obj.insert("match_lines".to_string(), serde_json::json!(m.match_lines));
-                if let Some(mc) = m.match_count {
-                    obj.insert("match_count".to_string(), serde_json::json!(mc));
-                }
-                if !m.context.is_empty() {
-                    obj.insert(
-                        "context".to_string(),
-                        serde_json::to_value(&m.context).unwrap_or(serde_json::Value::Null),
-                    );
-                }
-                let arr = files
-                    .entry(m.file_path.clone())
-                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-                if let serde_json::Value::Array(a) = arr {
-                    a.push(serde_json::Value::Object(obj));
-                }
-            }
+            // Компактная выдача: значение files[path] — массив локаторных строк
+            // "<name> (<kind>) L<start>-<end>: <строки>(+N)" (см. compact_body_matches).
+            let files = compact_body_matches(&matches);
             let payload = serde_json::json!({
                 "files": files,
                 "shown": shown,
@@ -1386,7 +1363,10 @@ pub async fn list_files(
         Ok(r) => {
             let deps: Vec<String> = r.iter().map(|lf| lf.path.clone()).collect();
             let hint = r.is_empty().then_some(HINT_LIST_FILES_EMPTY);
-            wrap_with_meta_hint(&storage, &r, deps, hint)
+            // Компактная выдача: каждый файл — строка "path | lang | N lines | size"
+            // (mtime не дублируем — он в _meta.file_mtimes).
+            let listed = compact_listed_files(&r);
+            wrap_with_meta_hint(&storage, &listed, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"list_files: {}\"}}", e),
     }
@@ -1433,7 +1413,7 @@ pub async fn grep_text(
         if path_glob.is_none() && language.is_none() {
             GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT
         } else {
-            500
+            100
         }
     });
     match storage.grep_text_filtered(
@@ -1447,31 +1427,9 @@ pub async fn grep_text(
         Ok((matches, truncated)) => {
             let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
             let shown = matches.len();
-            // Группировка находок по файлу: путь хранится один раз как ключ в
-            // `files`, а не повторяется в каждой находке (тот же приём, что у
-            // grep_code с v0.14.0). truncated рядом — модель видит, что показано
-            // не всё, и при необходимости дошлёт больший limit.
-            let mut files = serde_json::Map::new();
-            for m in &matches {
-                let mut obj = serde_json::Map::new();
-                obj.insert("line".to_string(), serde_json::json!(m.line));
-                obj.insert(
-                    "content".to_string(),
-                    serde_json::Value::String(m.content.clone()),
-                );
-                if !m.context.is_empty() {
-                    obj.insert(
-                        "context".to_string(),
-                        serde_json::to_value(&m.context).unwrap_or(serde_json::Value::Null),
-                    );
-                }
-                let arr = files
-                    .entry(m.path.clone())
-                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-                if let serde_json::Value::Array(a) = arr {
-                    a.push(serde_json::Value::Object(obj));
-                }
-            }
+            // Компактная выдача: значение files[path] — плоский массив строк
+            // "N: content" (см. compact_text_matches). Путь — один раз как ключ.
+            let files = compact_text_matches(&matches);
             let payload = serde_json::json!({
                 "files": files,
                 "shown": shown,
@@ -1483,6 +1441,93 @@ pub async fn grep_text(
         }
         Err(e) => format!("{{\"error\": \"grep_text: {}\"}}", e),
     }
+}
+
+// ── Компактная сборка выдачи grep_*/list_files (строки вместо объектов) ──
+//
+// Структурный JSON-оверхед (повторяющиеся ключи line/content на каждом из
+// тысяч совпадений) — основная статья расхода токенов. Здесь находки
+// сворачиваются в плоские строки "N: content", сгруппированные по файлу. `_meta`
+// (dependent_files/file_mtimes) собирается отдельно в wrap_with_meta_* и не затрагивается.
+
+/// grep_code/grep_text: значение files[path] — плоский, отсортированный по номеру
+/// строки, дедуплицированный массив строк "N: content". Совпадения и их контекст
+/// сливаются; строка-совпадение перекрывает context-строку с тем же номером.
+fn compact_text_matches(
+    matches: &[crate::storage::models::GrepTextMatch],
+) -> serde_json::Map<String, serde_json::Value> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<String, BTreeMap<usize, String>> = BTreeMap::new();
+    for m in matches {
+        let lines = acc.entry(m.path.clone()).or_default();
+        lines.insert(m.line, m.content.clone());
+        for c in &m.context {
+            lines.entry(c.line).or_insert_with(|| c.content.clone());
+        }
+    }
+    acc.into_iter()
+        .map(|(path, lines)| {
+            let arr: Vec<serde_json::Value> = lines
+                .into_iter()
+                .map(|(n, c)| serde_json::Value::String(format!("{}: {}", n, c)))
+                .collect();
+            (path, serde_json::Value::Array(arr))
+        })
+        .collect()
+}
+
+/// grep_body: значение files[path] — массив строк, по одной на функцию/класс:
+/// "<name> (<kind>) L<start>-<end>: <строки-совпадения>(+N)". При context_lines>0
+/// строки контекста "N: content" дописываются следом (локаторная строка
+/// самоидентифицируется по "(function)"/"(class)").
+fn compact_body_matches(
+    matches: &[crate::storage::models::GrepBodyMatch],
+) -> serde_json::Map<String, serde_json::Value> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    for m in matches {
+        let mut mls: String = m
+            .match_lines
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        if let Some(total) = m.match_count {
+            mls.push_str(&format!(" (+{})", total.saturating_sub(m.match_lines.len())));
+        }
+        let locator = format!(
+            "{} ({}) L{}-{}: {}",
+            m.name, m.kind, m.line_start, m.line_end, mls
+        );
+        let arr = acc.entry(m.file_path.clone()).or_default();
+        arr.push(serde_json::Value::String(locator));
+        for c in &m.context {
+            arr.push(serde_json::Value::String(format!("{}: {}", c.line, c.content)));
+        }
+    }
+    acc.into_iter()
+        .map(|(path, arr)| (path, serde_json::Value::Array(arr)))
+        .collect()
+}
+
+/// list_files: каждый файл — строка "<path> | <lang> | <N> lines | <size>".
+/// mtime НЕ включаем — он уже в _meta.file_mtimes (дублировать = лишние токены).
+fn compact_listed_files(
+    files: &[crate::storage::models::ListedFile],
+) -> Vec<serde_json::Value> {
+    files
+        .iter()
+        .map(|lf| {
+            let size = lf
+                .size
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            serde_json::Value::String(format!(
+                "{} | {} | {} lines | {}",
+                lf.path, lf.language, lf.lines_total, size
+            ))
+        })
+        .collect()
 }
 
 /// grep_code (Phase 2, v0.8.0): regex-поиск по содержимому **code-файлов** через
@@ -1513,28 +1558,9 @@ pub async fn grep_code(
         Ok((matches, truncated)) => {
             let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
             let shown = matches.len();
-            // Группировка находок по файлу: путь хранится один раз как ключ в
-            // `files`, а не повторяется в каждой находке (находки часто кучкуются
-            // в одном файле). Признак обрезки truncated — рядом: модель видит, что
-            // показано не всё, и при необходимости дошлёт больший limit.
-            let mut files = serde_json::Map::new();
-            for m in &matches {
-                let mut obj = serde_json::Map::new();
-                obj.insert("line".to_string(), serde_json::json!(m.line));
-                obj.insert("content".to_string(), serde_json::Value::String(m.content.clone()));
-                if !m.context.is_empty() {
-                    obj.insert(
-                        "context".to_string(),
-                        serde_json::to_value(&m.context).unwrap_or(serde_json::Value::Null),
-                    );
-                }
-                let arr = files
-                    .entry(m.path.clone())
-                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-                if let serde_json::Value::Array(a) = arr {
-                    a.push(serde_json::Value::Object(obj));
-                }
-            }
+            // Компактная выдача: значение files[path] — плоский массив строк
+            // "N: content" (см. compact_text_matches). Путь — один раз как ключ.
+            let files = compact_text_matches(&matches);
             let payload = serde_json::json!({
                 "files": files,
                 "shown": shown,
@@ -1670,5 +1696,96 @@ mod tests {
         let rows = mass_map(&pool, vec!["a".to_string(), "b".to_string()], |_st, it| it).await;
         let values: Vec<String> = rows.into_iter().map(|r| r.unwrap()).collect();
         assert_eq!(values, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    use crate::storage::models::{ContextLine, GrepBodyMatch, GrepTextMatch, ListedFile};
+
+    /// compact_text_matches без контекста: "N: content", группировка по файлу,
+    /// сортировка по номеру строки; несколько файлов — порядок по пути.
+    #[test]
+    fn compact_text_matches_no_context() {
+        let matches = vec![
+            GrepTextMatch { path: "b.rs".into(), line: 10, content: "ten".into(), context: vec![] },
+            GrepTextMatch { path: "a.rs".into(), line: 5, content: "five".into(), context: vec![] },
+            GrepTextMatch { path: "a.rs".into(), line: 2, content: "two".into(), context: vec![] },
+        ];
+        let files = compact_text_matches(&matches);
+        let a = files.get("a.rs").unwrap().as_array().unwrap();
+        assert_eq!(a, &vec![serde_json::json!("2: two"), serde_json::json!("5: five")]);
+        let b = files.get("b.rs").unwrap().as_array().unwrap();
+        assert_eq!(b, &vec![serde_json::json!("10: ten")]);
+        let keys: Vec<&str> = files.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["a.rs", "b.rs"]);
+    }
+
+    /// compact_text_matches с контекстом: слияние match+context, дедуп по строке,
+    /// строка-совпадение перекрывает context-строку того же номера.
+    #[test]
+    fn compact_text_matches_with_context_merges_and_dedups() {
+        let matches = vec![GrepTextMatch {
+            path: "f.rs".into(),
+            line: 3,
+            content: "MATCH".into(),
+            context: vec![
+                ContextLine { line: 2, content: "before".into() },
+                ContextLine { line: 3, content: "ctx-dup".into() },
+                ContextLine { line: 4, content: "after".into() },
+            ],
+        }];
+        let files = compact_text_matches(&matches);
+        let f = files.get("f.rs").unwrap().as_array().unwrap();
+        assert_eq!(
+            f,
+            &vec![
+                serde_json::json!("2: before"),
+                serde_json::json!("3: MATCH"),
+                serde_json::json!("4: after"),
+            ]
+        );
+    }
+
+    /// compact_body_matches: локаторная строка, "(+N)" при match_count>3,
+    /// контекст-строки дописаны при наличии.
+    #[test]
+    fn compact_body_matches_locator_and_context() {
+        let matches = vec![
+            GrepBodyMatch {
+                file_path: "doc.bsl".into(),
+                name: "Провести".into(),
+                kind: "function".into(),
+                line_start: 120,
+                line_end: 340,
+                match_lines: vec![125, 130, 200],
+                match_count: Some(8),
+                context: vec![],
+            },
+            GrepBodyMatch {
+                file_path: "doc.bsl".into(),
+                name: "Отменить".into(),
+                kind: "function".into(),
+                line_start: 400,
+                line_end: 410,
+                match_lines: vec![405],
+                match_count: None,
+                context: vec![ContextLine { line: 405, content: "x = 1;".into() }],
+            },
+        ];
+        let files = compact_body_matches(&matches);
+        let arr = files.get("doc.bsl").unwrap().as_array().unwrap();
+        assert_eq!(arr[0], serde_json::json!("Провести (function) L120-340: 125,130,200 (+5)"));
+        assert_eq!(arr[1], serde_json::json!("Отменить (function) L400-410: 405"));
+        assert_eq!(arr[2], serde_json::json!("405: x = 1;"));
+    }
+
+    /// compact_listed_files: строка без mtime; size=None → "?".
+    #[test]
+    fn compact_listed_files_format() {
+        let files = vec![
+            ListedFile { path: "src/foo.rs".into(), language: "rust".into(), lines_total: 724, size: Some(28504), mtime: Some(123) },
+            ListedFile { path: "bar.md".into(), language: "markdown".into(), lines_total: 3, size: None, mtime: None },
+        ];
+        let out = compact_listed_files(&files);
+        assert_eq!(out[0], serde_json::json!("src/foo.rs | rust | 724 lines | 28504"));
+        assert_eq!(out[1], serde_json::json!("bar.md | markdown | 3 lines | ?"));
     }
 }

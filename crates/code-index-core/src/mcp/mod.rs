@@ -108,6 +108,10 @@ pub struct SearchParams {
 pub struct NameParams {
     /// Алиас репозитория (из --path alias=dir при запуске сервера).
     pub repo: String,
+    /// Точное имя символа. Запасные имена на входе (модели путают ключ):
+    /// `symbol`, `query` принимаются как `name` — иначе слепой вызов падал
+    /// с тёмной ошибкой разборщика «missing field name» (потерянный ход).
+    #[serde(alias = "symbol", alias = "query")]
     pub name: String,
     pub language: Option<String>,
     /// Glob по path (Phase 1, post-filter).
@@ -948,7 +952,7 @@ impl CodeIndexServer {
         tools::get_call_tree(entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language).await
     }
 
-    #[tool(description = "Навигация: ГДЕ определён символ по ТОЧНОМУ имени — локации функций/классов/переменных/импортов БЕЗ тел (как search_*). Тело конкретного — get_function/get_class. path_glob — фильтр по пути. Возвращает {functions, classes, variables, imports} (облегчённые: имя/путь/строки/сигнатура).")]
+    #[tool(description = "Навигация: ГДЕ определён символ по ТОЧНОМУ имени — локации функций/классов/переменных/импортов БЕЗ тел (как search_*). Тело конкретного — get_function/get_class. Возвращает {functions, classes, variables, imports} (облегчённые: имя/путь/строки/сигнатура). Голым именем зови ТОЛЬКО для уникального имени: если имя — стандартный обработчик объекта/набора записей или просто распространённое, вернутся сотни локаций (truncated) — для таких сразу задавай path_glob (фильтр по пути).")]
     async fn find_symbol(&self, Parameters(p): Parameters<NameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1008,7 +1012,7 @@ impl CodeIndexServer {
         tools::search_text(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP); query — алиас regex. path_glob — фильтр по пути (SQL pushdown; альтернативы `{a,b}` поддерживаются). context_lines — N строк до/после совпадения. limit — число находок (default 100); при обрезке truncated=true. Возвращает JSON-объект {files: {\"<path>\": [{name, kind, line_start, line_end, match_lines, match_count?, context?}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
+    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP); query — алиас regex. path_glob — фильтр по пути (SQL pushdown; альтернативы `{a,b}` поддерживаются). context_lines — N строк до/после совпадения. limit — число находок (default 30); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"<name> (<kind>) L<start>-<end>: <строки>(+N)\", …]}, shown, limit, truncated} — по одной строке-локатору на функцию/класс; контекст (context_lines>0) дописан строками \"N: текст\".")]
     async fn grep_body(&self, Parameters(p): Parameters<GrepBodyParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1038,7 +1042,7 @@ impl CodeIndexServer {
         tools::stat_file(entry, p.path).await
     }
 
-    #[tool(description = "Список файлов в индексе с фильтрами. pattern — glob по пути (`**/*.py`; альтернативы `{a,b}`: `**/*.{rs,toml}`), path_prefix — префикс (`src/auth/`), language — язык. Возвращает JSON-массив [{path, language, lines_total, size, mtime}].")]
+    #[tool(description = "Список файлов в индексе с фильтрами. pattern — glob по пути (`**/*.py`; альтернативы `{a,b}`: `**/*.{rs,toml}`), path_prefix — префикс (`src/auth/`), language — язык. Возвращает JSON-массив строк \"<path> | <lang> | <N> lines | <size>\" (mtime — в _meta.file_mtimes).")]
     async fn list_files(&self, Parameters(p): Parameters<ListFilesParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1060,7 +1064,7 @@ impl CodeIndexServer {
         tools::read_file(entry, p.path, p.line_start, p.line_end).await
     }
 
-    #[tool(description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=). path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок; при обрезке truncated=true. Возвращает JSON-объект {files: {\"<path>\": [{line, content, context?}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
+    #[tool(description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=). path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
     async fn grep_text(&self, Parameters(p): Parameters<GrepTextParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1076,7 +1080,7 @@ impl CodeIndexServer {
         tools::grep_text(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
-    #[tool(description = "Regex-поиск по содержимому **code-файлов** (Phase 2, v0.8.0; параметр regex=, синоним query=): module-level код, идентификаторы, комментарии вне тел, макросы, use-импорты — всё что не ловит grep_body. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 100); при обрезке результат помечается truncated=true (дошлите больший limit, если нужно больше). Возвращает JSON-объект {files: {\"<path>\": [{line, content, context}]}, shown, limit, truncated} — находки сгруппированы по файлу, путь не дублируется в каждой строке.")]
+    #[tool(description = "Regex-поиск по содержимому **code-файлов** (Phase 2, v0.8.0; параметр regex=, синоним query=): module-level код, идентификаторы, комментарии вне тел, макросы, use-импорты — всё что не ловит grep_body. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
     async fn grep_code(&self, Parameters(p): Parameters<GrepCodeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
