@@ -5,6 +5,19 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.37.1] — 2026-06-16
+
+**Deterministic counts in BSL tools + compact subscription output when filtered by `source`. The model cites a ready-made number instead of recounting an array (LLMs undercount long lists), and `get_event_subscriptions` with a filter no longer blows past the output limit. No reindex required.**
+
+### Added
+
+- **`get_register_writers`: counts `writers_count` / `writes_to_count` + `*_count_by_type`** (per register type). The model used to recount the array of names by hand and undercount (43 → “40”); now the number is ready in the response.
+- **`get_object_structure`: a `counts` section** — element count for each array section (`tabular_sections`, `attributes`, `dimensions`, `resources`, `enum_values`…). Fixes the tabular-section undercount (10 → “5”).
+
+### Changed
+
+- **`get_event_subscriptions` with a `source` filter: instead of the full `sources` array — `sources_count` + `matches_source: true`.** For global events (`ПередЗаписью` etc.) subscriptions carry `sources` of up to hundreds of types (one had 256); echoing them ballooned the response past 80K chars and broke the output limit (the response went to a file, a turn was lost). Now for `source=РеализацияТоваровУслуг`: 80,183 → ~2,700 chars. Without a filter — the full `sources`, as before.
+
 ## [0.37.0] — 2026-06-16
 
 **Output token economy + robust resolution of 1C object names in BSL tools. Compact output format for `grep_*`/`list_files`; single-object BSL tools accept Russian type prefixes and no longer depend on the argument key name; `find_symbol` tolerates name synonyms. Output-format and resolution changes — NO reindex required.**
