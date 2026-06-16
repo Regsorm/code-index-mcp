@@ -198,12 +198,24 @@ fn resolve_one(
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .unwrap_or(Value::Null);
             let attrs_value = apply_sections(attrs_value, sections);
+            // Готовые счётчики секций (детерминированно): число элементов каждой
+            // секции-массива (tabular_sections, attributes, dimensions, resources,
+            // enum_values, …). Модель цитирует counts.tabular_sections, а не
+            // пересчитывает массив — LLM занижает длину (10 ТЧ → 5).
+            let counts: serde_json::Map<String, Value> = match &attrs_value {
+                Value::Object(m) => m
+                    .iter()
+                    .filter_map(|(k, v)| v.as_array().map(|a| (k.clone(), json!(a.len()))))
+                    .collect(),
+                _ => serde_json::Map::new(),
+            };
             json!({
                 "full_name": full_name,
                 "meta_type": meta_type,
                 "name": name,
                 "synonym": synonym,
                 "attributes": attrs_value,
+                "counts": counts,
             })
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => {

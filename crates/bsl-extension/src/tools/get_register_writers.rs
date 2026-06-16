@@ -116,12 +116,32 @@ impl IndexTool for GetRegisterWritersTool {
                     }
                 };
 
+            // Готовые счётчики (детерминированно): модель цитирует число, а не
+            // пересчитывает массив — LLM занижает длину длинных списков (43→40).
+            // Считаем ДО перемещения векторов в json!.
+            let count_by_type = |v: &[String]| -> serde_json::Map<String, Value> {
+                let mut m: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                for name in v {
+                    let t = name.split('.').next().unwrap_or("").to_string();
+                    *m.entry(t).or_insert(0) += 1;
+                }
+                m.into_iter().map(|(k, c)| (k, json!(c))).collect()
+            };
+            let writers_count = writers.len();
+            let writes_to_count = writes_to.len();
+            let writers_by_type = count_by_type(&writers);
+            let writes_to_by_type = count_by_type(&writes_to);
+
             crate::tools::wrap_with_meta(
                 json!({
                     "object": object,
                     "writers": writers,
+                    "writers_count": writers_count,
+                    "writers_count_by_type": writers_by_type,
                     "writers_truncated": writers_truncated,
                     "writes_to": writes_to,
+                    "writes_to_count": writes_to_count,
+                    "writes_to_count_by_type": writes_to_by_type,
                     "writes_to_truncated": writes_to_truncated,
                 }),
                 Vec::new(),
