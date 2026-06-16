@@ -5,6 +5,27 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.37.0] — 2026-06-16
+
+**Output token economy + robust resolution of 1C object names in BSL tools. Compact output format for `grep_*`/`list_files`; single-object BSL tools accept Russian type prefixes and no longer depend on the argument key name; `find_symbol` tolerates name synonyms. Output-format and resolution changes — NO reindex required.**
+
+### Changed
+
+- **Compact output format for `grep_body`/`grep_code`/`grep_text`/`list_files` (core).** Instead of JSON objects with repeated keys (`{"line":N,"content":"X"}` on each of thousands of matches) — flat strings grouped by file: `grep_text`/`grep_code` → `"N: content"`; `grep_body` → `"<name> (<kind>) L<start>-<end>: <lines>(+N)"`; `list_files` → `"<path> | <lang> | <N> lines | <size>"`. The structural JSON overhead was the main token cost (~55% of the response). `_meta` (dependent_files/file_mtimes) is assembled separately and not duplicated. Default `limit` lowered 100 → 30.
+- **`find_symbol`: sharpened description.** Call by bare name only for a unique name; for standard handlers / common names — pass `path_glob` right away (otherwise hundreds of locations, `truncated`).
+
+### Fixed
+
+- **BSL tools accept Russian type prefixes.** `get_object_structure`/`get_register_writers`/`get_data_links`/`find_data_path`/`find_references`/`get_object_profile`/`get_event_subscriptions`/`get_form_handlers`/`bsl_sql` with `object="Документ.X"` used to return empty (the index stores English types only). Input normalization via the `META_FORMS` table (`canonical_meta_type`/`normalize_object_ref`/`normalize_sql_object_refs`): `Документ.X` → `Document.X`; for `bsl_sql` — both singular and plural forms in query literals. Eliminates a wasted cascade: an empty `get_register_writers` triggered an avalanche of `read_file` over ManagerModule.
+- **Single-object BSL tools no longer depend on the key name.** `get_register_writers`/`get_data_links`/`find_references`/`get_object_profile`/`get_object_structure` take the value of the first non-empty string argument, skipping service keys (`repo`/`depth`/`limit`/…) — the model no longer trips on `object` vs `full_name`.
+- **`find_symbol` accepts `symbol`/`query` as aliases of `name` (core).** A call with `symbol=…` previously failed with the opaque deserializer error “missing field `name`” (a wasted turn). `#[serde(alias)]` — synonyms are picked up as `name`; the schema contract (required `name`) is unchanged.
+
+### Benchmark (UT 11.5, question “lifecycle of РеализацияТоваровУслуг”)
+
+- Old format (baseline): **1,282,904** tokens / 33 turns.
+- Compact format WITHOUT name resolution: **2,172,388** / 48 (+69% — empty `get_register_writers` drove a `read_file` cascade).
+- Compact format + name resolution (final): **917,247** / 24, clean re-run **926,170** / 27, `retry=0`, verdict COMPLETE — vs baseline **−28%**.
+
 ## [0.36.0] — 2026-06-14
 
 **CORE B: the call qualifier is preserved in the graph. BSL stores `callee` glued (`Module.Method`) — consistent with the other languages; precise resolution of common-module and manager-module calls. Direct-edge resolution 52% → ~80-82%, zero false bindings.**
