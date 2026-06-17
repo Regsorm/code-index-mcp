@@ -5,6 +5,15 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.38.1] — 2026-06-17
+
+**The daemon no longer rebuilds enrichment tables for nothing on startup. A daemon restart on unchanged data is now instant (previously every start = a full rebuild of `metadata_*`/terms/call-graph, minutes on large configs).**
+
+### Fixed
+
+- **Gate against idle re-enrichment on daemon startup.** On startup, after `full_reindex` (mtime fast-path), the daemon **unconditionally** ran the full `index_extras` — rebuilding `metadata_objects`/`data_links`/`role_rights`/`code_usages`/`procedure_terms` (hundreds of thousands of procedures)/`forms`/`subscriptions`, even when mtime reported "0 changes". On the full federation (UT/BP-SS/BP-TDK/ZUP) that was ~15 minutes wasted on any container restart. Now `index_extras` is skipped when: the DB already existed, `full_reindex` indexed 0 and deleted 0 files, and the processor's extras tables are non-empty (`LanguageProcessor::extras_present` — for BSL: non-empty `metadata_objects` + mechanical terms in `procedure_enrichment`). Any data change, a new DB, or empty extras → a full pass as before; incremental edits are still handled by the watcher loop via `index_extras_for_files`.
+- **Limitation:** the gate does not track the extras SCHEMA. If a release adds a new extras table, it will stay empty on unchanged data — such releases need a one-off full rebuild (`index --force` or a DB rebuild). Noted in the `extras_present` doc comment.
+
 ## [0.38.0] — 2026-06-17
 
 **Guard the output against client-side disk offload. Heavy responses (a large module's map, long arrays of values/sources/attributes) are trimmed at the source to a sample or a compact form — with a marker for the full count — and are no longer dumped to a file by the client at the cost of a lost turn. No reindex required (all on the serve output layer).**
