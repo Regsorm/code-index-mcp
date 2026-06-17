@@ -192,7 +192,7 @@ pub fn run_worker(
         let mut indexer = Indexer::with_config(&mut storage, index_config.clone());
         indexer.full_reindex(&path, false)
     };
-    match indexer_result {
+    let (reindex_indexed, reindex_deleted) = match indexer_result {
         Ok(result) => {
             eprintln!(
                 "[worker:{}] initial reindex: {} файлов за {} мс (записано {}, пропущено {}, удалено {})",
@@ -203,6 +203,7 @@ pub fn run_worker(
                 result.files_skipped,
                 result.files_deleted
             );
+            (result.files_indexed, result.files_deleted)
         }
         Err(e) => {
             tokio_block_on(async {
@@ -210,7 +211,7 @@ pub fn run_worker(
             });
             return;
         }
-    }
+    };
 
     // 6a. index_extras процессора — для BSL это парсинг Configuration.xml /
     //     Forms / EventSubscriptions и заполнение metadata_*-таблиц.
@@ -224,18 +225,37 @@ pub fn run_worker(
     //     продолжаем — например, для репо без Configuration.xml (старая
     //     выгрузка обработок) парсер может ничего не найти и это нормально.
     if let Some(proc) = resolved_processor.as_ref() {
-        let t0 = std::time::Instant::now();
-        if let Err(e) = proc.index_extras(&path, &mut storage) {
+        // Гейт против холостого re-enrichment на старте: если БД уже была и
+        // mtime-fast-path не нашёл изменений (0 записано / 0 удалено), а extras
+        // процессора уже наполнены — полный index_extras пропускаем (он дорогой:
+        // перестроение metadata_*/terms/графа на больших конфигурациях занимает
+        // минуты). Любое изменение данных, новая БД или пустые extras → полный
+        // проход как раньше. Инкрементальные правки покрывает watcher-цикл через
+        // index_extras_for_files.
+        let skip_extras = db_existed_before
+            && reindex_indexed == 0
+            && reindex_deleted == 0
+            && proc.extras_present(&storage);
+        if skip_extras {
             eprintln!(
-                "[worker:{}] index_extras процессора '{}' упал: {}. \
-                 Базовая индексация при этом сохранена.",
-                path.display(), proc.name(), e
+                "[worker:{}] index_extras пропущен: данные не менялись (mtime fast-path), \
+                 extras процессора '{}' уже на месте",
+                path.display(), proc.name()
             );
         } else {
-            eprintln!(
-                "[worker:{}] index_extras (полный) процессора '{}' выполнен за {} мс",
-                path.display(), proc.name(), t0.elapsed().as_millis()
-            );
+            let t0 = std::time::Instant::now();
+            if let Err(e) = proc.index_extras(&path, &mut storage) {
+                eprintln!(
+                    "[worker:{}] index_extras процессора '{}' упал: {}. \
+                     Базовая индексация при этом сохранена.",
+                    path.display(), proc.name(), e
+                );
+            } else {
+                eprintln!(
+                    "[worker:{}] index_extras (полный) процессора '{}' выполнен за {} мс",
+                    path.display(), proc.name(), t0.elapsed().as_millis()
+                );
+            }
         }
     }
 
