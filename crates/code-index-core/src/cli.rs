@@ -41,6 +41,37 @@ fn mass_mode_tools_from_daemon_cfg(config: Option<&Path>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Извлечь `daemon_cfg.cap.max_response_bytes` (моно-ветка). `None` при ошибке
+/// чтения/отсутствии секции → страж `mcp::cap` работает на дефолтном бюджете.
+fn response_cap_from_daemon_cfg(config: Option<&Path>) -> Option<usize> {
+    config
+        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
+        .and_then(|cfg| cfg.cap.max_response_bytes)
+}
+
+/// Извлечь `daemon_cfg.cap.max_function_body_chars` (моно-ветка). `None` →
+/// порог тела функции/класса на дефолте (`cap::DEFAULT_MAX_FUNCTION_BODY_CHARS`).
+fn function_body_cap_from_daemon_cfg(config: Option<&Path>) -> Option<usize> {
+    config
+        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
+        .and_then(|cfg| cfg.cap.max_function_body_chars)
+}
+
+/// Извлечь `daemon_cfg.cap.cap_tools` (моно-ветка). Пусто → дефолтный набор cap.
+fn cap_tools_from_daemon_cfg(config: Option<&Path>) -> Vec<String> {
+    config
+        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
+        .map(|cfg| cfg.cap.cap_tools)
+        .unwrap_or_default()
+}
+
+/// Извлечь `daemon_cfg.cap.cap_enabled` (моно-ветка). None → дефолт (cap включён).
+fn cap_enabled_from_daemon_cfg(config: Option<&Path>) -> Option<bool> {
+    config
+        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
+        .and_then(|cfg| cfg.cap.cap_enabled)
+}
+
 #[derive(Parser)]
 #[command(name = "code-index", version, about = "Высокопроизводительный индексатор кода с MCP-протоколом")]
 struct Cli {
@@ -603,6 +634,10 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                 )?
                 .apply_tools_whitelist(&daemon_cfg.tools.enabled)
                 .apply_mass_mode_tools(&daemon_cfg.mcp.mass_mode_tools);
+                crate::mcp::cap::set_response_cap(daemon_cfg.cap.max_response_bytes);
+                crate::mcp::cap::set_function_body_cap(daemon_cfg.cap.max_function_body_chars);
+                crate::mcp::cap::set_cap_tools(Some(daemon_cfg.cap.cap_tools.clone()));
+                crate::mcp::cap::set_cap_enabled(daemon_cfg.cap.cap_enabled);
                 let federate_router = federation::server::federate_router(server.clone());
                 let allowed = std::sync::Arc::new(federation::whitelist::build(&serve_cfg));
 
@@ -670,6 +705,10 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             let server = server
                 .apply_tools_whitelist(&tools_whitelist_from_daemon_cfg(config.as_deref()))
                 .apply_mass_mode_tools(&mass_mode_tools_from_daemon_cfg(config.as_deref()));
+            crate::mcp::cap::set_response_cap(response_cap_from_daemon_cfg(config.as_deref()));
+            crate::mcp::cap::set_function_body_cap(function_body_cap_from_daemon_cfg(config.as_deref()));
+            crate::mcp::cap::set_cap_tools(Some(cap_tools_from_daemon_cfg(config.as_deref())));
+            crate::mcp::cap::set_cap_enabled(cap_enabled_from_daemon_cfg(config.as_deref()));
             let bind_host = host.unwrap_or_else(|| "127.0.0.1".to_string());
 
             // Если запуск с --config — подписываемся на изменения daemon.toml,
