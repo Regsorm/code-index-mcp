@@ -218,7 +218,7 @@ impl IndexTool for SearchTermsTool {
                     );
                 }
             }
-            crate::tools::wrap_with_meta(result, Vec::new())
+            crate::tools::wrap_with_meta("search_terms", result, Vec::new())
         })
     }
 }

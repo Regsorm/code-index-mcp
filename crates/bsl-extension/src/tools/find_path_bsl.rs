@@ -192,7 +192,7 @@ impl IndexTool for FindPathBslTool {
                 }),
                 Err(e) => json!({"error": format!("database error: {}", e)}),
             };
-            crate::tools::wrap_with_meta(result_value, Vec::new())
+            crate::tools::wrap_with_meta("find_path_bsl", result_value, Vec::new())
         })
     }
 }

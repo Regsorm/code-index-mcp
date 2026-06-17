@@ -304,6 +304,7 @@ impl IndexTool for GetEventSubscriptionsTool {
 
             let count = out.len();
             crate::tools::wrap_with_meta(
+                "get_event_subscriptions",
                 json!({
                     "subscriptions": out,
                     "count": count,

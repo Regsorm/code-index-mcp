@@ -176,7 +176,7 @@ impl IndexTool for GetFormHandlersTool {
                     }
                 }
             };
-            crate::tools::wrap_with_meta(result_value, Vec::new())
+            crate::tools::wrap_with_meta("get_form_handlers", result_value, Vec::new())
         })
     }
 }

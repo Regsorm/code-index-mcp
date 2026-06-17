@@ -119,10 +119,7 @@ impl IndexTool for FindDataPathTool {
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    return crate::tools::wrap_with_meta(
-                        json!({ "error": format!("database error: {}", e) }),
-                        Vec::new(),
-                    );
+                    return crate::tools::wrap_error(json!({ "error": format!("database error: {}", e) }));
                 }
             };
 
@@ -175,10 +172,7 @@ impl IndexTool for FindDataPathTool {
             }
 
             if let Some(err) = db_err {
-                return crate::tools::wrap_with_meta(
-                    json!({ "error": format!("database error: {}", err) }),
-                    Vec::new(),
-                );
+                return crate::tools::wrap_error(json!({ "error": format!("database error: {}", err) }));
             }
 
             let result_value = if reached {
@@ -204,7 +198,7 @@ impl IndexTool for FindDataPathTool {
                     "from": from, "to": to, "found": false, "path": [], "max_depth": max_depth,
                 })
             };
-            crate::tools::wrap_with_meta(result_value, Vec::new())
+            crate::tools::wrap_with_meta("find_data_path", result_value, Vec::new())
         })
     }
 }

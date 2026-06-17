@@ -259,7 +259,7 @@ impl IndexTool for BslSqlTool {
                             None => payload["hint"] = json!(empty_result_hint(sql)),
                         }
                     }
-                    crate::tools::wrap_with_meta(payload, Vec::new())
+                    crate::tools::wrap_with_meta("bsl_sql", payload, Vec::new())
                 }
                 Err(e) => {
                     let interrupted = matches!(

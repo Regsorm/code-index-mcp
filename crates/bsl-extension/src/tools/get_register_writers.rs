@@ -133,6 +133,7 @@ impl IndexTool for GetRegisterWritersTool {
             let writes_to_by_type = count_by_type(&writes_to);
 
             crate::tools::wrap_with_meta(
+                "get_register_writers",
                 json!({
                     "object": object,
                     "writers": writers,

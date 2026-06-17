@@ -137,7 +137,19 @@ impl IndexTool for GetObjectStructureTool {
                     "error": "missing parameter: передайте 'full_name' — полное имя вида '<MetaType>.<Name>' (строка)"
                 })
             };
-            crate::tools::wrap_with_meta(result_value, Vec::new())
+            // Структурный инструмент (cap::STRUCTURAL_TOOLS): вместо слепого
+            // cap_response — посекционный omit (тяжёлую секцию ЦЕЛИКОМ, не обрезая
+            // частично), затем wrap БЕЗ cap. Так enum_synonyms (сотни ключей)
+            // выкидывается с count, а enum_values/имена остаются полными.
+            if code_index_core::mcp::cap::is_structural_tool("get_object_structure") {
+                let (result_value, omitted) = code_index_core::mcp::cap::omit_oversize_sections(
+                    result_value,
+                    code_index_core::mcp::cap::response_cap(),
+                );
+                crate::tools::wrap_with_meta_structural(result_value, Vec::new(), omitted)
+            } else {
+                crate::tools::wrap_with_meta("get_object_structure", result_value, Vec::new())
+            }
         })
     }
 }

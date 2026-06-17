@@ -49,17 +49,64 @@ use serde_json::{json, Value};
 /// не как файлы а как records в SQLite) — отдаём пустой массив. Entry попадёт
 /// в кэш без file-зависимостей и будет чиститься только по TTL (как раньше).
 /// Включение реальных dependent_files для BSL — задача следующей итерации.
-pub(crate) fn wrap_with_meta(result: Value, dependent_files: Vec<String>) -> Value {
-    json!({
+pub(crate) fn wrap_with_meta(tool: &str, result: Value, dependent_files: Vec<String>) -> Value {
+    // cap_response (обрез массивов с сэмплом) применяется ТОЛЬКО если инструмент
+    // в списке `[mcp].cap_tools` (параметр сервера; дефолт — cap::DEFAULT_CAP_TOOLS).
+    // Иначе ответ как есть. Серверная нода ужимает ДО federation-провода и клиента
+    // (не давая harness'у сбросить громадный tool_result на диск).
+    let (result, truncated) = if code_index_core::mcp::cap::cap_applies(tool) {
+        code_index_core::mcp::cap::cap_response(result, code_index_core::mcp::cap::response_cap())
+    } else {
+        (result, false)
+    };
+    let mut out = json!({
         "result": result,
         "_meta": { "dependent_files": dependent_files },
-    })
+    });
+    if truncated {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("response_truncated".to_string(), json!(true));
+            obj.insert(
+                "response_truncated_hint".to_string(),
+                json!(code_index_core::mcp::cap::CAP_HINT),
+            );
+        }
+    }
+    out
+}
+
+/// Обёртка для СТРУКТУРНЫХ инструментов (get_object_structure и др. из
+/// `cap::STRUCTURAL_TOOLS`): `{result, _meta}` БЕЗ `cap_response` — слепой обрез
+/// массивов исказил бы авторитетную структуру объекта 1С (получишь «1 значение
+/// перечисления из 816»). Размером такие tools управляют сами через
+/// `cap::omit_oversize_sections` (тяжёлую секцию целиком) ДО этой обёртки.
+/// `omitted` → добавить верхнеуровневый маркер + hint.
+pub(crate) fn wrap_with_meta_structural(
+    result: Value,
+    dependent_files: Vec<String>,
+    omitted: bool,
+) -> Value {
+    let mut out = json!({
+        "result": result,
+        "_meta": { "dependent_files": dependent_files },
+    });
+    if omitted {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("response_sections_omitted".to_string(), json!(true));
+            obj.insert(
+                "response_sections_omitted_hint".to_string(),
+                json!(code_index_core::mcp::cap::OMIT_HINT),
+            );
+        }
+    }
+    out
 }
 
 /// Сохранить _meta даже на ошибке, чтобы клиенты всегда получали единый формат
 /// `{result, _meta}`. Tool сам помещает в `result` что нужно (включая `{error: ...}`).
 pub(crate) fn wrap_error(error_value: Value) -> Value {
-    wrap_with_meta(error_value, Vec::new())
+    // Ошибки крошечные и капу не подлежат — без cap, без hint.
+    wrap_with_meta_structural(error_value, Vec::new(), false)
 }
 
 /// Имя объекта для single-object инструмента — берётся ЗНАЧЕНИЕ без оглядки на имя

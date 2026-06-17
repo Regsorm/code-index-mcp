@@ -150,7 +150,7 @@ impl IndexTool for GetDataLinksTool {
                 }
             }
 
-            crate::tools::wrap_with_meta(result, Vec::new())
+            crate::tools::wrap_with_meta("get_data_links", result, Vec::new())
         })
     }
 }

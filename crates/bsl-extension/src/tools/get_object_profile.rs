@@ -138,7 +138,7 @@ impl IndexTool for GetObjectProfileTool {
             timer.abort();
 
             match result {
-                Ok(v) => crate::tools::wrap_with_meta(v, Vec::new()),
+                Ok(v) => crate::tools::wrap_with_meta("get_object_profile", v, Vec::new()),
                 Err(e) => crate::tools::wrap_error(json!({
                     "error": format!("database error: {}", e)
                 })),

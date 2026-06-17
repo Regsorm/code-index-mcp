@@ -150,6 +150,7 @@ impl IndexTool for FindReferencesTool {
             timer.abort();
 
             crate::tools::wrap_with_meta(
+                "find_references",
                 json!({
                     "object": object,
                     "data_refs": data_refs,
