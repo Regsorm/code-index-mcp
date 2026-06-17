@@ -569,6 +569,24 @@ Recommended values:
 | 1C repos / git operations / large bulk edits | 1500 (default) |
 | CI or scripted batch edits | 3000+ |
 
+### Guarding output against disk offload (`[cap]`, v0.38.0)
+
+The client (`claude` CLI / Claude Code) caps a single `tool_result` streamed inline into context (`MAX_MCP_OUTPUT_TOKENS` ≈ 25,000 tokens). A response over the cap is dumped to a file on disk by the harness, handing the model only a path + preview — structured inline access is lost. To keep large outputs (a big module's map, long arrays of values/sources/attributes) from being offloaded, `serve` trims them at the source. Configured via an optional `[cap]` section in `daemon.toml`:
+
+```toml
+[cap]
+max_response_bytes      = 48000   # response budget in JSON bytes; 0 disables cap_response
+cap_enabled             = true    # global on/off for cap_response (takes precedence over cap_tools)
+cap_tools               = ["get_event_subscriptions", "bsl_sql", "find_references", "get_register_writers"]
+max_function_body_chars = 15000   # get_function/get_class body threshold; 0 keeps the full body
+```
+
+Mechanisms (all optional, act on the serve output layer, require no reindex):
+
+- **`cap_response`** — while the response JSON exceeds `max_response_bytes`, halves the heaviest array, leaving `<key>_total` (original count) and `<key>_truncated: true`. Applied to tools in `cap_tools` (when `cap_enabled = true`). Only arrays are trimmed — large strings (`read_file`/`grep`) are untouched. `get_file_summary` (core) is wired in here too: a giant module's map (hundreds of functions) no longer goes to offload.
+- **`omit_oversize_sections`** (for `get_object_structure`) — where an array/map is the full authoritative answer (a 1C object's structure), the heaviest section is dropped WHOLESALE with `<section>_omitted: true` + `<section>_count: N` (a partial sample would lie, “here are all the enum values”).
+- **Navigational body cap** (`get_function`/`get_class`) — a body longer than `max_function_body_chars` is returned as a head+tail+marker stub with a hint to `read_file(line_start,line_end)` / `grep_body`.
+
 ## Benchmarks
 
 Tested on 1C:Enterprise configurations (HDD, Windows):

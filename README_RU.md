@@ -573,6 +573,24 @@ code-index daemon reload
 | 1С-репо / git-операции / массовые правки | 1500 (дефолт) |
 | CI или скриптованные batch-правки | 3000+ |
 
+### Защита выдачи от disk-offload (`[cap]`, v0.38.0)
+
+Клиент (`claude` CLI / Claude Code) держит лимит на один `tool_result`, вливаемый inline в контекст (`MAX_MCP_OUTPUT_TOKENS` ≈ 25 000 токенов). Ответ сверх лимита harness сбрасывает в файл на диск, отдавая модели только путь + preview — структурный inline-доступ теряется. Чтобы крупные выдачи (карта большого модуля, длинные массивы значений/источников/реквизитов) не уходили в offload, `serve` режет их в источнике. Настраивается опциональной секцией `[cap]` в `daemon.toml`:
+
+```toml
+[cap]
+max_response_bytes      = 48000   # бюджет ответа в байтах JSON; 0 — выключить cap_response
+cap_enabled             = true    # глобальный выключатель cap_response (приоритетнее cap_tools)
+cap_tools               = ["get_event_subscriptions", "bsl_sql", "find_references", "get_register_writers"]
+max_function_body_chars = 15000   # порог тела get_function/get_class; 0 — тело всегда целиком
+```
+
+Механизмы (все опциональны, действуют на serve-слое выдачи, переиндексации не требуют):
+
+- **`cap_response`** — пока JSON ответа превышает `max_response_bytes`, усекает самый тяжёлый массив вдвое, оставляя `<ключ>_total` (исходное число) и `<ключ>_truncated: true`. Применяется к инструментам из `cap_tools` (при `cap_enabled = true`). Усекаются только массивы — большие строки (`read_file`/`grep`) не трогаются. Сюда же подключён `get_file_summary` (core): карта гигантского модуля (сотни функций) больше не уходит в offload.
+- **`omit_oversize_sections`** (для `get_object_structure`) — где массив/мапа = полный авторитетный ответ (структура объекта 1С), тяжёлая секция выкидывается ЦЕЛИКОМ с `<секция>_omitted: true` + `<секция>_count: N` (частичный сэмпл соврал бы «вот все значения перечисления»).
+- **Навигационный кап тела** (`get_function`/`get_class`) — тело длиннее `max_function_body_chars` отдаётся стабом голова+хвост+маркер+hint на `read_file(line_start,line_end)` / `grep_body`.
+
 ## Бенчмарки
 
 Протестировано на конфигурациях 1С:Предприятие (HDD, Windows):

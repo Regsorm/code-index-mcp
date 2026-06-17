@@ -5,6 +5,29 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.38.0] — 2026-06-17
+
+**Guard the output against client-side disk offload. Heavy responses (a large module's map, long arrays of values/sources/attributes) are trimmed at the source to a sample or a compact form — with a marker for the full count — and are no longer dumped to a file by the client at the cost of a lost turn. No reindex required (all on the serve output layer).**
+
+> Context. The client (`claude` CLI / Claude Code) caps a single `tool_result` streamed inline into context (`MAX_MCP_OUTPUT_TOKENS` ≈ 25,000 tokens). A response over the cap is **dumped to a file on disk** by the harness, handing the model only a path + preview — after which structured inline access is lost and the model greps the file in extra turns. The core hard caps (`grep_*` 1 MB, `read_file` 2 MB) miss this class: it's not one giant string but a long array (enum values, subscription sources, the function map of a large module).
+
+### Added
+
+- **`cap_response` — a generic response-size guard (serve layer).** While the serialized JSON exceeds the `[cap].max_response_bytes` budget (default **48,000 bytes** ≈ 12–24k Cyrillic tokens, comfortably under the 25k-token offload), it repeatedly finds the heaviest array-valued key and halves it, leaving `<key>_total` (original element count, set once) and `<key>_truncated: true` next to it. Only **arrays** are trimmed — large strings (`read_file`/`grep` content) are untouched. Gated by the `[cap].cap_tools` list (default: `get_event_subscriptions`, `bsl_sql`, `find_references`, `get_register_writers`).
+- **`[cap].cap_enabled` — a global on/off switch for `cap_response`** (default `true`). Takes precedence over the list: when `false`, cap applies to nothing regardless of `cap_tools` (structural omit and the navigational body cap work independently). Needed because an empty `cap_tools` means “default set”, not “off”.
+- **`omit_oversize_sections` for structural tools (`get_object_structure`).** Where an array/map is the FULL authoritative answer (a 1C object's structure), a partial sample would lie (“here are all the enum values”). So the heaviest section (array > 1 element / map > 16 keys) is dropped WHOLESALE with `<section>_omitted: true` + `<section>_count: N` — a section is either fully present or honestly omitted with its count.
+- **Navigational body cap (`get_function`/`get_class`).** A body longer than `[cap].max_function_body_chars` (default **15,000 chars**) → a navigational stub: head + tail + marker + a hint to `read_file(line_start,line_end)` / `grep_body`. A body is connected code, so it's cut head+tail (not by the middle) with an exact line range.
+- **`[cap]` config:** `max_response_bytes`, `cap_tools`, `cap_enabled`, `max_function_body_chars` (all optional; 0 for the byte/char thresholds disables the guard).
+
+### Fixed
+
+- **`get_file_summary` on giant modules no longer goes to disk offload.** `get_file_summary` is a core tool wrapped via `wrap_with_meta_extra`, where `cap` doesn't apply to the core; adding it to `cap_tools` didn't cover it. On `УправлениеДоступомСлужебный` (972 functions, 47,399 lines), even the compact map (`MAP_DETAIL_CAP = 120` — names+lines only, no signatures/docstrings) was **100,164 chars** on a single line → the client dumped the response to a file and the turn was lost (weak spot #4 of the UT-11 run, Q08 “RLS”). Now the core calls `cap_response` before wrapping: a sample + `functions_total` + `functions_truncated` remain, and the response is returned inline.
+
+### Measurement (UT-11 run, Q08 “access rights / RLS”, Sonnet)
+
+- On the fixed build: **0** disk offloads over the run, the largest `tool_result` was **19,128 chars** (~4.8k tokens) against the ~25k-token offload threshold. 38 `*_truncated` markers in the trace = the cap mechanisms working as intended. Verdict on the question — COMPLETE.
+- Smoke via federation (production UT, `УправлениеДоступомСлужебный` 47,399 lines): `functions_total: 972`, `functions_truncated: true`, compact map — response inline (~48 KB), offload eliminated.
+
 ## [0.37.1] — 2026-06-16
 
 **Deterministic counts in BSL tools + compact subscription output when filtered by `source`. The model cites a ready-made number instead of recounting an array (LLMs undercount long lists), and `get_event_subscriptions` with a filter no longer blows past the output limit. No reindex required.**
