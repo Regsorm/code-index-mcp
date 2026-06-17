@@ -155,6 +155,30 @@ impl LanguageProcessor for BslLanguageProcessor {
     ) -> anyhow::Result<()> {
         crate::index_extras::run_incremental_extras(repo_root, storage, changed, deleted)
     }
+
+    /// Extras считаются наполненными, когда непусты ОБЕ ключевые таблицы,
+    /// которые гарантированно есть у нормального BSL-репо: `metadata_objects`
+    /// (из Configuration.xml) и механические термы в `procedure_enrichment`
+    /// (из .bsl). Любая отсутствует/пуста (старая схема, прерванный прогон) →
+    /// `false` → демон сделает полный `index_extras`. Прочие extras
+    /// (event_subscriptions/forms) не проверяем — они легитимно бывают пусты.
+    fn extras_present(&self, storage: &Storage) -> bool {
+        let conn = storage.conn();
+        let meta: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metadata_objects", [], |r| r.get(0))
+            .unwrap_or(0);
+        if meta == 0 {
+            return false;
+        }
+        let terms: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM procedure_enrichment WHERE signature LIKE 'mech:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        terms > 0
+    }
 }
 
 #[cfg(test)]

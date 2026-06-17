@@ -2788,6 +2788,49 @@ mod tests {
         assert_eq!(count, 1, "повторный run не должен плодить дубликаты");
     }
 
+    #[test]
+    fn extras_present_requires_meta_and_terms() {
+        use crate::processor::BslLanguageProcessor;
+        use code_index_core::extension::processor::LanguageProcessor;
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects><Catalog>X</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        let mut storage = fresh_storage(&tmp);
+        let proc = BslLanguageProcessor::new();
+
+        // 1. Свежая БД — extras пусты → false (демон сделает полный проход).
+        assert!(!proc.extras_present(&storage), "пустые extras → false");
+
+        // 2. metadata_objects наполнено, но .bsl нет → terms пусты → всё ещё false
+        //    (гейт требует ОБЕ ключевые таблицы непустыми).
+        run_index_extras(&repo, &mut storage).unwrap();
+        assert!(
+            !proc.extras_present(&storage),
+            "metadata без механических terms → false"
+        );
+
+        // 3. Добавили механический терм → обе таблицы непусты → true
+        //    (рестарт демона при неизменных данных может пропустить пересбор).
+        storage
+            .conn()
+            .execute(
+                "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+                 VALUES (?1, 'X.bsl::П', 'термин', 'mech:v1', 0)",
+                params![REPO_DEFAULT],
+            )
+            .unwrap();
+        assert!(
+            proc.extras_present(&storage),
+            "metadata_objects + mech-terms непусты → true"
+        );
+    }
+
     /// Мини-репо для тестов механических термов: общий модуль с синонимом
     /// и процедурой с комментарием. files/functions заполняются вручную
     /// (как будто core-парсер уже отработал — extras его не запускают).
