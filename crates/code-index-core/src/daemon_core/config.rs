@@ -72,6 +72,12 @@ pub struct DaemonFileConfig {
     /// → массовый режим выключен у всех (дефолт с v0.28.0). См. [`McpSection`].
     #[serde(default)]
     pub mcp: McpSection,
+
+    /// Опциональная секция `[cap]` — параметры стража размера выдачи
+    /// (`cap_response`/`omit`/навигационный кап тела), защищающего ответы от
+    /// disk-offload у клиента. Отсутствие секции → дефолты кода. См. [`CapSection`].
+    #[serde(default)]
+    pub cap: CapSection,
 }
 
 /// Дефолтный hardcoded-лимит размера code-файла, content которого сохраняется
@@ -188,6 +194,65 @@ pub struct McpSection {
     /// отсутствует → массовый режим выключен у всех (дефолт).
     #[serde(default)]
     pub mass_mode_tools: Vec<String>,
+}
+
+/// Секция `[cap]` из конфига демона — параметры стража размера выдачи
+/// (`mcp::cap`), защищающего ответы от disk-offload на стороне клиента.
+/// Отдельна от `[mcp]` (массовый режим): это разные подсистемы выдачи.
+/// Отсутствие секции → все параметры на дефолтах кода (`mcp::cap::*`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapSection {
+    /// Бюджет размера одного ответа инструмента в БАЙТАХ сериализованного JSON
+    /// (страж `mcp::cap::cap_response`). При превышении самые длинные массивы
+    /// усекаются с маркерами `<ключ>_total`/`<ключ>_truncated` — чтобы клиент
+    /// (Claude Code) не сбрасывал громадный `tool_result` в файл на диск.
+    /// Отсутствует → дефолт `cap::DEFAULT_MAX_RESPONSE_BYTES` (~48 КБ);
+    /// `0` → страж выключен. Пример:
+    ///
+    /// ```toml
+    /// [cap]
+    /// max_response_bytes = 48000
+    /// ```
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+
+    /// Порог тела функции/класса в СИМВОЛАХ для `get_function`/`get_class`.
+    /// Тело длиннее → навигационный стаб (голова+хвост+маркер+hint на read_file)
+    /// вместо полного тела — чтобы крупная процедура не уходила в disk-offload
+    /// у клиента. Отсутствует → дефолт `cap::DEFAULT_MAX_FUNCTION_BODY_CHARS`
+    /// (~15000); `0` → выключено (тело всегда целиком). Пример:
+    ///
+    /// ```toml
+    /// [cap]
+    /// max_function_body_chars = 15000
+    /// ```
+    #[serde(default)]
+    pub max_function_body_chars: Option<usize>,
+
+    /// Список инструментов, к которым применяется `cap_response` (обрез массивов
+    /// с сэмплом + total). Пусто/отсутствует → дефолтный набор
+    /// `cap::DEFAULT_CAP_TOOLS`. Структурные tools (get_object_structure) под cap
+    /// не ставить — они управляют размером сами (посекционный omit). Пример:
+    ///
+    /// ```toml
+    /// [cap]
+    /// cap_tools = ["get_event_subscriptions", "bsl_sql"]
+    /// ```
+    #[serde(default)]
+    pub cap_tools: Vec<String>,
+
+    /// Глобальный выключатель `cap_response` (обрез массивов с сэмплом).
+    /// `true`/отсутствует → cap применяется к инструментам из `cap_tools`.
+    /// `false` → cap НЕ применяется ни к одному инструменту (omit структурных
+    /// и навигационный кап тела работают независимо — у них свои пороги).
+    /// Имеет приоритет над `cap_tools`. Пример:
+    ///
+    /// ```toml
+    /// [cap]
+    /// cap_enabled = false
+    /// ```
+    #[serde(default)]
+    pub cap_enabled: Option<bool>,
 }
 
 /// Секция `[enrichment]` из конфига демона.
@@ -699,6 +764,35 @@ mod tests {
     fn mcp_mass_mode_default_empty() {
         // Нет секции [mcp] → массовый режим выключен у всех (дефолт v0.28.0).
         let cfg: DaemonFileConfig = parse_str("").unwrap();
+        assert!(cfg.mcp.mass_mode_tools.is_empty());
+    }
+
+    #[test]
+    fn cap_section_default_empty() {
+        // Нет секции [cap] → все cap-параметры None/пусто (действуют дефолты кода).
+        let cfg: DaemonFileConfig = parse_str("").unwrap();
+        assert!(cfg.cap.max_response_bytes.is_none());
+        assert!(cfg.cap.max_function_body_chars.is_none());
+        assert!(cfg.cap.cap_tools.is_empty());
+        assert!(cfg.cap.cap_enabled.is_none());
+    }
+
+    #[test]
+    fn parses_cap_section() {
+        // Секция [cap] отдельна от [mcp]: cap-параметры читаются из неё.
+        let text = r#"
+            [cap]
+            max_response_bytes = 32000
+            max_function_body_chars = 9000
+            cap_tools = ["get_event_subscriptions", "bsl_sql"]
+            cap_enabled = false
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(cfg.cap.max_response_bytes, Some(32000));
+        assert_eq!(cfg.cap.max_function_body_chars, Some(9000));
+        assert_eq!(cfg.cap.cap_tools, vec!["get_event_subscriptions", "bsl_sql"]);
+        assert_eq!(cfg.cap.cap_enabled, Some(false));
+        // [mcp] и [cap] не пересекаются: mass_mode пуст.
         assert!(cfg.mcp.mass_mode_tools.is_empty());
     }
 

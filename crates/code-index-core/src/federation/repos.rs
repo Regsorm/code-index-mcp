@@ -159,6 +159,7 @@ mod tests {
             cache_targets: Vec::new(),
             tools: Default::default(),
             mcp: Default::default(),
+            cap: Default::default(),
         }
     }
 
