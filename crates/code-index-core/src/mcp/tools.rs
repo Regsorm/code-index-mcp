@@ -548,6 +548,54 @@ pub async fn search_class(
     }
 }
 
+/// Навигационный кап тела записи (function/class): если тело длиннее порога
+/// `cap::function_body_cap()` символов — заменить полное тело стабом
+/// «голова + хвост + маркер + точный диапазон строк для read_file» и добавить
+/// поля `body_truncated`/`body_lines_total`/`body_chars_total`. Иначе — запись
+/// как есть. Тело — связный код, поэтому НЕ режем серединой (потеря логики):
+/// голова сохраняет сигнатуру/начало, хвост — финал (часто запись движений),
+/// а полный текст/середина достаются точечным `read_file(line_start..line_end)`.
+/// Цель — не отдавать клиенту громадный tool_result, который harness сбросит в
+/// файл на диск (порог MAX_MCP_OUTPUT_TOKENS).
+fn cap_record_body(
+    mut record: serde_json::Value,
+    body: &str,
+    path: &str,
+    line_start: usize,
+    line_end: usize,
+) -> serde_json::Value {
+    const HEAD_LINES: usize = 60;
+    const TAIL_LINES: usize = 40;
+    let cap = crate::mcp::cap::function_body_cap();
+    let chars = body.chars().count();
+    if cap == 0 || chars <= cap {
+        return record;
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let total = lines.len();
+    // Если строк не больше, чем голова+хвост — усекать нечего (всё равно показали бы целиком).
+    if total <= HEAD_LINES + TAIL_LINES {
+        return record;
+    }
+    let head = lines[..HEAD_LINES].join("\n");
+    let tail = lines[total - TAIL_LINES..].join("\n");
+    let stub = format!(
+        "{head}\n\n…[ТЕЛО УСЕЧЕНО до головы+хвоста: всего {total} строк ({chars} симв.). \
+         Показаны первые {HEAD_LINES} и последние {TAIL_LINES}. Нужен фрагмент середины: \
+         по СМЫСЛУ (надёжнее — работает и без #Область) — grep_body(repo=<этот repo>, \
+         regex=\"<ключевое слово>\", path_glob=\"{path}\", context_lines=20); по СТРОКАМ — \
+         read_file(repo=<этот repo>, path=\"{path}\", line_start={line_start}, \
+         line_end={line_end}) (сузьте диапазон, иначе вернётся всё тело).]…\n\n{tail}"
+    );
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("body".to_string(), serde_json::json!(stub));
+        obj.insert("body_truncated".to_string(), serde_json::json!(true));
+        obj.insert("body_lines_total".to_string(), serde_json::json!(total));
+        obj.insert("body_chars_total".to_string(), serde_json::json!(chars));
+    }
+    record
+}
+
 pub async fn get_function(
     entry: &RepoEntry,
     name: String,
@@ -593,7 +641,20 @@ pub fn get_function_with(
                 return wrap_with_meta_extra(storage, &hits, deps, Some(extra));
             }
             let hint = if r.is_empty() { Some(HINT_GET_EMPTY) } else { None };
-            wrap_with_meta_hint(storage, &r, deps, hint)
+            // Навигационный кап оверсайз-тел (защита от disk-offload у клиента).
+            let records: Vec<serde_json::Value> = r
+                .iter()
+                .map(|fr| {
+                    cap_record_body(
+                        serde_json::to_value(fr).unwrap_or_else(|_| serde_json::json!({})),
+                        &fr.body,
+                        &lookup_path(storage, fr.file_id),
+                        fr.line_start,
+                        fr.line_end,
+                    )
+                })
+                .collect();
+            wrap_with_meta_hint(storage, &records, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"get_function: {}\"}}", e),
     }
@@ -641,7 +702,20 @@ pub fn get_class_with(
                 return wrap_with_meta_extra(storage, &hits, deps, Some(extra));
             }
             let hint = if r.is_empty() { Some(HINT_GET_EMPTY) } else { None };
-            wrap_with_meta_hint(storage, &r, deps, hint)
+            // Навигационный кап оверсайз-тел (защита от disk-offload у клиента).
+            let records: Vec<serde_json::Value> = r
+                .iter()
+                .map(|cr| {
+                    cap_record_body(
+                        serde_json::to_value(cr).unwrap_or_else(|_| serde_json::json!({})),
+                        &cr.body,
+                        &lookup_path(storage, cr.file_id),
+                        cr.line_start,
+                        cr.line_end,
+                    )
+                })
+                .collect();
+            wrap_with_meta_hint(storage, &records, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"get_class: {}\"}}", e),
     }
@@ -1097,6 +1171,16 @@ pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
                     "карта файла без тел функций/классов; тело — get_function(name) или read_file(line_start,line_end)"
                 },
             });
+            // Core-инструмент сам лимитируется по размеру (cap к core-wrap не
+            // применяется). На гигантских модулях 1С (УправлениеДоступомСлужебный —
+            // сотни процедур) даже компактная карта без тел превышает лимит одного
+            // tool_result у клиента и уходит в disk-offload (поймано прогоном УТ-11,
+            // Q08 RLS: 100 164 симв). Режем самый тяжёлый массив (functions/classes)
+            // до бюджета [mcp].max_response_bytes: остаётся sample + `<ключ>_total`
+            // (исходное число) + `<ключ>_truncated`. Полный перечень не нужен —
+            // конкретную функцию бери get_function(name) / grep_body.
+            let (payload, _capped) =
+                crate::mcp::cap::cap_response(payload, crate::mcp::cap::response_cap());
             wrap_with_meta(&storage, &payload, vec![path.clone()])
         }
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден\"}}", path),
@@ -1628,6 +1712,43 @@ mod tests {
     use super::*;
     use crate::storage::{PoolConfig, Storage, StoragePool};
     use std::time::{Duration, Instant};
+
+    /// Навигационный кап тела: оверсайз → голова+хвост+маркеры; малое — без
+    /// изменений; cap=0 → выключено. Один тест (не параллелить глобальный статик).
+    #[test]
+    fn cap_record_body_behaviour() {
+        // 1) оверсайз → голова + хвост + маркеры, середина выкинута
+        crate::mcp::cap::set_function_body_cap(Some(200));
+        let big: String = (0..300)
+            .map(|i| format!("строка_{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = cap_record_body(
+            serde_json::json!({ "body": big.clone() }),
+            &big,
+            "base/X/Module.bsl",
+            10,
+            310,
+        );
+        assert_eq!(out["body_truncated"], serde_json::json!(true));
+        assert_eq!(out["body_lines_total"], serde_json::json!(300));
+        let b = out["body"].as_str().unwrap();
+        assert!(b.contains("строка_0") && b.contains("строка_299"), "голова+хвост");
+        assert!(!b.contains("строка_150"), "середина выкинута");
+        assert!(b.contains("ТЕЛО УСЕЧЕНО") && b.contains("read_file") && b.contains("base/X/Module.bsl"));
+        assert!(b.len() < big.len(), "стаб реально короче тела");
+        // 2) малое тело — без изменений
+        let small = "малое тело\nвторая".to_string();
+        let out2 = cap_record_body(serde_json::json!({ "body": small.clone() }), &small, "p", 1, 2);
+        assert!(out2.get("body_truncated").is_none());
+        assert_eq!(out2["body"], serde_json::json!(small));
+        // 3) cap=0 → выключено (тело целиком)
+        crate::mcp::cap::set_function_body_cap(Some(0));
+        let out3 = cap_record_body(serde_json::json!({ "body": big.clone() }), &big, "p", 1, 300);
+        assert!(out3.get("body_truncated").is_none());
+        // вернуть дефолт, чтобы не влиять на другие тесты
+        crate::mcp::cap::set_function_body_cap(None);
+    }
 
     /// На BSL-репо пустые поиски процедур (search_function, grep_body, grep_code,
     /// find_symbol) подсказывают search_terms; на прочих языках — старый hint.

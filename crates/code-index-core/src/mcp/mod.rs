@@ -27,6 +27,7 @@ use crate::federation::client::RemoteClientPool;
 use crate::federation::repos::FederatedRepo;
 use crate::storage::{PoolConfig, Storage, StoragePool};
 
+pub mod cap;
 pub mod config_watch;
 pub mod tools;
 
