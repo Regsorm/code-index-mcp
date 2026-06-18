@@ -5,6 +5,20 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.39.0] — 2026-06-18
+
+**The daemon no longer hangs on bulk git updates of 1C repos. A metadata-composition change (`Configuration.xml` in the batch) now rebuilds only the lightweight XML enrichment layer, not the heavy code layer — no reindex required (daemon serve watcher-path change).**
+
+> Context. On a bulk update of a local BSL repo (`git reset --hard` / `pull` to a distant commit) the watcher collects a batch containing a changed `Configuration.xml`. Previously this triggered a FULL `run_index_extras` right inside the watcher loop — rebuilding `metadata_*` + `data_links` + `role_rights` + `code_usages` + `procedure_terms` (hundreds of thousands of procedures) + the call graph, in a "live" context competing with the `serve` reader for SQLite → busy-spin at 100% CPU for tens of minutes. Reproduced identically on the VM (docker) and Windows.
+
+### Fixed
+
+- **A `Configuration.xml` change no longer triggers a full re-enrichment in the watcher loop.** In `run_incremental_extras`, the `config_changed` branch (fires on any changed `Configuration.xml` — which is rewritten on every `DumpConfigToFiles` export, not only on real composition edits) used to `return run_index_extras(...)`, a full heavy pass. It now rebuilds only the **XML layer** and does NOT `return`: the heavy code layer is kept current by per-file `update_*_for_file` over the batch's `.bsl`. On full UT (57K files) a config-changed batch of 43 `Configuration.xml` files takes **~21 s** (XML layer) instead of a multi-minute hang. The object list stays correct — adding/removing/renaming an object is reflected in `metadata_objects` equivalently to a full rebuild (3 regression tests).
+
+### Changed
+
+- **`run_index_extras` split into an XML layer and a code layer.** The new `run_index_extras_metadata_layer` builds the object list, structure (`attributes_json`), data links, config-level edges, role rights, synonyms, forms, subscriptions, modules — an XML-export walk (seconds even on UT). The heavy code layer (`metadata_code_usages`, `procedure_terms`, `build_call_graph`) is called from the full `run_index_extras` afterwards, and is left untouched on the incremental path on a composition change. A full rebuild still runs on initial reindex and `index --force`. Full-pass behavior is unchanged: phase order preserved, dependencies (attributes/synonyms → metadata_objects, call_graph → forms/subscriptions) respected.
+
 ## [0.38.1] — 2026-06-17
 
 **The daemon no longer rebuilds enrichment tables for nothing on startup. A daemon restart on unchanged data is now instant (previously every start = a full rebuild of `metadata_*`/terms/call-graph, minutes on large configs).**
