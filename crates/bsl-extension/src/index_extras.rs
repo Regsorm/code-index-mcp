@@ -71,8 +71,54 @@ const REPO_DEFAULT: &str = "default";
 pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     let conn = storage.conn();
 
-    // Каждая фаза независима. Если одна ошибка — пишем warning, идём
-    // дальше; одна сломанная подписка не должна валить весь процесс.
+    // XML-слой обогащения (перечень, структура, связи, права, формы, подписки,
+    // модули) — обход XML выгрузки, дёшево. Вынесен в отдельную функцию, чтобы
+    // инкрементальный путь при изменении состава (Configuration.xml) пересобирал
+    // ТОЛЬКО его, не трогая тяжёлый код-слой ниже.
+    run_index_extras_metadata_layer(repo_root, conn)?;
+
+    // КОД-слой (тяжёлый: обратный индекс использований по всему .bsl, термы по
+    // сотням тысяч процедур, полный граф вызовов). На инкрементальном пути НЕ
+    // вызывается — его держат точечные update_*_for_file по .bsl батча.
+    // Обратный индекс использований объектов МД в коде (.bsl) → metadata_code_usages.
+    if let Err(e) = index_metadata_code_usages(repo_root, conn) {
+        tracing::warn!("metadata_code_usages: {}", e);
+    }
+    // Механические термы процедур (имя + объект + синоним + комментарий) —
+    // после синонимов (использует metadata_objects.synonym, заполнен в слое) и
+    // после core-индексации (читает functions/files). Без LLM, секунды на конфигурацию.
+    if let Err(e) = index_procedure_terms(repo_root, conn) {
+        tracing::warn!("procedure_terms: {}", e);
+    }
+    // Граф вызовов строится ПОСЛЕ заполнения metadata_forms и event_subscriptions
+    // (они в XML-слое выше) — он опирается на их содержимое.
+    if let Err(e) = build_call_graph(conn) {
+        tracing::warn!("proc_call_graph: {}", e);
+    }
+    // ANALYZE: без статистики SQLite в рекурсивном шаге find_path_bsl/
+    // find_data_path использует лишь префикс индекса (repo=) и сканирует
+    // все рёбра repo на каждой итерации (depth=3 ~240с на КА1.1). После
+    // ANALYZE планировщик знает селективность (~5 рёбер на caller_proc_key)
+    // и берёт seek по двум столбцам → depth=3 падает до ~0.05с. Хинт
+    // INDEXED BY это НЕ чинит — решает только статистика. Графы строятся
+    // заново при каждом reindex (DELETE+INSERT), поэтому ANALYZE здесь, в
+    // конце прохода, освежает статистику синхронно с ними (~0.6с на 2.4ГБ).
+    if let Err(e) = conn.execute_batch("ANALYZE;") {
+        tracing::warn!("ANALYZE: {}", e);
+    }
+    Ok(())
+}
+
+/// XML-слой обогащения: перечень объектов, связи данных, конфиг-уровневые
+/// рёбра, права ролей, структура объектов (attributes_json), синонимы, формы,
+/// подписки, модули. Всё это — обход XML выгрузки (дёшево, секунды даже на УТ),
+/// без тяжёлого КОД-слоя (code_usages / procedure_terms / call_graph).
+///
+/// Вызывается из полного `run_index_extras` (следом идёт код-слой) и из
+/// инкрементального пути при изменении состава (`config_changed`), где код-слой
+/// держится точечно по .bsl батча. Идемпотентен (каждая фаза DELETE+INSERT либо
+/// UPDATE по full_name). Каждая фаза независима: ошибка → warning, идём дальше.
+fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
     if let Err(e) = index_metadata_objects(repo_root, conn) {
         tracing::warn!("metadata_objects: {}", e);
     }
@@ -91,13 +137,9 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     if let Err(e) = index_role_rights(repo_root, conn) {
         tracing::warn!("role_rights: {}", e);
     }
-    // Обратный индекс использований объектов МД в коде (.bsl) → metadata_code_usages.
-    if let Err(e) = index_metadata_code_usages(repo_root, conn) {
-        tracing::warn!("metadata_code_usages: {}", e);
-    }
     // Полная структура объектов (реквизиты+типы, ТЧ, измерения, ресурсы)
     // → metadata_objects.attributes_json. Зависит от строк, созданных
-    // index_metadata_objects (выполняется выше), — делает UPDATE по full_name.
+    // index_metadata_objects (выше), — делает UPDATE по full_name.
     if let Err(e) = index_object_attributes(repo_root, conn) {
         tracing::warn!("object_attributes: {}", e);
     }
@@ -109,12 +151,6 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     if let Err(e) = index_object_synonyms(repo_root, conn) {
         tracing::warn!("object_synonyms: {}", e);
     }
-    // Механические термы процедур (имя + объект + синоним + комментарий) —
-    // после синонимов (использует metadata_objects.synonym) и после core-
-    // индексации (читает functions/files). Без LLM, секунды на конфигурацию.
-    if let Err(e) = index_procedure_terms(repo_root, conn) {
-        tracing::warn!("procedure_terms: {}", e);
-    }
     if let Err(e) = index_metadata_forms(repo_root, conn) {
         tracing::warn!("metadata_forms: {}", e);
     }
@@ -123,31 +159,10 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     }
     // metadata_modules зависят от UUID объектов (читают XML-файлы напрямую)
     // и от ConfigDumpInfo.xml каждой sub-config. Не зависят от других
-    // *_index_extras-функций; порядок не критичен.
-    //
-    // TODO(инкрементальность, после этапа 8): когда демон будет вызывать
-    // index_extras на отдельные file-events (а не полный reindex репо),
-    // нужно сделать здесь UPSERT по хешу XML-файла, а не DELETE+INSERT.
-    // Сейчас полный пересбор оправдан: после `DumpConfigToFiles` платформа
-    // 1С перезаписывает всю выгрузку, включая ConfigDumpInfo.xml.
+    // *_index_extras-функций; порядок не критичен. После `DumpConfigToFiles`
+    // платформа 1С перезаписывает всю выгрузку, поэтому полный пересбор оправдан.
     if let Err(e) = index_metadata_modules(repo_root, conn) {
         tracing::warn!("metadata_modules: {}", e);
-    }
-    // Граф вызовов строится ПОСЛЕ заполнения metadata_forms и
-    // event_subscriptions — он опирается на их содержимое.
-    if let Err(e) = build_call_graph(conn) {
-        tracing::warn!("proc_call_graph: {}", e);
-    }
-    // ANALYZE: без статистики SQLite в рекурсивном шаге find_path_bsl/
-    // find_data_path использует лишь префикс индекса (repo=) и сканирует
-    // все рёбра repo на каждой итерации (depth=3 ~240с на КА1.1). После
-    // ANALYZE планировщик знает селективность (~5 рёбер на caller_proc_key)
-    // и берёт seek по двум столбцам → depth=3 падает до ~0.05с. Хинт
-    // INDEXED BY это НЕ чинит — решает только статистика. Графы строятся
-    // заново при каждом reindex (DELETE+INSERT), поэтому ANALYZE здесь, в
-    // конце прохода, освежает статистику синхронно с ними (~0.6с на 2.4ГБ).
-    if let Err(e) = conn.execute_batch("ANALYZE;") {
-        tracing::warn!("ANALYZE: {}", e);
     }
     Ok(())
 }
@@ -654,12 +669,19 @@ pub fn run_incremental_extras(
         }
     }
 
-    // Структурное изменение состава объектов → полный пересбор.
-    if config_changed {
-        return run_index_extras(repo_root, storage);
-    }
-
+    // Структурное изменение состава объектов (Configuration.xml в батче): мог
+    // добавиться/удалиться/переименоваться объект. Пересобираем ТОЛЬКО лёгкий
+    // XML-слой (перечень + структура + связи + права + формы + подписки + модули,
+    // обход XML — секунды), а НЕ тяжёлый код-слой (термы ~260K / граф / usages).
+    // Код-слой держат точечные update_*_for_file по .bsl этого батча (ниже),
+    // поэтому здесь НЕ делаем return и НЕ зовём полный run_index_extras — это
+    // убирает многоминутный re-enrichment на ходу (зависание daemon на bulk git).
     let conn = storage.conn();
+    if config_changed {
+        if let Err(e) = run_index_extras_metadata_layer(repo_root, conn) {
+            tracing::warn!("incremental metadata-layer rebuild: {}", e);
+        }
+    }
     for p in &object_xmls {
         update_data_links_for_object(conn, p)?;
         update_object_attributes_for_object(repo_root, conn, p)?;
@@ -2725,6 +2747,184 @@ mod tests {
             .unwrap()
             .write_all(content.as_bytes())
             .unwrap();
+    }
+
+    #[test]
+    fn incremental_config_change_adds_new_object() {
+        // Изменение состава (Configuration.xml в батче) → инкрементальный путь
+        // синхронизирует перечень metadata_objects через XML-слой, БЕЗ тяжёлого
+        // полного пересбора. Результат эквивалентен полному run_index_extras.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        let cnt = |st: &Storage| -> i64 {
+            st.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata_objects WHERE repo = ?",
+                    params![REPO_DEFAULT],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(cnt(&storage), 1, "исходно один объект");
+
+        // Добавили новый объект Склады в состав (Configuration.xml + .bsl менеджера).
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog><Catalog>Склады</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        let bsl = repo
+            .join("Catalogs")
+            .join("Склады")
+            .join("Ext")
+            .join("ManagerModule.bsl");
+        write(&bsl, "Процедура П() Экспорт\nКонецПроцедуры");
+
+        // Инкрементальный путь с Configuration.xml в батче (как при реальной
+        // выгрузке) → config_changed=true → синхронизация перечня XML-слоем.
+        run_incremental_extras(
+            &repo,
+            &mut storage,
+            &[repo.join("Configuration.xml"), bsl],
+            &[],
+        )
+        .unwrap();
+
+        // Эталон: полный пересбор свежей БД того же (изменённого) репо.
+        let tmp2 = TempDir::new().unwrap();
+        let mut full = fresh_storage(&tmp2);
+        run_index_extras(&repo, &mut full).unwrap();
+
+        assert_eq!(cnt(&storage), 2, "новый объект Склады заведён");
+        assert_eq!(
+            cnt(&storage),
+            cnt(&full),
+            "incremental metadata_objects == full"
+        );
+    }
+
+    // Набор full_name объектов репо (сортированный) — надёжнее COUNT: ловит и
+    // переименование (число строк не меняется, а состав имён — да).
+    #[cfg(test)]
+    fn object_names(st: &Storage) -> Vec<String> {
+        let conn = st.conn();
+        let mut s = conn
+            .prepare("SELECT full_name FROM metadata_objects WHERE repo = ? ORDER BY full_name")
+            .unwrap();
+        let rows = s.query_map(params![REPO_DEFAULT], |r| r.get(0)).unwrap();
+        rows.map(|x| x.unwrap()).collect()
+    }
+
+    #[test]
+    fn incremental_config_change_removes_object() {
+        // Удаление объекта из состава → инкрементальный путь убирает запись из
+        // metadata_objects (через XML-слой), не оставляя «призрак». Эквивалентно
+        // полному пересбору.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog><Catalog>Склады</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        let sklady_bsl = repo
+            .join("Catalogs")
+            .join("Склады")
+            .join("Ext")
+            .join("ManagerModule.bsl");
+        write(&sklady_bsl, "Процедура П() Экспорт\nКонецПроцедуры");
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        assert_eq!(object_names(&storage).len(), 2, "исходно два объекта");
+
+        // Удалили Склады из состава.
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        std::fs::remove_file(&sklady_bsl).ok();
+        run_incremental_extras(
+            &repo,
+            &mut storage,
+            &[repo.join("Configuration.xml")],
+            &[sklady_bsl],
+        )
+        .unwrap();
+
+        let tmp2 = TempDir::new().unwrap();
+        let mut full = fresh_storage(&tmp2);
+        run_index_extras(&repo, &mut full).unwrap();
+
+        assert_eq!(
+            object_names(&storage),
+            object_names(&full),
+            "incremental: удалённый объект убран из metadata_objects (== full)"
+        );
+    }
+
+    #[test]
+    fn incremental_config_change_reflects_rename() {
+        // Переименование объекта → инкрементальный путь отражает новое имя в
+        // metadata_objects (старое убрано, новое заведено). Число строк не
+        // меняется, поэтому сверяем НАБОР имён. Эквивалентно полному пересбору.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects><Catalog>Старый</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        let old_bsl = repo
+            .join("Catalogs")
+            .join("Старый")
+            .join("Ext")
+            .join("ManagerModule.bsl");
+        write(&old_bsl, "Процедура П() Экспорт\nКонецПроцедуры");
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        assert_eq!(object_names(&storage), vec!["Catalog.Старый".to_string()]);
+
+        // Переименовали Старый → Новый.
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects><Catalog>Новый</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        std::fs::remove_file(&old_bsl).ok();
+        let new_bsl = repo
+            .join("Catalogs")
+            .join("Новый")
+            .join("Ext")
+            .join("ManagerModule.bsl");
+        write(&new_bsl, "Процедура П() Экспорт\nКонецПроцедуры");
+        run_incremental_extras(
+            &repo,
+            &mut storage,
+            &[repo.join("Configuration.xml"), new_bsl],
+            &[old_bsl],
+        )
+        .unwrap();
+
+        let tmp2 = TempDir::new().unwrap();
+        let mut full = fresh_storage(&tmp2);
+        run_index_extras(&repo, &mut full).unwrap();
+
+        assert_eq!(
+            object_names(&storage),
+            object_names(&full),
+            "incremental отразил переименование объекта (== full)"
+        );
     }
 
     #[test]
