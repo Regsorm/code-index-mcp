@@ -277,10 +277,16 @@ where
 }
 
 fn to_json<T: serde::Serialize>(value: &T) -> String {
-    match serde_json::to_string(value) {
-        Ok(s) => s,
-        Err(e) => format!("{{\"error\": \"Сериализация: {}\"}}", e),
-    }
+    // Второй (помимо `wrap_with_meta_extra`) путь сериализации модель-facing
+    // ответов: stat_file/get_stats/health/local_stats отдают плоский JSON без
+    // `{result, _meta}`-обёртки. Срезаем те же внутренние техполя, чтобы охват
+    // класса A был исчерпывающим (stat_file несёт content_hash/indexed_at).
+    let mut v = match serde_json::to_value(value) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"error\": \"Сериализация: {}\"}}", e),
+    };
+    strip_plumbing_recursive(&mut v);
+    serde_json::to_string(&v).unwrap_or_else(|e| format!("{{\"error\": \"Сериализация: {}\"}}", e))
 }
 
 // ── Event-based invalidation helpers (Phase 2) ──────────────────────────────
@@ -351,10 +357,14 @@ pub(crate) fn wrap_with_meta_extra<T: serde::Serialize>(
             file_mtimes.insert(p.clone(), serde_json::json!(m));
         }
     }
-    let result_value = match serde_json::to_value(result) {
+    let mut result_value = match serde_json::to_value(result) {
         Ok(v) => v,
         Err(e) => return format!("{{\"error\": \"Сериализация result: {}\"}}", e),
     };
+    // Срез внутренних техполей (класс A: id/хэши/таймстемпы) ДО пристёгивания
+    // `_meta`. Бесполезны модели в любом core-инструменте, амплифицируются
+    // cache_read'ом каждый ход. `_meta` собирается отдельно ниже — не задет.
+    strip_plumbing_recursive(&mut result_value);
     let mut wrapped = serde_json::json!({
         "result": result_value,
         "_meta": { "dependent_files": deps, "file_mtimes": file_mtimes },
@@ -366,6 +376,40 @@ pub(crate) fn wrap_with_meta_extra<T: serde::Serialize>(
     }
     serde_json::to_string(&wrapped)
         .unwrap_or_else(|e| format!("{{\"error\": \"Сериализация wrap: {}\"}}", e))
+}
+
+/// Рекурсивно удалить внутренние «плумбинг»-поля из сериализованного результата
+/// ДО пристёгивания `_meta`. Эти 6 ключей (внутренние id, хэши узла/контента/AST,
+/// таймстемп индексации) бесполезны модели в любом core-инструменте и
+/// амплифицируются cache_read'ом каждый ход. Обходит и объекты, и массивы —
+/// верхний уровень многих tool'ов это `Vec<Record>` (get_function/get_class/
+/// get_callers сериализуются в JSON-массив, а не объект). `mtime`/`file_size`
+/// НЕ трогаем намеренно — их смысл несёт stat_file.
+fn strip_plumbing_recursive(v: &mut serde_json::Value) {
+    const PLUMBING_KEYS: [&str; 6] = [
+        "id",
+        "file_id",
+        "node_hash",
+        "content_hash",
+        "ast_hash",
+        "indexed_at",
+    ];
+    match v {
+        serde_json::Value::Object(map) => {
+            for k in PLUMBING_KEYS {
+                map.remove(k);
+            }
+            for child in map.values_mut() {
+                strip_plumbing_recursive(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_plumbing_recursive(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Собрать `dependent_files` из vec'а записей через extractor file_id.
@@ -1712,6 +1756,49 @@ mod tests {
     use super::*;
     use crate::storage::{PoolConfig, Storage, StoragePool};
     use std::time::{Duration, Instant};
+
+    /// Срез плумбинга: 6 ключей исчезают на объекте, на элементах массива и
+    /// во вложенности; полезные поля (name/body/path и пр.) сохраняются.
+    #[test]
+    fn strip_plumbing_removes_internal_keys_recursively() {
+        // массив записей (как Vec<FunctionRecord>) + вложенный объект
+        let mut v = serde_json::json!([
+            {
+                "id": 1,
+                "file_id": 42,
+                "node_hash": "abc",
+                "name": "ПолучитьСумму",
+                "body": "тело",
+                "nested": { "ast_hash": "z", "content_hash": "c", "keep": 7 }
+            },
+            {
+                "indexed_at": "2026-06-22",
+                "path": "src/x.bsl",
+                "lines_total": 100
+            }
+        ]);
+        strip_plumbing_recursive(&mut v);
+
+        let arr = v.as_array().unwrap();
+        let first = arr[0].as_object().unwrap();
+        // плумбинг срезан
+        for k in ["id", "file_id", "node_hash"] {
+            assert!(!first.contains_key(k), "ключ {k} должен быть срезан");
+        }
+        // полезное сохранено
+        assert_eq!(first["name"], "ПолучитьСумму");
+        assert_eq!(first["body"], "тело");
+        // вложенный объект тоже очищен, но keep остался
+        let nested = first["nested"].as_object().unwrap();
+        assert!(!nested.contains_key("ast_hash"));
+        assert!(!nested.contains_key("content_hash"));
+        assert_eq!(nested["keep"], 7);
+
+        let second = arr[1].as_object().unwrap();
+        assert!(!second.contains_key("indexed_at"));
+        assert_eq!(second["path"], "src/x.bsl");
+        assert_eq!(second["lines_total"], 100);
+    }
 
     /// Навигационный кап тела: оверсайз → голова+хвост+маркеры; малое — без
     /// изменений; cap=0 → выключено. Один тест (не параллелить глобальный статик).

@@ -1032,7 +1032,7 @@ impl CodeIndexServer {
         .await
     }
 
-    #[tool(description = "Метаданные файла из индекса: existence, размер, mtime, lines_total, language, content_hash, indexed_at, category. Чистая выборка из таблицы files (быстро).")]
+    #[tool(description = "Метаданные файла из индекса: existence, размер, mtime, lines_total, language, category. Чистая выборка из таблицы files (быстро).")]
     async fn stat_file(&self, Parameters(p): Parameters<StatFileParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
