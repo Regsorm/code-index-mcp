@@ -5,6 +5,18 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.40.0] — 2026-06-22
+
+**Strip internal technical fields (internal ids, hashes, timestamps) from model-facing MCP responses. Fields the model never uses are removed at response serialization time — the payload is cleaner and consistently shorter, independent of model behavior. No reindex required (all on the serve output layer).**
+
+> Context. In an E2E run on UT-11, `cache_read` was ~90% of the token bill — every turn re-reads the whole accumulated context, so any useless field in a tool response is amplified on every turn. An audit of output fields isolated a "plumbing" class — internal row/file identifiers, node/content/AST hashes and the index timestamp — that the model needs in no tool.
+
+### Changed
+
+- **Internal technical fields are stripped at the response serialization choke point.** The `strip_plumbing_recursive` helper recursively (over objects and arrays — the top level of many tools is a `Vec<Record>`) removes the keys `id`, `file_id`, `node_hash`, `content_hash`, `ast_hash`, `indexed_at` from the response body. It is called at two points covering both serialization paths of model-facing responses: `wrap_with_meta_extra` (the `{result, _meta}` wrapper — `get_function`/`get_class`/`get_callers`/`get_callees`/`get_call_tree`/`find_symbol`/`get_imports`/`get_file_summary`/`read_file`/`list_files`/`grep_*`/`search_*` and others) and `to_json` (flat responses without the wrapper — `stat_file`/`get_stats`/`health`). The strip runs BEFORE `_meta` is attached, so `_meta.dependent_files`/`file_mtimes` (the input for event-based cache invalidation) are untouched. Under federation the strip runs on each node locally (the federation forward passes already-stripped JSON through).
+- **`stat_file` no longer returns `content_hash`/`indexed_at`** — the `size`/`mtime`/`lines_total`/`language`/`exists`/`category` fields are kept; the tool description is updated.
+- **Untouched:** the `path`/`file_path`/`body`/signature fields, the data-link and call graphs, the BSL tools (their own wrapper is built from SQL rows and carries no plumbing), the cache invalidation mechanism, and indexing (the daemon compares `content_hash`/`mtime` directly against SQLite, not against the model-facing output).
+
 ## [0.39.0] — 2026-06-18
 
 **The daemon no longer hangs on bulk git updates of 1C repos. A metadata-composition change (`Configuration.xml` in the batch) now rebuilds only the lightweight XML enrichment layer, not the heavy code layer — no reindex required (daemon serve watcher-path change).**
