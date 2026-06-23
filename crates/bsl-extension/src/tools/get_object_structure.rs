@@ -39,7 +39,7 @@ impl IndexTool for GetObjectStructureTool {
          (attributes/dimensions/resources/tabular_sections) присутствуют всегда (пустые — []). \
          Это единственный источник структуры объекта — XML объектов НЕ индексируется как \
          текст, не ищите его через list_files/grep_text. For BSL/1C repositories only. \
-         МАССОВЫЙ РЕЖИМ ('full_names'): батчи список ТОЛЬКО когда точно нужен ВЕСЬ набор и структура одного объекта не отменит надобность в остальных (например, разбираешь уже подтверждённый список). Если ОТБИРАЕШЬ, какие из объектов релевантны, или результат одного может сделать остальные ненужными — НЕ батчи, запрашивай по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в том же порядке."
+         МАССОВЫЙ РЕЖИМ ('full_names'): батчи список ТОЛЬКО когда точно нужен ВЕСЬ набор и структура одного объекта не отменит надобность в остальных (например, разбираешь уже подтверждённый список). Если ОТБИРАЕШЬ, какие из объектов релевантны, или результат одного может сделать остальные ненужными — НЕ батчи, запрашивай по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в том же порядке. КРИТЕРИЙ-СЕЛЕКТОР ('name_like' + опц. 'meta_type'): когда нужны структуры ВСЕХ объектов одной темы — не зови по одному и не перечисляй имена, передай подстроку имени: name_like='ЭДО' вернёт структуры всех объектов, чьё имя содержит 'ЭДО', ОДНИМ вызовом. Сочетай с sections= (узкие секции на каждый объект). Лимит 50 объектов (truncated=true, если совпало больше — уточни критерий). Ответ — {matched:N, truncated, results:[...]}."
     }
 
     fn input_schema(&self) -> Value {
@@ -58,6 +58,14 @@ impl IndexTool for GetObjectStructureTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Список полных имён для МАССОВОГО запроса. Применяй ТОЛЬКО когда заведомо нужен весь набор (см. описание инструмента); если отбираешь релевантные — по одному 'full_name'. Ответ — {results:[...]} в том же порядке."
+                },
+                "name_like": {
+                    "type": "string",
+                    "description": "КРИТЕРИЙ-СЕЛЕКТОР: подстрока имени объекта (без префикса типа). Вернёт структуры ВСЕХ объектов, чьё имя содержит подстроку, ОДНИМ вызовом — вместо серии вызовов по одному. Применяй, когда нужны все объекты одной темы (name_like='ЭДО' → все объекты ЭДО). Сочетай с sections= (узкие секции) и при необходимости meta_type=. Лимит 50 объектов (truncated=true, если совпало больше — уточни подстроку). Регистр учитывается."
+                },
+                "meta_type": {
+                    "type": "string",
+                    "description": "Необязательный фильтр типа для name_like: 'Catalog'/'Document'/'InformationRegister'/'Enum'/… (RU тоже: 'Справочник'/'Документ'). Сужает критерий до одного вида метаданных. Без name_like не действует."
                 },
                 "sections": {
                     "type": "array",
@@ -84,8 +92,82 @@ impl IndexTool for GetObjectStructureTool {
                 .get("sections")
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
-            // Массовый режим (full_names) приоритетен; иначе одиночный full_name.
-            let result_value = if let Some(arr) = args.get("full_names").and_then(|v| v.as_array())
+            // Критерий-селектор (name_like) приоритетен: сервер сам разворачивает
+            // плоский предикат в список объектов и отдаёт их структуры за 1 ход
+            // (общая конвенция объектно-ключевых инструментов). Массовый режим
+            // (full_names) — следующий по приоритету; иначе одиночный full_name.
+            let result_value = if let Some(name_like) = args
+                .get("name_like")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            {
+                // Лимит объектов: защита от слишком широкого критерия (иначе
+                // LIKE '%а%' вытащит пол-конфигурации). Больше лимита → truncated.
+                const NAME_LIKE_CAP: usize = 50;
+                let meta_type = args
+                    .get("meta_type")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                // Развернуть критерий в список full_name (одно соединение, до mass_map).
+                let expanded = {
+                    let storage = match ctx.storage.get().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return crate::tools::wrap_error(json!({
+                                "error": format!("storage pool: {}", e)
+                            }));
+                        }
+                    };
+                    crate::tools::expand_object_criterion(
+                        storage.conn(),
+                        name_like,
+                        meta_type,
+                        NAME_LIKE_CAP,
+                    )
+                };
+                let (full_names, truncated) = match expanded {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return crate::tools::wrap_error(json!({
+                            "error": format!("name_like: {}", e)
+                        }));
+                    }
+                };
+                if full_names.is_empty() {
+                    json!({
+                        "matched": 0,
+                        "results": [],
+                        "hint": format!(
+                            "Критерий name_like='{}'{} не нашёл объектов. Проверь подстроку/тип \
+                             (регистр учитывается) или используй search_terms для поиска по теме.",
+                            name_like,
+                            meta_type
+                                .map(|m| format!(", meta_type='{}'", m))
+                                .unwrap_or_default()
+                        )
+                    })
+                } else {
+                    let matched = full_names.len();
+                    let repo_label = ctx.repo.to_string();
+                    let sections_c = sections.clone();
+                    let rows = code_index_core::mcp::tools::mass_map(
+                        ctx.storage,
+                        full_names,
+                        move |st, fqn| {
+                            resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref())
+                        },
+                    )
+                    .await;
+                    let results: Vec<Value> = rows
+                        .into_iter()
+                        .map(|r| match r {
+                            Ok(v) => v,
+                            Err(e) => json!({ "error": e }),
+                        })
+                        .collect();
+                    json!({ "matched": matched, "truncated": truncated, "results": results })
+                }
+            } else if let Some(arr) = args.get("full_names").and_then(|v| v.as_array())
             {
                 // Конкуррентно: каждый элемент берёт своё соединение из пула и
                 // исполняется в spawn_blocking (mass_map). Нестроковые элементы

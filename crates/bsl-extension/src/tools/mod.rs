@@ -119,7 +119,8 @@ pub(crate) fn wrap_error(error_value: Value) -> Value {
 /// `get_form_handlers` owner+form_name) — там имя ключа значимо.
 pub(crate) fn object_value(args: &Value) -> Option<&str> {
     const SERVICE: &[&str] = &[
-        "repo", "depth", "limit", "direction", "sections", "language", "max_depth",
+        "repo", "depth", "limit", "direction", "sections", "language", "max_depth", "name_like",
+        "meta_type",
     ];
     args.as_object()?
         .iter()
@@ -160,4 +161,126 @@ pub(crate) fn meta_type_to_folder(meta_type: &str) -> Option<String> {
         _ => return None,
     };
     Some(folder.to_string())
+}
+
+/// Развернуть плоский критерий-селектор в список `full_name` по индексу
+/// метаданных. ОБЩАЯ конвенция объектно-ключевых инструментов: вместо одного
+/// имени модель передаёт предикат (`name_like` — подстрока имени объекта +
+/// опц. `meta_type`), сервер сам разворачивает его в набор за один SQL по
+/// `metadata_objects` (`repo='default'` — как в `resolve_one`), дальше набор
+/// уходит в `mass_map`. Это форма ПРЕДИКАТА (высокий adoption, как sections=),
+/// а не форма списка (`full_names[]` модель спонтанно не собирает).
+///
+/// `cap` — потолок объектов (защита от широкого критерия вроде LIKE '%а%').
+/// Берём `cap + 1` строк, чтобы отличить «ровно cap» от «больше cap».
+/// Возвращает `(full_names ≤ cap, truncated)`. Регистр LIKE для кириллицы
+/// значим (SQLite case-insensitive только для ASCII).
+pub(crate) fn expand_object_criterion(
+    conn: &rusqlite::Connection,
+    name_like: &str,
+    meta_type: Option<&str>,
+    cap: usize,
+) -> rusqlite::Result<(Vec<String>, bool)> {
+    // meta_type канонизируем (RU→EN, как resolve_one); неизвестный тип оставляем
+    // как есть — SQL просто вернёт 0 строк (критерий ни с чем не совпал).
+    let canon = meta_type.map(|t| match crate::code_usages::canonical_meta_type(t) {
+        Some(c) => c.to_string(),
+        None => t.to_string(),
+    });
+    let limit = (cap + 1) as i64;
+    let rows: Vec<String> = if let Some(mt) = &canon {
+        let mut stmt = conn.prepare(
+            "SELECT full_name FROM metadata_objects \
+             WHERE repo = 'default' AND name LIKE '%' || ?1 || '%' AND meta_type = ?2 \
+             ORDER BY full_name LIMIT ?3",
+        )?;
+        let it = stmt.query_map(rusqlite::params![name_like, mt, limit], |r| {
+            r.get::<_, String>(0)
+        })?;
+        it.collect::<rusqlite::Result<Vec<String>>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT full_name FROM metadata_objects \
+             WHERE repo = 'default' AND name LIKE '%' || ?1 || '%' \
+             ORDER BY full_name LIMIT ?2",
+        )?;
+        let it = stmt.query_map(rusqlite::params![name_like, limit], |r| {
+            r.get::<_, String>(0)
+        })?;
+        it.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+    let truncated = rows.len() > cap;
+    let full_names = rows.into_iter().take(cap).collect();
+    Ok((full_names, truncated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn mem_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for ddl in crate::schema::SCHEMA_EXTENSIONS {
+            conn.execute_batch(ddl).unwrap();
+        }
+        let rows = [
+            ("Catalog.НастройкиЭДО", "Catalog", "НастройкиЭДО"),
+            ("Document.СообщениеЭДО", "Document", "СообщениеЭДО"),
+            ("InformationRegister.АбонентыЭДО", "InformationRegister", "АбонентыЭДО"),
+            ("Catalog.Контрагенты", "Catalog", "Контрагенты"),
+        ];
+        for (fqn, mt, nm) in rows {
+            conn.execute(
+                "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+                 VALUES ('default', ?, ?, ?)",
+                rusqlite::params![fqn, mt, nm],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn expand_filters_by_name_substring() {
+        let conn = mem_db();
+        let (names, truncated) = expand_object_criterion(&conn, "ЭДО", None, 50).unwrap();
+        assert_eq!(names.len(), 3);
+        assert!(!truncated);
+        assert!(names.iter().all(|n| n.contains("ЭДО")));
+        assert!(!names.contains(&"Catalog.Контрагенты".to_string()));
+    }
+
+    #[test]
+    fn expand_filters_by_meta_type() {
+        let conn = mem_db();
+        let (names, _) = expand_object_criterion(&conn, "ЭДО", Some("Catalog"), 50).unwrap();
+        assert_eq!(names, vec!["Catalog.НастройкиЭДО".to_string()]);
+    }
+
+    #[test]
+    fn expand_meta_type_accepts_russian_singular() {
+        let conn = mem_db();
+        // RU singular «Документ» канонизируется в Document.
+        let (names, _) = expand_object_criterion(&conn, "ЭДО", Some("Документ"), 50).unwrap();
+        assert_eq!(names, vec!["Document.СообщениеЭДО".to_string()]);
+    }
+
+    #[test]
+    fn expand_cap_sets_truncated() {
+        let conn = mem_db();
+        // cap=2 при 3 совпадениях → ровно 2 имени + truncated.
+        let (names, truncated) = expand_object_criterion(&conn, "ЭДО", None, 2).unwrap();
+        assert_eq!(names.len(), 2);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn expand_empty_when_no_match() {
+        let conn = mem_db();
+        let (names, truncated) =
+            expand_object_criterion(&conn, "НесуществующаяТема", None, 50).unwrap();
+        assert!(names.is_empty());
+        assert!(!truncated);
+    }
 }
