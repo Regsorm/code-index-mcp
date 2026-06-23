@@ -5,6 +5,16 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.41.0] — 2026-06-23
+
+**Criterion selector `name_like` (+ optional `meta_type`) on `get_object_structure`: structures of ALL objects of one theme in a single call, without enumerating names. No reindex required (serve layer). Empirically the model adopts it readily — it is a parameter on an already-used tool, unlike generic SQL.**
+
+> Context. The model queries object structures one by one (a series of `get_object_structure`). The list form `full_names[]` is not adopted spontaneously (it requires enumerating all names first). A flat name-based predicate collapses that series into one turn — and, unlike `bsl_sql`, it is adopted without a system-prompt mention (it rides the already-used `get_object_structure`).
+
+### Added
+
+- **`name_like` and `meta_type` on `get_object_structure`.** `name_like` is an object-name substring (without the type prefix): the server expands the criterion via a single SQL over `metadata_objects` and returns the structures of ALL matching objects in one call. `meta_type` (optional, RU/EN: `Catalog`/`Document`/…) narrows to a single metadata kind. Combines with `sections=` (narrow sections per object). Response — `{matched, truncated, results:[...]}`. Broad-criterion guard: cap of 50 objects (`truncated=true` if more matched — refine the criterion). A shared `expand_object_criterion` helper lays groundwork for the same convention on other object-keyed tools. Substring matching is case-sensitive for Cyrillic (SQLite `LIKE` is case-insensitive for ASCII only).
+
 ## [0.40.0] — 2026-06-22
 
 **Strip internal technical fields (internal ids, hashes, timestamps) from model-facing MCP responses. Fields the model never uses are removed at response serialization time — the payload is cleaner and consistently shorter, independent of model behavior. No reindex required (all on the serve output layer).**
