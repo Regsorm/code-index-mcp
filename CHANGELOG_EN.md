@@ -5,6 +5,23 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.42.0] — 2026-06-24
+
+**Result cache + session re-delivery dedup + PER-FILE freshness and invalidation — all INSIDE serve. Stripping of internal `_meta` moved into serve: a separate mcp-cache-ci proxy in front of serve is no longer needed in the ci chain. No reindex required (all on the serve output layer).**
+
+> Context. Caching of responses lived in a separate mcp-cache-ci proxy in front of serve — an extra hop, a second cache layer, and session identity (for dedup) did not reach serve cleanly. Moving it inside serve makes it self-sufficient in the ci chain. Freshness and invalidation are PER-FILE (parity with the removed proxy): only requests that actually depend on the changed file are affected, not the whole repo.
+
+### Added
+
+- **In-serve result cache (`ServeCache`, `serve_cache.rs`).** Cross-session (key `{repo}|{tool}|{sha256(args without repo)}`, NO session — results reused across conversations), stores the full response, TTL 3600s (a safety net for invalidation). Only LOCAL repos cached; `health`, `get_stats` and federation repos bypass the cache (federation is cached on the remote node).
+- **Session re-delivery dedup (`SessionDedup`, `serve_dedup.rs`).** Keyed by `mcp-session-id` from the HTTP header (rmcp puts `http::request::Parts` into `context.extensions`). Elides tabular-result rows (`result.rows`) already delivered IN THIS session, with a `rows_elided_already_delivered:N` marker. Non-tabular responses untouched. A layer separate from the cache: the cache stores the full (session-independent) result, dedup trims at delivery per session. Another session with the same query gets the full result.
+- **Per-file freshness + event-based watcher→serve invalidation.** The daemon sends `POST /mark-dirty {repo, files:[{path, mtime}]}` (files changed on disk with observed-mtime, index not caught up) and post-commit `POST /invalidate {repo, file_paths}`. A response is NOT cached and NOT served from cache **only** if its source file is dirty — disk observed-mtime newer than `index_mtime` from the response's `_meta.file_mtimes`; per-file invalidation drops only the keys depending on that file (a "file → keys" reverse index). Requests about untouched files are unaffected — **no whole-repo coarsening**. New serve HTTP routes: `/mark-dirty`, `/invalidate`, `/cache-stats` (observability). Wired by a `[[cache_targets]] url="http://127.0.0.1:8013"` line in `daemon.toml` (the daemon sends one payload to all targets). `invalidate` with `all`/without `file_paths` is a full/repo reset (force-reindex).
+
+### Changed
+
+- **Stripping of internal `_meta` moved from the proxy into serve (`finish` → `strip_meta`).** The output throat `finish` (all `call_tool` return paths, including the federation forward) removes `_meta` (`dependent_files`/`file_mtimes`) from the client response — three forms: `content[*].text` (nested JSON), top-level `{result,_meta}`, `structuredContent._meta`. By delivery time `_meta` has already been used by the freshness/invalidation channel; the model does not need it and it bloats context. Mirrors mcp-cache-ci's `strip_meta`. Result: serve is self-sufficient in the ci chain — a separate ci proxy cache is not mandatory, clients talk to serve directly.
+- **Serve cache and dedup are enabled by default** (TTL 3600s — hardcoded; moving to config is the next step). Not affected: indexing (the daemon compares `content_hash`/`mtime` over SQLite, not over output), data/call graphs, BSL tools, the federation protocol, **concurrent request handling** (multi-threaded tokio + SQLite connection pool — short cache locks, never held across `await`).
+
 ## [0.41.0] — 2026-06-23
 
 **Criterion selector `name_like` (+ optional `meta_type`) on `get_object_structure`: structures of ALL objects of one theme in a single call, without enumerating names. No reindex required (serve layer). Empirically the model adopts it readily — it is a parameter on an already-used tool, unlike generic SQL.**
