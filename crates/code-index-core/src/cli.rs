@@ -483,6 +483,16 @@ async fn serve_http(
     );
 
     let mut app = axum::Router::new().nest_service("/mcp", http_service);
+    // Роуты per-file свежести кэша serve (сигналы от демона при переиндексации):
+    //   POST /mark-dirty {repo, files:[{path,mtime}]} — пометить файлы грязными (до commit);
+    //   POST /invalidate {repo, file_paths:[...]}      — снять пометки + снести зависящие ключи.
+    // Совместимы по форме с прокси mcp-cache-ci (демон шлёт те же payload'ы).
+    let cache_routes = axum::Router::new()
+        .route("/mark-dirty", axum::routing::post(mark_dirty_route))
+        .route("/invalidate", axum::routing::post(invalidate_route))
+        .route("/cache-stats", axum::routing::get(cache_stats_route))
+        .with_state(server.clone());
+    app = app.merge(cache_routes);
     if let Some(fr) = federate_router {
         app = app.merge(fr);
     }
@@ -510,6 +520,91 @@ async fn serve_http(
     .await
     .map_err(|e| anyhow::anyhow!("axum serve error: {}", e))?;
     Ok(())
+}
+
+/// `GET /cache-stats` — наблюдаемость кэша serve (для смоука и /health-обвязки):
+/// enabled + entries/hits/misses/invalidations.
+async fn cache_stats_route(
+    axum::extract::State(server): axum::extract::State<crate::mcp::CodeIndexServer>,
+) -> axum::Json<serde_json::Value> {
+    let (entries, hits, misses, invalidations) = server.cache.stats();
+    let (dedup_sessions, dedup_elided) = server.dedup.stats();
+    axum::Json(serde_json::json!({
+        "enabled": server.cache.enabled(),
+        "entries": entries,
+        "hits": hits,
+        "misses": misses,
+        "invalidations": invalidations,
+        "dirty_files": server.cache.dirty_count(),
+        "dedup_enabled": server.dedup.enabled(),
+        "dedup_sessions": dedup_sessions,
+        "dedup_elided_rows": dedup_elided,
+    }))
+}
+
+/// `POST /mark-dirty {repo|base, files:[{path, mtime}]}` — ранний сигнал от
+/// демона: файлы изменены на диске (observed-mtime), индекс ещё не догнал.
+/// Помечаем КАЖДЫЙ файл «грязным» с его observed-mtime → serve по файлу не
+/// кэширует/не отдаёт ответы, опирающиеся на не догнавший индекс (без огрубления
+/// на весь репо). Форма payload — как у прокси mcp-cache-ci (тот же объект).
+async fn mark_dirty_route(
+    axum::extract::State(server): axum::extract::State<crate::mcp::CodeIndexServer>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    let repo = body
+        .get("repo")
+        .or_else(|| body.get("base"))
+        .and_then(|v| v.as_str());
+    let files: Vec<(String, i64)> = body
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|it| {
+                    let path = it.get("path").and_then(|v| v.as_str())?;
+                    let mtime = it.get("mtime").and_then(|v| v.as_i64())?;
+                    Some((path.to_string(), mtime))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let marked = files.len();
+    if let Some(repo) = repo {
+        server.cache.mark_dirty(repo, &files);
+    }
+    axum::Json(serde_json::json!({ "ok": true, "repo": repo, "marked": marked }))
+}
+
+/// `POST /invalidate {repo|base, file_paths:[...]}` — post-commit: индекс догнал
+/// диск. Per-file: снимаем «грязные» пометки указанных файлов и сносим из кэша
+/// ТОЛЬКО ключи, зависящие от них (обратный индекс) — без огрубления на репо.
+/// `all=true` → полный сброс. `repo` без `file_paths` → репо-сброс
+/// (force-reindex/совместимость).
+async fn invalidate_route(
+    axum::extract::State(server): axum::extract::State<crate::mcp::CodeIndexServer>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    if body.get("all").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let removed = server.cache.invalidate_all();
+        return axum::Json(serde_json::json!({ "removed": removed, "all": true }));
+    }
+    let repo = body
+        .get("repo")
+        .or_else(|| body.get("base"))
+        .and_then(|v| v.as_str());
+    let paths: Vec<String> = body
+        .get("file_paths")
+        .and_then(|f| f.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let removed = match repo {
+        // Per-file: снести только ключи, зависящие от изменённых файлов.
+        Some(r) if !paths.is_empty() => server.cache.invalidate_files(r, &paths),
+        // Без списка файлов — репо-сброс (force-reindex/совместимость).
+        Some(r) => server.cache.invalidate_scope(r),
+        None => 0,
+    };
+    axum::Json(serde_json::json!({ "removed": removed, "repo": repo, "files": paths.len() }))
 }
 
 /// Точка входа для бинарных wrapper'ов. Принимает уже собранный реестр

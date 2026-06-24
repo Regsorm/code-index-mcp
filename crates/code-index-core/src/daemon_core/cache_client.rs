@@ -72,11 +72,14 @@ impl CacheClient {
     /// Возвращает только число успешных HTTP-ответов (2xx). Любые ошибки
     /// (соединение, таймаут, 5xx) пишутся в stderr и не пробрасываются вверх —
     /// событийный канал «best-effort», TTL остаётся safety net на стороне cache-ci.
-    pub async fn invalidate_files(&self, file_paths: &[String]) -> usize {
+    pub async fn invalidate_files(&self, repo: &str, file_paths: &[String]) -> usize {
         if file_paths.is_empty() || self.targets.is_empty() {
             return 0;
         }
-        let payload = json!({ "file_paths": file_paths });
+        // `repo` нужен serve (кэш repo-scope: снять flux + снести ключи репо).
+        // Прокси mcp-cache-ci его игнорирует — у него приоритет `file_paths`
+        // (точная инвалидация по reverse_index). Один payload на оба target'а.
+        let payload = json!({ "repo": repo, "file_paths": file_paths });
         let mut joins = Vec::with_capacity(self.targets.len());
         for target in self.targets.iter() {
             let url = format!("{}/invalidate", target.url);
@@ -203,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn invalidate_files_noop_on_empty_paths() {
         let c = CacheClient::new(vec!["http://127.0.0.1:8011".into()]);
-        let ok = c.invalidate_files(&[]).await;
+        let ok = c.invalidate_files("ut", &[]).await;
         assert_eq!(ok, 0);
     }
 
@@ -211,7 +214,7 @@ mod tests {
     async fn invalidate_files_noop_on_no_targets() {
         let c = CacheClient::new(Vec::new());
         let ok = c
-            .invalidate_files(&["src/X.bsl".to_string()])
+            .invalidate_files("ut", &["src/X.bsl".to_string()])
             .await;
         assert_eq!(ok, 0);
     }
@@ -222,7 +225,7 @@ mod tests {
         // Главное проверить что вызов НЕ паникует и возвращает 0 успехов.
         let c = CacheClient::new(vec!["http://127.0.0.1:1".into()]);
         let ok = c
-            .invalidate_files(&["src/X.bsl".to_string()])
+            .invalidate_files("ut", &["src/X.bsl".to_string()])
             .await;
         assert_eq!(ok, 0);
     }

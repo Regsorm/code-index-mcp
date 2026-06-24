@@ -10,3 +10,5 @@ pub mod watcher;        // File watcher на базе notify
 pub mod daemon_core;    // Ядро фонового демона: конфиг, IPC, состояние, HTTP-сервер
 pub mod federation;     // Федеративный serve (v0.5.0-rc6+): serve.toml, форвард tool-call
 pub mod extension;      // Trait-API для расширений (v0.6+): LanguageProcessor, IndexTool, ToolContext
+pub mod serve_cache;    // In-process кэш результатов tool-вызовов в serve (встроенная форма прокси)
+pub mod serve_dedup;    // Сессионный дедуп ре-доставки строк результата (по mcp-session-id)

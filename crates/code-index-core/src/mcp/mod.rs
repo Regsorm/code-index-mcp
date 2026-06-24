@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::extension::{IndexTool, ProcessorRegistry};
+use crate::serve_cache::ServeCache;
+use crate::serve_dedup::SessionDedup;
 use crate::federation::client::RemoteClientPool;
 use crate::federation::repos::FederatedRepo;
 use crate::storage::{PoolConfig, Storage, StoragePool};
@@ -375,6 +377,15 @@ pub struct CodeIndexServer {
     /// отбивает вызов с ним. Управляется `daemon.toml [mcp].mass_mode_tools`.
     /// Перечень массовых инструментов — [`MASS_MODE_PARAMS`].
     pub mass_mode_tools: Arc<BTreeSet<String>>,
+    /// In-process кэш результатов tool-вызовов (встроенная форма прокси
+    /// mcp-cache-ci для ci-цепочки). Общий на все сессии (поле `Arc`, сервер
+    /// клонируется на сессию). Кэшируются только LOCAL-репо (federation
+    /// инвалидируется на удалённой ноде, не локальным watcher'ом). Инвалидация
+    /// — по scope (repo) через `/invalidate` от демона при переиндексации.
+    pub cache: Arc<ServeCache>,
+    /// Сессионный дедуп ре-доставки строк результата (ключ — mcp-session-id).
+    /// Общий на сессии (Arc), состояние внутри ключуется по session_id.
+    pub dedup: Arc<SessionDedup>,
 }
 
 impl CodeIndexServer {
@@ -396,6 +407,10 @@ impl CodeIndexServer {
             peer: Arc::new(Mutex::new(None)),
             allowed_tools: Arc::new(None),
             mass_mode_tools: Arc::new(BTreeSet::new()),
+            // TTL 3600с — подстраховка; основной механизм корректности —
+            // инвалидация по scope от демона при переиндексации.
+            cache: Arc::new(ServeCache::new(3600, true)),
+            dedup: Arc::new(SessionDedup::new(true)),
         }
     }
 
@@ -420,6 +435,10 @@ impl CodeIndexServer {
             peer: Arc::new(Mutex::new(None)),
             allowed_tools: Arc::new(None),
             mass_mode_tools: Arc::new(BTreeSet::new()),
+            // TTL 3600с — подстраховка; основной механизм корректности —
+            // инвалидация по scope от демона при переиндексации.
+            cache: Arc::new(ServeCache::new(3600, true)),
+            dedup: Arc::new(SessionDedup::new(true)),
         }
     }
 
@@ -485,6 +504,10 @@ impl CodeIndexServer {
             peer: Arc::new(Mutex::new(None)),
             allowed_tools: Arc::new(None),
             mass_mode_tools: Arc::new(BTreeSet::new()),
+            // TTL 3600с — подстраховка; основной механизм корректности —
+            // инвалидация по scope от демона при переиндексации.
+            cache: Arc::new(ServeCache::new(3600, true)),
+            dedup: Arc::new(SessionDedup::new(true)),
         })
     }
 
@@ -1109,6 +1132,231 @@ impl CodeIndexServer {
 // `LanguageProcessor`-ов. Поэтому пишем три метода руками, делегируя
 // core-tools в `tool_router`, а extension — в свой Vec.
 
+/// Инструменты, которые НЕ кэшируем: `health` (liveness) и `get_stats`
+/// (federation-опрос живости remote-нод — ответ должен быть свежим).
+fn is_cacheable_tool(tool: &str) -> bool {
+    !matches!(tool, "health" | "get_stats")
+}
+
+/// Снять служебное поле `_meta` из сериализованного `CallToolResult` перед
+/// отдачей клиенту — зеркало `strip_meta` прокси mcp-cache-ci. `_meta`
+/// (`dependent_files` / `file_mtimes`) — служебный канал serve↔демон: deps шли
+/// бы в reverse-index, mtimes — в write-triggered ревалидацию. К моменту выдачи
+/// инвалидация уже отработала по scope (repo), клиенту (модели) поле не нужно и
+/// только раздувает контекст. Три формы: MCP `content[*].text` (вложенный JSON),
+/// top-level `{result,_meta}` (non-MCP), `structuredContent._meta` (structured
+/// output extension-tools — ловилось на живом `get_object_structure`).
+/// Возвращает `(payload, changed)`; при любой неожиданности payload не меняется.
+fn strip_meta(payload: &str) -> (String, bool) {
+    let mut v: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(_) => return (payload.to_string(), false),
+    };
+    let mut changed = false;
+    let is_mcp = v.get("content").map(|c| c.is_array()).unwrap_or(false);
+    if is_mcp {
+        // Наш `_meta` лежит во вложенном JSON `content[*].text`; top-level `_meta`
+        // (поле протокола rmcp) не трогаем.
+        if let Some(content) = v.get_mut("content").and_then(|c| c.as_array_mut()) {
+            for item in content.iter_mut() {
+                let text = match item.get("text").and_then(|t| t.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => continue,
+                };
+                let mut inner: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(iv) => iv,
+                    Err(_) => continue,
+                };
+                let removed = inner
+                    .as_object_mut()
+                    .map(|o| o.remove("_meta").is_some())
+                    .unwrap_or(false);
+                if removed {
+                    if let Ok(reser) = serde_json::to_string(&inner) {
+                        item["text"] = serde_json::Value::String(reser);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    } else if let Some(obj) = v.as_object_mut() {
+        // Top-level форма (non-MCP бэкенд): `_meta` рядом с `result`.
+        if obj.remove("_meta").is_some() {
+            changed = true;
+        }
+    }
+    // structuredContent (rmcp structured output) — extension-tools serve кладут
+    // `{_meta, result}` ещё и сюда, дублируя content[*].text.
+    if let Some(sc) = v
+        .get_mut("structuredContent")
+        .and_then(|s| s.as_object_mut())
+    {
+        if sc.remove("_meta").is_some() {
+            changed = true;
+        }
+    }
+    if changed {
+        (
+            serde_json::to_string(&v).unwrap_or_else(|_| payload.to_string()),
+            true,
+        )
+    } else {
+        (payload.to_string(), false)
+    }
+}
+
+/// Достать `_meta`-объект из сериализованного `CallToolResult`. Три формы (как
+/// в `strip_meta`): вложенный JSON в `content[*].text`, `structuredContent._meta`,
+/// top-level `_meta`. `None`, если `_meta` нет. Парсинг — БЕЗ удержания локов кэша.
+fn extract_meta_obj(payload: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if v.get("content").map(|c| c.is_array()).unwrap_or(false) {
+        if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
+            for item in arr {
+                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                    if let Ok(inner) = serde_json::from_str::<serde_json::Value>(t) {
+                        if let Some(m) = inner.get("_meta") {
+                            return Some(m.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(m) = v.get("structuredContent").and_then(|s| s.get("_meta")) {
+        return Some(m.clone());
+    }
+    v.get("_meta").cloned()
+}
+
+/// Имена файлов-источников ответа из `_meta.dependent_files` (для обратного
+/// индекса per-file инвалидации).
+fn meta_dependent_files(meta: &serde_json::Value) -> Vec<String> {
+    meta.get("dependent_files")
+        .and_then(|d| d.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl CodeIndexServer {
+    /// Ключ кэша для (tool, args), если репо локальный и инструмент кэшируем.
+    /// `None` → не кэшировать: remote-репо (federation инвалидируется на
+    /// удалённой ноде, не локальным watcher'ом), health/get_stats, нет `repo`,
+    /// кэш выключен.
+    fn cache_key_if_local(&self, tool: &str, args: &serde_json::Value) -> Option<String> {
+        if !self.cache.enabled() || !is_cacheable_tool(tool) {
+            return None;
+        }
+        let repo = args.get("repo").and_then(|v| v.as_str())?;
+        let entry = self.repos.get(repo)?;
+        if !entry.is_local {
+            return None;
+        }
+        // Свежесть проверяется ПО ФАЙЛУ уже на выдаче/записи (response_is_stale),
+        // а не подавлением кэша всего репо — здесь ключ строим всегда.
+        Some(ServeCache::key(repo, tool, args))
+    }
+
+    /// Положить успешный результат в кэш (no-op при `key=None`, ошибке или
+    /// `is_error`). Вызывается на каждом пути возврата `call_tool`.
+    /// Per-file свежесть: НЕ кэшируем ответ, построенный на не догнавшем индексе
+    /// (хоть один файл-источник «грязный»). Зависимые файлы регистрируются в
+    /// обратном индексе для точечной инвалидации.
+    fn maybe_cache(
+        &self,
+        key: &Option<String>,
+        repo: &str,
+        result: &Result<CallToolResult, ErrorData>,
+    ) {
+        let (Some(k), Ok(res)) = (key, result) else {
+            return;
+        };
+        if res.is_error.unwrap_or(false) {
+            return;
+        }
+        let Ok(s) = serde_json::to_string(res) else {
+            return;
+        };
+        let meta = extract_meta_obj(&s);
+        if let Some(m) = &meta {
+            if self.meta_has_stale(repo, m) {
+                return; // ответ на не догнавшем индексе — не кэшируем
+            }
+        }
+        let deps = meta.as_ref().map(meta_dependent_files).unwrap_or_default();
+        self.cache.insert(k.clone(), Arc::new(s), repo, &deps);
+    }
+
+    /// Ответ построен на НЕ догнавшем индексе? Проверка ПО ФАЙЛУ: для каждого
+    /// файла-источника (`_meta.file_mtimes`) сверяем index_mtime с observed-mtime
+    /// диска (`dirty`). `true` → хоть один файл «грязный» (на диске новее индекса).
+    fn response_is_stale(&self, repo: &str, payload: &str) -> bool {
+        match extract_meta_obj(payload) {
+            Some(m) => self.meta_has_stale(repo, &m),
+            None => false,
+        }
+    }
+
+    /// Есть ли среди файлов `_meta.file_mtimes` хоть один «грязный» относительно
+    /// своего index_mtime (см. `ServeCache::is_path_stale`).
+    fn meta_has_stale(&self, repo: &str, meta: &serde_json::Value) -> bool {
+        let Some(mtimes) = meta.get("file_mtimes").and_then(|m| m.as_object()) else {
+            return false;
+        };
+        for (path, idx) in mtimes {
+            if let Some(index_mtime) = idx.as_i64() {
+                if self.cache.is_path_stale(repo, path, index_mtime) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Финальная обработка результата перед отдачей клиенту: сессионный дедуп
+    /// ре-доставки (опустить строки табличного результата, уже отданные в ЭТОЙ
+    /// сессии). Применяется ПОСЛЕ кэша — кэш хранит ПОЛНЫЙ результат
+    /// (session-independent), а дедуп специфичен для сессии и в кэш не пишется.
+    /// Нетабличные результаты и ошибки проходят без изменений.
+    fn finish(
+        &self,
+        session_id: &Option<String>,
+        result: Result<CallToolResult, ErrorData>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Ok(res) = &result else {
+            return result;
+        };
+        if res.is_error.unwrap_or(false) {
+            return result;
+        }
+        let Ok(s) = serde_json::to_string(res) else {
+            return result;
+        };
+        // 1. Сессионный дедуп ре-доставки (опустить уже отданные в этой сессии
+        //    строки табличного результата). Выключен → проходим без изменений.
+        let (s, elided) = if self.dedup.enabled() {
+            self.dedup.process(session_id.as_deref(), &s)
+        } else {
+            (s, 0)
+        };
+        // 2. Срез служебного `_meta` перед отдачей клиенту (раньше это делал
+        //    прокси mcp-cache-ci; теперь serve самодостаточен в ci-цепочке).
+        let (s, meta_stripped) = strip_meta(&s);
+        // Ничего не изменилось → отдаём исходный результат без лишней пересборки.
+        if elided == 0 && !meta_stripped {
+            return result;
+        }
+        match serde_json::from_str::<CallToolResult>(&s) {
+            Ok(new_res) => Ok(new_res),
+            Err(_) => result,
+        }
+    }
+}
+
 impl ServerHandler for CodeIndexServer {
     fn get_info(&self) -> ServerInfo {
         // enable_tool_list_changed: даём клиенту знать, что мы способны
@@ -1166,6 +1414,18 @@ impl ServerHandler for CodeIndexServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Session id из HTTP-заголовка `mcp-session-id`: rmcp вкладывает
+        // `http::request::Parts` в `context.extensions` (tower.rs), а оттуда оно
+        // попадает в `RequestContext.extensions`. Нужен для сессионного дедупа
+        // ре-доставки — ключ «что уже отдано в этой сессии».
+        let session_id: Option<String> = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|p| p.headers.get("mcp-session-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        tracing::debug!(session = ?session_id, tool = %request.name.as_ref(), "call_tool");
+
         // 0. Whitelist-проверка ДО router-диспетча. Модель может вызвать
         // tool, отсутствующий в `tools/list` (из системного промпта, из
         // памяти обучения, из CLAUDE.md проекта) — без этой проверки
@@ -1210,6 +1470,35 @@ impl ServerHandler for CodeIndexServer {
                 }
             }
         }
+        // Кэш результатов (встроенная форма прокси): ключ {repo}|{tool}|{hash}.
+        // Кэшируем только LOCAL-репо и кэшируемые инструменты (federation,
+        // health, get_stats минуют кэш — `cache_key_if_local` вернёт None).
+        // На промахе считаем как обычно и кладём результат в кэш на каждом
+        // пути возврата через `maybe_cache`.
+        let args_val = request
+            .arguments
+            .clone()
+            .map(serde_json::Value::Object)
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        // Имя репо (если есть) — для per-file свежести кэша и обратного индекса.
+        let repo_opt = args_val
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let cache_key = self.cache_key_if_local(request.name.as_ref(), &args_val);
+        if let Some(ref key) = cache_key {
+            if let Some(payload) = self.cache.get(key) {
+                // Per-file свежесть: не отдавать кэш, построенный на не догнавшем
+                // индексе (файл-источник «грязный»); иначе — отдать из кэша.
+                let repo = repo_opt.as_deref().unwrap_or("");
+                if !self.response_is_stale(repo, &payload) {
+                    if let Ok(res) = serde_json::from_str::<CallToolResult>(&payload) {
+                        return self.finish(&session_id, Ok(res));
+                    }
+                }
+            }
+        }
+
         // 1. Сначала core-tools — они есть всегда.
         if self.tool_router.has_route(request.name.as_ref()) {
             let tcc = rmcp::handler::server::tool::ToolCallContext::new(
@@ -1217,7 +1506,9 @@ impl ServerHandler for CodeIndexServer {
                 request,
                 context,
             );
-            return self.tool_router.call(tcc).await;
+            let r = self.tool_router.call(tcc).await;
+            self.maybe_cache(&cache_key, repo_opt.as_deref().unwrap_or(""), &r);
+            return self.finish(&session_id, r);
         }
         // 2. Иначе — extension-tools. Ищем по имени.
         let tool_name = request.name.as_ref();
@@ -1281,7 +1572,7 @@ impl ServerHandler for CodeIndexServer {
             .await;
             let value: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"raw": body}));
-            return Ok(CallToolResult::structured(value));
+            return self.finish(&session_id, Ok(CallToolResult::structured(value)));
         }
         let storage = entry.storage_pool();
         let root_path: Option<&Path> = entry.root_path.as_deref();
@@ -1296,7 +1587,9 @@ impl ServerHandler for CodeIndexServer {
 
         // Прогон через `IndexTool::execute` и обёртка результата.
         let value = ext.execute(args, ctx).await;
-        Ok(CallToolResult::structured(value))
+        let r = Ok(CallToolResult::structured(value));
+        self.maybe_cache(&cache_key, repo_opt.as_deref().unwrap_or(""), &r);
+        self.finish(&session_id, r)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -1638,5 +1931,110 @@ mod conditional_registration_tests {
         shrunk.insert("python".to_string());
         server.reload_extensions(shrunk).await;
         assert_eq!(server.extension_tools_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod strip_meta_tests {
+    use super::{extract_meta_obj, meta_dependent_files, strip_meta};
+    use serde_json::json;
+
+    // MCP-форма: `_meta` во вложенном JSON content[*].text — должен сняться,
+    // `result` сохраниться.
+    #[test]
+    fn strips_meta_from_mcp_content_text() {
+        let inner = json!({"result": [1, 2, 3], "_meta": {"dependent_files": ["a.bsl"]}});
+        let payload = json!({
+            "content": [{"type": "text", "text": inner.to_string()}]
+        })
+        .to_string();
+        let (out, changed) = strip_meta(&payload);
+        assert!(changed, "_meta должен быть снят");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let text = v["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(parsed.get("_meta").is_none(), "_meta остался во вложенном JSON");
+        assert_eq!(parsed["result"], json!([1, 2, 3]), "result должен сохраниться");
+    }
+
+    // structuredContent-форма (rmcp structured output, extension-tools): `_meta`
+    // дублируется здесь — тоже снимаем (ловилось на живом get_object_structure).
+    #[test]
+    fn strips_meta_from_structured_content() {
+        let payload = json!({
+            "content": [{"type": "text", "text": "{\"result\":{}}"}],
+            "structuredContent": {"result": {"full_name": "Catalog.X"}, "_meta": {"dependent_files": []}}
+        })
+        .to_string();
+        let (out, changed) = strip_meta(&payload);
+        assert!(changed);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["structuredContent"].get("_meta").is_none());
+        assert_eq!(v["structuredContent"]["result"]["full_name"], "Catalog.X");
+    }
+
+    // Top-level форма (non-MCP): `_meta` рядом с `result`.
+    #[test]
+    fn strips_top_level_meta() {
+        let payload = json!({"result": [], "_meta": {"dependent_files": ["x"]}}).to_string();
+        let (out, changed) = strip_meta(&payload);
+        assert!(changed);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("_meta").is_none());
+    }
+
+    // Нет `_meta` → payload не меняется (changed=false), без лишней пересборки.
+    #[test]
+    fn no_meta_is_unchanged() {
+        let payload = json!({"content": [{"type": "text", "text": "{\"result\":[1]}"}]}).to_string();
+        let (out, changed) = strip_meta(&payload);
+        assert!(!changed, "без _meta changed должен быть false");
+        assert_eq!(out, payload);
+    }
+
+    // Невалидный JSON → возвращаем как есть, не паникуем.
+    #[test]
+    fn invalid_json_is_passthrough() {
+        let (out, changed) = strip_meta("не json");
+        assert!(!changed);
+        assert_eq!(out, "не json");
+    }
+
+    // extract_meta_obj достаёт _meta из всех трёх форм.
+    #[test]
+    fn extract_meta_obj_three_forms() {
+        // 1) MCP content[*].text (вложенный JSON)
+        let inner = json!({"result": [1], "_meta": {"file_mtimes": {"a.bsl": 100}}});
+        let mcp = json!({"content": [{"type": "text", "text": inner.to_string()}]}).to_string();
+        let m = extract_meta_obj(&mcp).expect("content-form _meta");
+        assert_eq!(m["file_mtimes"]["a.bsl"], 100);
+
+        // 2) structuredContent._meta
+        let sc = json!({
+            "content": [{"type": "text", "text": "{\"result\":{}}"}],
+            "structuredContent": {"result": {}, "_meta": {"file_mtimes": {"b.bsl": 200}}}
+        })
+        .to_string();
+        let m = extract_meta_obj(&sc).expect("structuredContent _meta");
+        assert_eq!(m["file_mtimes"]["b.bsl"], 200);
+
+        // 3) top-level _meta
+        let top = json!({"result": [], "_meta": {"file_mtimes": {"c.bsl": 300}}}).to_string();
+        let m = extract_meta_obj(&top).expect("top-level _meta");
+        assert_eq!(m["file_mtimes"]["c.bsl"], 300);
+
+        // нет _meta → None
+        assert!(extract_meta_obj("{\"content\":[]}").is_none());
+        assert!(extract_meta_obj("не json").is_none());
+    }
+
+    // meta_dependent_files читает список файлов-источников.
+    #[test]
+    fn meta_dependent_files_reads_list() {
+        let meta = json!({"dependent_files": ["src/X.bsl", "src/Y.bsl"], "file_mtimes": {}});
+        let deps = meta_dependent_files(&meta);
+        assert_eq!(deps, vec!["src/X.bsl".to_string(), "src/Y.bsl".to_string()]);
+        // нет поля → пусто
+        assert!(meta_dependent_files(&json!({})).is_empty());
     }
 }

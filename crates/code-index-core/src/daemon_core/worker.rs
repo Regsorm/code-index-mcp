@@ -467,8 +467,9 @@ pub fn run_worker(
                     let paths_to_invalidate = collect_invalidate_paths(&path, &batch);
                     if !paths_to_invalidate.is_empty() {
                         let cc_clone = cc.clone();
+                        let repo = entry.effective_alias();
                         tokio_block_on(async move {
-                            cc_clone.invalidate_files(&paths_to_invalidate).await;
+                            cc_clone.invalidate_files(&repo, &paths_to_invalidate).await;
                         });
                     }
                 }
