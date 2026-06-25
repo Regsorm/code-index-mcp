@@ -12,12 +12,12 @@ Published on Infostart: [Code Index — структурный поиск по �
 
 **Rust-native code index for AI agents. Static binary. Production-grade BSL/1C support.**
 
-One static binary for Windows/Linux/macOS — no runtime, no dependencies. Indexes large repositories in seconds, returns results to AI agents over MCP in milliseconds. 25 tools: 18 universal + 7 BSL-specific for 1C:Enterprise configurations.
+One static binary for Windows/Linux/macOS — no runtime, no dependencies. Indexes large repositories in seconds, returns results to AI agents over MCP in milliseconds. 31 tools: 20 universal + 11 BSL-specific for 1C:Enterprise configurations.
 
 ## What's inside
 
 - **Performance.** 62,000 files indexed in 43 seconds, sub-ms search per query. Production-grade for 100K+ file monorepos.
-- **25 MCP tools.** 18 universal (functions, classes, callers/callees, file content, grep) + 7 BSL-tools (object structure, form handlers, event subscriptions, call graph, data links).
+- **31 MCP tools.** 20 universal (functions, classes, callers/callees, file content, grep) + 11 BSL-tools (object structure & profile, form handlers, event subscriptions, call graph, data links, register writers, impact map, read-only SQL).
 - **Native BSL/1C.** Parses XML-exports of 1C:Enterprise 8.3 configurations. Data-link graph (object→object edges via reference types in attributes) — ~60,000 edges in seconds for a typical accounting configuration.
 - **Federation.** One MCP server can serve multiple repositories across machines — pass `repo: "alias"` in each tool call.
 - **Compressed content storage.** File contents stored in SQLite via zstd, cheap random-access reads for AI agents.
@@ -346,7 +346,7 @@ All fields are optional; omitting the section uses the defaults. The default is 
 
 ### Additional tools for 1C repos (only in `bsl-indexer`, v0.6+)
 
-When BSL repos are present in `daemon.toml` (`language = "bsl"`), 5 BSL-specific tools are auto-registered:
+When BSL repos are present in `daemon.toml` (`language = "bsl"`), 11 BSL-specific tools are auto-registered:
 
 | Tool | Description |
 |------|-------------|
@@ -358,6 +358,9 @@ When BSL repos are present in `daemon.toml` (`language = "bsl"`), 5 BSL-specific
 | `get_data_links` | **Data-links graph (v0.10.0):** what an object references / what references it, via reference-typed attributes, register dimensions and tabular-section attributes (`data_links` table). `direction=out\|in\|both`, `depth=1..4`. Replaces a series of `get_object_structure` calls when tracing relations. Targets like `*CatalogRef`/`*AnyRef`/`*DefinedType.X` are generalized refs (terminal, not expanded) |
 | `find_data_path` | **Data-links graph (v0.10.0):** chain of reference links from one object to another (BFS over `data_links`, like `find_path` but for data, not calls) |
 | `get_register_writers` | **Register recorders / document movements (v0.16.0):** for a register (`AccumulationRegister.Stock`) returns `writers` — documents writing movements; for a document — `writes_to` (target registers). From the declarative `<RegisterRecords>` set (recorder edges of `data_links`). One call covers both directions |
+| `get_object_profile` | **Object passport in one call (v0.21.0):** the full portrait of an object — structure + forms + modules + data links — instead of a series of `get_object_structure`/`get_form_handlers`/`get_data_links`. The `sections` parameter (`['structure'\|'forms'\|'modules'\|'data_links']`) narrows the response |
+| `find_references` | **Impact map (v0.21.0):** everything that references an object, in one call — reverse `data_links` (structural refs from metadata) + `metadata_code_usages` (usages in `.bsl` code) + `role_rights` (roles holding rights on it), broken down by kind with samples (`limit`) |
+| `bsl_sql` | **Arbitrary read-only SQL (v0.21.0):** a `SELECT`/`WITH` query over the repo's `index.db` for the long tail of metadata/graph questions that have no dedicated tool (roles/RLS, joins, aggregations). Guard: `SELECT`/`WITH` only + `Statement::readonly()` + row cap + timeout. Tables: `metadata_objects`, `metadata_modules`, `metadata_forms`, `event_subscriptions`, `data_links`, `role_rights`, `proc_call_graph`, core `functions`/`files`. An empty result over the procedure tables auto-falls back to `search_terms` |
 
 These tools appear in `tools/list` **only when at least one BSL repo is configured** (conditional registration). When the repo set changes in `daemon.toml`, the server emits `notifications/tools/list_changed`. On Claude Code 2.1.120 this notification is currently [ignored](https://github.com/anthropics/claude-code/issues/13646); workaround — manual `/mcp Reconnect`.
 
