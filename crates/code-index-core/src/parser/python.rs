@@ -38,18 +38,16 @@ fn node_text<'a>(node: tree_sitter::Node<'a>, source: &'a [u8]) -> &'a str {
 /// Ищет первый expression_statement в блоке body, содержащий строковой литерал.
 fn extract_docstring(body_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut cursor = body_node.walk();
-    for child in body_node.children(&mut cursor) {
-        if child.kind() == "expression_statement" {
-            // Первый дочерний элемент expression_statement
-            if let Some(expr) = child.child(0) {
-                let kind = expr.kind();
-                if kind == "string" || kind == "concatenated_string" {
-                    return Some(node_text(expr, source).to_string());
-                }
+    // Смотрим только первый значимый узел body (docstring всегда первый).
+    let first = body_node.children(&mut cursor).next()?;
+    if first.kind() == "expression_statement" {
+        // Первый дочерний элемент expression_statement
+        if let Some(expr) = first.child(0) {
+            let kind = expr.kind();
+            if kind == "string" || kind == "concatenated_string" {
+                return Some(node_text(expr, source).to_string());
             }
         }
-        // Заходим только в первый значимый узел body (docstring всегда первый)
-        break;
     }
     None
 }
