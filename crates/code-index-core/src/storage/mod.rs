@@ -781,61 +781,24 @@ impl Storage {
     /// Файлы oversize=1 (без content) пропускаются.
     ///
     /// Параметры идентичны `grep_text_filtered` для совместимости в MCP-слое.
-    pub fn grep_code_filtered(
-        &self,
-        regex_pattern: &str,
-        path_glob: Option<&str>,
-        language: Option<&str>,
+    /// Общий пост-процессинг для grep_code/grep_text: стримом по строкам
+    /// (path, zstd-blob) разжимает контент, ищет regex построчно, набирает
+    /// context_lines, соблюдает потолки limit и max_total_bytes. Возвращает
+    /// (совпадения, truncated). Стриминговый вход — без материализации всех
+    /// blob'ов в память: ранний выход по лимитам не читает остаток.
+    fn grep_zstd_stream(
+        rows: impl Iterator<Item = rusqlite::Result<(String, Vec<u8>)>>,
+        compiled: &regex::Regex,
         limit: usize,
         context_lines: usize,
         max_total_bytes: usize,
     ) -> Result<(Vec<GrepTextMatch>, bool)> {
-        let compiled = regex::Regex::new(regex_pattern)
-            .context("grep_code: невалидный regex")?;
-
-        let mut conds: Vec<String> = vec![
-            "fc.oversize = 0".to_string(),
-            "fc.content_blob IS NOT NULL".to_string(),
-        ];
-        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(g) = path_glob {
-            // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
-            let variants = expand_glob_braces(g);
-            conds.push(format!(
-                "({})",
-                vec!["fi.path GLOB ?"; variants.len()].join(" OR ")
-            ));
-            for v in variants {
-                params_dyn.push(Box::new(normalize_glob(&v)));
-            }
-        }
-        if let Some(l) = language {
-            conds.push("fi.language = ?".to_string());
-            params_dyn.push(Box::new(l.to_string()));
-        }
-        let sql = format!(
-            "SELECT fi.path, fc.content_blob
-             FROM file_contents fc
-             JOIN files fi ON fi.id = fc.file_id
-             WHERE {}
-             ORDER BY fi.path",
-            conds.join(" AND ")
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
-
-        let candidate_rows: Vec<(String, Vec<u8>)> = stmt
-            .query_map(params_refs.as_slice(), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
         let mut results: Vec<GrepTextMatch> = Vec::new();
         let mut total_bytes: usize = 0;
-        for (path, blob) in candidate_rows {
+        for row in rows {
             // Безопасный decode zstd с лимитом размера (защита от zstd-bomb).
             // Битые blob'ы или превышение лимита пропускаем — не валим весь поиск.
+            let (path, blob) = row?;
             let bytes = match Self::decode_zstd_safe(&blob) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -888,6 +851,55 @@ impl Storage {
             }
         }
         Ok((results, false))
+    }
+
+    pub fn grep_code_filtered(
+        &self,
+        regex_pattern: &str,
+        path_glob: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+        context_lines: usize,
+        max_total_bytes: usize,
+    ) -> Result<(Vec<GrepTextMatch>, bool)> {
+        let compiled = regex::Regex::new(regex_pattern)
+            .context("grep_code: невалидный regex")?;
+
+        let mut conds: Vec<String> = vec![
+            "fc.oversize = 0".to_string(),
+            "fc.content_blob IS NOT NULL".to_string(),
+        ];
+        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(g) = path_glob {
+            // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
+            let variants = expand_glob_braces(g);
+            conds.push(format!(
+                "({})",
+                vec!["fi.path GLOB ?"; variants.len()].join(" OR ")
+            ));
+            for v in variants {
+                params_dyn.push(Box::new(normalize_glob(&v)));
+            }
+        }
+        if let Some(l) = language {
+            conds.push("fi.language = ?".to_string());
+            params_dyn.push(Box::new(l.to_string()));
+        }
+        let sql = format!(
+            "SELECT fi.path, fc.content_blob
+             FROM file_contents fc
+             JOIN files fi ON fi.id = fc.file_id
+             WHERE {}
+             ORDER BY fi.path",
+            conds.join(" AND ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        Self::grep_zstd_stream(rows, &compiled, limit, context_lines, max_total_bytes)
     }
 
     // ── Поисковые запросы ────────────────────────────────────────────────────
@@ -2002,65 +2014,10 @@ impl Storage {
         let mut stmt = self.conn.prepare(&sql)?;
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
-        let candidate_rows: Vec<(String, Vec<u8>)> = stmt
-            .query_map(params_refs.as_slice(), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        // Post-process: разжать blob, построчный поиск, контекст, лимиты.
-        let mut results: Vec<GrepTextMatch> = Vec::new();
-        let mut total_bytes: usize = 0;
-        for (path, blob) in candidate_rows {
-            let bytes = match Self::decode_zstd_safe(&blob) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let content = match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            // Быстрый отказ: нет совпадения во всём файле — пропускаем построчный обход.
-            if !compiled.is_match(&content) {
-                continue;
-            }
-            let lines: Vec<&str> = content.lines().collect();
-            for (i, line) in lines.iter().enumerate() {
-                if !compiled.is_match(line) {
-                    continue;
-                }
-                let line_no = i + 1;
-                let context = if context_lines > 0 {
-                    let from = i.saturating_sub(context_lines);
-                    let to = (i + context_lines + 1).min(lines.len());
-                    (from..to)
-                        .map(|j| ContextLine {
-                            line: j + 1,
-                            content: lines[j].to_string(),
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                let row_bytes = line.len()
-                    + context.iter().map(|c| c.content.len()).sum::<usize>()
-                    + path.len();
-                total_bytes = total_bytes.saturating_add(row_bytes);
-                if total_bytes > max_total_bytes {
-                    return Ok((results, true));
-                }
-                results.push(GrepTextMatch {
-                    path: path.clone(),
-                    line: line_no,
-                    content: line.to_string(),
-                    context,
-                });
-                if results.len() >= limit {
-                    return Ok((results, true));
-                }
-            }
-        }
-        Ok((results, false))
+        let rows = stmt.query_map(params_refs.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        Self::grep_zstd_stream(rows, &compiled, limit, context_lines, max_total_bytes)
     }
 
     /// grep_body с поддержкой context_lines. Существующий `grep_body` без
