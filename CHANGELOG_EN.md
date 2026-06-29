@@ -5,6 +5,21 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.42.1] — 2026-06-29
+
+**Cosmetic release: internal code-cleanliness fixes with no behavior change. Tool output, indexing and the protocol are untouched. No reindex required.**
+
+> Context. Targeted cleanup following an external code review: removed a `clippy::never_loop` pattern, de-duplicated the grep output layer, and dropped a dead function in the indexer. Observable behavior is identical to 0.42.0 (verified: 314 tests green, grep output diff before/after, live smoke on both nodes — local and federated).
+
+### Changed
+
+- **Grep-layer dedup: shared streaming helper `grep_zstd_stream`.** `grep_code_filtered` and `grep_text_filtered` (storage) shared ~80 lines of identical post-processing (zstd decode → per-line regex → `context_lines` → `limit`/byte caps). Extracted into a single helper taking a row iterator — this also removes the intermediate materialization of all blobs into a `Vec` (early exit on caps no longer reads the rest). Output contract (`GrepTextMatch`, ordering, `truncated`) unchanged.
+- **`extract_docstring` (Python parser): removed the `clippy::never_loop` pattern.** A `for` loop that always ran a single iteration with an unconditional `break` was replaced by an explicit read of the first body node (`next()?`). Docstring extraction logic is identical.
+
+### Removed
+
+- **Dead function `collect_candidates_standalone` (indexer).** A full duplicate of the `collect_candidates` method with no caller anywhere in the codebase. The live candidate-collection path (`Indexer::collect_candidates`, used by `full_reindex`) is untouched.
+
 ## [0.42.0] — 2026-06-24
 
 **Result cache + session re-delivery dedup + PER-FILE freshness and invalidation — all INSIDE serve. Stripping of internal `_meta` moved into serve: a separate mcp-cache-ci proxy in front of serve is no longer needed in the ci chain. No reindex required (all on the serve output layer).**
