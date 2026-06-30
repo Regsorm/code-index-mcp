@@ -782,7 +782,17 @@ impl<'a> Indexer<'a> {
             .par_iter()
             .map(|entry| {
                 match hasher::file_hash(&entry.abs_path) {
-                    Ok((content, hash)) => Ok((entry.rel_path.clone(), content, hash, entry.category.clone(), entry.mtime, entry.file_size)),
+                    Ok((content, hash, is_binary)) => {
+                        // Двоичный контент под видом code-файла (EDT-защищённые
+                        // модули поставщика — .bsl с двоичным образом) переводим
+                        // в Binary, чтобы не отдавать в tree-sitter.
+                        let category = if is_binary {
+                            FileCategory::Binary
+                        } else {
+                            entry.category.clone()
+                        };
+                        Ok((entry.rel_path.clone(), content, hash, category, entry.mtime, entry.file_size))
+                    }
                     Err(e) => Err((entry.rel_path.clone(), e.to_string())),
                 }
             })
@@ -794,6 +804,12 @@ impl<'a> Indexer<'a> {
         for item in read_results {
             match item {
                 Ok((rel_path, content, hash, category, mtime, file_size)) => {
+                    // Двоичные файлы (в т.ч. распознанные по контенту в file_hash)
+                    // в индекс не идут — ни парсинга, ни записи.
+                    if matches!(category, FileCategory::Binary) {
+                        result.files_skipped += 1;
+                        continue;
+                    }
                     if !force {
                         if let Some((_, existing_hash, _, _)) = existing_files.get(&rel_path) {
                             if *existing_hash == hash {

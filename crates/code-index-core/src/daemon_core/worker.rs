@@ -591,8 +591,8 @@ fn apply_event(
 ) {
     match event {
         FileEvent::Modified(abs) | FileEvent::Created(abs) => {
-            let (content, hash) = match hasher::file_hash(abs) {
-                Ok(pair) => pair,
+            let (content, hash, is_binary) = match hasher::file_hash(abs) {
+                Ok(triple) => triple,
                 Err(e) => {
                     // Частый случай: atomic-save через .tmp → rename. Watcher увидел
                     // событие на .tmp, но к моменту хэширования файл уже переименован.
@@ -620,7 +620,13 @@ fn apply_event(
                 .to_string_lossy()
                 .replace('\\', "/");
 
-            let category = categorize_file(abs);
+            // Двоичный контент (EDT-защищённый модуль — .bsl с двоичным образом)
+            // трактуем как Binary: не парсим, как и обычные бинарные файлы.
+            let category = if is_binary {
+                FileCategory::Binary
+            } else {
+                categorize_file(abs)
+            };
             match category {
                 FileCategory::Code(language) => {
                     let ext = abs

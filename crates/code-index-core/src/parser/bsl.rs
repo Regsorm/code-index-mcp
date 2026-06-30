@@ -379,15 +379,56 @@ fn visit_module_var(node: tree_sitter::Node, ctx: &mut VisitContext) {
 }
 
 /// Главная функция парсинга BSL-файла
+/// Порог времени на парсинг одного BSL-файла — страховка от патологий tree-sitter.
+/// 10 с даёт ~5-кратный запас над самым медленным легитимным модулем (≈2 с на 8 МБ),
+/// при этом обрывает деградацию на аномальном вводе за секунды вместо минут.
+const PARSE_TIMEOUT_MS: u64 = 10_000;
+
+/// Признак, что под расширением `.bsl` лежит не исходник, а двоичные данные.
+/// EDT выгружает защищённые модули поставщика как `ObjectModule.bsl` с двоичным
+/// образом 1С (сигнатура `FF FF FF 7F`) вместо текста — конфигуратор для тех же
+/// модулей использует `.bin`. NUL-байт в первых килобайтах — надёжный маркер
+/// не-текста (как в git/file): валидный BSL-исходник его не содержит, а на таком
+/// вводе tree-sitter уходит в нелинейную деградацию (квадратично по размеру).
+fn looks_binary(source: &str) -> bool {
+    source.as_bytes().iter().take(8192).any(|&b| b == 0)
+}
+
+/// Пустой результат — для файлов, пропущенных защитой (двоичные либо превысившие таймаут).
+fn empty_parse_result(source: &str) -> ParseResult {
+    ParseResult {
+        functions: Vec::new(),
+        classes: Vec::new(),
+        imports: Vec::new(),
+        calls: Vec::new(),
+        variables: Vec::new(),
+        lines_total: source.lines().count(),
+        ast_hash: String::new(),
+    }
+}
+
 fn parse_bsl(source: &str) -> Result<ParseResult> {
+    // Защита 1: двоичный .bsl (EDT-защищённые модули) — не отдаём в tree-sitter,
+    // иначе он деградирует на бесструктурном вводе и вешает индексацию.
+    if looks_binary(source) {
+        return Ok(empty_parse_result(source));
+    }
+
     let mut ts_parser = tree_sitter::Parser::new();
     ts_parser
         .set_language(&tree_sitter_onescript::LANGUAGE.into())
         .map_err(|e| anyhow!("Ошибка установки языка tree-sitter-onescript: {}", e))?;
 
-    let tree = ts_parser
-        .parse(source, None)
-        .ok_or_else(|| anyhow!("tree-sitter не смог распарсить BSL-файл"))?;
+    // Защита 2: дедлайн на парсинг — страховка от любой будущей патологии.
+    // При превышении parse() возвращает None; трактуем как пустой результат,
+    // чтобы один файл не ронял ошибкой и не вешал всю индексацию.
+    #[allow(deprecated)]
+    ts_parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
+
+    let tree = match ts_parser.parse(source, None) {
+        Some(t) => t,
+        None => return Ok(empty_parse_result(source)),
+    };
 
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
@@ -567,5 +608,15 @@ mod tests {
         assert!(f.override_type.is_none());
         assert!(f.override_target.is_none());
         assert_eq!(f.return_type.as_deref(), Some("&НаСервере"));
+    }
+
+    #[test]
+    fn test_binary_source_yields_empty_not_hang() {
+        // .bsl с двоичным содержимым (EDT-защищённый модуль поставщика) не должен
+        // парситься tree-sitter'ом: возвращаем пустой результат, без зависания.
+        let parser = BslParser::new();
+        let binary = "\u{0}\u{2}binary\u{0}image content";
+        let result = parser.parse(binary, "ObjectModule.bsl").unwrap();
+        assert_eq!(result.functions.len(), 0);
     }
 }
