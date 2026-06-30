@@ -119,6 +119,14 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
 /// держится точечно по .bsl батча. Идемпотентен (каждая фаза DELETE+INSERT либо
 /// UPDATE по full_name). Каждая фаза независима: ошибка → warning, идём дальше.
 fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    // Формат 1C:EDT (`.mdo`) — отдельный путь разбора. Заполняет ТЕ ЖЕ таблицы
+    // (metadata_objects / data_links), поэтому downstream-инструменты не меняются.
+    if let Some(src_root) = crate::xml::edt_mdo::detect_edt_src(repo_root) {
+        if let Err(e) = run_edt_metadata_layer(&src_root, conn) {
+            tracing::warn!("edt metadata layer: {}", e);
+        }
+        return Ok(());
+    }
     if let Err(e) = index_metadata_objects(repo_root, conn) {
         tracing::warn!("metadata_objects: {}", e);
     }
@@ -164,6 +172,227 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
     if let Err(e) = index_metadata_modules(repo_root, conn) {
         tracing::warn!("metadata_modules: {}", e);
     }
+    Ok(())
+}
+
+/// EDT-аналог metadata-слоя: обходит `src/<Тип>/<Имя>/<Имя>.mdo` и заполняет
+/// `metadata_objects` (состав + синоним + `attributes_json`) и `data_links`
+/// (ссылочные реквизиты/измерения + движения документов). Один проход по
+/// объектам вместо серии раздельных (в формате EDT весь объект — в одном
+/// `.mdo`, читать файл повторно незачем). Идемпотентно: DELETE+INSERT всего
+/// репо. Формы/подписки/права/модули EDT — отдельными проходами (этап 2).
+fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    use crate::xml::edt_mdo;
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_objects WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
+    conn.execute("DELETE FROM data_links WHERE repo = ?", params![REPO_DEFAULT])?;
+    conn.execute(
+        "DELETE FROM metadata_forms WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
+    conn.execute(
+        "DELETE FROM event_subscriptions WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
+
+    let mut ins_obj = conn.prepare(
+        "INSERT OR IGNORE INTO metadata_objects \
+         (repo, full_name, meta_type, name, synonym, attributes_json) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )?;
+    let mut ins_link = conn.prepare(
+        "INSERT OR IGNORE INTO data_links \
+         (repo, from_object, from_path, to_object, link_kind, is_composite, is_universal) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    let mut ins_form = conn.prepare(
+        "INSERT OR IGNORE INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+         VALUES (?, ?, ?, ?)",
+    )?;
+    let mut ins_sub = conn.prepare(
+        "INSERT OR IGNORE INTO event_subscriptions \
+         (repo, name, event, handler_module, handler_proc, sources_json) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )?;
+
+    let mut objects = 0usize;
+    let mut links = 0usize;
+    let mut forms = 0usize;
+    let mut subs = 0usize;
+    // Обходим ВСЕ папки типов в src/ (не только OBJECT_FOLDERS): meta_type берём
+    // из корневого тега `.mdo` (parse_mdo_header) — как index_object_synonyms для
+    // формата Конфигуратора. Так в metadata_objects попадают и объекты без
+    // структуры реквизитов (CommonModule/Constant/Report/Role/CommonPicture/...) —
+    // с синонимом. Структуру/связи парсим для всех; пустые — отбрасываем.
+    let type_dirs = match std::fs::read_dir(src_root) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("edt: read_dir({}): {}", src_root.display(), e);
+            conn.execute("COMMIT", [])?;
+            return Ok(());
+        }
+    };
+    for td in type_dirs.filter_map(|e| e.ok()) {
+        let type_dir = td.path();
+        if !type_dir.is_dir() {
+            continue;
+        }
+        // Configuration — сама конфигурация, не папка объектов; пропускаем.
+        if type_dir.file_name().and_then(|s| s.to_str()) == Some("Configuration") {
+            continue;
+        }
+        let objs = match std::fs::read_dir(&type_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in objs.filter_map(|e| e.ok()) {
+            let obj_dir = entry.path();
+            if !obj_dir.is_dir() {
+                continue;
+            }
+            let obj_name = match obj_dir.file_name().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let mdo = obj_dir.join(format!("{}.mdo", obj_name));
+            if !mdo.is_file() {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&mdo) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("edt: read {}: {}", mdo.display(), e);
+                    continue;
+                }
+            };
+            // meta_type из корневого тега `mdclass:<Тип>`; синоним из шапки.
+            let (meta_type, synonym) = match edt_mdo::parse_mdo_header(&content) {
+                Some((mt, _name, syn)) => (mt, syn),
+                None => continue,
+            };
+            let full_name = format!("{}.{}", meta_type, obj_name);
+            let attributes_json = match edt_mdo::parse_mdo_structure_xml(&content) {
+                Ok(s) if !s.is_empty() => Some(s.to_json().to_string()),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!("edt structure {}: {}", mdo.display(), e);
+                    None
+                }
+            };
+            ins_obj.execute(params![
+                REPO_DEFAULT,
+                &full_name,
+                &meta_type,
+                &obj_name,
+                synonym,
+                attributes_json,
+            ])?;
+            objects += 1;
+
+            // Подписка на событие: помимо строки в metadata_objects пишем в
+            // event_subscriptions (источник get_event_subscriptions).
+            if meta_type == "EventSubscription" {
+                if let Some((nm, ev, module, proc_, sources)) =
+                    edt_mdo::parse_mdo_event_subscription(&content)
+                {
+                    let sources_json = serde_json::to_string(&sources)?;
+                    ins_sub.execute(params![
+                        REPO_DEFAULT,
+                        &nm,
+                        &ev,
+                        &module,
+                        &proc_,
+                        &sources_json,
+                    ])?;
+                    subs += 1;
+                }
+            }
+
+            match edt_mdo::parse_mdo_datalinks_xml(&content) {
+                Ok(edges) => {
+                    for edge in edges {
+                        ins_link.execute(params![
+                            REPO_DEFAULT,
+                            &full_name,
+                            &edge.from_path,
+                            &edge.to_object,
+                            edge.link_kind,
+                            edge.is_composite as i64,
+                            edge.is_universal as i64,
+                        ])?;
+                        links += 1;
+                    }
+                }
+                Err(e) => tracing::warn!("edt data_links {}: {}", mdo.display(), e),
+            }
+
+            // Формы объекта: <obj>/Forms/<ФормаИмя>/Form.form. owner_full_name —
+            // в формате папки выгрузки '<PluralFolder>.<Имя>' (Documents.X), как у
+            // metadata_forms формата Конфигуратора.
+            let forms_dir = obj_dir.join("Forms");
+            if forms_dir.is_dir() {
+                let type_folder = type_dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                let owner = format!("{}.{}", type_folder, obj_name);
+                if let Ok(fread) = std::fs::read_dir(&forms_dir) {
+                    for fe in fread.filter_map(|e| e.ok()) {
+                        let fdir = fe.path();
+                        if !fdir.is_dir() {
+                            continue;
+                        }
+                        let form_name = match fdir.file_name().and_then(|s| s.to_str()) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        let form_file = fdir.join("Form.form");
+                        if !form_file.is_file() {
+                            continue;
+                        }
+                        let fcontent = match std::fs::read_to_string(&form_file) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        let handlers = edt_mdo::parse_mdo_form_handlers(&fcontent);
+                        let handlers_json = serde_json::to_string(
+                            &handlers
+                                .iter()
+                                .map(|(ev, h)| serde_json::json!({"event": ev, "handler": h}))
+                                .collect::<Vec<_>>(),
+                        )?;
+                        ins_form.execute(params![
+                            REPO_DEFAULT,
+                            &owner,
+                            &form_name,
+                            &handlers_json,
+                        ])?;
+                        forms += 1;
+                    }
+                }
+            }
+        }
+    }
+    drop(ins_obj);
+    drop(ins_link);
+    drop(ins_form);
+    drop(ins_sub);
+    backfill_data_link_keys(conn)?;
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!(
+        "edt metadata: {} объектов, {} рёбер data_links, {} форм, {} подписок (src={})",
+        objects,
+        links,
+        forms,
+        subs,
+        src_root.display()
+    );
     Ok(())
 }
 

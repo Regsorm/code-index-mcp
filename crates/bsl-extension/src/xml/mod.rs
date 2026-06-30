@@ -21,6 +21,9 @@
 
 pub mod config_dump_info;
 pub mod configuration;
+// `edt_mdo` — формат 1C:EDT (`.mdo`): структура объектов, связи данных,
+// синоним/шапка. Заполняет те же таблицы, что и формат Конфигуратора.
+pub mod edt_mdo;
 pub mod event_subscriptions;
 pub mod forms;
 pub mod metadata_refs;

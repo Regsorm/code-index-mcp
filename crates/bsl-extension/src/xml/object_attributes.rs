@@ -1173,7 +1173,9 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
 }
 
 /// Склеить типы поля в человекочитаемую 1С-строку (составной → через ` | `).
-fn pretty_types(types: &[String]) -> String {
+/// pub(crate): переиспользуется EDT-парсером (xml::edt_mdo) — нормализует
+/// типы `.mdo` в тот же `cfg:`/`xs:` вид и зовёт эту же функцию.
+pub(crate) fn pretty_types(types: &[String]) -> String {
     if types.is_empty() {
         return "—".to_string();
     }
