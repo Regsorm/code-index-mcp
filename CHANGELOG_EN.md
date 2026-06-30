@@ -5,6 +5,26 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.42.2] — 2026-06-30
+
+**1C:EDT export format support: parsing of `.mdo` metadata and parser protection against binary modules.**
+
+> Context. Configurations exported via 1C:EDT (rather than the Configurator) are stored in a different layout: metadata lives in XML `.mdo` files (the `mdclass` schema), and vendor-protected modules are written by EDT under the `.bsl` extension with a binary image instead of text (the Configurator uses `.bin` for the same modules). This release adds `.mdo` parsing and fixes the parser degradation on such binary "`.bsl`" files.
+
+### Added
+
+- **Parsing of 1C:EDT export metadata (`.mdo`).** A new layer builds the same tables (`metadata_objects`, `data_links`, `metadata_forms`, `event_subscriptions`) as for the Configurator export, by walking `src/<Type>/<Name>/<Name>.mdo` across all object types — downstream tools (`get_object_structure`, `get_object_profile`, `get_data_links`, `get_register_writers`, `get_form_handlers`, `get_event_subscriptions`, `find_references`, etc.) work on EDT repositories unchanged. Format detection is by `Configuration.mdo` at the export root.
+
+### Fixed
+
+- **Indexing hang on binary "`.bsl`" files from EDT exports.** EDT stores vendor-protected modules as `ObjectModule.bsl` containing a 1C binary container (signature `FF FF FF 7F`) instead of source text. tree-sitter degraded quadratically on such input — a single 1.3 MB module took tens of minutes on one core and hung indexing of the whole repository. Added binary-content detection on raw bytes (in `file_hash`): a file with the container signature or a NUL byte is flagged binary and not handed to the parser. As a safeguard against any other pathology — a per-file parse deadline (10 s) in the BSL parser. Verified on ~81,000 `.bsl` files (5 configurations, both Configurator and EDT exports): no false positives.
+
+### Testing
+
+- 316 unit/integration tests green (including 2 new ones for binary-content detection).
+- Live smoke on the EDT export of BP TDK (23,155 files): indexing in 70 s versus an indefinite hang before the fix.
+- Regression on the federated Configurator repository BP TDK (90,024 files, force-reindex from scratch): index statistics matched the previous run bit-for-bit — the protection is strictly a no-op on normal repositories.
+
 ## [0.42.1] — 2026-06-29
 
 **Cosmetic release: internal code-cleanliness fixes with no behavior change. Tool output, indexing and the protocol are untouched. No reindex required.**
