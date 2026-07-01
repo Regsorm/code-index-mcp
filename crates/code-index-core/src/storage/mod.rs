@@ -1216,6 +1216,35 @@ impl Storage {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// Регистронезависимый поиск функций по имени — FALLBACK для
+    /// [`get_function_by_name`] при пустом точном совпадении. Точное сравнение
+    /// (`WHERE name = ?1`, idx_functions_name) в SQLite побайтовое — регистр
+    /// кириллицы НЕ фолдится, поэтому `ЗаполнитьЖурнал` ≠ `заполнитьжурнал`.
+    /// FTS5-токенайзер unicode61 регистр кириллицы фолдит, поэтому кандидатов
+    /// берём через `search_functions` (имя — самый весомый столбец bm25),
+    /// затем оставляем строгое ci-равенство имени в Rust (FTS матчит токенами,
+    /// фильтр отсекает лишние совпадения по телу/подстроке). Дорогой путь
+    /// оправдан: исполняется лишь когда точный поиск уже вернул 0.
+    pub fn get_function_by_name_ci(&self, name: &str) -> Result<Vec<FunctionRecord>> {
+        let want = name.to_lowercase();
+        let cands = self.search_functions(name, 100, None)?;
+        Ok(cands
+            .into_iter()
+            .filter(|f| f.name.to_lowercase() == want)
+            .collect())
+    }
+
+    /// Регистронезависимый поиск классов по имени — зеркало
+    /// [`get_function_by_name_ci`]. Fallback для [`get_class_by_name`].
+    pub fn get_class_by_name_ci(&self, name: &str) -> Result<Vec<ClassRecord>> {
+        let want = name.to_lowercase();
+        let cands = self.search_classes(name, 100, None)?;
+        Ok(cands
+            .into_iter()
+            .filter(|c| c.name.to_lowercase() == want)
+            .collect())
+    }
+
     /// Найти все вызовы, где данная функция является caller
     pub fn get_callees(&self, function_name: &str, language: Option<&str>) -> Result<Vec<CallRecord>> {
         match language {
@@ -2693,6 +2722,69 @@ mod tests {
         let results = storage.search_functions("binary_search", 10, None).expect("search_functions");
         assert_eq!(results.len(), 1, "должна найтись ровно одна функция");
         assert_eq!(results[0].name, "binary_search");
+    }
+
+    #[test]
+    fn test_get_function_ci_fallback_cyrillic() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+        let file_id = storage.upsert_file(&make_file("/src/Module.bsl")).unwrap();
+        storage
+            .insert_functions(&[
+                make_function(file_id, "ЗаполнитьЖурналОперацийМаксимо"),
+                make_function(file_id, "ПолучитьОперацииWS_IBS_MATRECTRANS"),
+            ])
+            .unwrap();
+
+        // Точное совпадение по регистру — работает как прежде.
+        assert_eq!(
+            storage.get_function_by_name("ЗаполнитьЖурналОперацийМаксимо").unwrap().len(),
+            1,
+        );
+        // Другой регистр кириллицы → точный (побайтовый) поиск пуст.
+        assert!(
+            storage.get_function_by_name("заполнитьжурналоперациймаксимо").unwrap().is_empty(),
+            "точный поиск обязан быть регистрозависимым (fast-path без изменений)",
+        );
+        // ci-fallback находит по имени независимо от регистра.
+        let ci = storage.get_function_by_name_ci("заполнитьжурналоперациймаксимо").unwrap();
+        assert_eq!(ci.len(), 1, "ci-fallback должен найти функцию");
+        assert_eq!(ci[0].name, "ЗаполнитьЖурналОперацийМаксимо");
+        // Имя службы с подчёркиваниями (unicode61 бьёт по '_') — тоже находится.
+        let ci2 = storage.get_function_by_name_ci("получитьоперацииws_ibs_matrectrans").unwrap();
+        assert_eq!(ci2.len(), 1, "имя с подчёркиваниями должно находиться ci");
+        assert_eq!(ci2[0].name, "ПолучитьОперацииWS_IBS_MATRECTRANS");
+        // Несуществующее имя — пусто (не ложное срабатывание по подстроке).
+        assert!(
+            storage.get_function_by_name_ci("несуществующаяфункция").unwrap().is_empty(),
+            "ci-fallback не должен возвращать посторонние функции",
+        );
+    }
+
+    #[test]
+    fn test_get_class_ci_fallback_cyrillic() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+        let file_id = storage.upsert_file(&make_file("/src/types.py")).unwrap();
+        storage
+            .insert_classes(&[ClassRecord {
+                id: None,
+                file_id,
+                name: "ОписаниеОперации".into(),
+                line_start: 1,
+                line_end: 5,
+                bases: None,
+                docstring: Some("Класс описания операции".into()),
+                body: "class ОписаниеОперации: pass".into(),
+                node_hash: "hc1".into(),
+            }])
+            .unwrap();
+
+        assert!(
+            storage.get_class_by_name("описаниеоперации").unwrap().is_empty(),
+            "точный поиск класса регистрозависим",
+        );
+        let ci = storage.get_class_by_name_ci("описаниеоперации").unwrap();
+        assert_eq!(ci.len(), 1, "ci-fallback класса находит по имени");
+        assert_eq!(ci[0].name, "ОписаниеОперации");
     }
 
     #[test]

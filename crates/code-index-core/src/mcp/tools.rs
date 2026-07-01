@@ -659,6 +659,14 @@ pub fn get_function_with(
 ) -> String {
     match storage.get_function_by_name(&name) {
         Ok(mut r) => {
+            // Точное совпадение пусто → регистронезависимый fallback (кириллица:
+            // точный поиск побайтовый, регистр не фолдит). Частый класс ошибок
+            // на BSL-репо: lowercase-имя из памяти модели. См. get_function_by_name_ci.
+            if r.is_empty() {
+                if let Ok(ci) = storage.get_function_by_name_ci(&name) {
+                    r = ci;
+                }
+            }
             if let Some(ref g) = path_glob {
                 let matcher = match build_path_matcher(g) {
                     Ok(m) => m,
@@ -722,6 +730,13 @@ pub fn get_class_with(
 ) -> String {
     match storage.get_class_by_name(&name) {
         Ok(mut r) => {
+            // Точное совпадение пусто → регистронезависимый fallback (зеркало
+            // get_function_with). См. get_class_by_name_ci.
+            if r.is_empty() {
+                if let Ok(ci) = storage.get_class_by_name_ci(&name) {
+                    r = ci;
+                }
+            }
             if let Some(ref g) = path_glob {
                 let matcher = match build_path_matcher(g) {
                     Ok(m) => m,
