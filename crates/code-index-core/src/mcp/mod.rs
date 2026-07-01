@@ -143,6 +143,11 @@ pub struct MultiNameParams {
 pub struct FunctionNameParams {
     /// Алиас репозитория (из --path alias=dir при запуске сервера).
     pub repo: String,
+    /// Точное имя функции. Запасные ключи на входе (модели путают параметр
+    /// с get_function): `name`, `symbol` принимаются как `function_name` —
+    /// иначе слепой вызов get_callers/get_callees падал тёмной ошибкой
+    /// разборщика «missing field function_name» (потерянный ход).
+    #[serde(alias = "name", alias = "symbol")]
     pub function_name: String,
     pub language: Option<String>,
     /// Cap на число рёбер графа вызовов (default 200). При обрезке в ответе —
@@ -1036,7 +1041,7 @@ impl CodeIndexServer {
         tools::search_text(entry, p.query, p.limit, p.language, p.path_glob).await
     }
 
-    #[tool(description = "Поиск по телам функций и классов. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP); query — алиас regex. path_glob — фильтр по пути (SQL pushdown; альтернативы `{a,b}` поддерживаются). context_lines — N строк до/после совпадения. limit — число находок (default 30); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"<name> (<kind>) L<start>-<end>: <строки>(+N)\", …]}, shown, limit, truncated} — по одной строке-локатору на функцию/класс; контекст (context_lines>0) дописан строками \"N: текст\".")]
+    #[tool(description = "Поиск ТОЛЬКО в телах функций и классов (module-level код — объявления Перем, таблицы инициализации/маршрутизации, константы и строковые литералы ВНЕ процедур — НЕ виден; для поиска по всему файлу бери grep_code). Плюс grep_body в том, что показывает, в какой ИМЕННО функции/классе найден паттерн. pattern — подстрока (LIKE), regex — регулярное выражение (REGEXP); query — алиас regex. path_glob — фильтр по пути (SQL pushdown; альтернативы `{a,b}` поддерживаются). context_lines — N строк до/после совпадения. limit — число находок (default 30); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"<name> (<kind>) L<start>-<end>: <строки>(+N)\", …]}, shown, limit, truncated} — по одной строке-локатору на функцию/класс; контекст (context_lines>0) дописан строками \"N: текст\".")]
     async fn grep_body(&self, Parameters(p): Parameters<GrepBodyParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1104,7 +1109,7 @@ impl CodeIndexServer {
         tools::grep_text(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
-    #[tool(description = "Regex-поиск по содержимому **code-файлов** (Phase 2, v0.8.0; параметр regex=, синоним query=): module-level код, идентификаторы, комментарии вне тел, макросы, use-импорты — всё что не ловит grep_body. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
+    #[tool(description = "Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=): ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
     async fn grep_code(&self, Parameters(p): Parameters<GrepCodeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1757,6 +1762,37 @@ mod mass_mode_tests {
         assert!(names.contains("get_class"));
         assert!(names.contains("get_object_structure"));
         assert_eq!(MASS_MODE_PARAMS.len(), 3);
+    }
+}
+
+// ── Тесты алиасов параметров ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod param_alias_tests {
+    use super::*;
+
+    #[test]
+    fn function_name_params_accepts_name_and_symbol_aliases() {
+        // Модели часто шлют 'name' в get_callers/get_callees (путают ключ с
+        // get_function). serde-alias принимает его как function_name — иначе
+        // слепой вызов падал «missing field function_name» (потерянный ход).
+        let by_name: FunctionNameParams =
+            serde_json::from_value(serde_json::json!({"repo": "ut", "name": "ПолучитьОписаниеWS"}))
+                .expect("alias 'name' должен приниматься");
+        assert_eq!(by_name.function_name, "ПолучитьОписаниеWS");
+
+        let by_symbol: FunctionNameParams = serde_json::from_value(
+            serde_json::json!({"repo": "ut", "symbol": "ПолучитьОписаниеWS"}),
+        )
+        .expect("alias 'symbol' должен приниматься");
+        assert_eq!(by_symbol.function_name, "ПолучитьОписаниеWS");
+
+        // Канонический ключ по-прежнему работает.
+        let canon: FunctionNameParams = serde_json::from_value(
+            serde_json::json!({"repo": "ut", "function_name": "X"}),
+        )
+        .expect("канонический ключ function_name");
+        assert_eq!(canon.function_name, "X");
     }
 }
 
