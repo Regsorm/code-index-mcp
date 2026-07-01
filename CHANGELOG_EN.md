@@ -5,6 +5,26 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.43.0] — 2026-07-01
+
+**1C code navigation resilient to case and to parameter confusion: case-insensitive symbol lookup, `name` accepted in the call graph, clarified grep tool descriptions.**
+
+> Context. Thanks to **Yuri Gridunov** for detailed statistics of code-index calls from a real bulk 1C-integration documentation session (Composer + Sonnet, ~260 tool calls) — it precisely surfaced the recurring Cyrillic friction points and pointed at what to fix. All three changes are backward-compatible; no reindex required (serve output layer only).
+
+### Added
+
+- **Case-insensitive symbol lookup in `get_function`/`get_class`.** Exact name matching in SQLite is byte-wise and does not fold Cyrillic case: `заполнитьжурнал` failed to find `ЗаполнитьЖурнал` even though the function exists. Now, when the exact match is empty, a fallback via FTS kicks in (the `unicode61` tokenizer folds Cyrillic case) with a strict case-insensitive name check in Rust — the fast exact path is untouched, and the more expensive fallback runs only when the query would otherwise return 0. It catches a common model error ("lowercase name from memory") and works correctly on names with underscores (`уоп_подключаемыекоманды_выполнить`).
+
+### Changed
+
+- **`get_callers`/`get_callees` accept `name` (and `symbol`) as an alias for `function_name`.** Models regularly confused the parameter key with `get_function`, and a blind call failed with the opaque parser error "missing field function_name" — a wasted turn. Added a serde alias (as `find_symbol` already had). The canonical `function_name` works as before.
+- **Clarified `grep_code` and `grep_body` descriptions.** The `grep_code` description wrongly framed it as a complement to `grep_body` ("everything grep_body misses"), whereas it actually searches the FULL file text (module-level + bodies) — a superset. The descriptions now explicitly distinguish: `grep_code` — all occurrences of a string/name anywhere in the file (routing tables, `Перем` declarations, literals + bodies); `grep_body` — bodies only, but tells you which procedure the match is in. This removes the frequent miss "used grep_body for a service name and missed its module-level usage".
+
+### Testing
+
+- Unit tests: ci-fallback (Cyrillic + underscores + no false positives), class fallback, alias deserialization. Whole workspace green (code-index-core 319, bsl-extension 168, 0 failed).
+- Live smoke on real data: local serve (lowercase `get_function` → function body) and the federated node via federation (lowercase `уоп_подключаемыекоманды_выполнить` on `ut` → 31 locations).
+
 ## [0.42.2] — 2026-06-30
 
 **1C:EDT export format support: parsing of `.mdo` metadata and parser protection against binary modules.**
