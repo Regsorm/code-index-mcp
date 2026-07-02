@@ -5,6 +5,27 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.44.1] — 2026-07-03
+
+**Speeding up the extras phase of a full index: procedure-term raw data collected during the parallel parse, batched full-text rebuild, one-shot materialization of the call graph. A reindex is required to benefit; the index is byte-identical to before.**
+
+> Profiling a full index of BP_TDK (88279 files) showed that the extras phase is dominated not by search but by write phases: per-row index/trigger maintenance and re-reading what the core already parsed. Three changes remove the redundant work without changing the data (verified with sha256 of the graph and the terms against the previous DB). They touch only the FULL-reindex path; the incremental path and the public `code-index` are untouched.
+
+### Changed
+
+- **`procedure_terms`: raw data collected during the parallel core parse (54 s → 17 s on BP_TDK).** Previously the term layer re-read every `.bsl` from disk and filled `procedure_enrichment` row by row, while that table has an FTS5 index with a trigram tokenizer on the `terms` column — tokenizing ~530k rows through per-row triggers was the dominant cost. Now the name/comment/object are collected straight from the hot `parse_results` during the parallel parse (like `code_usages`), the synonym is joined in after the XML synonym layer, and the full text is built with a single `INSERT … VALUES('rebuild')` with the FTS triggers dropped for the bulk insert and guaranteed to be restored afterwards. The terms of BP_TDK's ~530k procedures are byte-identical (sha256 matched).
+- **Call graph: `calls⋈files` materialized once (93 s → 52 s on BP_TDK).** Building `proc_call_graph` (direct edges) and `direct_edge_files` ran the expensive `JOIN … DISTINCT` over `calls⋈files` twice — once per table — and paired with a per-row insert into an indexed table it degraded worse than the sum of its parts. Now the edge set `(path, caller, callee)` is collected into a temp table once with `DISTINCT`, and both tables are filled from it with plain inserts, no repeated JOIN/DISTINCT. The graph is byte-identical (sha256 of all edges matched).
+
+### Testing
+
+- Full `index --force` on BP_TDK: `procedure_enrichment`(mech) = 529756, `metadata_code_usages` = 260166, `proc_call_graph` = 1236771 (direct 1165856), `direct_edge_files` = 2424236 — all match the previous DB; sha256 of the graph and sha256 of the terms are identical. FTS is in sync (fts = content = 529756), trigram search works, FTS triggers and graph indexes are intact after the reindex.
+- Whole workspace green (514 tests, 0 failed), including `procedure_enrichment_inserts_propagate_to_fts`, `procedure_enrichment_update_resyncs_fts`, `incremental_terms_update_and_cleanup`, `proc_call_graph_unique_constraint_works`.
+- Confirmed by diff: the incremental functions (`update_procedure_terms_for_file`, `update_code_usages_for_file`, `update_call_graph_direct_for_file`) are unchanged — the edits are only in the full-reindex path.
+
+### Compatibility
+
+- **A full reindex is required** to get the speedup (the changes are in the full-reindex path). The data format is unchanged: an old index keeps working, and the speedup appears on the next full reindex (`index --force` or recreating `.code-index`).
+
 ## [0.44.0] — 2026-07-02
 
 **`did_you_mean` suggestions with similar names on empty `get_function`/`get_class` + cosmetic hint refinements (dynamic calls in the call graph).**
