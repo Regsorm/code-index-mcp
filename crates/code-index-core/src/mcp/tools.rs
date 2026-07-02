@@ -692,7 +692,17 @@ pub fn get_function_with(
                 });
                 return wrap_with_meta_extra(storage, &hits, deps, Some(extra));
             }
-            let hint = if r.is_empty() { Some(HINT_GET_EMPTY) } else { None };
+            if r.is_empty() {
+                // 0 после точного и ci-поиска → did_you_mean с похожими именами
+                // (префикс-LIKE + FTS, ранжирование Левенштейном). Экономит модели
+                // повторные слепые вызовы с вариациями имени.
+                let sugg = storage.suggest_function_names(&name, 5).unwrap_or_default();
+                let mut extra = serde_json::json!({ "hint": HINT_GET_EMPTY });
+                if !sugg.is_empty() {
+                    extra["did_you_mean"] = serde_json::json!(sugg);
+                }
+                return wrap_with_meta_extra(storage, &r, deps, Some(extra));
+            }
             // Навигационный кап оверсайз-тел (защита от disk-offload у клиента).
             let records: Vec<serde_json::Value> = r
                 .iter()
@@ -706,7 +716,7 @@ pub fn get_function_with(
                     )
                 })
                 .collect();
-            wrap_with_meta_hint(storage, &records, deps, hint)
+            wrap_with_meta_hint(storage, &records, deps, None)
         }
         Err(e) => format!("{{\"error\": \"get_function: {}\"}}", e),
     }
@@ -760,7 +770,15 @@ pub fn get_class_with(
                 });
                 return wrap_with_meta_extra(storage, &hits, deps, Some(extra));
             }
-            let hint = if r.is_empty() { Some(HINT_GET_EMPTY) } else { None };
+            if r.is_empty() {
+                // did_you_mean — зеркало get_function_with.
+                let sugg = storage.suggest_class_names(&name, 5).unwrap_or_default();
+                let mut extra = serde_json::json!({ "hint": HINT_GET_EMPTY });
+                if !sugg.is_empty() {
+                    extra["did_you_mean"] = serde_json::json!(sugg);
+                }
+                return wrap_with_meta_extra(storage, &r, deps, Some(extra));
+            }
             // Навигационный кап оверсайз-тел (защита от disk-offload у клиента).
             let records: Vec<serde_json::Value> = r
                 .iter()
@@ -774,7 +792,7 @@ pub fn get_class_with(
                     )
                 })
                 .collect();
-            wrap_with_meta_hint(storage, &records, deps, hint)
+            wrap_with_meta_hint(storage, &records, deps, None)
         }
         Err(e) => format!("{{\"error\": \"get_class: {}\"}}", e),
     }

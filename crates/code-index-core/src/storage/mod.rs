@@ -1245,6 +1245,125 @@ impl Storage {
             .collect())
     }
 
+    /// Похожие имена функций для `did_you_mean` при пустом get_function
+    /// (после точного и ci-поиска). Кандидаты из двух взаимодополняющих
+    /// источников: префикс-LIKE по имени (ловит опечатку в середине/хвосте
+    /// слова, которую FTS-токен целиком не сматчит) и FTS (ловит совпадение
+    /// по токенам-частям — имена с '_', перестановка слов). Ранжирование —
+    /// расстояние Левенштейна к запросу без учёта регистра.
+    pub fn suggest_function_names(&self, name: &str, limit: usize) -> Result<Vec<String>> {
+        let mut cands = self.names_by_prefix("functions", name)?;
+        for f in self.search_functions(name, 50, None)? {
+            cands.push(f.name);
+        }
+        Ok(Self::rank_name_suggestions(name, cands, limit))
+    }
+
+    /// Зеркало [`suggest_function_names`] для классов.
+    pub fn suggest_class_names(&self, name: &str, limit: usize) -> Result<Vec<String>> {
+        let mut cands = self.names_by_prefix("classes", name)?;
+        for c in self.search_classes(name, 50, None)? {
+            cands.push(c.name);
+        }
+        Ok(Self::rank_name_suggestions(name, cands, limit))
+    }
+
+    /// DISTINCT-имена таблицы (`functions`/`classes` — только внутренние
+    /// вызовы, имя таблицы не из пользовательского ввода) по префиксам
+    /// запроса, от длинного к короткому (12 → 9 → 6 символов). Длинный
+    /// префикс важен на «горячих» началах имён (в 1С тысячи функций на
+    /// 'Провер%'/'Заполн%'): короткий префикс с LIMIT набирает случайные
+    /// 50 и настоящее имя в пул не попадает. LIKE в SQLite фолдит регистр
+    /// только для ASCII, поэтому каждый префикс пробуем в регистровых
+    /// вариантах: как есть, нижний, с заглавной первой буквой.
+    fn names_by_prefix(&self, table: &str, name: &str) -> Result<Vec<String>> {
+        let chars: Vec<char> = name.chars().collect();
+        let sql = format!("SELECT DISTINCT name FROM {} WHERE name LIKE ?1 LIMIT 50", table);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut out: Vec<String> = Vec::new();
+        let mut probed: Vec<String> = Vec::new();
+        for len in [12usize, 9, 6] {
+            if chars.len() < len && len != 6 {
+                continue;
+            }
+            let prefix: String = chars.iter().take(len.min(chars.len())).collect();
+            if prefix.is_empty() {
+                break;
+            }
+            let lower = prefix.to_lowercase();
+            let mut first_upper = String::new();
+            let mut it = lower.chars();
+            if let Some(c) = it.next() {
+                first_upper.extend(c.to_uppercase());
+                first_upper.push_str(it.as_str());
+            }
+            for v in [prefix, lower, first_upper] {
+                if probed.contains(&v) {
+                    continue;
+                }
+                probed.push(v.clone());
+                let rows = stmt.query_map(params![format!("{}%", v)], |r| r.get::<_, String>(0))?;
+                out.extend(rows.flatten());
+            }
+            // Длинный префикс дал достаточный пул точных кандидатов —
+            // короткие пробы только зальют его случайным шумом.
+            if out.len() >= 60 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Дедуп кандидатов + сортировка по расстоянию Левенштейна (без учёта
+    /// регистра) к запрошенному имени, обрезка до `limit`.
+    fn rank_name_suggestions(name: &str, cands: Vec<String>, limit: usize) -> Vec<String> {
+        /// Классическое DP; имена короткие, квадратичность не существенна.
+        fn levenshtein(a: &str, b: &str) -> usize {
+            let a: Vec<char> = a.chars().collect();
+            let b: Vec<char> = b.chars().collect();
+            let mut prev: Vec<usize> = (0..=b.len()).collect();
+            let mut cur = vec![0usize; b.len() + 1];
+            for i in 1..=a.len() {
+                cur[0] = i;
+                for j in 1..=b.len() {
+                    let cost = usize::from(a[i - 1] != b[j - 1]);
+                    cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+                }
+                std::mem::swap(&mut prev, &mut cur);
+            }
+            prev[b.len()]
+        }
+        let want = name.to_lowercase();
+        let mut uniq: Vec<String> = Vec::new();
+        for c in cands {
+            if !uniq.contains(&c) {
+                uniq.push(c);
+            }
+        }
+        // Порог адекватности: дальше трети длины запроса (мин. 3 правки) —
+        // уже не «похожее имя», а шум из общего префикса; лучше пустой
+        // did_you_mean, чем пять посторонних имён. Кандидат-«продолжение»
+        // (ЗаполнитьЖурналОпераций → …ОперацийМаксимо) не штрафуем за весь
+        // хвост: сравниваем голову кандидата длиной запроса, хвост = +1.
+        let want_n = want.chars().count();
+        let max_dist = (want_n / 3).max(3);
+        let mut scored: Vec<(usize, String)> = uniq
+            .into_iter()
+            .filter_map(|c| {
+                let cl = c.to_lowercase();
+                let mut d = levenshtein(&cl, &want);
+                if cl.chars().count() > want_n {
+                    let head: String = cl.chars().take(want_n).collect();
+                    d = d.min(levenshtein(&head, &want) + 1);
+                }
+                (d <= max_dist).then_some((d, c))
+            })
+            .collect();
+        scored.sort_by(|x, y| x.0.cmp(&y.0).then_with(|| x.1.cmp(&y.1)));
+        scored.truncate(limit);
+        scored.into_iter().map(|(_, c)| c).collect()
+    }
+
     /// Найти все вызовы, где данная функция является caller
     pub fn get_callees(&self, function_name: &str, language: Option<&str>) -> Result<Vec<CallRecord>> {
         match language {
@@ -2785,6 +2904,69 @@ mod tests {
         let ci = storage.get_class_by_name_ci("описаниеоперации").unwrap();
         assert_eq!(ci.len(), 1, "ci-fallback класса находит по имени");
         assert_eq!(ci[0].name, "ОписаниеОперации");
+    }
+
+    #[test]
+    fn test_suggest_function_names_typo() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+        let file_id = storage.upsert_file(&make_file("/src/Module.bsl")).unwrap();
+        storage
+            .insert_functions(&[
+                make_function(file_id, "ЗаполнитьЖурналОперацийМаксимо"),
+                make_function(file_id, "УстановитьФлагПодтверждения"),
+            ])
+            .unwrap();
+
+        // Опечатка в хвосте слова (…Операции вместо …Операций…): FTS-токен
+        // целиком не совпадает, спасает префикс-LIKE.
+        let sugg = storage.suggest_function_names("ЗаполнитьЖурналОперации", 5).unwrap();
+        assert!(
+            sugg.contains(&"ЗаполнитьЖурналОперацийМаксимо".to_string()),
+            "did_you_mean должен предложить настоящее имя, получили: {:?}",
+            sugg,
+        );
+        assert!(
+            !sugg.contains(&"УстановитьФлагПодтверждения".to_string()),
+            "постороннее имя не должно попадать в подсказки: {:?}",
+            sugg,
+        );
+        // Запрос в нижнем регистре с опечаткой — ловится регистровым
+        // вариантом префикса (LIKE кириллицу не фолдит).
+        let sugg_lower = storage.suggest_function_names("заполнитьжурналоперации", 5).unwrap();
+        assert!(
+            sugg_lower.contains(&"ЗаполнитьЖурналОперацийМаксимо".to_string()),
+            "lowercase-запрос с опечаткой должен давать подсказку: {:?}",
+            sugg_lower,
+        );
+        // Мусорный запрос — без подсказок.
+        let none = storage.suggest_function_names("qqqzzzневедомое", 5).unwrap();
+        assert!(none.is_empty(), "мусорный запрос не должен давать подсказок: {:?}", none);
+    }
+
+    #[test]
+    fn test_suggest_class_names_typo() {
+        let storage = Storage::open_in_memory().expect("Ошибка создания БД");
+        let file_id = storage.upsert_file(&make_file("/src/types.py")).unwrap();
+        storage
+            .insert_classes(&[ClassRecord {
+                id: None,
+                file_id,
+                name: "ОписаниеОперации".into(),
+                line_start: 1,
+                line_end: 5,
+                bases: None,
+                docstring: None,
+                body: "class ОписаниеОперации: pass".into(),
+                node_hash: "hc1".into(),
+            }])
+            .unwrap();
+
+        let sugg = storage.suggest_class_names("ОписаниеОперацци", 5).unwrap();
+        assert!(
+            sugg.contains(&"ОписаниеОперации".to_string()),
+            "did_you_mean класса должен предложить настоящее имя: {:?}",
+            sugg,
+        );
     }
 
     #[test]
