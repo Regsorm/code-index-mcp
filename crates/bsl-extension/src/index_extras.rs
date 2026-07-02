@@ -1006,29 +1006,25 @@ fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     // `ОбработкаПроведения` больше не схлопываются в одну строку).
     // callee_proc_name остаётся сырым именем; callee_proc_key (адрес
     // цели) заполняет резолвер на этапе 4e.
+    // ── direct + direct_edge_files: материализуем calls⋈files ОДИН раз ──
+    // Дорогой JOIN+DISTINCT по calls⋈files раньше гонялся дважды (для
+    // proc_call_graph и для direct_edge_files) и в паре с построчной вставкой
+    // в индексируемую таблицу деградировал сильнее суммы частей. Собираем
+    // распарсенное множество рёбер во временную таблицу один раз и наполняем
+    // из неё обе таблицы простыми вставками без повторного JOIN/DISTINCT.
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_direct_raw; CREATE TEMP TABLE tmp_direct_raw AS SELECT DISTINCT f.path AS path, c.caller AS caller, c.callee AS callee FROM calls c JOIN files f ON f.id = c.file_id WHERE c.caller IS NOT NULL AND c.callee IS NOT NULL;")?;
+
     let direct_count = conn.execute(
-        "INSERT OR IGNORE INTO proc_call_graph \
-         (repo, caller_proc_key, callee_proc_name, call_type) \
-         SELECT DISTINCT ?, f.path || '::' || c.caller, c.callee, 'direct' \
-         FROM calls c JOIN files f ON f.id = c.file_id \
-         WHERE c.caller IS NOT NULL AND c.callee IS NOT NULL",
+        "INSERT OR IGNORE INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) SELECT ?, path || '::' || caller, callee, 'direct' FROM tmp_direct_raw",
         params![REPO_DEFAULT],
     )?;
 
-    // Привязка direct-рёбер к файлам (для per-file инкремента). Полный
-    // пересбор: очищаем и наполняем заново из calls ⋈ files. proc_call_graph
-    // остаётся дедуплицированной — это лишь side-карта «файл → его рёбра».
+    conn.execute("DELETE FROM direct_edge_files WHERE repo = ?", params![REPO_DEFAULT])?;
     conn.execute(
-        "DELETE FROM direct_edge_files WHERE repo = ?",
+        "INSERT OR IGNORE INTO direct_edge_files (repo, caller, callee, source_file) SELECT ?, caller, callee, path FROM tmp_direct_raw",
         params![REPO_DEFAULT],
     )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO direct_edge_files (repo, caller, callee, source_file) \
-         SELECT DISTINCT ?, c.caller, c.callee, f.path \
-         FROM calls c JOIN files f ON f.id = c.file_id \
-         WHERE c.caller IS NOT NULL AND c.callee IS NOT NULL",
-        params![REPO_DEFAULT],
-    )?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_direct_raw;")?;
 
     // ── subscription: event_subscriptions → ребро ────────────────────
     // caller_proc_key для подписок — это «виртуальный триггер» вида
