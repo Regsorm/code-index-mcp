@@ -7,7 +7,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use code_index_core::extension::{IndexTool, LanguageProcessor};
+use code_index_core::extension::{
+    IndexTool, LanguageProcessor, ParseExtrasCollector,
+};
 use code_index_core::parser::{bsl::BslParser, LanguageParser};
 use code_index_core::storage::Storage;
 
@@ -140,6 +142,14 @@ impl LanguageProcessor for BslLanguageProcessor {
         storage: &mut Storage,
     ) -> anyhow::Result<()> {
         crate::index_extras::run_index_extras(repo_root, storage)
+    }
+
+    /// Сборщик extras для параллельного парсинга (полный путь индексации).
+    /// Вытаскивает BSL-сырьё (обращения к объектам МД и т.д.) из горячих в RAM
+    /// parse_results вместо повторного чтения диска в `index_extras`.
+    /// Реализация — [`crate::parse_collector::BslParseCollector`].
+    fn parse_collector(&self) -> Option<Box<dyn ParseExtrasCollector>> {
+        Some(Box::new(crate::parse_collector::BslParseCollector::new()))
     }
 
     /// Инкрементальное обновление extras для файлов одного watcher-батча.

@@ -17,6 +17,7 @@ pub mod code_usages;
 pub mod enrichment;
 pub mod index_extras;
 pub mod module_constants;
+pub mod parse_collector;
 pub mod processor;
 pub mod schema;
 pub mod terms;

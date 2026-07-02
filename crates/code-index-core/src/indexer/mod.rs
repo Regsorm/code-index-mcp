@@ -147,6 +147,12 @@ impl<'a> Indexer<'a> {
         // Определяем: это первичная индексация (пустая БД) или обновление
         let is_fresh_db = existing_files.is_empty();
 
+        // Сборщик extras участвует ТОЛЬКО в полном парсинге (--force или свежая
+        // БД): тогда парсятся все файлы и его полный DELETE+rebuild корректен.
+        // При частичном mtime-fast-path (демон с изменениями) сборщик выключаем
+        // — extras-слои пересобирает index_extras как раньше (с диска).
+        let collector = if force || is_fresh_db { collector } else { None };
+
         // ── Этап 1: сбор кандидатов (параллельный read+hash) ─────────────────
         let candidates_start = std::time::Instant::now();
         let (candidate_files, seen_paths, metadata_updates) = self.collect_candidates(root, force, &existing_files, &mut result)?;

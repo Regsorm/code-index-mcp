@@ -81,7 +81,11 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // сотням тысяч процедур, полный граф вызовов). На инкрементальном пути НЕ
     // вызывается — его держат точечные update_*_for_file по .bsl батча.
     // Обратный индекс использований объектов МД в коде (.bsl) → metadata_code_usages.
-    if let Err(e) = index_metadata_code_usages(repo_root, conn) {
+    // Если parse-collector уже наполнил слой в этом проходе (полная переиндексация
+    // bsl-indexer), повторный disk-rebuild пропускаем — данные идентичны.
+    if crate::parse_collector::collector_did(conn, crate::parse_collector::MARK_CODE_USAGES) {
+        tracing::info!("metadata_code_usages: наполнено parse-collector'ом, disk-rebuild пропущен");
+    } else if let Err(e) = index_metadata_code_usages(repo_root, conn) {
         tracing::warn!("metadata_code_usages: {}", e);
     }
     // Механические термы процедур (имя + объект + синоним + комментарий) —
