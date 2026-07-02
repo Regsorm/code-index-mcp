@@ -38,6 +38,30 @@ pub const METADATA_MODULES_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_mm_extension ON metadata_modules(repo, extension_name);",
 ];
 
+/// DDL трёх FTS-триггеров `procedure_enrichment` (INSERT/DELETE/UPDATE) —
+/// отдельной константой, потому что переиспользуется и в SCHEMA_EXTENSIONS,
+/// и в bulk-пересборке термов (`build_procedure_terms_from_staging`), где
+/// триггеры снимаются на время массовой вставки и ставятся обратно.
+pub const PE_FTS_TRIGGERS_DDL: &str = "
+    CREATE TRIGGER IF NOT EXISTS pe_fts_insert
+    AFTER INSERT ON procedure_enrichment BEGIN
+        INSERT INTO fts_procedure_enrichment(rowid, terms)
+        VALUES (new.id, new.terms);
+    END;
+    CREATE TRIGGER IF NOT EXISTS pe_fts_delete
+    AFTER DELETE ON procedure_enrichment BEGIN
+        INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment, rowid, terms)
+        VALUES ('delete', old.id, old.terms);
+    END;
+    CREATE TRIGGER IF NOT EXISTS pe_fts_update
+    AFTER UPDATE ON procedure_enrichment BEGIN
+        INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment, rowid, terms)
+        VALUES ('delete', old.id, old.terms);
+        INSERT INTO fts_procedure_enrichment(rowid, terms)
+        VALUES (new.id, new.terms);
+    END;
+    ";
+
 /// CREATE TABLE / INDEX для специфичных 1С-таблиц.
 /// Идемпотентно — все CREATE через IF NOT EXISTS.
 pub const SCHEMA_EXTENSIONS: &[&str] = &[
@@ -255,32 +279,10 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     );
     ",
 
-    // Триггеры синхронизации FTS при INSERT/DELETE/UPDATE.
-    // Аналог core::TRIGGERS_SQL для functions/classes — те же 3 события,
-    // явное удаление-перед-вставкой при UPDATE.
-    "
-    CREATE TRIGGER IF NOT EXISTS pe_fts_insert
-    AFTER INSERT ON procedure_enrichment BEGIN
-        INSERT INTO fts_procedure_enrichment(rowid, terms)
-        VALUES (new.id, new.terms);
-    END;
-    ",
-    "
-    CREATE TRIGGER IF NOT EXISTS pe_fts_delete
-    AFTER DELETE ON procedure_enrichment BEGIN
-        INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment, rowid, terms)
-        VALUES ('delete', old.id, old.terms);
-    END;
-    ",
-    "
-    CREATE TRIGGER IF NOT EXISTS pe_fts_update
-    AFTER UPDATE ON procedure_enrichment BEGIN
-        INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment, rowid, terms)
-        VALUES ('delete', old.id, old.terms);
-        INSERT INTO fts_procedure_enrichment(rowid, terms)
-        VALUES (new.id, new.terms);
-    END;
-    ",
+    // Триггеры синхронизации FTS при INSERT/DELETE/UPDATE — единым DDL
+    // PE_FTS_TRIGGERS_DDL (переиспользуется bulk-пересборкой термов, где
+    // триггеры снимаются на время массовой вставки и ставятся обратно).
+    PE_FTS_TRIGGERS_DDL,
 
     // ── embedding_meta ────────────────────────────────────────────────────
     // Глобальная (не per-repo) служебная таблица «ключ-значение» для

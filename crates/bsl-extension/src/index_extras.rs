@@ -2471,61 +2471,81 @@ fn index_procedure_terms(repo_root: &Path, conn: &rusqlite::Connection) -> Resul
 /// .bsl с диска. Синоним объекта подставляется по metadata_objects (синонимы
 /// заполнены XML-слоем, идущим ДО этого шага). В конце staging дропается.
 fn build_procedure_terms_from_staging(conn: &rusqlite::Connection) -> Result<()> {
-    use crate::terms::{build_terms, MECH_SIGNATURE};
+    // Bulk-пересборка полнотекста: снимаем FTS-триггеры procedure_enrichment
+    // на время массовой вставки (иначе триграммный токенайзер срабатывает
+    // построчно на ~530k строк — доминирующая стоимость слоя). После вставки
+    // один INSERT ... VALUES('rebuild') перестраивает FTS целиком за проход.
+    // Триггеры возвращаем ВСЕГДА (даже при ошибке тела) — иначе после flush
+    // на диск инкрементальный путь потеряет синхронизацию FTS.
+    conn.execute_batch("DROP TRIGGER IF EXISTS pe_fts_insert; DROP TRIGGER IF EXISTS pe_fts_delete; DROP TRIGGER IF EXISTS pe_fts_update;")?;
 
-    let mut syn: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    {
-        let mut stmt = conn.prepare("SELECT full_name, synonym FROM metadata_objects WHERE repo = ?1 AND synonym IS NOT NULL AND synonym != ''")?;
-        let rows = stmt.query_map(params![REPO_DEFAULT], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in rows.flatten() {
-            syn.insert(row.0, row.1);
+    let body = || -> Result<()> {
+        use crate::terms::{build_terms, MECH_SIGNATURE};
+
+        let mut syn: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT full_name, synonym FROM metadata_objects WHERE repo = ?1 AND synonym IS NOT NULL AND synonym != ''")?;
+            let rows = stmt.query_map(params![REPO_DEFAULT], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows.flatten() {
+                syn.insert(row.0, row.1);
+            }
         }
-    }
 
-    let staged: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = {
-        let mut stmt = conn.prepare("SELECT proc_key, proc_name, object_meta_type, object_name, comment FROM _proc_terms_staging")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-            ))
-        })?;
-        rows.flatten().collect()
+        let staged: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = {
+            let mut stmt = conn.prepare("SELECT proc_key, proc_name, object_meta_type, object_name, comment FROM _proc_terms_staging")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            rows.flatten().collect()
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+        conn.execute("BEGIN", [])?;
+        conn.execute("DELETE FROM procedure_enrichment WHERE repo = ?1 AND signature LIKE 'mech:%'", params![REPO_DEFAULT])?;
+        let mut filled = 0usize;
+        {
+            let mut ins = conn.prepare("INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(repo, proc_key) DO NOTHING")?;
+            for (proc_key, proc_name, object_meta_type, object_name, comment) in &staged {
+                let synonym = match (object_meta_type, object_name) {
+                    (Some(mt), Some(nm)) => syn.get(&format!("{}.{}", mt, nm)).map(String::as_str),
+                    _ => None,
+                };
+                let terms = build_terms(proc_name, object_name.as_deref(), synonym, comment.as_deref());
+                if terms.is_empty() {
+                    continue;
+                }
+                filled += ins.execute(params![REPO_DEFAULT, proc_key, terms, MECH_SIGNATURE, now])?;
+            }
+        }
+        conn.execute("COMMIT", [])?;
+
+        // FTS сняли с триггеров — перестраиваем полнотекст целиком из content-таблицы.
+        conn.execute_batch("INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment) VALUES('rebuild');")?;
+        conn.execute_batch("DROP TABLE IF EXISTS _proc_terms_staging;")?;
+
+        tracing::info!("procedure_terms (staging): механически обогащено {} процедур", filled);
+        Ok(())
     };
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
-    conn.execute("BEGIN", [])?;
-    conn.execute("DELETE FROM procedure_enrichment WHERE repo = ?1 AND signature LIKE 'mech:%'", params![REPO_DEFAULT])?;
-    let mut filled = 0usize;
-    {
-        let mut ins = conn.prepare("INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(repo, proc_key) DO NOTHING")?;
-        for (proc_key, proc_name, object_meta_type, object_name, comment) in &staged {
-            let synonym = match (object_meta_type, object_name) {
-                (Some(mt), Some(nm)) => syn.get(&format!("{}.{}", mt, nm)).map(String::as_str),
-                _ => None,
-            };
-            let terms = build_terms(proc_name, object_name.as_deref(), synonym, comment.as_deref());
-            if terms.is_empty() {
-                continue;
-            }
-            filled += ins.execute(params![REPO_DEFAULT, proc_key, terms, MECH_SIGNATURE, now])?;
-        }
-    }
-    conn.execute("COMMIT", [])?;
-    conn.execute_batch("DROP TABLE IF EXISTS _proc_terms_staging;")?;
-
-    tracing::info!("procedure_terms (staging): механически обогащено {} процедур", filled);
-    Ok(())
+    let result = body();
+    // Вернуть FTS-триггеры при любом исходе тела.
+    let recreated = conn
+        .execute_batch(crate::schema::PE_FTS_TRIGGERS_DDL)
+        .map_err(anyhow::Error::from);
+    result.and(recreated)
 }
 
 /// Per-file обновление механических термов для одного `.bsl`: снести свои
