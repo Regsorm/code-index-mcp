@@ -187,10 +187,16 @@ pub fn run_worker(
 
     eprintln!("[worker:{}] initial reindex", path.display());
 
-    // 6. Полная переиндексация (fast-path по mtime, если БД уже есть)
+    // 6. Полная переиндексация (fast-path по mtime, если БД уже есть).
+    //    Первичная индексация демона — полный путь (НЕ инкремент), поэтому
+    //    сборщик extras BSL здесь уместен (инкрементальные обновления идут
+    //    через index_extras_for_files и сборщик не задействуют).
+    let parse_collector = resolved_processor
+        .as_ref()
+        .and_then(|proc| proc.parse_collector());
     let indexer_result = {
         let mut indexer = Indexer::with_config(&mut storage, index_config.clone());
-        indexer.full_reindex(&path, false)
+        indexer.full_reindex_with_collector(&path, false, parse_collector.as_deref())
     };
     let (reindex_indexed, reindex_deleted) = match indexer_result {
         Ok(result) => {

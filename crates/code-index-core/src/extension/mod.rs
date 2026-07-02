@@ -24,6 +24,7 @@ pub mod tool;
 
 pub use context::ToolContext;
 pub use processor::{
-    LanguageProcessor, ProcessorRegistry, StandardLanguageProcessor,
+    LanguageProcessor, ParseExtrasCollector, ParsedFileCtx, ProcessorRegistry,
+    StandardLanguageProcessor,
 };
 pub use tool::IndexTool;

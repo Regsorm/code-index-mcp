@@ -19,10 +19,39 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::parser::types::ParseResult;
 use crate::parser::LanguageParser;
 use crate::storage::Storage;
 
 use super::tool::IndexTool;
+
+/// Контекст одного распарсенного файла для сборщика extras в фазе парсинга.
+/// `parse_result` присутствует только для code-файлов (у text-файлов — None).
+pub struct ParsedFileCtx<'a> {
+    pub rel_path: &'a str,
+    pub language: &'a str,
+    pub content: &'a str,
+    pub parse_result: Option<&'a ParseResult>,
+}
+
+/// Сборщик специфичного «сырья» в фазе ПАРАЛЛЕЛЬНОГО парсинга ядра.
+///
+/// Реализуется расширением языка (bsl-extension), чтобы вытащить свои данные
+/// (обращения к объектам, комментарии процедур, метаданные XML), пока
+/// содержимое файла ещё горячее в RAM — вместо повторного чтения диска в
+/// `index_extras` после парсинга. Для универсальных сборок сборщика нет.
+///
+/// `on_parsed` зовётся из rayon `par_iter` (обязан быть `Send + Sync` и копить
+/// результаты потоко-безопасно). `write` вызывается СЕРИЙНО после фазы записи
+/// ядра — сбрасывает накопленное в БД (SQLite однопоточен на запись).
+pub trait ParseExtrasCollector: Send + Sync {
+    /// Обработать один распарсенный файл (параллельно). Только накопление
+    /// в потоко-безопасные буферы — без записи в БД.
+    fn on_parsed(&self, ctx: ParsedFileCtx);
+
+    /// Сбросить накопленное сырьё в БД. Серийно, после фазы записи ядра.
+    fn write(&self, storage: &mut Storage) -> anyhow::Result<()>;
+}
 
 /// Описание одного языка/расширения для code-index.
 ///
@@ -121,6 +150,16 @@ pub trait LanguageProcessor: Send + Sync {
     /// релизов нужен разовый полный пересбор (`index --force` или ребилд БД).
     fn extras_present(&self, _storage: &Storage) -> bool {
         false
+    }
+
+    /// Сборщик extras для фазы ПАРАЛЛЕЛЬНОГО парсинга (только полный путь
+    /// индексации). `None` (по умолчанию) — расширение в парсинге не
+    /// участвует, extras целиком делаются в `index_extras` после. bsl-extension
+    /// возвращает сборщик, вытаскивающий code_usages/термы/метаданные во время
+    /// парсинга (содержимое горячее в RAM, диск не перечитывается).
+    /// Инкрементальный путь (`index_extras_for_files`) сборщик НЕ использует.
+    fn parse_collector(&self) -> Option<Box<dyn ParseExtrasCollector>> {
+        None
     }
 }
 

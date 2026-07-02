@@ -925,11 +925,17 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                 }
             }
 
-            // 5. Создать Indexer с конфигом
+            // 5. Создать Indexer с конфигом. Сборщик extras (bsl-indexer)
+            //    берём заранее — он владеет собой, storage не занимает.
+            let parse_collector = registry
+                .as_ref()
+                .and_then(|reg| reg.resolve(None, &abs_path))
+                .and_then(|proc| proc.parse_collector());
             let mut indexer = Indexer::with_config(&mut storage, config);
 
             // 6. Запустить индексацию
-            let result = indexer.full_reindex(&abs_path, force)?;
+            let result =
+                indexer.full_reindex_with_collector(&abs_path, force, parse_collector.as_deref())?;
 
             // 6a. Hook расширения: для BSL-репо здесь происходит
             // парсинг XML-метаданных и заполнение специфичных таблиц

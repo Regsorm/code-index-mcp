@@ -108,6 +108,21 @@ impl<'a> Indexer<'a> {
     ///
     /// По завершении удаляет из БД записи файлов, которых больше нет на диске.
     pub fn full_reindex(&mut self, root: &Path, force: bool) -> Result<IndexResult> {
+        self.full_reindex_with_collector(root, force, None)
+    }
+
+    /// Полная переиндексация с опциональным сборщиком extras (см.
+    /// [`crate::extension::ParseExtrasCollector`]). Публичная сборка и все
+    /// старые вызовы идут через `full_reindex` → `collector = None` → поведение
+    /// идентично прежнему. bsl-indexer передаёт сборщик BSL: тот вытаскивает
+    /// своё сырьё в фазе параллельного парсинга, пока содержимое горячее в RAM,
+    /// вместо повторного чтения диска в `index_extras`.
+    pub fn full_reindex_with_collector(
+        &mut self,
+        root: &Path,
+        force: bool,
+        collector: Option<&dyn crate::extension::ParseExtrasCollector>,
+    ) -> Result<IndexResult> {
         let start = std::time::Instant::now();
         let mut result = IndexResult {
             files_scanned: 0,
@@ -259,6 +274,34 @@ impl<'a> Indexer<'a> {
         let parse_ms = parse_start.elapsed().as_millis();
         eprintln!("[timing] Парсинг (rayon): {} мс ({} файлов)", parse_ms, parse_results.len());
 
+        // ── Этап 2b: сбор extras-сырья (bsl-indexer) ─────────────────────────
+        // Пока parse_results ещё горячие в RAM — параллельно отдаём каждый
+        // файл сборщику расширения (обращения к объектам, комментарии, XML).
+        // Диск не перечитывается. Для универсальной сборки collector = None →
+        // проход пропускается, накладных расходов ноль.
+        if let Some(collector) = collector {
+            use crate::extension::ParsedFileCtx;
+            parse_results.par_iter().for_each(|pf| match pf {
+                ParsedFile::Code { rel_path, language, parse_result, raw_content, .. } => {
+                    collector.on_parsed(ParsedFileCtx {
+                        rel_path,
+                        language,
+                        content: raw_content,
+                        parse_result: Some(parse_result),
+                    });
+                }
+                ParsedFile::Text { rel_path, content, .. } => {
+                    collector.on_parsed(ParsedFileCtx {
+                        rel_path,
+                        language: "text",
+                        content,
+                        parse_result: None,
+                    });
+                }
+                ParsedFile::Error { .. } => {}
+            });
+        }
+
         // ── Этап 3: последовательная запись в SQLite ──────────────────────────
         // SQLite не поддерживает параллельную запись — пишем из основного потока.
         let write_start = std::time::Instant::now();
@@ -351,6 +394,12 @@ impl<'a> Indexer<'a> {
         self.storage.commit_batch()?;
         let write_ms = write_start.elapsed().as_millis();
         eprintln!("[timing] Запись в БД: {} мс ({} файлов)", write_ms, result.files_indexed);
+
+        // Сброс накопленного сборщиком extras сырья (серийно, после фазы
+        // записи ядра). Для универсальной сборки collector = None.
+        if let Some(collector) = collector {
+            collector.write(&mut *self.storage)?;
+        }
 
         // Обновляем mtime/file_size для файлов с неизменённым содержимым.
         if !metadata_updates.is_empty() {
