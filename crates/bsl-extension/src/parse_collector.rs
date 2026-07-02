@@ -31,6 +31,20 @@ const REPO_DEFAULT: &str = "default";
 /// Ключ слоя `metadata_code_usages` в temp-маркере «сделано сборщиком».
 pub const MARK_CODE_USAGES: &str = "code_usages";
 
+/// Ключ слоя термов процедур в temp-маркере «сделано сборщиком».
+pub const MARK_PROC_TERMS: &str = "proc_terms";
+
+/// Одна строка сырья термов процедуры, собранная в фазе парсинга. Синоним
+/// объекта тут отсутствует намеренно — он ещё не заполнен (XML-слой идёт
+/// позже); подставляется по metadata_objects при сборке из staging.
+struct StagedProcTerm {
+    proc_key: String,
+    proc_name: String,
+    object_meta_type: Option<&'static str>,
+    object_name: Option<String>,
+    comment: Option<String>,
+}
+
 /// Сборщик extras BSL для параллельного парсинга. Копит сырьё потоко-безопасно
 /// в `on_parsed` (rayon), сбрасывает в БД в `write` (серийно, после фазы записи
 /// ядра).
@@ -38,6 +52,9 @@ pub const MARK_CODE_USAGES: &str = "code_usages";
 pub struct BslParseCollector {
     /// Накопленные обращения к объектам МД: (file_path, обращения этого файла).
     code_usages: Mutex<Vec<(String, Vec<CodeUsage>)>>,
+    /// Сырьё термов процедур (имя + объект + комментарий), собранное в
+    /// парсинге. Синоним объекта подставляется позже, при сборке из staging.
+    proc_terms: Mutex<Vec<StagedProcTerm>>,
 }
 
 impl BslParseCollector {
@@ -48,18 +65,44 @@ impl BslParseCollector {
 
 impl ParseExtrasCollector for BslParseCollector {
     fn on_parsed(&self, ctx: ParsedFileCtx) {
-        // Обращения к объектам МД извлекаются только из .bsl-модулей.
+        // Все слои сборщика извлекаются только из .bsl-модулей.
         if !ctx.rel_path.to_ascii_lowercase().ends_with(".bsl") {
             return;
         }
+
+        // Слой 1: обращения к объектам МД → metadata_code_usages.
         let usages = extract_code_usages(ctx.content);
-        if usages.is_empty() {
-            return;
+        if !usages.is_empty() {
+            self.code_usages
+                .lock()
+                .expect("BslParseCollector.code_usages mutex")
+                .push((ctx.rel_path.to_string(), usages));
         }
-        self.code_usages
-            .lock()
-            .expect("BslParseCollector.code_usages mutex")
-            .push((ctx.rel_path.to_string(), usages));
+
+        // Слой 2: сырьё термов процедур (имя + объект + комментарий). Синоним
+        // объекта НЕ берём — он ещё не заполнен; подставится позже.
+        if let Some(pr) = ctx.parse_result {
+            if !pr.functions.is_empty() {
+                use crate::terms::{extract_leading_comment, object_from_module_path};
+                let object = object_from_module_path(ctx.rel_path);
+                let lines: Vec<&str> = ctx.content.lines().collect();
+                let mut staged: Vec<StagedProcTerm> = Vec::with_capacity(pr.functions.len());
+                for f in &pr.functions {
+                    let comment = extract_leading_comment(&lines, f.line_start);
+                    staged.push(StagedProcTerm {
+                        proc_key: format!("{}::{}", ctx.rel_path, f.name),
+                        proc_name: f.name.clone(),
+                        object_meta_type: object.as_ref().map(|(mt, _)| *mt),
+                        object_name: object.as_ref().map(|(_, nm)| nm.clone()),
+                        comment,
+                    });
+                }
+                self.proc_terms
+                    .lock()
+                    .expect("BslParseCollector.proc_terms mutex")
+                    .extend(staged);
+            }
+        }
     }
 
     fn write(&self, storage: &mut Storage) -> Result<()> {
@@ -110,6 +153,32 @@ impl ParseExtrasCollector for BslParseCollector {
             total,
             files.len()
         );
+
+        // Слой 2: сырьё термов процедур → temp-таблица _proc_terms_staging.
+        // Финальная сборка термов (build_terms с синонимом объекта) — позже,
+        // в build_procedure_terms_from_staging, ПОСЛЕ заполнения синонимов
+        // XML-слоем. Здесь только сброс накопленного сырья.
+        {
+            let terms = self
+                .proc_terms
+                .lock()
+                .expect("BslParseCollector.proc_terms mutex");
+            conn.execute_batch("DROP TABLE IF EXISTS _proc_terms_staging; CREATE TEMP TABLE _proc_terms_staging (proc_key TEXT, proc_name TEXT, object_meta_type TEXT, object_name TEXT, comment TEXT);")?;
+            conn.execute("BEGIN", [])?;
+            {
+                let mut stmt = conn.prepare("INSERT INTO _proc_terms_staging (proc_key, proc_name, object_meta_type, object_name, comment) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+                for t in terms.iter() {
+                    stmt.execute(params![&t.proc_key, &t.proc_name, t.object_meta_type, &t.object_name, &t.comment])?;
+                }
+            }
+            conn.execute("COMMIT", [])?;
+            mark_done(conn, MARK_PROC_TERMS)?;
+            tracing::info!(
+                "procedure_terms (parse-collector): {} процедур в staging",
+                terms.len()
+            );
+        }
+
         Ok(())
     }
 }

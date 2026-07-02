@@ -89,9 +89,15 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
         tracing::warn!("metadata_code_usages: {}", e);
     }
     // Механические термы процедур (имя + объект + синоним + комментарий) —
-    // после синонимов (использует metadata_objects.synonym, заполнен в слое) и
-    // после core-индексации (читает functions/files). Без LLM, секунды на конфигурацию.
-    if let Err(e) = index_procedure_terms(repo_root, conn) {
+    // после синонимов (использует metadata_objects.synonym, заполнен в слое).
+    // Если parse-collector собрал сырьё в staging (полная переиндексация
+    // bsl-indexer) — строим из него, без повторного чтения .bsl с диска;
+    // иначе полный disk-rebuild (инкремент / публичный путь).
+    if crate::parse_collector::collector_did(conn, crate::parse_collector::MARK_PROC_TERMS) {
+        if let Err(e) = build_procedure_terms_from_staging(conn) {
+            tracing::warn!("procedure_terms (staging): {}", e);
+        }
+    } else if let Err(e) = index_procedure_terms(repo_root, conn) {
         tracing::warn!("procedure_terms: {}", e);
     }
     // Граф вызовов строится ПОСЛЕ заполнения metadata_forms и event_subscriptions
@@ -2457,6 +2463,68 @@ fn index_procedure_terms(repo_root: &Path, conn: &rusqlite::Connection) -> Resul
     conn.execute("COMMIT", [])?;
 
     tracing::info!("procedure_terms: механически обогащено {} процедур", filled);
+    Ok(())
+}
+
+/// Сборка механических термов из staging (`_proc_terms_staging`, наполнен
+/// parse-collector'ом в фазе параллельного парсинга) — БЕЗ повторного чтения
+/// .bsl с диска. Синоним объекта подставляется по metadata_objects (синонимы
+/// заполнены XML-слоем, идущим ДО этого шага). В конце staging дропается.
+fn build_procedure_terms_from_staging(conn: &rusqlite::Connection) -> Result<()> {
+    use crate::terms::{build_terms, MECH_SIGNATURE};
+
+    let mut syn: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT full_name, synonym FROM metadata_objects WHERE repo = ?1 AND synonym IS NOT NULL AND synonym != ''")?;
+        let rows = stmt.query_map(params![REPO_DEFAULT], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows.flatten() {
+            syn.insert(row.0, row.1);
+        }
+    }
+
+    let staged: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = {
+        let mut stmt = conn.prepare("SELECT proc_key, proc_name, object_meta_type, object_name, comment FROM _proc_terms_staging")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        rows.flatten().collect()
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    conn.execute("DELETE FROM procedure_enrichment WHERE repo = ?1 AND signature LIKE 'mech:%'", params![REPO_DEFAULT])?;
+    let mut filled = 0usize;
+    {
+        let mut ins = conn.prepare("INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(repo, proc_key) DO NOTHING")?;
+        for (proc_key, proc_name, object_meta_type, object_name, comment) in &staged {
+            let synonym = match (object_meta_type, object_name) {
+                (Some(mt), Some(nm)) => syn.get(&format!("{}.{}", mt, nm)).map(String::as_str),
+                _ => None,
+            };
+            let terms = build_terms(proc_name, object_name.as_deref(), synonym, comment.as_deref());
+            if terms.is_empty() {
+                continue;
+            }
+            filled += ins.execute(params![REPO_DEFAULT, proc_key, terms, MECH_SIGNATURE, now])?;
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    conn.execute_batch("DROP TABLE IF EXISTS _proc_terms_staging;")?;
+
+    tracing::info!("procedure_terms (staging): механически обогащено {} процедур", filled);
     Ok(())
 }
 
