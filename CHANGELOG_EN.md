@@ -5,6 +5,25 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.44.0] — 2026-07-02
+
+**`did_you_mean` suggestions with similar names on empty `get_function`/`get_class` + cosmetic hint refinements (dynamic calls in the call graph).**
+
+> A follow-up to **Yuri Gridunov**'s call statistics (see 0.43.0): after fixing the case-related misses, two frictions remained — repeated blind calls with name variations, and the false conclusion "0 callers = dead code" on dynamic dispatchers. Both changes live in the serve output layer; no reindex required.
+
+### Added
+
+- **`did_you_mean` in `get_function`/`get_class`.** When both the exact and the case-insensitive lookup return 0, the response includes up to 5 similar names. Candidates come from two complementary sources: prefix-LIKE on the name probing from a long prefix to a short one (12 → 9 → 6 characters — on "hot" 1C name starts like `Провер%`/`Заполн%` a short prefix with a LIMIT collects random names and loses the target) and FTS (token-part matches — names with `_`). Ranking — case-insensitive Levenshtein distance with a sanity threshold (a third of the query length, minimum 3): an empty `did_you_mean` beats five unrelated names sharing a prefix. A "continuation" name (`ЗаполнитьЖурналОпераций` → `…ОперацийМаксимо`) is not penalized for its long tail. Same pattern `get_object_structure` and `bsl_sql` already had.
+
+### Cosmetic changes
+
+- **Clarified the `get_callers`/`get_callees` hint on 0 edges.** Added an explicit warning: "0 callers ≠ dead code" — the function may be invoked dynamically (`Выполнить`/`Вычислить` building the name from strings, a typical dispatcher pattern), with a recommendation to check `grep_code` by a name fragment (it also sees string literals). This closes the frequent model error "no edges → dead code" with text alone, no indexer changes: a measurement across 6 production repos showed ~42 real name dispatchers over 5 configurations — a dedicated dynamic-call candidate table would not pay off.
+
+### Testing
+
+- Unit tests: suggestions on a typo in the word tail, lowercase+typo, no garbage suggestions for a non-existent name, a mirror test for classes. Whole workspace green (code-index-core 321, bsl-extension 168, integration 23, 0 failed).
+- Live smoke locally and via federation: `ОбработатьЗапрсо` → `ОбработатьЗапрос` (wms, single suggestion — noise cut by the threshold), `ПроверитьУсловияТригера` → `ПроверитьУсловияТриггера` first (ut, "hot" prefix), the new call-graph hint from both nodes, ci-fallback regression (`уоп_подключаемыекоманды_выполнить` → 31 locations).
+
 ## [0.43.0] — 2026-07-01
 
 **1C code navigation resilient to case and to parameter confusion: case-insensitive symbol lookup, `name` accepted in the call graph, clarified grep tool descriptions.**
