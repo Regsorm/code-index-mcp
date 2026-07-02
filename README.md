@@ -295,8 +295,8 @@ For a shared HTTP process:
 |------|-------------|
 | `search_function` | Full-text search across functions (name, docstring, body) |
 | `search_class` | Full-text search across classes |
-| `get_function` | Get function by exact name |
-| `get_class` | Get class by exact name |
+| `get_function` | Get function by exact name (case-insensitive fallback; **(v0.44.0)** on 0 matches returns `did_you_mean` with similar names) |
+| `get_class` | Get class by exact name (case-insensitive fallback; **(v0.44.0)** on 0 matches returns `did_you_mean` with similar names) |
 | `get_callers` | Who calls this function? **(v0.35.0)** each row carries the caller's source `path` (distinguishes same-named callers from different files) |
 | `get_callees` | What does this function call? **(v0.35.0)** each row carries the source `path` |
 | `find_path` | **(v0.23.0)** Shortest path in the call graph between two functions `from`→`to` (iterative cycle-safe BFS over unique `calls` nodes, `max_depth=5`, any language). Returns path edges `[{caller, callee, line}]` |
