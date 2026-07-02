@@ -106,6 +106,22 @@ pub fn extract_form_uuid_from_file(path: &Path) -> Result<Option<String>> {
     Ok(extract_form_uuid_from_str(&content))
 }
 
+/// Извлечь UUID формы из любого варианта XML-владельца:
+///  * `Forms/<FormName>.xml` (иерархическая выгрузка DumpConfigToFiles) —
+///    корень `MetaDataObject`, uuid у дочернего `<Form uuid="…">`;
+///  * `Form.xml` layout-варианта — uuid атрибут корневого `<Form>`.
+/// Порядок важен: object-стиль первым (у layout-корня uuid на дочернем
+/// элементе отсутствует, ветка вернёт None и сработает fallback).
+pub fn extract_form_uuid_any_from_str(xml: &str) -> Option<String> {
+    extract_object_uuid_from_str(xml).or_else(|| extract_form_uuid_from_str(xml))
+}
+
+/// Прочитать XML-владельца формы с диска и извлечь uuid (оба варианта layout).
+pub fn extract_form_uuid_any_from_file(path: &Path) -> Result<Option<String>> {
+    let content = std::fs::read_to_string(path)?;
+    Ok(extract_form_uuid_any_from_str(&content))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +186,30 @@ mod tests {
     fn extract_form_uuid_returns_none_when_missing() {
         let xml = r#"<Form><Events/></Form>"#;
         assert!(extract_form_uuid_from_str(xml).is_none());
+    }
+
+    #[test]
+    fn extract_form_uuid_any_handles_metadata_object_style() {
+        // Иерархическая выгрузка: Forms/<FormName>.xml — MetaDataObject/Form.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses">
+  <Form uuid="11112222-3333-4444-5555-666677778888">
+    <Properties><Name>ФормаДокумента</Name></Properties>
+  </Form>
+</MetaDataObject>"#;
+        assert_eq!(
+            extract_form_uuid_any_from_str(xml).as_deref(),
+            Some("11112222-3333-4444-5555-666677778888")
+        );
+    }
+
+    #[test]
+    fn extract_form_uuid_any_handles_root_attr_style() {
+        let xml = r#"<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"
+              uuid="b4d8a4b7-1111-2222-3333-444444444444"><Events/></Form>"#;
+        assert_eq!(
+            extract_form_uuid_any_from_str(xml).as_deref(),
+            Some("b4d8a4b7-1111-2222-3333-444444444444")
+        );
     }
 }

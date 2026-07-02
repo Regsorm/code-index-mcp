@@ -10,6 +10,34 @@
 // `LanguageProcessor::schema_extensions()` при первом открытии БД
 // репозитория с `language = "bsl"`.
 
+/// DDL таблицы `metadata_modules` — отдельной константой, потому что
+/// используется и в SCHEMA_EXTENSIONS, и в миграции `index_metadata_modules`
+/// (пересоздание таблицы при старом UNIQUE-ключе без extension_name).
+pub const METADATA_MODULES_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS metadata_modules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        full_name TEXT NOT NULL,
+        object_name TEXT NOT NULL,
+        module_type TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        property_id TEXT NOT NULL,
+        config_version TEXT,
+        code_path TEXT,
+        extension_name TEXT,
+        UNIQUE(repo, full_name, extension_name)
+    );
+    ";
+
+/// Индексы `metadata_modules` — тоже переиспользуются миграцией.
+pub const METADATA_MODULES_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_mm_repo ON metadata_modules(repo);",
+    "CREATE INDEX IF NOT EXISTS idx_mm_object_name ON metadata_modules(repo, object_name);",
+    "CREATE INDEX IF NOT EXISTS idx_mm_module_type ON metadata_modules(repo, module_type);",
+    "CREATE INDEX IF NOT EXISTS idx_mm_object_id ON metadata_modules(object_id);",
+    "CREATE INDEX IF NOT EXISTS idx_mm_extension ON metadata_modules(repo, extension_name);",
+];
+
 /// CREATE TABLE / INDEX для специфичных 1С-таблиц.
 /// Идемпотентно — все CREATE через IF NOT EXISTS.
 pub const SCHEMA_EXTENSIONS: &[&str] = &[
@@ -157,26 +185,12 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     // `(repo, full_name)` уникален; `full_name` имеет вид
     // `<MetaType>.<Name>.<ModuleType>`, например
     // `Document.РеализацияТоваровУслуг.ManagerModule`.
-    "
-    CREATE TABLE IF NOT EXISTS metadata_modules (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        repo TEXT NOT NULL,
-        full_name TEXT NOT NULL,
-        object_name TEXT NOT NULL,
-        module_type TEXT NOT NULL,
-        object_id TEXT NOT NULL,
-        property_id TEXT NOT NULL,
-        config_version TEXT,
-        code_path TEXT,
-        extension_name TEXT,
-        UNIQUE(repo, full_name)
-    );
-    ",
-    "CREATE INDEX IF NOT EXISTS idx_mm_repo ON metadata_modules(repo);",
-    "CREATE INDEX IF NOT EXISTS idx_mm_object_name ON metadata_modules(repo, object_name);",
-    "CREATE INDEX IF NOT EXISTS idx_mm_module_type ON metadata_modules(repo, module_type);",
-    "CREATE INDEX IF NOT EXISTS idx_mm_object_id ON metadata_modules(object_id);",
-    "CREATE INDEX IF NOT EXISTS idx_mm_extension ON metadata_modules(repo, extension_name);",
+    METADATA_MODULES_DDL,
+    METADATA_MODULES_INDEXES[0],
+    METADATA_MODULES_INDEXES[1],
+    METADATA_MODULES_INDEXES[2],
+    METADATA_MODULES_INDEXES[3],
+    METADATA_MODULES_INDEXES[4],
 
     // ── procedure_enrichment ──────────────────────────────────────────────
     // LLM-обогащение процедур бизнес-терминами (этап 5a).

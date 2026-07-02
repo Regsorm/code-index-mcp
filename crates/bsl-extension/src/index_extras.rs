@@ -36,7 +36,7 @@ use crate::xml::object_attributes::{
     parse_object_attributes_file, parse_object_header_xml, parse_object_structure_file,
     ObjectStructure,
 };
-use crate::xml::object_uuid::{extract_form_uuid_from_file, extract_object_uuid_from_file};
+use crate::xml::object_uuid::{extract_form_uuid_any_from_file, extract_object_uuid_from_file};
 
 /// Папки выгрузки → singular meta_type. Объектные XML лежат прямо в этих
 /// папках (`Catalogs/<Имя>.xml`). Перечислены только типы со ссылочными
@@ -2711,6 +2711,26 @@ fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connection) -> Resu
 
     let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
     conn.execute("BEGIN", [])?;
+    // Миграция: старый ключ UNIQUE(repo, full_name) без extension_name терял
+    // модули расширений-доработок (то же имя, что в base) через INSERT OR
+    // IGNORE. Обнаружив старую схему — пересоздаём таблицу с новым ключом.
+    let old_ddl: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='metadata_modules'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(ddl) = old_ddl {
+        if !ddl.contains("extension_name)") {
+            conn.execute("DROP TABLE metadata_modules", [])?;
+            conn.execute(crate::schema::METADATA_MODULES_DDL, [])?;
+            for idx_ddl in crate::schema::METADATA_MODULES_INDEXES {
+                conn.execute(idx_ddl, [])?;
+            }
+            tracing::info!("metadata_modules: миграция схемы — UNIQUE ключ дополнен extension_name");
+        }
+    }
     conn.execute(
         "DELETE FROM metadata_modules WHERE repo = ?",
         params![REPO_DEFAULT],
@@ -2763,7 +2783,7 @@ fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connection) -> Resu
             // UUID берём из XML владельца. Для форм — uuid формы (атрибут
             // на корне Form), для объектов — uuid дочернего тега MetaDataObject.
             let uuid_opt = match owner_xml_kind {
-                OwnerKind::Form => extract_form_uuid_from_file(&owner_xml_path).ok().flatten(),
+                OwnerKind::Form => extract_form_uuid_any_from_file(&owner_xml_path).ok().flatten(),
                 OwnerKind::Object => {
                     extract_object_uuid_from_file(&owner_xml_path).ok().flatten()
                 }
@@ -2845,7 +2865,9 @@ enum OwnerKind {
 /// Особый случай: Module.bsl внутри `Forms/<X>/Ext/Form/Module.bsl` — это
 /// FormModule, а не CommonModule.Module.
 fn classify_module(bsl_path: &Path, raw_type: &'static str) -> (&'static str, OwnerKind) {
-    if raw_type == "Module" && path_has_segment(bsl_path, "Forms") {
+    if raw_type == "Module"
+        && (path_has_segment(bsl_path, "Forms") || path_has_segment(bsl_path, "CommonForms"))
+    {
         return ("FormModule", OwnerKind::Form);
     }
     // CommandModule в `<Object>/Commands/<CmdName>/Ext/CommandModule.bsl` —
@@ -2862,10 +2884,14 @@ fn path_has_segment(p: &Path, segment: &str) -> bool {
     })
 }
 
-/// Найти Form.xml для модуля формы.
-/// Layout: `<...>/Forms/<FormName>/[Ext/]Form/Module.bsl`
-/// → искать `<...>/Forms/<FormName>/[Ext/]Form.xml`.
-/// Возвращает (путь к Form.xml, owner_full_name = "<MetaType>.<OwnerName>.Form.<FormName>").
+/// Найти XML-владельца для модуля формы.
+/// Обычные формы: `<...>/<MetaType>/<Owner>/Forms/<FormName>/[Ext/Form/]Module.bsl`;
+/// общие формы:   `<...>/CommonForms/<FormName>/[Ext/Form/]Module.bsl`.
+/// UUID формы живёт в `Forms/<FormName>.xml` (сосед папки формы,
+/// иерархическая выгрузка DumpConfigToFiles, стиль MetaDataObject/Form) —
+/// это основной случай; `<FormDir>/[Ext/]Form.xml` (uuid атрибутом корня) —
+/// запасной layout-вариант.
+/// Возвращает (путь к XML, owner_full_name).
 fn find_form_owner(bsl_path: &Path) -> Option<(std::path::PathBuf, String)> {
     let segments: Vec<&str> = bsl_path
         .components()
@@ -2874,19 +2900,27 @@ fn find_form_owner(bsl_path: &Path) -> Option<(std::path::PathBuf, String)> {
             _ => None,
         })
         .collect();
-    let forms_idx = segments.iter().rposition(|s| *s == "Forms")?;
-    if forms_idx + 1 >= segments.len() || forms_idx < 2 {
+    let (form_name, owner_full) = if let Some(idx) = segments.iter().rposition(|s| *s == "Forms") {
+        if idx + 1 >= segments.len() || idx < 2 {
+            return None;
+        }
+        let form_name = segments[idx + 1];
+        let owner_name = segments[idx - 1];
+        let meta_type = segments[idx - 2];
+        (form_name, format!("{}.{}.Form.{}", meta_type, owner_name, form_name))
+    } else if let Some(idx) = segments.iter().rposition(|s| *s == "CommonForms") {
+        if idx + 1 >= segments.len() {
+            return None;
+        }
+        let form_name = segments[idx + 1];
+        (form_name, format!("CommonForms.{}", form_name))
+    } else {
         return None;
-    }
-    let form_name = segments[forms_idx + 1];
-    let owner_name = segments[forms_idx - 1];
-    let meta_type = segments[forms_idx - 2];
-    // Form.xml в директории формы. Пробуем оба варианта layout: с `Ext/` и без.
+    };
+    // Поднимаемся до папки с именем формы.
     let mut form_dir = bsl_path.to_path_buf();
     while let Some(parent) = form_dir.parent() {
         form_dir = parent.to_path_buf();
-        // Дошли до папки с именем формы — в ней Form.xml (с `Ext/Form.xml`
-        // или прямо `Form.xml`).
         if form_dir
             .file_name()
             .and_then(|s| s.to_str())
@@ -2896,9 +2930,14 @@ fn find_form_owner(bsl_path: &Path) -> Option<(std::path::PathBuf, String)> {
             break;
         }
     }
-    let candidates = [form_dir.join("Ext").join("Form.xml"), form_dir.join("Form.xml")];
+    // Кандидаты владельца по приоритету (см. doc-комментарий).
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(forms_dir) = form_dir.parent() {
+        candidates.push(forms_dir.join(format!("{form_name}.xml")));
+    }
+    candidates.push(form_dir.join("Ext").join("Form.xml"));
+    candidates.push(form_dir.join("Form.xml"));
     let xml_path = candidates.into_iter().find(|p| p.is_file())?;
-    let owner_full = format!("{}.{}.Form.{}", meta_type, owner_name, form_name);
     Some((xml_path, owner_full))
 }
 
