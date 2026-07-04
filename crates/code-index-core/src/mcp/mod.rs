@@ -97,7 +97,8 @@ impl RepoEntry {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SearchParams {
-    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     pub query: String,
     pub limit: Option<usize>,
@@ -109,7 +110,8 @@ pub struct SearchParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct NameParams {
-    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     /// Точное имя символа. Запасные имена на входе (модели путают ключ):
     /// `symbol`, `query` принимаются как `name` — иначе слепой вызов падал
@@ -127,7 +129,8 @@ pub struct NameParams {
 /// одиночный NameParams.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct MultiNameParams {
-    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     /// Имя ОДНОГО символа. Для нескольких — `names`.
     pub name: Option<String>,
@@ -141,7 +144,8 @@ pub struct MultiNameParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FunctionNameParams {
-    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     /// Точное имя функции. Запасные ключи на входе (модели путают параметр
     /// с get_function): `name`, `symbol` принимаются как `function_name` —
@@ -157,7 +161,8 @@ pub struct FunctionNameParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FindPathParams {
-    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     /// Имя функции-источника (caller) — начало пути.
     pub from: String,
@@ -171,7 +176,8 @@ pub struct FindPathParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CallTreeParams {
-    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     /// Имя функции-корня дерева.
     pub root: String,
@@ -188,7 +194,8 @@ pub struct CallTreeParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ImportParams {
-    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     pub file_id: Option<i64>,
     pub module: Option<String>,
@@ -199,14 +206,16 @@ pub struct ImportParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FilePathParams {
-    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     pub path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GrepBodyParams {
-    /// Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     /// Подстрока (LIKE).
     pub pattern: Option<String>,
@@ -235,12 +244,17 @@ pub struct StatsParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct StatFileParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
+    /// Путь к файлу как он хранится в индексе (см. list_files).
     pub path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListFilesParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     /// Glob по path (`**/*.py`, `Documents/**/*.bsl`). Опционально.
     pub pattern: Option<String>,
@@ -252,7 +266,10 @@ pub struct ListFilesParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ReadFileParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
+    /// Путь к файлу как он хранится в индексе (см. list_files).
     pub path: String,
     /// 1-based, inclusive. None — с начала.
     pub line_start: Option<usize>,
@@ -262,6 +279,8 @@ pub struct ReadFileParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GrepTextParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     /// Регулярное выражение (синтаксис crate `regex`).
     pub regex: Option<String>,
@@ -280,6 +299,8 @@ pub struct GrepTextParams {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GrepCodeParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Без него вызов не пройдёт. Список доступных алиасов — get_stats.
     pub repo: String,
     /// Регулярное выражение (синтаксис crate `regex`).
     pub regex: Option<String>,
@@ -1060,7 +1081,7 @@ impl CodeIndexServer {
         .await
     }
 
-    #[tool(description = "Метаданные файла из индекса: existence, размер, mtime, lines_total, language, category. Чистая выборка из таблицы files (быстро).")]
+    #[tool(description = "Метаданные файла из индекса: existence, размер, mtime, lines_total, language, category. Чистая выборка из таблицы files (быстро). ОБЯЗАТЕЛЬНЫ оба параметра: repo (алиас репозитория, список — get_stats) и path.")]
     async fn stat_file(&self, Parameters(p): Parameters<StatFileParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1082,7 +1103,7 @@ impl CodeIndexServer {
         tools::list_files(entry, p.pattern, p.path_prefix, p.language, p.limit).await
     }
 
-    #[tool(description = "Прочитать содержимое файла из индекса. Отдаёт реальный content и для text-файлов (yaml/md/json/toml/xml/sh и др.), и для code-файлов (zstd-decode из file_contents, Phase 2 v0.8.0+); поле category в ответе — \"text\" или \"code\". Oversize code-файлы (> max_code_file_size_bytes) возвращают oversize=true и пустой content (их читать через get_function/grep_body/grep_code). line_start/line_end — 1-based, inclusive. Soft-cap 5000 строк / 500 КБ (truncated=true при обрезке), hard-cap 2 МБ.")]
+    #[tool(description = "Прочитать содержимое файла из индекса. ОБЯЗАТЕЛЬНЫ оба параметра: repo (алиас репозитория, список — get_stats) и path. Отдаёт реальный content и для text-файлов (yaml/md/json/toml/xml/sh и др.), и для code-файлов (zstd-decode из file_contents, Phase 2 v0.8.0+); поле category в ответе — \"text\" или \"code\". Oversize code-файлы (> max_code_file_size_bytes) возвращают oversize=true и пустой content (их читать через get_function/grep_body/grep_code). line_start/line_end — 1-based, inclusive. Soft-cap 5000 строк / 500 КБ (truncated=true при обрезке), hard-cap 2 МБ.")]
     async fn read_file(&self, Parameters(p): Parameters<ReadFileParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
