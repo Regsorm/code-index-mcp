@@ -5,6 +5,22 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.44.2] — 2026-07-04
+
+**The required `repo` parameter is now described consistently in the JSON schema of ALL tools with an explicit "REQUIRED" marker, and for `read_file`/`stat_file` the requirement is also spelled out in the tool description. Weak models kept omitting this parameter and the call failed (GitHub issue #3).**
+
+> For `read_file`/`stat_file`, `list_files`, `grep_text`, `grep_code` the `repo` field had no description at all — in `tools/list` the model saw neither the parameter's purpose nor that it was required. Other tools had a description but did not emphasize that it is required. Weak local models (e.g. qwen3-4b via LM Studio) called `read_file` with only `path` and got an opaque error. This change only touches the schema descriptions; behavior and data are unchanged.
+
+### Fixed
+
+- **Consistent `repo` field description across all parameter structs.** Every `repo: String` now carries the doc-comment "REQUIRED. Repository alias (from --path alias=dir…). The call fails without it. List — get_stats." — previously some tools (`read_file`, `stat_file`, `list_files`, `grep_text`, `grep_code`) had no description, and the rest did not stress that it is required. The optional `repo` of `get_stats` (`Option<String>`) is left untouched. `repo` was already required at the type level; this change makes it visible to the model in `tools/list`.
+- **`read_file` / `stat_file`: the requirement of both parameters is spelled out in the tool description.** The `#[tool(description=…)]` now states that `repo` and `path` are required; the `path` field also got a short description.
+
+### Testing
+
+- Whole `code-index-core` green (321 tests, 0 failed).
+- Live smoke of the built `code-index serve` (HTTP, MCP handshake → `tools/list`): for `read_file`, `stat_file`, `list_files`, `grep_code`, `grep_text`, `search_function`, `get_function`, `find_symbol`, `inputSchema.properties.repo.description` is non-empty and contains "REQUIRED", and `repo` is present in `required`; for `get_stats`, `repo` stays optional (`required` empty).
+
 ## [0.44.1] — 2026-07-03
 
 **Speeding up the extras phase of a full index: procedure-term raw data collected during the parallel parse, batched full-text rebuild, one-shot materialization of the call graph. A reindex is required to benefit; the index is byte-identical to before.**
