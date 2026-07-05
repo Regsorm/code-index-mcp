@@ -5,6 +5,27 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.44.3] — 2026-07-05
+
+**Fixed the quadratic degradation of a bulk update of an existing DB: the old rows of changed files are deleted in a single batch pass while the indexes are still alive, instead of a per-file DELETE with no indexes. At UT scale (2M calls) the delete phase for a 500-file update went 260,385 ms → 234 ms (×1113); a reindex after a mass git pull: hours → minutes.**
+
+> On a bulk update of a non-empty DB (number of changed files > `bulk_threshold`), `prepare_bulk_load()` dropped the secondary `idx_*_file` indexes BEFORE the write loop, and the loop ran 5 `DELETE … WHERE file_id = ?` per file with the indexes already gone → a full table scan per file. On UT (`calls` ~2M rows × thousands of changed files) this meant tens of billions of row scans on a single core — hours instead of minutes. The initial index (empty DB) and the incremental path (< threshold, indexes alive) were not affected and were not changed.
+
+### Fixed
+
+- **Batch deletion of old rows in a single pass while the `idx_*_file` indexes are alive.** The bulk-update branch of a non-empty DB now: (1) drops the functions/classes FTS triggers so the batch DELETE does not fire them row by row; (2) deletes the old rows of the changed files (only those already present in the DB) with `DELETE … WHERE file_id IN (…)` in chunks across the 5 "code" tables (`functions`, `classes`, `imports`, `calls`, `variables`) in a single transaction — while the secondary indexes are still in place; (3) only then drops the B-tree indexes. In the write loop `skip_delete = bulk_mode || is_fresh_db` — per-row DELETEs are no longer run, the old rows are already gone. `finish_bulk_load()` (recreating indexes, triggers, FTS rebuild) is unchanged.
+- **Text/FTS is deliberately not touched in the batch.** `text_contents` has `file_id` as its primary key (deletion is cheap), and the contentless `fts_text_files` pointer is rebuilt idempotently in `insert_text_file` when the file is rewritten — a separate batch pass is unnecessary and would be incorrect (it needs the old text).
+- `drop_indexes_and_triggers()` was split into `drop_indexes()` + `drop_fts_triggers()`; the former function is kept as their composition.
+
+### Testing
+
+- New unit test `test_bulk_update_existing_db`: after a bulk update the `functions`/`classes`/`imports`/`calls`/`variables`/`text` counts strictly equal a fresh index of the same final snapshot (no duplicates), and FTS finds the new symbols and no longer finds the old ones. Whole `code-index-core` green (322 tests, 0 failed), workspace green.
+- Live smoke ON DISK on a real UT 11.5 configuration (a copy, 57k files, 4.3 GB DB, `calls` 2,075,353). A/B of the old binary (0.44.2) vs the new one on a bulk update of 500 changed files: the "DB write" phase **260,385 ms → 234 ms (×1113)**; all 7 count tables identical (the old one is correct but slow). Extrapolated to a git pull of ~15k files: the delete phase goes from hours to seconds.
+
+### Compatibility
+
+- The data format and DB schema are unchanged — no reindex is required, existing indexes are fully compatible. The change touches only the bulk-update path of a non-empty DB; the initial index and the incremental path are untouched.
+
 ## [0.44.2] — 2026-07-04
 
 **The required `repo` parameter is now described consistently in the JSON schema of ALL tools with an explicit "REQUIRED" marker, and for `read_file`/`stat_file` the requirement is also spelled out in the tool description. Weak models kept omitting this parameter and the call failed (GitHub issue #3).**
