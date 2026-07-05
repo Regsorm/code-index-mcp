@@ -162,6 +162,12 @@ impl<'a> Indexer<'a> {
         // Включаем bulk-load если количество файлов для индексации превышает порог
         let bulk_mode = candidate_files.len() > self.config.bulk_threshold;
 
+        // В bulk-режиме построчный DELETE в фазе записи пропускаем:
+        //   • свежая БД — удалять нечего;
+        //   • обновление непустой БД — старые строки кандидатов чистим одним
+        //     пакетным проходом ниже, пока индексы idx_*_file ещё живы.
+        let skip_delete = bulk_mode || is_fresh_db;
+
         if bulk_mode && is_fresh_db {
             // Первичная индексация: таблицы уже созданы через initialize(),
             // дропаем индексы которые были созданы вместе со схемой
@@ -172,12 +178,32 @@ impl<'a> Indexer<'a> {
             );
             self.storage.prepare_bulk_load()?;
         } else if bulk_mode {
-            // Обновление существующей БД: дропаем индексы перед массовой загрузкой
+            // Обновление существующей БД. Порядок критичен для скорости:
+            //   1) снять FTS-триггеры functions/classes, чтобы пакетный DELETE
+            //      не дёргал их построчно (второй скрытый тормоз);
+            //   2) удалить старые строки кандидатов одним пакетным проходом,
+            //      ПОКА вторичные индексы idx_*_file живы (иначе построчный
+            //      DELETE вырождается в полный скан таблиц на каждый файл —
+            //      квадратичная деградация);
+            //   3) дропнуть B-tree индексы перед массовой вставкой.
             eprintln!(
-                "[bulk] Обновление {} файлов (порог {}): удаляем индексы",
+                "[bulk] Обновление {} файлов (порог {}): пакетное удаление старых строк + удаление индексов",
                 candidate_files.len(),
                 self.config.bulk_threshold
             );
+            self.storage.drop_fts_triggers()?;
+            // Только те кандидаты, что реально есть в БД (у новых файлов старых
+            // строк нет). file_id берём из уже загруженной карты existing_files.
+            let victim_ids: Vec<i64> = candidate_files
+                .iter()
+                .filter_map(|c| existing_files.get(c.0.as_str()).map(|e| e.0))
+                .collect();
+            eprintln!(
+                "[bulk] Пакетное удаление старых строк: {} из {} кандидатов уже были в БД",
+                victim_ids.len(),
+                candidate_files.len()
+            );
+            self.storage.delete_file_data_bulk(&victim_ids)?;
             self.storage.prepare_bulk_load()?;
         }
 
@@ -350,7 +376,7 @@ impl<'a> Indexer<'a> {
                         *lines_total,
                         ast_hash,
                         parse_result,
-                        is_fresh_db,
+                        skip_delete,
                         Some(*mtime),
                         Some(*file_size),
                         text_for_fts.as_deref(),
@@ -373,7 +399,7 @@ impl<'a> Indexer<'a> {
                     mtime,
                     file_size,
                 } => {
-                    match self.write_text_to_db(rel_path, content_hash, *lines_total, content, is_fresh_db, Some(*mtime), Some(*file_size)) {
+                    match self.write_text_to_db(rel_path, content_hash, *lines_total, content, skip_delete, Some(*mtime), Some(*file_size)) {
                         Ok(_) => {
                             result.files_indexed += 1;
                             batch_count += 1;
@@ -1312,5 +1338,101 @@ class App:
         // FTS по-прежнему работает после повторного прохода
         let found_after = storage.search_functions("fresh_func_10", 10, None).unwrap();
         assert!(!found_after.is_empty(), "FTS должен работать и после повторной индексации");
+    }
+
+    /// Тест: bulk-ОБНОВЛЕНИЕ непустой БД — сценарий бага квадратичной деградации.
+    ///
+    /// Индексируем набор файлов, затем меняем содержимое ВСЕХ (> bulk_threshold)
+    /// и переиндексируем. Проверяем, что после bulk-обновления:
+    /// - нет дублей строк (functions/classes/imports/calls/variables/text) —
+    ///   счётчики строго совпадают со свежей индексацией того же финального среза;
+    /// - FTS находит НОВЫЕ символы и НЕ находит старые (rebuild functions/classes
+    ///   + отсутствие висячих токенов contentless-указателя fts_text_files).
+    #[test]
+    fn test_bulk_update_existing_db() {
+        // Пишет исходный (upd=false) или финальный (upd=true) вариант всех файлов.
+        fn write_variant(dir: &std::path::Path, upd: bool) {
+            for i in 0..20 {
+                let code = if upd {
+                    format!("def upd_func_{i}(x):\n    \"\"\"Обновлённая {i}.\"\"\"\n    other_{i}(x)\n    z = x * {i}\n    return z\n")
+                } else {
+                    format!("def orig_func_{i}(x):\n    \"\"\"Оригинальная {i}.\"\"\"\n    helper_{i}(x)\n    y = x + {i}\n    return y\n")
+                };
+                fs::write(dir.join(format!("mod_{i}.py")), code).unwrap();
+            }
+            // Текстовые файлы (проверяют путь text_contents + contentless FTS).
+            // Маркеры РАЗНОЙ длины — чтобы менялся размер файла и mtime+size
+            // fast-path не счёл текст неизменным (иначе .md были бы пропущены).
+            for i in 0..6 {
+                let marker = if upd { "zzfreshtoken" } else { "zzoldmarker" };
+                fs::write(
+                    dir.join(format!("note_{i}.md")),
+                    format!("# Заметка {i}\n{marker} строка {i}\n"),
+                )
+                .unwrap();
+            }
+        }
+
+        // 26 файлов >> порога 5 → гарантированно bulk-режим.
+        let config = IndexConfig {
+            bulk_threshold: 5,
+            ..Default::default()
+        };
+
+        // ── Эталон: свежая индексация ФИНАЛЬНОГО среза в отдельную БД ─────────
+        let ref_dir = TempDir::new().unwrap();
+        write_variant(ref_dir.path(), true);
+        let mut ref_storage = Storage::open_in_memory().unwrap();
+        {
+            let mut indexer = Indexer::with_config(&mut ref_storage, config.clone());
+            indexer.full_reindex(ref_dir.path(), false).unwrap();
+        }
+        let baseline = ref_storage.get_stats().unwrap();
+
+        // ── Проверяемый путь: индексируем ORIG, затем перезаписываем на UPD ───
+        let upd_dir = TempDir::new().unwrap();
+        write_variant(upd_dir.path(), false);
+        let mut storage = Storage::open_in_memory().unwrap();
+        {
+            let mut indexer = Indexer::with_config(&mut storage, config.clone());
+            indexer.full_reindex(upd_dir.path(), false).unwrap();
+        }
+        // Меняем содержимое ВСЕХ файлов → все становятся кандидатами (> порога),
+        // is_fresh_db=false → ветка bulk-ОБНОВЛЕНИЯ непустой БД.
+        write_variant(upd_dir.path(), true);
+        let result = {
+            let mut indexer = Indexer::with_config(&mut storage, config);
+            indexer.full_reindex(upd_dir.path(), false).unwrap()
+        };
+        assert_eq!(result.files_skipped, 0, "все файлы изменены — пропусков нет");
+        assert_eq!(result.errors.len(), 0, "ошибок быть не должно");
+
+        // ── Нет дублей: счётчики строго равны свежей индексации ──────────────
+        let after = storage.get_stats().unwrap();
+        assert_eq!(after.total_files, baseline.total_files, "files: без дублей");
+        assert_eq!(after.total_functions, baseline.total_functions, "functions: без дублей");
+        assert_eq!(after.total_classes, baseline.total_classes, "classes: без дублей");
+        assert_eq!(after.total_imports, baseline.total_imports, "imports: без дублей");
+        assert_eq!(after.total_calls, baseline.total_calls, "calls: без дублей");
+        assert_eq!(after.total_variables, baseline.total_variables, "variables: без дублей");
+        assert_eq!(after.total_text_files, baseline.total_text_files, "text: без дублей");
+
+        // ── FTS: новые символы находятся, старые — нет ───────────────────────
+        assert!(
+            !storage.search_functions("upd_func_0", 10, None).unwrap().is_empty(),
+            "FTS должен находить обновлённую функцию после rebuild"
+        );
+        assert!(
+            storage.search_functions("orig_func_0", 10, None).unwrap().is_empty(),
+            "старая функция не должна оставаться в FTS после bulk-обновления"
+        );
+        assert!(
+            !storage.search_text("zzfreshtoken", 10, None).unwrap().is_empty(),
+            "текстовый FTS должен находить новый маркер"
+        );
+        assert!(
+            storage.search_text("zzoldmarker", 10, None).unwrap().is_empty(),
+            "старый текстовый маркер не должен оставаться в contentless-указателе"
+        );
     }
 }
