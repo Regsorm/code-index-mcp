@@ -367,11 +367,11 @@ pub fn migrate_v5(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Удалить все обычные индексы и FTS-триггеры (перед bulk-load).
+/// Удалить обычные B-tree индексы (перед bulk-load), НЕ трогая FTS-триггеры.
 ///
 /// Вызывается перед массовой загрузкой данных, чтобы ускорить INSERT:
-/// без индексов и триггеров вставка работает значительно быстрее.
-pub fn drop_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+/// без индексов вставка работает значительно быстрее.
+pub fn drop_indexes(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch("
         -- Удаляем индексы на таблице files
         DROP INDEX IF EXISTS idx_files_path;
@@ -399,7 +399,20 @@ pub fn drop_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Resul
         -- Удаляем индексы на таблице variables
         DROP INDEX IF EXISTS idx_variables_name;
         DROP INDEX IF EXISTS idx_variables_file;
+    ")?;
+    Ok(())
+}
 
+/// Удалить FTS-триггеры (functions/classes), НЕ трогая B-tree индексы.
+///
+/// Нужно ДО пакетного DELETE старых строк при bulk-обновлении непустой БД:
+/// иначе каждый удаляемый ряд построчно дёргает fts_*_delete-триггер (скрытый
+/// тормоз). FTS всё равно перестраивается целиком в rebuild_indexes_and_triggers().
+/// text_files-триггеров с migrate_v5 нет (указатель fts_text_files стал
+/// contentless и наполняется из Rust), но DROP IF EXISTS оставлен для БД,
+/// не прошедших миграцию.
+pub fn drop_fts_triggers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("
         -- Удаляем FTS-триггеры functions
         DROP TRIGGER IF EXISTS fts_functions_insert;
         DROP TRIGGER IF EXISTS fts_functions_delete;
@@ -410,11 +423,21 @@ pub fn drop_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Resul
         DROP TRIGGER IF EXISTS fts_classes_delete;
         DROP TRIGGER IF EXISTS fts_classes_update;
 
-        -- Удаляем FTS-триггеры text_files
+        -- Удаляем FTS-триггеры text_files (совместимость с домиграционными БД)
         DROP TRIGGER IF EXISTS fts_text_files_insert;
         DROP TRIGGER IF EXISTS fts_text_files_delete;
         DROP TRIGGER IF EXISTS fts_text_files_update;
     ")?;
+    Ok(())
+}
+
+/// Удалить все обычные индексы и FTS-триггеры (перед bulk-load).
+///
+/// Композиция [`drop_indexes`] + [`drop_fts_triggers`]. Сохранена как единая
+/// точка вызова для первичной bulk-индексации (свежая БД).
+pub fn drop_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    drop_indexes(conn)?;
+    drop_fts_triggers(conn)?;
     Ok(())
 }
 

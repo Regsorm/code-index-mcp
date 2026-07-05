@@ -2350,6 +2350,73 @@ impl Storage {
     ///
     /// Вызывать перед началом bulk-load, если планируется индексация > N файлов.
     /// Без индексов и триггеров каждый INSERT выполняется значительно быстрее.
+    /// Снять FTS-триггеры (functions/classes), не трогая B-tree индексы.
+    ///
+    /// Нужно перед пакетным DELETE старых строк в bulk-обновлении непустой БД:
+    /// иначе каждый удаляемый ряд построчно дёргал бы fts_*_delete-триггер.
+    /// FTS всё равно перестраивается целиком в [`finish_bulk_load`].
+    pub fn drop_fts_triggers(&self) -> Result<()> {
+        schema::drop_fts_triggers(&self.conn)
+            .context("drop_fts_triggers: ошибка удаления FTS-триггеров")?;
+        Ok(())
+    }
+
+    /// Пакетно удалить строки-потомки для набора файлов (bulk-обновление
+    /// непустой БД).
+    ///
+    /// Чистит ТОЛЬКО таблицы, вторичный индекс которых (`idx_*_file`) дропается
+    /// в bulk-режиме: `functions`, `classes`, `imports`, `calls`, `variables`.
+    /// Для них построчный `DELETE WHERE file_id = ?` без индекса вырождается в
+    /// полный скан таблицы на каждый файл — квадратичная деградация на больших
+    /// БД (на УТ: calls ~1,9 млн строк × ~15 тыс. файлов). Один проход `IN (...)`,
+    /// пока индексы `idx_*_file` ещё живы, снимает проблему.
+    ///
+    /// Текст/FTS здесь НЕ трогаем намеренно: `text_contents` имеет `file_id`
+    /// первичным ключом (удаление дёшево), а contentless-указатель
+    /// `fts_text_files` идемпотентно пересобирается в [`insert_text_file`] при
+    /// повторной записи файла (тот сам снимает старый токен по старому тексту).
+    /// Отдельный пакетный проход по тексту не нужен и был бы неверным.
+    ///
+    /// Вызывать ДО [`prepare_bulk_load`] (пока индексы `idx_*_file` живы).
+    /// Всё удаление — в одной транзакции.
+    pub fn delete_file_data_bulk(&self, file_ids: &[i64]) -> Result<()> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+        // Только таблицы с дропаемым в bulk вторичным индексом по file_id.
+        const TABLES: [&str; 5] = ["functions", "classes", "imports", "calls", "variables"];
+        // Чанк ≤ 900 id — с запасом под лимит переменных SQLite (999) и длину SQL.
+        const CHUNK: usize = 900;
+
+        self.begin_batch()?;
+        let outcome = (|| -> Result<()> {
+            for chunk in file_ids.chunks(CHUNK) {
+                // file_ids получены из БД (i64) — инлайним как литералы, инъекции нет.
+                let list = chunk
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                for table in TABLES {
+                    self.conn
+                        .execute(&format!("DELETE FROM {table} WHERE file_id IN ({list})"), [])
+                        .with_context(|| format!("delete_file_data_bulk: DELETE FROM {table}"))?;
+                }
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                self.commit_batch()?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     pub fn prepare_bulk_load(&self) -> Result<()> {
         schema::drop_indexes_and_triggers(&self.conn)
             .context("prepare_bulk_load: ошибка удаления индексов и триггеров")?;
