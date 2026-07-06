@@ -1,0 +1,34 @@
+# bsl-indexer — MCP-сервер структурного поиска по коду в контейнере.
+#
+#   docker compose -f deploy/docker/docker-compose.yml up -d --build
+#
+# Собирает bsl-indexer из исходников репозитория, индексирует примонтированные
+# репозитории (см. daemon.toml) и отдаёт MCP по HTTP на http://localhost:9003/mcp.
+name: bsl-indexer
+
+services:
+  bsl-indexer:
+    build:
+      # Контекст — корень репозитория (исходники для cargo build).
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: bsl-indexer:local
+    container_name: bsl-indexer
+    environment:
+      CODE_INDEX_HOME: /data/code-index-home
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: "9003"
+    volumes:
+      # Индексируемые репозитории (rw: демон пишет <repo>/.code-index/index.db
+      # рядом с исходниками). Переопределяется переменной REPOS_DIR (или .env).
+      - ${REPOS_DIR:-./repos}:/repos
+      # Runtime демона (daemon.json и пр.) — общий для демона и serve.
+      - bsl-indexer-home:/data/code-index-home
+      # Конфиг с путями индексации — из репозитория (host-config, правится под себя).
+      - ./daemon.toml:/data/code-index-home/daemon.toml:ro
+    ports:
+      - "9003:9003"
+    restart: unless-stopped
+
+volumes:
+  bsl-indexer-home:

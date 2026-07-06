@@ -1,0 +1,24 @@
+# Конфиг фонового демона bsl-indexer в контейнере.
+# Пути — ВНУТРИ контейнера (том с исходниками монтируется в /repos, см.
+# docker-compose.yml). Демон — единственный писатель: индексирует перечисленные
+# папки и держит <repo>/.code-index/index.db актуальным. serve (read-only MCP
+# HTTP) читает те же index.db.
+#
+# ОТРЕДАКТИРУЙТЕ [[paths]] под свои репозитории перед запуском.
+
+[daemon]
+http_host = "127.0.0.1"   # control-сервер демона (loopback внутри контейнера)
+http_port = 0             # автовыбор свободного порта; реальный пишется в daemon.json
+log_level = "info"
+
+# Пример: выгрузка конфигурации 1С (язык bsl). alias — короткое имя репо в MCP.
+[[paths]]
+path = "/repos/cf"
+alias = "cf"
+language = "bsl"
+
+# Пример второго репо (расширение). Добавляйте/удаляйте блоки по необходимости.
+# [[paths]]
+# path = "/repos/mcp_tools"
+# alias = "mcp_tools"
+# language = "bsl"

@@ -1,0 +1,17 @@
+# Контекст сборки Docker — корень репозитория (deploy/docker/Dockerfile).
+# Отсекаем тяжёлые и ненужные для `cargo build` артефакты, чтобы контекст не
+# раздувался и не инвалидировал кэш слоёв.
+target/
+target2/
+.git/
+.github/
+.code-index/
+*.db
+*.db-shm
+*.db-wal
+.claude/
+.playwright-mcp/
+node_modules/
+npm/
+docs/
+deploy/docker/repos/
