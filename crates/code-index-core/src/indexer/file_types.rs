@@ -60,6 +60,16 @@ pub const EXCLUDE_DIRS: &[&str] = &[
 
 /// Определить категорию файла по расширению пути
 pub fn categorize_file(path: &Path) -> FileCategory {
+    // `ConfigDumpInfo.xml` — служебная опись выгрузки 1С (uuid + configVersion
+    // всех объектов и под-элементов). В общий текстовый индекс не кладём:
+    // поиск по хэшам версий бессмысленен, а базовая опись весит десятки МБ.
+    // Единственный потребитель — заполнение таблицы `config_manifest`
+    // (bsl-extension), которое читает файл напрямую с диска, а не из индекса.
+    // Binary = «пропустить, не индексировать».
+    if path.file_name().and_then(|n| n.to_str()) == Some("ConfigDumpInfo.xml") {
+        return FileCategory::Binary;
+    }
+
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -133,6 +143,25 @@ mod tests {
     #[test]
     fn test_no_extension() {
         assert_eq!(categorize_file(Path::new("Makefile")), FileCategory::Binary);
+    }
+
+    #[test]
+    fn config_dump_info_skipped_by_name() {
+        // Вариант 2: опись выгрузки 1С не индексируется как текст —
+        // единственный потребитель файла — заполнение config_manifest.
+        assert_eq!(
+            categorize_file(Path::new("extensions/ent_Наборы/ConfigDumpInfo.xml")),
+            FileCategory::Binary
+        );
+        assert_eq!(
+            categorize_file(Path::new("base/ConfigDumpInfo.xml")),
+            FileCategory::Binary
+        );
+        // Обычный объектный XML остаётся текстовым (xml_1c-апгрейд — позже в indexer).
+        assert_eq!(
+            categorize_file(Path::new("base/Catalogs/Контрагенты.xml")),
+            FileCategory::Text
+        );
     }
 
     #[test]

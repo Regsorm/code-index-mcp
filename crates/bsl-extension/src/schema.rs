@@ -83,12 +83,45 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
         name TEXT NOT NULL,
         synonym TEXT,
         attributes_json TEXT,
+        -- Владелец объекта в multi-config выгрузке: '' — базовая конфигурация
+        -- (или объект расширения с ObjectBelonging=Adopted, т.е. заимствованный
+        -- из базовой); 'Extensions/<EF_X>' — собственный (Native) объект
+        -- расширения. Нужен для diff-удаления перечня по владельцу, когда
+        -- Configuration.xml перестаёт быть триггером полного пересбора.
+        sub_config TEXT NOT NULL DEFAULT '',
         UNIQUE(repo, full_name)
     );
     ",
     "CREATE INDEX IF NOT EXISTS idx_metadata_objects_repo ON metadata_objects(repo);",
     "CREATE INDEX IF NOT EXISTS idx_metadata_objects_meta_type ON metadata_objects(repo, meta_type);",
     "CREATE INDEX IF NOT EXISTS idx_metadata_objects_name ON metadata_objects(name);",
+
+    // ── config_manifest ───────────────────────────────────────────────────
+    // Плоский реестр строк ConfigDumpInfo.xml всех областей выгрузки (base +
+    // каждое расширение). Одна строка = один элемент описи одной области:
+    // объект (`Catalog.Контрагенты`, с configVersion), модуль
+    // (`CommonModule.X.Module`, с configVersion) или структурный под-элемент
+    // (`...Attribute.Основной` / `...TabularSection.Товары` / `...EnumValue.X`,
+    // у которых своего configVersion в описи НЕТ → пустая строка).
+    //
+    // `area` — та же кодировка, что `metadata_objects.sub_config`: '' —
+    // базовая конфигурация; 'extensions/<имя>' — область расширения. Один
+    // заимствованный объект попадает сюда дважды: строкой area='' (дом-база)
+    // и строкой area='extensions/<имя>' (заимствователь). Это НЕ дубль —
+    // каждая строка отдельный факт «в такой-то области объект числится».
+    //
+    // Наполняется при полной индексации (`index_config_manifest`); источник
+    // истины для diff-сверки Фазы 2 без опоры на порядок watcher-событий.
+    "
+    CREATE TABLE IF NOT EXISTS config_manifest (
+        repo TEXT NOT NULL,
+        area TEXT NOT NULL,
+        full_name TEXT NOT NULL,
+        config_version TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (repo, area, full_name)
+    ) WITHOUT ROWID;
+    ",
+    "CREATE INDEX IF NOT EXISTS idx_config_manifest_full_name ON config_manifest(repo, full_name);",
 
     // ── metadata_forms ────────────────────────────────────────────────────
     // Управляемая форма объекта конфигурации. `owner_full_name` —
@@ -480,6 +513,8 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
 pub fn migrate_extensions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     ensure_column(conn, "data_links", "to_object_key", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "role_rights", "object_name_key", "TEXT NOT NULL DEFAULT ''")?;
+    // Владелец объекта (base '' / Extensions/<EF_X>) для diff-удаления перечня.
+    ensure_column(conn, "metadata_objects", "sub_config", "TEXT NOT NULL DEFAULT ''")?;
     ensure_trigram_tokenizer(conn)?;
     Ok(())
 }
@@ -604,6 +639,61 @@ mod tests {
 
         // Идемпотентность: повтор миграции — no-op, не падает.
         super::migrate_extensions(&conn).unwrap();
+    }
+
+    #[test]
+    fn migrate_extensions_adds_sub_config_column() {
+        // Симуляция БД от бинарника до внедрения sub_config: metadata_objects
+        // без колонки sub_config. migrate_extensions обязан её добавить (ALTER),
+        // а последующий DDL-батч SCHEMA_EXTENSIONS — не падать.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata_objects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo TEXT NOT NULL, full_name TEXT NOT NULL,
+                meta_type TEXT NOT NULL, name TEXT NOT NULL,
+                synonym TEXT, attributes_json TEXT,
+                UNIQUE(repo, full_name));",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "metadata_objects", "sub_config"));
+
+        super::migrate_extensions(&conn).unwrap();
+        for ddl in SCHEMA_EXTENSIONS {
+            conn.execute_batch(ddl)
+                .expect("DDL после migrate_extensions не должен падать");
+        }
+        assert!(column_exists(&conn, "metadata_objects", "sub_config"));
+
+        // Дефолт '' — существующие строки получают пустого владельца (база).
+        conn.execute(
+            "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+             VALUES ('ut', 'Catalog.Контрагенты', 'Catalog', 'Контрагенты')",
+            [],
+        )
+        .unwrap();
+        let owner: String = conn
+            .query_row(
+                "SELECT sub_config FROM metadata_objects WHERE full_name = 'Catalog.Контрагенты'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, "", "новая строка без sub_config → владелец база ('')");
+
+        // Идемпотентность: повтор миграции — no-op, не падает.
+        super::migrate_extensions(&conn).unwrap();
+    }
+
+    #[test]
+    fn fresh_schema_has_sub_config_column() {
+        // Свежая БД: колонку создаёт сразу CREATE TABLE из SCHEMA_EXTENSIONS,
+        // без ALTER.
+        let conn = Connection::open_in_memory().unwrap();
+        for ddl in SCHEMA_EXTENSIONS {
+            conn.execute_batch(ddl).unwrap();
+        }
+        assert!(column_exists(&conn, "metadata_objects", "sub_config"));
     }
 
     #[test]

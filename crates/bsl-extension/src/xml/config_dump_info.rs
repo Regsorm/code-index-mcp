@@ -101,6 +101,72 @@ pub fn parse_config_dump_info_str(xml: &str) -> HashMap<String, String> {
     result
 }
 
+/// Прочитать `ConfigDumpInfo.xml` и вернуть ВСЕ строки описи как пары
+/// `(full_name, configVersion)`. В отличие от [`parse_config_dump_info`]
+/// (карта uuid→cv только по объектам верхнего уровня) сохраняет КАЖДЫЙ
+/// элемент `<Metadata>`, включая вложенные под-элементы (реквизиты, ТЧ,
+/// значения перечислений) и модули (`<name>.Module`).
+///
+/// `full_name` — атрибут `name` (`Catalog.Контрагенты`,
+/// `Catalog.Контрагенты.Attribute.ИНН`, `CommonModule.X.Module`).
+/// `configVersion` есть у объектов и модулей; у структурных под-элементов
+/// его в описи нет → пустая строка. Ключ строки — имя, `id` не нужен.
+///
+/// Пустой вектор если файл отсутствует/нечитаем (опись опциональна).
+pub fn parse_config_dump_info_rows(cfg_root: &Path) -> Result<Vec<(String, String)>> {
+    let path = cfg_root.join("ConfigDumpInfo.xml");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    Ok(parse_config_dump_info_rows_str(&content))
+}
+
+/// Тот же разбор, но из строки (для тестов и mock-сценариев).
+pub fn parse_config_dump_info_rows_str(xml: &str) -> Vec<(String, String)> {
+    let mut result: Vec<(String, String)> = Vec::new();
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = e.name();
+                let raw = name.as_ref();
+                let tag = std::str::from_utf8(raw).unwrap_or("");
+                let local = tag.split(':').last().unwrap_or(tag);
+                if local != "Metadata" {
+                    continue;
+                }
+                let mut full_name: Option<String> = None;
+                let mut config_version: Option<String> = None;
+                for attr in e.attributes().flatten() {
+                    match attr.key.as_ref() {
+                        b"name" => {
+                            full_name = attr.unescape_value().ok().map(|cow| cow.to_string());
+                        }
+                        b"configVersion" => {
+                            config_version = attr.unescape_value().ok().map(|cow| cow.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                // `name` обязателен (ключ строки); `configVersion` опционален —
+                // у структурных под-элементов его нет, пишем пустую строку.
+                if let Some(full_name) = full_name {
+                    result.push((full_name, config_version.unwrap_or_default()));
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +224,37 @@ mod tests {
     fn does_not_panic_on_malformed_xml() {
         let _ = parse_config_dump_info_str("<<<not really xml>");
         let _ = parse_config_dump_info_str("</wrong>");
+    }
+
+    #[test]
+    fn rows_keep_subelements_and_modules() {
+        let xml = r#"<ConfigDumpInfo>
+  <ConfigVersions>
+    <Metadata name="Catalog.X" id="a" configVersion="catver">
+      <Metadata name="Catalog.X.Attribute.Y" id="a1"/>
+    </Metadata>
+    <Metadata name="CommonModule.M" id="b" configVersion="modobj"/>
+    <Metadata name="CommonModule.M.Module" id="b.0" configVersion="modver"/>
+  </ConfigVersions>
+</ConfigDumpInfo>"#;
+        let rows = parse_config_dump_info_rows_str(xml);
+        // Объект + под-элемент (без cv) + объект-модуль + строка модуля = 4.
+        assert_eq!(rows.len(), 4);
+        assert!(rows.contains(&("Catalog.X".to_string(), "catver".to_string())));
+        assert!(rows.contains(&("Catalog.X.Attribute.Y".to_string(), String::new())));
+        assert!(rows.contains(&("CommonModule.M.Module".to_string(), "modver".to_string())));
+    }
+
+    #[test]
+    fn rows_empty_on_no_metadata() {
+        assert!(parse_config_dump_info_rows_str("<ConfigDumpInfo><Other/></ConfigDumpInfo>").is_empty());
+    }
+
+    #[test]
+    fn rows_skip_row_without_name() {
+        let xml = r#"<ConfigDumpInfo><Metadata id="x" configVersion="v"/><Metadata name="OK" configVersion="okv"/></ConfigDumpInfo>"#;
+        let rows = parse_config_dump_info_rows_str(xml);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], ("OK".to_string(), "okv".to_string()));
     }
 }

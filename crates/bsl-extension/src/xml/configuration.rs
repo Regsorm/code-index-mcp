@@ -45,7 +45,7 @@ pub struct ObjectRef {
 /// Имена тегов, которые мы понимаем как тип объекта внутри `<ChildObjects>`.
 /// Совпадает с `METADATA_TYPES` в core::parser::xml_1c, но мы держим список
 /// здесь, чтобы bsl-extension не зависела от деталей core-парсера.
-const KNOWN_META_TYPES: &[&str] = &[
+pub(crate) const KNOWN_META_TYPES: &[&str] = &[
     "Subsystem",
     "Catalog",
     "Document",
