@@ -576,52 +576,12 @@ fn update_call_graph_direct_for_file(
         }
     }
 
-    // Этап 4e (инкремент): резолв callee_proc_key для рёбер ЭТОГО файла. Та же
-    // логика, что в resolve_direct_callee_keys, но в области одного файла —
-    // через точное сравнение пути вызывателя (НЕ LIKE: путь содержит '_', а это
-    // wildcard LIKE). Ограничение: правка файла не переразрешает входящие рёбра
-    // ДРУГИХ файлов, чья цель — процедура этого файла (напр. при переименовании
-    // экспортной процедуры). Эти ключи могут устареть до полного пересбора —
-    // приемлемо (демон периодически делает полный rebuild).
-    {
-        // (а) локальный вызов в том же файле.
-        conn.execute(
-            "UPDATE proc_call_graph \
-             SET callee_proc_key = ?2 || '::' || callee_proc_name \
-             WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
-               AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2 \
-               AND EXISTS (SELECT 1 FROM functions fn JOIN files fl ON fl.id = fn.file_id \
-                           WHERE fl.path = ?2 AND fn.name = proc_call_graph.callee_proc_name)",
-            params![REPO_DEFAULT, &rel],
-        )?;
-        // (б) уникальный экспорт во всей конфигурации.
-        conn.execute(
-            "UPDATE proc_call_graph \
-             SET callee_proc_key = ( \
-                 SELECT fl.path || '::' || fn.name FROM functions fn JOIN files fl ON fl.id = fn.file_id \
-                 WHERE fn.name = proc_call_graph.callee_proc_name AND fn.args LIKE '%) Экспорт%' LIMIT 1) \
-             WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
-               AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2 \
-               AND (SELECT COUNT(*) FROM functions fn \
-                    WHERE fn.name = proc_call_graph.callee_proc_name AND fn.args LIKE '%) Экспорт%') = 1",
-            params![REPO_DEFAULT, &rel],
-        )?;
-    }
-
-    // (в) квалифицированный вызов общего модуля (склеенный `Модуль.Метод`) —
-    // точная привязка по квалификатору, для рёбер этого файла.
-    build_common_module_methods(conn)?;
-    resolve_callee_keys_by_qualifier(conn, Some(&rel))?;
-    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_cmeth;")?;
-
-    // (г) менеджер-вызовы `Коллекция.Объект.Метод` для рёбер этого файла.
-    resolve_callee_keys_by_manager(conn, Some(&rel))?;
-
-    // Этап 4e-prune (инкремент): отсев платформенного балласта для этого файла.
-    prune_platform_balast(conn, Some(&rel))?;
-    // + объектные вызовы `Объект.Метод` для рёбер этого файла.
-    prune_object_method_calls(conn, Some(&rel))?;
-
+    // callee_proc_key здесь НЕ резолвим: новые рёбра остаются с NULL-адресом,
+    // а резолв всего графа (resolve_and_prune_direct_edges) вызывающий делает
+    // ОДИН раз после пофайлового цикла батча. Пофайловый резолв раньше
+    // (build_common_module_methods + resolve_* + prune_* на КАЖДЫЙ .bsl) давал
+    // квадратичную деградацию на bulk-батче: каждый файл заново сканировал весь
+    // proc_call_graph и пересобирал tmp-карты общих модулей.
     conn.execute("COMMIT", [])?;
     tracing::debug!(
         "call_graph direct per-file {}: old={} new={}",
@@ -746,9 +706,24 @@ fn object_full_name_any(xml_path: &Path) -> Option<(&'static str, String)> {
 /// рёбра (`from_object = X`) и переразобрать только его XML. Покрывает и
 /// recorder-рёбра (движения документа), т.к. они тоже имеют `from_object`
 /// = документ. Если файл удалён — рёбра просто исчезают.
-fn update_data_links_for_object(conn: &rusqlite::Connection, xml_path: &Path) -> Result<()> {
+fn update_data_links_for_object(
+    conn: &rusqlite::Connection,
+    roots: &[std::path::PathBuf],
+    xml_path: &Path,
+) -> Result<()> {
     let owner_full = match object_full_name_from_path(xml_path) {
         Some((_mt, full)) => full,
+        None => return Ok(()),
+    };
+    // Папка (plural) и имя объекта — из пути; ищем копии объекта во ВСЕХ sub-config
+    // и объединяем рёбра (симметрично bulk index_data_links), а не разбираем один
+    // пришедший файл. Удалённая/ушедшая копия отсеивается сама (файла нет).
+    let folder = match xml_path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+    let stem = match xml_path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
         None => return Ok(()),
     };
     let _ = conn.execute("ROLLBACK", []);
@@ -757,27 +732,35 @@ fn update_data_links_for_object(conn: &rusqlite::Connection, xml_path: &Path) ->
         "DELETE FROM data_links WHERE repo = ? AND from_object = ?",
         params![REPO_DEFAULT, &owner_full],
     )?;
-    if xml_path.is_file() {
-        match parse_object_attributes_file(xml_path, &owner_full) {
-            Ok(edges) => {
-                let mut stmt = conn.prepare(
-                    "INSERT OR IGNORE INTO data_links \
-                     (repo, from_object, from_path, to_object, link_kind, is_composite, is_universal) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
-                )?;
-                for edge in edges {
-                    stmt.execute(params![
-                        REPO_DEFAULT,
-                        &owner_full,
-                        &edge.from_path,
-                        &edge.to_object,
-                        edge.link_kind,
-                        edge.is_composite as i64,
-                        edge.is_universal as i64,
-                    ])?;
+    {
+        let mut stmt = conn.prepare(
+            "INSERT OR IGNORE INTO data_links \
+             (repo, from_object, from_path, to_object, link_kind, is_composite, is_universal) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        for root in roots {
+            let cand = root.join(&folder).join(format!("{}.xml", stem));
+            if !cand.is_file() {
+                continue;
+            }
+            match parse_object_attributes_file(&cand, &owner_full) {
+                Ok(edges) => {
+                    for edge in edges {
+                        stmt.execute(params![
+                            REPO_DEFAULT,
+                            &owner_full,
+                            &edge.from_path,
+                            &edge.to_object,
+                            edge.link_kind,
+                            edge.is_composite as i64,
+                            edge.is_universal as i64,
+                        ])?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("update_data_links_for_object {}: {}", cand.display(), e)
                 }
             }
-            Err(e) => tracing::warn!("update_data_links_for_object {}: {}", xml_path.display(), e),
         }
     }
     backfill_data_link_keys(conn)?;
@@ -793,8 +776,8 @@ fn update_data_links_for_object(conn: &rusqlite::Connection, xml_path: &Path) ->
 /// без него инкремент расходился бы с полным пересбором. Строка объекта должна
 /// уже существовать (создаётся `index_metadata_objects`).
 fn update_object_attributes_for_object(
-    repo_root: &Path,
     conn: &rusqlite::Connection,
+    roots: &[std::path::PathBuf],
     xml_path: &Path,
 ) -> Result<()> {
     let owner_full = match object_full_name_from_path(xml_path) {
@@ -802,7 +785,8 @@ fn update_object_attributes_for_object(
         None => return Ok(()),
     };
     // Папка (plural) и имя объекта — из пути изменённого XML; ищем копии этого
-    // объекта во всех sub-config и мерджим (base-first).
+    // объекта во всех sub-config (`roots`, посчитаны один раз на пачку) и мерджим
+    // (base-first).
     let folder = match xml_path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) {
         Some(s) => s.to_string(),
         None => return Ok(()),
@@ -811,9 +795,8 @@ fn update_object_attributes_for_object(
         Some(s) => s.to_string(),
         None => return Ok(()),
     };
-    let roots = sub_config_roots(repo_root);
     let json_opt =
-        merged_object_structure(&roots, &folder, &stem).map(|s| s.to_json().to_string());
+        merged_object_structure(roots, &folder, &stem).map(|s| s.to_json().to_string());
     conn.execute(
         "UPDATE metadata_objects SET attributes_json = ? WHERE repo = ? AND full_name = ?",
         params![json_opt, REPO_DEFAULT, &owner_full],
@@ -841,6 +824,7 @@ fn update_object_attributes_for_object(
 fn upsert_metadata_object(
     repo_root: &Path,
     conn: &rusqlite::Connection,
+    roots: &[std::path::PathBuf],
     xml_path: &Path,
 ) -> Result<()> {
     let (meta_type, full_name) = match object_full_name_any(xml_path) {
@@ -856,12 +840,11 @@ fn upsert_metadata_object(
         None => return Ok(()),
     };
 
-    let roots = sub_config_roots(repo_root); // base-first
     let mut synonym: Option<String> = None;
     let mut owner = String::new();
     let mut owner_is_base = false;
     let mut any_copy = false;
-    for sub_root in &roots {
+    for sub_root in roots {
         let cand = sub_root.join(&folder).join(format!("{}.xml", stem));
         if !cand.is_file() {
             continue;
@@ -1111,6 +1094,14 @@ pub fn run_incremental_extras(
     // поэтому здесь НЕ делаем return и НЕ зовём полный run_index_extras — это
     // убирает многоминутный re-enrichment на ходу (зависание daemon на bulk git).
     let conn = storage.conn();
+    // sub_config_roots (обход дерева repo) считаем ОДИН раз на пачку и прокидываем
+    // в пофайловые функции — иначе каждая пере-сборка объекта делала бы свой обход
+    // (до трёх на объект). Ленивое: только когда есть объектные/описные события,
+    // иначе пачка «только .bsl» не платила бы за лишний обход дерева.
+    let need_roots =
+        !dump_info_areas.is_empty() || !all_object_xmls.is_empty() || !object_xmls.is_empty();
+    let roots: Vec<std::path::PathBuf> =
+        if need_roots { sub_config_roots(repo_root) } else { Vec::new() };
     // Фаза 3: сверка затронутых областей по свежей описи вместо квадратичного
     // полного пересбора метаданного слоя. Каждая область → точечный diff реестра
     // config_manifest; индексные действия — ТОЛЬКО на удалении объектов (каскад
@@ -1119,7 +1110,7 @@ pub fn run_incremental_extras(
     // / update_*_for_*). reconcile_area ведёт собственные транзакции, поэтому
     // безопасен до пофайловых веток; home объекта читается ДО их правок.
     for area_root in &dump_info_areas {
-        match reconcile_area(repo_root, conn, area_root) {
+        match reconcile_area(repo_root, conn, &roots, area_root) {
             Ok(s) => tracing::info!(
                 "reconcile_area {}: +{} ~{} -{} (объектов удалено {}, пере-собрано {})",
                 area_root.display(), s.added, s.updated, s.removed,
@@ -1133,13 +1124,13 @@ pub fn run_incremental_extras(
     // там всегда '' — Configuration.xml не знает ObjectBelonging), upsert поверх
     // выставит корректного владельца Native-объектам.
     for p in &all_object_xmls {
-        if let Err(e) = upsert_metadata_object(repo_root, conn, p) {
+        if let Err(e) = upsert_metadata_object(repo_root, conn, &roots, p) {
             tracing::warn!("upsert_metadata_object {}: {}", p.display(), e);
         }
     }
     for p in &object_xmls {
-        update_data_links_for_object(conn, p)?;
-        update_object_attributes_for_object(repo_root, conn, p)?;
+        update_data_links_for_object(conn, &roots, p)?;
+        update_object_attributes_for_object(conn, &roots, p)?;
     }
     for p in &form_xmls {
         update_metadata_forms_for_file(repo_root, conn, p)?;
@@ -1164,6 +1155,18 @@ pub fn run_incremental_extras(
         if let Err(e) = update_metadata_module_for_file(repo_root, conn, p, &mut cfgver_cache) {
             tracing::warn!("update_metadata_module_for_file {}: {}", p.display(), e);
         }
+    }
+    // Этап 4e ОДИН раз на батч: резолв callee_proc_key новых direct-рёбер +
+    // отсев балласта (тот же хелпер, что в полном пересборе). Пофайловый цикл
+    // выше кладёт лишь сырые рёбра с NULL-адресом (дёшево, по индексам); тяжёлый
+    // глобальный резолв (build_common_module_methods + resolve_* + prune_*) идёт
+    // здесь единожды — вместо N-кратного повтора на каждый файл (была
+    // квадратичная деградация на bulk-батче в тысячи файлов).
+    if !bsl_paths.is_empty() {
+        let _ = conn.execute("ROLLBACK", []);
+        conn.execute("BEGIN", [])?;
+        resolve_and_prune_direct_edges(conn)?;
+        conn.execute("COMMIT", [])?;
     }
     // Слой extension_override зависит от functions.override_* (обновляется
     // core-индексатором при правке .bsl) — полный пересбор дёшев (один SELECT).
@@ -1345,21 +1348,10 @@ fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
         params![REPO_DEFAULT],
     )?;
 
-    // ── этап 4e: резолв адреса цели (callee_proc_key) для direct-рёбер ──
-    // Полный пересбор графа → резолвим разом по всему набору рёбер (set-based,
-    // через временные таблицы). Инкремент по файлу резолвит свои рёбра сам
-    // (см. update_call_graph_direct_for_file).
-    resolve_direct_callee_keys(conn)?;
-
-    // ── этап 4e-D: резолв менеджер-вызовов `Коллекция.Объект.Метод` ──
-    resolve_callee_keys_by_manager(conn, None)?;
-
-    // ── этап 4e-prune: отсев платформенного балласта ──
-    // Рёбра в методы коллекций/объектов и глобальные функции платформы (цель
-    // вне кода конфигурации). Только полный набор; инкремент чистит свои рёбра.
-    prune_platform_balast(conn, None)?;
-    // Объектные вызовы `Объект.Метод` (квалификатор — переменная, не модуль).
-    prune_object_method_calls(conn, None)?;
+    // ── этап 4e + 4e-D + 4e-prune: резолв callee_proc_key + отсев балласта ──
+    // Общий с инкрементом хелпер: run_incremental_extras зовёт его же ОДИН раз
+    // после пофайловой вставки рёбер батча → идентичность full↔incremental.
+    resolve_and_prune_direct_edges(conn)?;
 
     conn.execute("COMMIT", [])?;
 
@@ -1376,6 +1368,20 @@ fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     // TODO(этап 4g): external_assignment — runtime-анализ переменных
     // неопределённого типа. Опционально, очень дорогая фича.
 
+    Ok(())
+}
+
+/// Этап 4e (общий для полного пересбора и инкремента): заполнить
+/// `callee_proc_key` всем direct-рёбрам с NULL-адресом и отсеять
+/// платформенный/объектный балласт. Транзакцией управляет вызывающий.
+/// Трогает ТОЛЬКО рёбра с `callee_proc_key IS NULL` → идемпотентен: результат
+/// идентичен при вызове из `build_call_graph` (после полной вставки рёбер) и из
+/// `run_incremental_extras` (после пофайловой вставки рёбер батча).
+fn resolve_and_prune_direct_edges(conn: &rusqlite::Connection) -> Result<()> {
+    resolve_direct_callee_keys(conn)?;
+    resolve_callee_keys_by_manager(conn, None)?;
+    prune_platform_balast(conn, None)?;
+    prune_object_method_calls(conn, None)?;
     Ok(())
 }
 
@@ -1938,24 +1944,39 @@ fn delete_object_cascade(
 fn remerge_object(
     repo_root: &Path,
     conn: &rusqlite::Connection,
+    roots: &[std::path::PathBuf],
     meta_type: &str,
     name: &str,
+    cfgver_cache: &mut std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashMap<String, String>,
+    >,
 ) -> Result<()> {
     let folder = match plural_folder(meta_type) {
         Some(f) => f,
         None => return Ok(()),
     };
     let rel = format!("{}/{}.xml", folder, name);
-    let xml_path = sub_config_roots(repo_root)
-        .into_iter()
+    let xml_path = roots
+        .iter()
         .map(|root| root.join(&rel))
         .find(|p| p.is_file());
     let xml_path = match xml_path {
         Some(p) => p,
         None => return Ok(()), // корневого XML нет (объект без структуры) — пере-сливать нечего
     };
-    upsert_metadata_object(repo_root, conn, &xml_path)?;
-    update_object_attributes_for_object(repo_root, conn, &xml_path)?;
+    upsert_metadata_object(repo_root, conn, roots, &xml_path)?;
+    update_object_attributes_for_object(conn, roots, &xml_path)?;
+    // data_links симметрично attributes_json: пересобрать по оставшимся копиям.
+    // Первично для ухода заимствователя, когда delete объектного XML watcher-ом
+    // не доставлен (надёжный сигнал — MODIFY описи → сюда). Идемпотентно при
+    // повторной пересборке в этой же пачке.
+    update_data_links_for_object(conn, roots, &xml_path)?;
+    // metadata_modules симметрично: пересобрать модули объекта по оставшимся
+    // копиям (DELETE + обход .bsl во всех roots). Без этого config_version
+    // модулей формы заимствователя устаревал бы при уходе — расхождение с полным
+    // reindex, пойман федеративным smoke на УТ 11.5.
+    update_metadata_modules_for_object(repo_root, conn, roots, &xml_path, cfgver_cache)?;
     Ok(())
 }
 
@@ -1969,6 +1990,7 @@ fn remerge_object(
 fn reconcile_area(
     repo_root: &Path,
     conn: &rusqlite::Connection,
+    roots: &[std::path::PathBuf],
     area_root: &Path,
 ) -> Result<ReconcileStats> {
     let area = compute_extension_name(repo_root, area_root);
@@ -1996,6 +2018,13 @@ fn reconcile_area(
     }
 
     let mut stats = ReconcileStats::default();
+    // Кэш описей sub-config'ов на всю область — общий для пере-сборки
+    // metadata_modules всех объектов (parse_config_dump_info дорогой, не читаем
+    // одну опись повторно для каждого объекта/модуля).
+    let mut cfgver_cache: std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashMap<String, String>,
+    > = std::collections::HashMap::new();
 
     // 1) Пропавшие строки — индексные действия только для объектов (по дому).
     //    Каскад/пере-сборка ведут собственные транзакции, поэтому делаем их ДО
@@ -2010,7 +2039,7 @@ fn reconcile_area(
                 delete_object_cascade(conn, full_name, &meta_type, &name)?;
                 stats.deleted_objects += 1;
             } else {
-                remerge_object(repo_root, conn, &meta_type, &name)?;
+                remerge_object(repo_root, conn, roots, &meta_type, &name, &mut cfgver_cache)?;
                 stats.remerged_objects += 1;
             }
         }
@@ -3066,10 +3095,19 @@ fn update_procedure_terms_for_file(
     let rel = rel_path(repo_root, bsl_path);
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
+    // proc_key имеет вид '<rel>::<proc>'. Прежнее `proc_key LIKE ?||'::%'` делало
+    // SCAN всей procedure_enrichment (LIKE в SQLite case-insensitive → индекс
+    // idx_pe_proc_key НЕ используется). На массовом deleted-батче это квадратично:
+    // каждый удалённый .bsl сканировал ~260K строк (1446 файлов git-pull → минуты).
+    // Range по префиксу '<rel>::' идёт через индекс (SEARCH вместо SCAN): нижняя
+    // граница '<rel>::', верхняя '<rel>:;' (последний ':' префикса +1 = ';').
+    // signature LIKE 'mech:%' остаётся доп-фильтром уже на строках одного файла.
+    let pk_lo = format!("{}::", rel);
+    let pk_hi = format!("{}:;", rel);
     conn.execute(
         "DELETE FROM procedure_enrichment \
-         WHERE repo = ?1 AND signature LIKE 'mech:%' AND proc_key LIKE ?2 || '::%'",
-        params![REPO_DEFAULT, &rel],
+         WHERE repo = ?1 AND proc_key >= ?2 AND proc_key < ?3 AND signature LIKE 'mech:%'",
+        params![REPO_DEFAULT, &pk_lo, &pk_hi],
     )?;
     if bsl_path.is_file() {
         let procs: Vec<(String, i64)> = {
@@ -3443,69 +3481,79 @@ fn sub_root_for_path(repo_root: &Path, path: &Path) -> Option<std::path::PathBuf
     None
 }
 
-/// Per-file точечное обновление `metadata_modules` для одного изменённого `.bsl`.
-/// Аналог одной итерации `index_metadata_modules` (те же хелперы classify/owner/
-/// uuid → полная эквивалентность), но по конкретному файлу: закрывает дыру
-/// «строка нового модуля не заводится без Configuration.xml в батче». `config_version`
-/// (только для точности dbgs-breakpoints, не для поиска) берётся из
-/// `ConfigDumpInfo.xml` sub-config'а с кэшем `cfgver_cache` на батч — чтобы не
-/// перечитывать один файл для каждого `.bsl` большой пачки. Не .bsl-модуль
-/// известного типа / без владельца / без UUID → no-op.
-fn update_metadata_module_for_file(
+/// Данные одной строки `metadata_modules`, собранные из `.bsl`-модуля. Отделены
+/// от вставки, чтобы одну логику (classify/owner/uuid/config_version) использовать
+/// и пофайлово (`update_metadata_module_for_file`), и по-объектно
+/// (`update_metadata_modules_for_object`) в рамках одной транзакции.
+struct ModuleRow {
+    full_name: String,
+    object_name: String,
+    effective_type: &'static str,
+    object_id: String,
+    property_id: &'static str,
+    config_version: Option<String>,
+    code_path: String,
+    extension_name: String,
+}
+
+/// Собрать строку `metadata_modules` из одного `.bsl` (те же хелперы classify/
+/// owner/uuid, что у `index_metadata_modules` → полная эквивалентность). Не
+/// .bsl-модуль известного типа / без владельца / без UUID → `None` (no-op у
+/// вызывающего). `config_version` (только для точности dbgs-breakpoints, не для
+/// поиска) берётся из `ConfigDumpInfo.xml` sub-config'а через кэш `cfgver_cache`
+/// на батч — чтобы не перечитывать опись для каждого `.bsl` большой пачки.
+fn build_module_row(
     repo_root: &Path,
-    conn: &rusqlite::Connection,
     bsl_path: &Path,
     cfgver_cache: &mut std::collections::HashMap<
         std::path::PathBuf,
         std::collections::HashMap<String, String>,
     >,
-) -> Result<()> {
-    let file_name = match bsl_path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return Ok(()),
-    };
-    let module_type = match module_type_by_filename(file_name) {
-        Some(t) => t,
-        None => return Ok(()),
-    };
+) -> Option<ModuleRow> {
+    let file_name = bsl_path.file_name().and_then(|n| n.to_str())?;
+    let module_type = module_type_by_filename(file_name)?;
     let (effective_type, owner_xml_kind) = classify_module(bsl_path, module_type);
-    let property_id = match property_id_by_type(effective_type) {
-        Some(p) => p,
-        None => return Ok(()),
-    };
+    let property_id = property_id_by_type(effective_type)?;
     let owner_info = match owner_xml_kind {
         OwnerKind::Form => find_form_owner(bsl_path),
         OwnerKind::Object => find_object_owner(bsl_path),
     };
-    let (owner_xml_path, object_name) = match owner_info {
-        Some(t) => t,
-        None => return Ok(()),
-    };
+    let (owner_xml_path, object_name) = owner_info?;
     let uuid_opt = match owner_xml_kind {
         OwnerKind::Form => extract_form_uuid_any_from_file(&owner_xml_path).ok().flatten(),
         OwnerKind::Object => extract_object_uuid_from_file(&owner_xml_path).ok().flatten(),
     };
     let object_id = match uuid_opt {
         Some(u) if !u.is_empty() => u,
-        _ => return Ok(()),
+        _ => return None,
     };
-
-    let sub_root = sub_root_for_path(repo_root, bsl_path).unwrap_or_else(|| repo_root.to_path_buf());
+    let sub_root =
+        sub_root_for_path(repo_root, bsl_path).unwrap_or_else(|| repo_root.to_path_buf());
     let extension_name = compute_extension_name(repo_root, &sub_root);
     let config_versions = cfgver_cache
         .entry(sub_root.clone())
         .or_insert_with(|| parse_config_dump_info(&sub_root).unwrap_or_default());
     let config_version = config_versions.get(&object_id).cloned();
-
     let full_name = format!("{}.{}", object_name, effective_type);
-    let code_path_rel = bsl_path
+    let code_path = bsl_path
         .strip_prefix(repo_root)
         .unwrap_or(bsl_path)
         .to_string_lossy()
         .replace('\\', "/");
+    Some(ModuleRow {
+        full_name,
+        object_name,
+        effective_type,
+        object_id,
+        property_id,
+        config_version,
+        code_path,
+        extension_name,
+    })
+}
 
-    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
-    conn.execute("BEGIN", [])?;
+/// Вставка/обновление одной строки `metadata_modules`. Транзакцией управляет вызывающий.
+fn insert_module_row(conn: &rusqlite::Connection, row: &ModuleRow) -> Result<()> {
     conn.execute(
         "INSERT INTO metadata_modules \
          (repo, full_name, object_name, module_type, object_id, property_id, \
@@ -3520,16 +3568,95 @@ fn update_metadata_module_for_file(
              code_path = excluded.code_path",
         params![
             REPO_DEFAULT,
-            &full_name,
-            &object_name,
-            effective_type,
-            &object_id,
-            property_id,
-            config_version.as_deref(),
-            &code_path_rel,
-            &extension_name,
+            &row.full_name,
+            &row.object_name,
+            row.effective_type,
+            &row.object_id,
+            row.property_id,
+            row.config_version.as_deref(),
+            &row.code_path,
+            &row.extension_name,
         ],
     )?;
+    Ok(())
+}
+
+/// Per-file точечное обновление `metadata_modules` для одного изменённого `.bsl`.
+/// Закрывает дыру «строка нового модуля не заводится без Configuration.xml в
+/// батче». Не .bsl-модуль известного типа / без владельца / без UUID → no-op.
+fn update_metadata_module_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    bsl_path: &Path,
+    cfgver_cache: &mut std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashMap<String, String>,
+    >,
+) -> Result<()> {
+    let row = match build_module_row(repo_root, bsl_path, cfgver_cache) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    insert_module_row(conn, &row)?;
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Per-object пересборка `metadata_modules` объекта: DELETE всех его модулей (по
+/// всем sub-config'ам, ключ `object_name`) + обход каталогов объекта во ВСЕХ
+/// `roots` с повторной вставкой по существующим `.bsl`. Симметрично
+/// `update_data_links_for_object`: при уходе заимствователя опись расширения
+/// обнуляется, но `.bsl`-модули форм физически на месте — пофайловый путь их не
+/// трогает, и `config_version` устаревал бы (расхождение с полным reindex,
+/// пойман федеративным smoke на УТ 11.5). Здесь модули приводятся к свежей описи.
+fn update_metadata_modules_for_object(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    roots: &[std::path::PathBuf],
+    xml_path: &Path,
+    cfgver_cache: &mut std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashMap<String, String>,
+    >,
+) -> Result<()> {
+    // Папка (plural) и имя объекта — из пути корневого XML; `object_name` в
+    // metadata_modules хранится как '<PluralFolder>.<Name>'.
+    let folder = match xml_path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+    let stem = match xml_path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+    let object_name = format!("{}.{}", folder, stem);
+    let like = format!("{}.%", object_name);
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    // Модули самого объекта (ObjectModule/ManagerModule: object_name точно) и его
+    // форм/команд (object_name '<obj>.Form.X' / '<obj>.Command.Y': по LIKE).
+    conn.execute(
+        "DELETE FROM metadata_modules \
+         WHERE repo = ? AND (object_name = ? OR object_name LIKE ?)",
+        params![REPO_DEFAULT, &object_name, &like],
+    )?;
+    for root in roots {
+        let obj_dir = root.join(&folder).join(&stem);
+        if !obj_dir.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(&obj_dir).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if let Some(row) = build_module_row(repo_root, entry.path(), cfgver_cache) {
+                insert_module_row(conn, &row)?;
+            }
+        }
+    }
     conn.execute("COMMIT", [])?;
     Ok(())
 }
@@ -4088,6 +4215,7 @@ mod tests {
         upsert_metadata_object(
             &repo,
             conn,
+            &sub_config_roots(&repo),
             &repo.join("base").join("Catalogs").join("Контрагенты.xml"),
         )
         .unwrap();
@@ -4105,6 +4233,7 @@ mod tests {
         upsert_metadata_object(
             &repo,
             conn,
+            &sub_config_roots(&repo),
             &repo.join("extensions").join("EF_A").join("Catalogs").join("МойОбъект.xml"),
         )
         .unwrap();
@@ -4254,7 +4383,7 @@ mod tests {
   <Metadata name="Catalog.Живой" id="z1" configVersion="v2"/>
 </ConfigVersions></ConfigDumpInfo>"#,
         );
-        let stats = reconcile_area(&repo, conn, &repo.join("base")).unwrap();
+        let stats = reconcile_area(&repo, conn, &sub_config_roots(&repo), &repo.join("base")).unwrap();
         assert_eq!(stats.deleted_objects, 1);
 
         assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM metadata_objects WHERE full_name = ?", "Catalog.Удаляемый"), 0);
@@ -4308,7 +4437,7 @@ mod tests {
             &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
             r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#,
         );
-        let stats = reconcile_area(&repo, conn, &repo.join("extensions").join("EF_A")).unwrap();
+        let stats = reconcile_area(&repo, conn, &sub_config_roots(&repo), &repo.join("extensions").join("EF_A")).unwrap();
         assert_eq!(stats.remerged_objects, 1, "заимствователь уронил — пере-сборка, не удаление");
         assert_eq!(stats.deleted_objects, 0);
 
@@ -4357,7 +4486,7 @@ mod tests {
   <Metadata name="Catalog.Товар" id="t1" configVersion="v1"/>
 </ConfigVersions></ConfigDumpInfo>"#,
         );
-        let stats = reconcile_area(&repo, conn, &repo.join("base")).unwrap();
+        let stats = reconcile_area(&repo, conn, &sub_config_roots(&repo), &repo.join("base")).unwrap();
         assert_eq!(stats.deleted_objects, 0, "реквизит — не удаление объекта (Вариант А)");
         assert_eq!(stats.remerged_objects, 0);
 
@@ -5858,6 +5987,391 @@ mod tests {
         );
     }
 
+    // ── Уход заимствователя / изменение копии расширения: data_links должны
+    //    строиться слиянием по копиям (симметрично bulk index_data_links) ──────
+    //
+    // Общий фикстур: база Catalog.Контрагенты с реквизитом-ссылкой ОсновнойГород
+    // → Catalog.Города; EF_A заимствует Контрагенты (Adopted) с ДОБАВЛЕННЫМ своим
+    // реквизитом ДопРегион → Catalog.Регионы. Полный индекс даёт ДВА ребра:
+    // Контрагенты→Города (база) и Контрагенты→Регионы (расширение).
+    fn write_borrow_repo(repo: &Path) {
+        write(
+            &repo.join("base").join("Configuration.xml"),
+            r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("Catalogs").join("Контрагенты.xml"),
+            r#"<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Catalog uuid="root"><Properties><Name>Контрагенты</Name></Properties>
+    <ChildObjects>
+      <Attribute uuid="a1"><Properties><Name>ОсновнойГород</Name>
+        <Type><v8:Type>cfg:CatalogRef.Города</v8:Type></Type>
+      </Properties></Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="k1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
+        );
+        write(
+            &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+            r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml"),
+            r#"<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Catalog uuid="root"><Properties><Name>Контрагенты</Name><ObjectBelonging>Adopted</ObjectBelonging></Properties>
+    <ChildObjects>
+      <Attribute uuid="b1"><Properties><Name>ДопРегион</Name>
+        <Type><v8:Type>cfg:CatalogRef.Регионы</v8:Type></Type>
+      </Properties></Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>"#,
+        );
+        write(
+            &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="k1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
+        );
+    }
+
+    // Снять заимствование EF_A: удалить его копию объекта с диска, опись — пустая
+    // (расширение выжило, но заимствует пусто). Возвращает (путь_описи, путь_копии).
+    fn drop_ef_a_borrow(repo: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let copy = repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml");
+        let _ = std::fs::remove_file(&copy);
+        let dump = repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml");
+        write(&dump, r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#);
+        (dump, copy)
+    }
+
+    #[test]
+    fn incremental_borrower_drop_keeps_data_links() {
+        // Уход заимствователя, delete-событие копии ДОСТАВЛЕНО. Дефект: пофайловый
+        // update_data_links_for_object по удалённой копии сносит ВСЕ рёбра объекта
+        // (в т.ч. базовое) и не переразбирает (файла нет) → data_links пуст.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write_borrow_repo(&repo);
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+
+        let (dump, copy) = drop_ef_a_borrow(&repo);
+        run_incremental_extras(&repo, &mut storage, &[dump], &[copy]).unwrap();
+
+        // Эталон: финальное состояние (только база) с нуля.
+        let tmp_t = TempDir::new().unwrap();
+        let repo_t = tmp_t.path().join("repo");
+        write_borrow_repo(&repo_t);
+        drop_ef_a_borrow(&repo_t);
+        let mut st_t = fresh_storage(&tmp_t);
+        run_index_extras(&repo_t, &mut st_t).unwrap();
+
+        assert_eq!(
+            snapshot_dl(storage.conn()),
+            snapshot_dl(st_t.conn()),
+            "data_links после ухода заимствователя (delete доставлен) != полному пересбору"
+        );
+        assert_eq!(
+            snapshot_attrs(storage.conn()),
+            snapshot_attrs(st_t.conn()),
+            "attributes_json != полному пересбору"
+        );
+    }
+
+    #[test]
+    fn incremental_borrower_drop_opis_only_keeps_data_links() {
+        // Уход заимствователя, delete-событие копии ПОТЕРЯНО watcher-ом: в пачке
+        // только MODIFY описи расширения. Дефект: remerge_object (по опись-событию)
+        // сейчас data_links не трогает → EF_A-ребро остаётся фантомом.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write_borrow_repo(&repo);
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+
+        let (dump, _copy) = drop_ef_a_borrow(&repo); // копия удалена с диска, но события delete нет
+        run_incremental_extras(&repo, &mut storage, &[dump], &[]).unwrap();
+
+        let tmp_t = TempDir::new().unwrap();
+        let repo_t = tmp_t.path().join("repo");
+        write_borrow_repo(&repo_t);
+        drop_ef_a_borrow(&repo_t);
+        let mut st_t = fresh_storage(&tmp_t);
+        run_index_extras(&repo_t, &mut st_t).unwrap();
+
+        assert_eq!(
+            snapshot_dl(storage.conn()),
+            snapshot_dl(st_t.conn()),
+            "data_links после ухода заимствователя (delete потерян) != полному пересбору"
+        );
+    }
+
+    #[test]
+    fn incremental_borrower_drop_rebuilds_metadata_modules() {
+        // Уход заимствователя: EF_A-копия объекта удалена + опись EF_A пуста, но
+        // .bsl-модуль копии остаётся на диске сиротой. Дефект (до фикса):
+        // remerge_object не трогал metadata_modules → строка модуля EF_A
+        // (со своим config_version) остаётся, расходясь с полным reindex, где
+        // модуль-сирота отсеивается (owner XML удалён). Фикс: remerge пере-собирает
+        // модули объекта (DELETE + обход roots). Пойман федеративным smoke на УТ 11.5.
+        fn write_repo(repo: &Path) {
+            write(
+                &repo.join("base").join("Configuration.xml"),
+                r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+            );
+            write(
+                &repo.join("base").join("Catalogs").join("Контрагенты.xml"),
+                r#"<MetaDataObject><Catalog uuid="cbase"><Properties><Name>Контрагенты</Name></Properties></Catalog></MetaDataObject>"#,
+            );
+            write(
+                &repo.join("base").join("Catalogs").join("Контрагенты").join("Ext").join("ManagerModule.bsl"),
+                "Процедура П() Экспорт\nКонецПроцедуры",
+            );
+            write(
+                &repo.join("base").join("ConfigDumpInfo.xml"),
+                r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="cbase" configVersion="VER-base"/></ConfigVersions></ConfigDumpInfo>"#,
+            );
+            write(
+                &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+                r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+            );
+            write(
+                &repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml"),
+                r#"<MetaDataObject><Catalog uuid="cbase"><Properties><Name>Контрагенты</Name><ObjectBelonging>Adopted</ObjectBelonging></Properties></Catalog></MetaDataObject>"#,
+            );
+            write(
+                &repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты").join("Ext").join("ManagerModule.bsl"),
+                "Процедура П() Экспорт\nКонецПроцедуры",
+            );
+            write(
+                &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+                r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="cbase" configVersion="VER-ext"/></ConfigVersions></ConfigDumpInfo>"#,
+            );
+        }
+        let snap_mods = |st: &Storage| -> Vec<(String, String, Option<String>, String)> {
+            st.conn()
+                .prepare(
+                    "SELECT full_name, object_name, config_version, extension_name \
+                     FROM metadata_modules WHERE repo=? ORDER BY full_name, extension_name",
+                )
+                .unwrap()
+                .query_map(params![REPO_DEFAULT], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write_repo(&repo);
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+
+        // уход: удалить EF_A-копию объекта + опустошить опись EF_A; .bsl-модуль остаётся
+        let copy = repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml");
+        std::fs::remove_file(&copy).unwrap();
+        let dump = repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml");
+        write(&dump, r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#);
+        run_incremental_extras(&repo, &mut storage, &[dump], &[copy]).unwrap();
+
+        // эталон: полный пересбор финального состояния (только база)
+        let tmp_t = TempDir::new().unwrap();
+        let repo_t = tmp_t.path().join("repo");
+        write_repo(&repo_t);
+        std::fs::remove_file(
+            repo_t.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml"),
+        )
+        .unwrap();
+        write(
+            &repo_t.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#,
+        );
+        let mut st_t = fresh_storage(&tmp_t);
+        run_index_extras(&repo_t, &mut st_t).unwrap();
+
+        assert_eq!(
+            snap_mods(&storage),
+            snap_mods(&st_t),
+            "metadata_modules после ухода заимствователя != полному пересбору"
+        );
+    }
+
+    #[test]
+    fn incremental_ext_copy_change_keeps_base_data_links() {
+        // Изменена ТОЛЬКО копия расширения (объект жив в базе и в EF_A). Дефект:
+        // update_data_links_for_object по копии EF_A сносит все рёбра и разбирает
+        // только EF_A → базовое ребро Контрагенты→Города теряется.
+        let modified_ef_copy = r#"<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
+  <Catalog uuid="root"><Properties><Name>Контрагенты</Name><ObjectBelonging>Adopted</ObjectBelonging></Properties>
+    <ChildObjects>
+      <Attribute uuid="b1"><Properties><Name>ДопОкруг</Name>
+        <Type><v8:Type>cfg:CatalogRef.Округа</v8:Type></Type>
+      </Properties></Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>"#;
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write_borrow_repo(&repo);
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+
+        let ef_copy = repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml");
+        write(&ef_copy, modified_ef_copy);
+        run_incremental_extras(&repo, &mut storage, &[ef_copy], &[]).unwrap();
+
+        let tmp_t = TempDir::new().unwrap();
+        let repo_t = tmp_t.path().join("repo");
+        write_borrow_repo(&repo_t);
+        write(
+            &repo_t.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml"),
+            modified_ef_copy,
+        );
+        let mut st_t = fresh_storage(&tmp_t);
+        run_index_extras(&repo_t, &mut st_t).unwrap();
+
+        assert_eq!(
+            snapshot_dl(storage.conn()),
+            snapshot_dl(st_t.conn()),
+            "data_links после изменения копии расширения != полному пересбору (базовое ребро потеряно?)"
+        );
+        assert_eq!(
+            snapshot_attrs(storage.conn()),
+            snapshot_attrs(st_t.conn()),
+            "attributes_json != полному пересбору"
+        );
+    }
+
+    #[test]
+    fn incremental_massive_object_change_matches_full() {
+        // Масштаб: N объектов кольцом ссылок в базе, все заимствованы EF_A с
+        // добавленным реквизитом. Массивная пачка: все базовые файлы меняют реф
+        // (кольцо 1→2) + сняты ВСЕ заимствования (удалены копии EF_A). Единый путь
+        // должен построчно сойтись к полному пересбору финального состояния.
+        const N: usize = 60;
+
+        fn base_obj_xml(i: usize, to: usize) -> String {
+            format!(
+                "<MetaDataObject xmlns:v8=\"http://v8.1c.ru/8.3/data/core\">\n\
+                 <Catalog uuid=\"r{i}\"><Properties><Name>Спр{i}</Name></Properties>\n\
+                 <ChildObjects><Attribute uuid=\"a{i}\"><Properties><Name>Реф</Name>\n\
+                 <Type><v8:Type>cfg:CatalogRef.Спр{to}</v8:Type></Type>\n\
+                 </Properties></Attribute></ChildObjects></Catalog></MetaDataObject>"
+            )
+        }
+
+        // Собрать репо: base с реф-сдвигом ref_shift; borrow=true → EF_A заимствует
+        // все объекты (Adopted) с реквизитом-ссылкой на Спр{(i+2)%N}.
+        fn build(repo: &Path, borrow: bool, ref_shift: usize) {
+            let mut base_children = String::new();
+            let mut base_dump = String::from("<ConfigDumpInfo><ConfigVersions>");
+            for i in 0..N {
+                base_children.push_str(&format!("<Catalog>Спр{i}</Catalog>"));
+                base_dump.push_str(&format!(
+                    "<Metadata name=\"Catalog.Спр{i}\" id=\"c{i}\" configVersion=\"v1\"/>"
+                ));
+                write(
+                    &repo.join("base").join("Catalogs").join(format!("Спр{i}.xml")),
+                    &base_obj_xml(i, (i + ref_shift) % N),
+                );
+            }
+            base_dump.push_str("</ConfigVersions></ConfigDumpInfo>");
+            write(
+                &repo.join("base").join("Configuration.xml"),
+                &format!("<MetaDataObject><Configuration><ChildObjects>{base_children}</ChildObjects></Configuration></MetaDataObject>"),
+            );
+            write(&repo.join("base").join("ConfigDumpInfo.xml"), &base_dump);
+
+            if borrow {
+                let mut ef_children = String::new();
+                let mut ef_dump = String::from("<ConfigDumpInfo><ConfigVersions>");
+                for i in 0..N {
+                    ef_children.push_str(&format!("<Catalog>Спр{i}</Catalog>"));
+                    ef_dump.push_str(&format!(
+                        "<Metadata name=\"Catalog.Спр{i}\" id=\"c{i}\" configVersion=\"v1\"/>"
+                    ));
+                    let to = (i + 2) % N;
+                    write(
+                        &repo.join("extensions").join("EF_A").join("Catalogs").join(format!("Спр{i}.xml")),
+                        &format!(
+                            "<MetaDataObject xmlns:v8=\"http://v8.1c.ru/8.3/data/core\">\n\
+                             <Catalog uuid=\"r{i}\"><Properties><Name>Спр{i}</Name><ObjectBelonging>Adopted</ObjectBelonging></Properties>\n\
+                             <ChildObjects><Attribute uuid=\"e{i}\"><Properties><Name>ЭкстРеф</Name>\n\
+                             <Type><v8:Type>cfg:CatalogRef.Спр{to}</v8:Type></Type>\n\
+                             </Properties></Attribute></ChildObjects></Catalog></MetaDataObject>"
+                        ),
+                    );
+                }
+                ef_dump.push_str("</ConfigVersions></ConfigDumpInfo>");
+                write(
+                    &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+                    &format!("<MetaDataObject><Configuration><ChildObjects>{ef_children}</ChildObjects></Configuration></MetaDataObject>"),
+                );
+                write(&repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"), &ef_dump);
+            } else {
+                write(
+                    &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+                    r#"<MetaDataObject><Configuration><ChildObjects></ChildObjects></Configuration></MetaDataObject>"#,
+                );
+                write(
+                    &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+                    r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#,
+                );
+            }
+        }
+
+        // Эталон: финальное состояние (реф-сдвиг 2, заимствование снято).
+        let tmp_t = TempDir::new().unwrap();
+        let repo_t = tmp_t.path().join("repo");
+        build(&repo_t, false, 2);
+        let mut st_t = fresh_storage(&tmp_t);
+        run_index_extras(&repo_t, &mut st_t).unwrap();
+
+        // Инкремент: исходное (сдвиг 1, всё заимствовано) → полный индекс → массивная пачка.
+        let tmp_i = TempDir::new().unwrap();
+        let repo_i = tmp_i.path().join("repo");
+        build(&repo_i, true, 1);
+        let mut st_i = fresh_storage(&tmp_i);
+        run_index_extras(&repo_i, &mut st_i).unwrap();
+
+        let mut changed: Vec<std::path::PathBuf> = Vec::new();
+        let mut deleted: Vec<std::path::PathBuf> = Vec::new();
+        for i in 0..N {
+            let p = repo_i.join("base").join("Catalogs").join(format!("Спр{i}.xml"));
+            write(&p, &base_obj_xml(i, (i + 2) % N)); // база: реф-сдвиг 1→2
+            changed.push(p);
+            let c = repo_i.join("extensions").join("EF_A").join("Catalogs").join(format!("Спр{i}.xml"));
+            std::fs::remove_file(&c).unwrap(); // снять заимствование: удалить копию
+            deleted.push(c);
+        }
+        write(
+            &repo_i.join("extensions").join("EF_A").join("Configuration.xml"),
+            r#"<MetaDataObject><Configuration><ChildObjects></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        let ef_dump = repo_i.join("extensions").join("EF_A").join("ConfigDumpInfo.xml");
+        write(&ef_dump, r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#);
+        changed.push(ef_dump);
+
+        run_incremental_extras(&repo_i, &mut st_i, &changed, &deleted).unwrap();
+
+        assert_eq!(
+            snapshot_dl(st_i.conn()),
+            snapshot_dl(st_t.conn()),
+            "data_links после массивной пачки != полному пересбору"
+        );
+        assert_eq!(
+            snapshot_attrs(st_i.conn()),
+            snapshot_attrs(st_t.conn()),
+            "attributes_json после массивной пачки != полному пересбору"
+        );
+    }
+
     #[test]
     fn incremental_call_graph_direct_matches_full() {
         // Репо с подпиской и формой — проверяем, что инкремент .bsl
@@ -5923,6 +6437,75 @@ mod tests {
             snapshot_pcg(st_t.conn()),
             "proc_call_graph после инкремента .bsl != полному пересбору"
         );
+    }
+
+    #[test]
+    fn incremental_call_graph_multifile_batch_matches_full() {
+        // Батч из ДВУХ .bsl за один run_incremental_extras: два общих модуля
+        // кросс-ссылаются экспортными методами (`МодульА.ПроцА` ↔ `МодульБ.ПроцБ`).
+        // После рефакторинга резолв callee_proc_key идёт ОДИН раз на батч (а не
+        // пофайлово) — проверяем, что итоговый proc_call_graph совпадает с полным
+        // пересбором, и что обе кросс-ссылки резолвнуты в адреса общих модулей.
+        let cfg = r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects></ChildObjects></Configuration></MetaDataObject>"#;
+        let pa = "CommonModules/МодульА/Ext/Module.bsl";
+        let pb = "CommonModules/МодульБ/Ext/Module.bsl";
+
+        let seed = |st: &Storage, a: &[(&str, &str)], b: &[(&str, &str)]| {
+            let conn = st.conn();
+            let fa = ensure_file(conn, pa);
+            let fb = ensure_file(conn, pb);
+            set_func(conn, fa, "ПроцА", "() Экспорт");
+            set_func(conn, fb, "ПроцБ", "() Экспорт");
+            set_calls(conn, fa, a);
+            set_calls(conn, fb, b);
+        };
+
+        // truth: конечные вызовы, полный пересбор.
+        let tmp_t = TempDir::new().unwrap();
+        let repo_t = tmp_t.path().join("repo");
+        write(&repo_t.join("Configuration.xml"), cfg);
+        let mut st_t = fresh_storage(&tmp_t);
+        seed(&st_t, &[("ПроцА", "МодульБ.ПроцБ")], &[("ПроцБ", "МодульА.ПроцА")]);
+        run_index_extras(&repo_t, &mut st_t).unwrap();
+
+        // incr: v1-вызовы → полный пересбор → правка ОБОИХ модулей (v2) → батч-инкремент.
+        let tmp_i = TempDir::new().unwrap();
+        let repo_i = tmp_i.path().join("repo");
+        write(&repo_i.join("Configuration.xml"), cfg);
+        let mut st_i = fresh_storage(&tmp_i);
+        seed(&st_i, &[("ПроцА", "СтароеИмя")], &[("ПроцБ", "ЕщёСтарое")]);
+        run_index_extras(&repo_i, &mut st_i).unwrap();
+        // v2: те же вызовы, что в truth.
+        {
+            let conn = st_i.conn();
+            let fa = ensure_file(conn, pa);
+            let fb = ensure_file(conn, pb);
+            set_calls(conn, fa, &[("ПроцА", "МодульБ.ПроцБ")]);
+            set_calls(conn, fb, &[("ПроцБ", "МодульА.ПроцА")]);
+        }
+        let bsl_a = repo_i.join("CommonModules").join("МодульА").join("Ext").join("Module.bsl");
+        let bsl_b = repo_i.join("CommonModules").join("МодульБ").join("Ext").join("Module.bsl");
+        run_incremental_extras(&repo_i, &mut st_i, &[bsl_a, bsl_b], &[]).unwrap();
+
+        assert_eq!(
+            snapshot_pcg(st_i.conn()),
+            snapshot_pcg(st_t.conn()),
+            "proc_call_graph после батч-инкремента 2 файлов != полному пересбору"
+        );
+
+        // Явная проверка: обе кросс-ссылки резолвнуты в адреса общих модулей.
+        let key = |callee: &str| -> Option<String> {
+            st_i.conn()
+                .query_row(
+                    "SELECT callee_proc_key FROM proc_call_graph                      WHERE repo=?1 AND call_type='direct' AND callee_proc_name=?2",
+                    params![REPO_DEFAULT, callee],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(key("МодульБ.ПроцБ"), Some(format!("{pb}::ПроцБ")), "А→Б резолвнут");
+        assert_eq!(key("МодульА.ПроцА"), Some(format!("{pa}::ПроцА")), "Б→А резолвнут");
     }
 
     #[test]
