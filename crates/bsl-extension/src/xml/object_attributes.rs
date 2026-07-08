@@ -878,6 +878,45 @@ pub fn parse_object_header_xml(content: &str) -> Option<(String, String, Option<
     }
 }
 
+/// Извлечь значение `<ObjectBelonging>` из шапки объекта расширения:
+/// `"Adopted"` — объект заимствован из базовой конфигурации, `"Native"` —
+/// собственный объект расширения. `None` — тега нет (объект базовой
+/// конфигурации; в расширении тег присутствует). Прерывается на
+/// `<ChildObjects>` — тег живёт в `<Properties>` шапки, состав читать незачем
+/// (иначе подхватился бы `ObjectBelonging` вложенного реквизита).
+pub fn parse_object_belonging(content: &str) -> Option<String> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut want = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
+                if local == "ChildObjects" {
+                    break;
+                }
+                // true только для самого тега ObjectBelonging; любой другой
+                // Start сбрасывает флаг (защита от <ObjectBelonging/> без текста).
+                want = local == "ObjectBelonging";
+            }
+            Ok(Event::Text(t)) if want => {
+                let txt = t
+                    .unescape()
+                    .map(|s| s.into_owned())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                return if txt.is_empty() { None } else { Some(txt) };
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
 pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
     let mut reader = Reader::from_str(content);
     reader.config_mut().trim_text(true);
@@ -1277,6 +1316,28 @@ mod tests {
         assert_eq!(mt2, "Constant");
         assert_eq!(name2, "Конст1");
         assert_eq!(syn2, None);
+    }
+
+    #[test]
+    fn parse_belonging_adopted_native_and_absent() {
+        let adopted = r#"<MetaDataObject><Catalog><Properties><Name>Контрагенты</Name><ObjectBelonging>Adopted</ObjectBelonging></Properties></Catalog></MetaDataObject>"#;
+        assert_eq!(parse_object_belonging(adopted).as_deref(), Some("Adopted"));
+
+        let native = r#"<MetaDataObject><Catalog><Properties><Name>МойСпр</Name><ObjectBelonging>Native</ObjectBelonging></Properties></Catalog></MetaDataObject>"#;
+        assert_eq!(parse_object_belonging(native).as_deref(), Some("Native"));
+
+        // Тега нет → None (объект базовой конфигурации).
+        let base = r#"<MetaDataObject><Catalog><Properties><Name>Базовый</Name></Properties></Catalog></MetaDataObject>"#;
+        assert_eq!(parse_object_belonging(base), None);
+
+        // ObjectBelonging вложенного реквизита (внутри ChildObjects) не подхватывается —
+        // break на ChildObjects происходит раньше.
+        let nested = r#"<MetaDataObject><Catalog><Properties><Name>X</Name></Properties><ChildObjects><Attribute><Properties><Name>Поле</Name><ObjectBelonging>Native</ObjectBelonging></Properties></Attribute></ChildObjects></Catalog></MetaDataObject>"#;
+        assert_eq!(
+            parse_object_belonging(nested),
+            None,
+            "break на ChildObjects — реквизитный ObjectBelonging игнорируется"
+        );
     }
 
     /// Тестовый конструктор поля без синонима/обязательности.

@@ -22,7 +22,7 @@ use rusqlite::params;
 use walkdir::WalkDir;
 
 use crate::module_constants::{module_type_by_filename, property_id_by_type};
-use crate::xml::config_dump_info::parse_config_dump_info;
+use crate::xml::config_dump_info::{parse_config_dump_info, parse_config_dump_info_rows};
 use crate::xml::configuration::parse_configuration_file;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
 use crate::xml::forms::parse_form_file;
@@ -33,8 +33,8 @@ use crate::xml::metadata_refs::{
     parse_role_rights_file, parse_subsystem_content_file,
 };
 use crate::xml::object_attributes::{
-    parse_object_attributes_file, parse_object_header_xml, parse_object_structure_file,
-    ObjectStructure,
+    parse_object_attributes_file, parse_object_belonging, parse_object_header_xml,
+    parse_object_structure_file, ObjectStructure,
 };
 use crate::xml::object_uuid::{extract_form_uuid_any_from_file, extract_object_uuid_from_file};
 
@@ -59,6 +59,59 @@ const OBJECT_FOLDERS: &[(&str, &str)] = &[
     // нужны для get_object_structure → enum_values (B2). parse_object_structure_xml
     // собирает <EnumValue>, index_object_attributes пишет в attributes_json.
     ("Enums", "Enum"),
+];
+
+/// Полный маппинг «папка (plural) → meta_type» для ВСЕХ типов верхнего уровня,
+/// выгружаемых как `<sub_root>/<Папка>/<Имя>.xml`. Надмножество `OBJECT_FOLDERS`
+/// (там только типы со ссылочной структурой для data_links/attributes). Нужен
+/// upsert-ветке перечня/синонима: она должна покрывать те же типы, что попадают
+/// в `metadata_objects` из Configuration.xml (все `KNOWN_META_TYPES`), а не
+/// только объекты со структурой. Полноту стережёт тест
+/// `all_object_folders_cover_known_meta_types`.
+const ALL_OBJECT_FOLDERS: &[(&str, &str)] = &[
+    ("Subsystems", "Subsystem"),
+    ("Catalogs", "Catalog"),
+    ("Documents", "Document"),
+    ("Enums", "Enum"),
+    ("Constants", "Constant"),
+    ("InformationRegisters", "InformationRegister"),
+    ("AccumulationRegisters", "AccumulationRegister"),
+    ("AccountingRegisters", "AccountingRegister"),
+    ("CalculationRegisters", "CalculationRegister"),
+    ("DataProcessors", "DataProcessor"),
+    ("Reports", "Report"),
+    ("CommonModules", "CommonModule"),
+    ("ChartsOfCharacteristicTypes", "ChartOfCharacteristicTypes"),
+    ("ChartsOfAccounts", "ChartOfAccounts"),
+    ("ChartsOfCalculationTypes", "ChartOfCalculationTypes"),
+    ("ExchangePlans", "ExchangePlan"),
+    ("BusinessProcesses", "BusinessProcess"),
+    ("Tasks", "Task"),
+    ("DocumentJournals", "DocumentJournal"),
+    ("FilterCriteria", "FilterCriterion"),
+    ("EventSubscriptions", "EventSubscription"),
+    ("ScheduledJobs", "ScheduledJob"),
+    ("FunctionalOptions", "FunctionalOption"),
+    ("FunctionalOptionsParameters", "FunctionalOptionsParameter"),
+    ("DefinedTypes", "DefinedType"),
+    ("CommonAttributes", "CommonAttribute"),
+    ("SettingsStorages", "SettingsStorage"),
+    ("WSReferences", "WSReference"),
+    ("WebServices", "WebService"),
+    ("HTTPServices", "HTTPService"),
+    ("Styles", "Style"),
+    ("Languages", "Language"),
+    ("SessionParameters", "SessionParameter"),
+    ("Roles", "Role"),
+    ("CommonForms", "CommonForm"),
+    ("CommonCommands", "CommonCommand"),
+    ("CommandGroups", "CommandGroup"),
+    ("CommonTemplates", "CommonTemplate"),
+    ("CommonPictures", "CommonPicture"),
+    ("XDTOPackages", "XDTOPackage"),
+    ("Sequences", "Sequence"),
+    ("Bots", "Bot"),
+    ("ExternalDataSources", "ExternalDataSource"),
 ];
 
 /// Repo-key для оффлайн-индексации (через `bsl-indexer index .`).
@@ -181,6 +234,12 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
     // платформа 1С перезаписывает всю выгрузку, поэтому полный пересбор оправдан.
     if let Err(e) = index_metadata_modules(repo_root, conn) {
         tracing::warn!("metadata_modules: {}", e);
+    }
+    // Реестр строк ConfigDumpInfo.xml всех областей (base + расширения) —
+    // плоский снимок состава для diff-сверки Фазы 2. Только текст описей,
+    // объектные XML не читает. Идемпотентно (DELETE repo + reinsert).
+    if let Err(e) = index_config_manifest(repo_root, conn) {
+        tracing::warn!("config_manifest: {}", e);
     }
     Ok(())
 }
@@ -665,6 +724,24 @@ fn object_full_name_from_path(xml_path: &Path) -> Option<(&'static str, String)>
     None
 }
 
+/// Как [`object_full_name_from_path`], но для ВСЕХ типов верхнего уровня
+/// (`ALL_OBJECT_FOLDERS`), а не только объектов со ссылочной структурой.
+/// Используется upsert-веткой перечня/синонима, которая должна вести те же
+/// типы, что попадают в `metadata_objects` из Configuration.xml.
+fn object_full_name_any(xml_path: &Path) -> Option<(&'static str, String)> {
+    if xml_path.extension().and_then(|e| e.to_str()) != Some("xml") {
+        return None;
+    }
+    let stem = xml_path.file_stem().and_then(|s| s.to_str())?;
+    let parent_name = xml_path.parent()?.file_name()?.to_str()?;
+    for (folder, meta_type) in ALL_OBJECT_FOLDERS {
+        if *folder == parent_name {
+            return Some((meta_type, format!("{}.{}", meta_type, stem)));
+        }
+    }
+    None
+}
+
 /// Per-object обновление `data_links` для одного объекта: удалить его прежние
 /// рёбра (`from_object = X`) и переразобрать только его XML. Покрывает и
 /// recorder-рёбра (движения документа), т.к. они тоже имеют `from_object`
@@ -741,6 +818,99 @@ fn update_object_attributes_for_object(
         "UPDATE metadata_objects SET attributes_json = ? WHERE repo = ? AND full_name = ?",
         params![json_opt, REPO_DEFAULT, &owner_full],
     )?;
+    Ok(())
+}
+
+/// Per-object upsert строки `metadata_objects` (перечень + синоним + владелец
+/// `sub_config`) из шапки объектного XML. В отличие от `index_metadata_objects`
+/// (полный DELETE repo + reinsert из Configuration.xml на триггере
+/// `config_changed`), ведёт ОДИН объект точечно на объектном событии — закрывает
+/// дыру «синоним/перечень изменённого объекта не обновляются, если в батче нет
+/// Configuration.xml».
+///
+/// Синоним и владелец вычисляются ПЕРЕСБОРОМ по всем sub-config'ам объекта
+/// (base-first), а не по одному пришедшему файлу — результат детерминирован при
+/// любом порядке прихода событий (как в `update_object_attributes_for_object`).
+/// `attributes_json` НЕ трогаем: его отдельно ведёт
+/// `update_object_attributes_for_object`, `ON CONFLICT` его сохраняет.
+///
+/// Владелец: копия в base ИЛИ `Adopted` ИЛИ без тега `ObjectBelonging` → база
+/// (`''`); только `Native` в расширении → путь расширения. Строку из воздуха не
+/// создаём — если на диске нет ни одной копии (объект удалён), выходим (удаление
+/// ведёт отдельная ветка Фазы 2).
+fn upsert_metadata_object(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    xml_path: &Path,
+) -> Result<()> {
+    let (meta_type, full_name) = match object_full_name_any(xml_path) {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+    let folder = match xml_path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+    let stem = match xml_path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+
+    let roots = sub_config_roots(repo_root); // base-first
+    let mut synonym: Option<String> = None;
+    let mut owner = String::new();
+    let mut owner_is_base = false;
+    let mut any_copy = false;
+    for sub_root in &roots {
+        let cand = sub_root.join(&folder).join(format!("{}.xml", stem));
+        if !cand.is_file() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&cand) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        any_copy = true;
+        // Синоним base-first: первый непустой (roots идут base-first).
+        if synonym.is_none() {
+            if let Some((_mt, _nm, Some(s))) = parse_object_header_xml(&content) {
+                if !s.is_empty() {
+                    synonym = Some(s);
+                }
+            }
+        }
+        if owner_is_base {
+            continue;
+        }
+        let ext_name = compute_extension_name(repo_root, sub_root);
+        let belonging = parse_object_belonging(&content);
+        if ext_name.is_empty() || belonging.as_deref() != Some("Native") {
+            // base-root, либо Adopted, либо тега нет → владелец база.
+            owner = String::new();
+            owner_is_base = true;
+        } else {
+            // Native в расширении.
+            owner = ext_name;
+        }
+    }
+
+    if !any_copy {
+        return Ok(());
+    }
+
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym, sub_config) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(repo, full_name) DO UPDATE SET \
+             meta_type = excluded.meta_type, \
+             name = excluded.name, \
+             synonym = excluded.synonym, \
+             sub_config = excluded.sub_config",
+        params![REPO_DEFAULT, &full_name, meta_type, &stem, synonym, &owner],
+    )?;
+    conn.execute("COMMIT", [])?;
     Ok(())
 }
 
@@ -846,10 +1016,12 @@ fn update_event_subscription_for_file(conn: &rusqlite::Connection, xml_path: &Pa
 ///   * `EventSubscriptions/*.xml` → per-sub строка + slice-rebuild слоя
 ///     `subscription`.
 ///
-/// Изменение `Configuration.xml` = структурное изменение состава объектов
-/// (добавление/удаление/переименование): редкое, приходит большим батчом —
-/// для него делаем полный `run_index_extras` (проще и корректнее, чем
-/// частично латать состав + attributes_json всех объектов).
+/// Изменение `ConfigDumpInfo.xml` (опись выгрузки) = триггер сверки состава
+/// объектов области (Фаза 3): `reconcile_area` точечно diff-ит реестр
+/// `config_manifest` и удаляет из индекса ТОЛЬКО пропавшие объекты (каскад по
+/// дому / пере-сборка заимствователя). Добавленные и изменённые объекты
+/// индексируются своим ходом пофайловыми ветками — квадратичный полный пересбор
+/// метаданного слоя на каждую область больше не нужен.
 ///
 /// `ANALYZE` здесь не вызываем (в отличие от полного пути): статистика,
 /// собранная при initial reindex, остаётся достаточной; ежебатчевый ANALYZE
@@ -862,8 +1034,11 @@ pub fn run_incremental_extras(
     deleted: &[std::path::PathBuf],
 ) -> Result<()> {
     let mut bsl_paths: Vec<&std::path::PathBuf> = Vec::new();
-    let mut config_changed = false;
+    let mut dump_info_areas: Vec<std::path::PathBuf> = Vec::new();
     let mut object_xmls: Vec<&std::path::PathBuf> = Vec::new();
+    // Корневые объектные XML ВСЕХ типов верхнего уровня (надмножество object_xmls)
+    // для точечного upsert перечня/синонима/владельца. Только changed (см. ниже).
+    let mut all_object_xmls: Vec<&std::path::PathBuf> = Vec::new();
     let mut form_xmls: Vec<&std::path::PathBuf> = Vec::new();
     let mut sub_xmls: Vec<&std::path::PathBuf> = Vec::new();
     // Источники data_links конфиг-уровня / role_rights изменились в этом батче.
@@ -891,8 +1066,17 @@ pub fn run_incremental_extras(
         }
         if ext.eq_ignore_ascii_case("bsl") {
             bsl_paths.push(p);
-        } else if fname == "Configuration.xml" {
-            config_changed = true;
+        } else if fname == "ConfigDumpInfo.xml" {
+            // Опись выгрузки области — триггер сверки реестра config_manifest
+            // (Фаза 3). Область = каталог описи (рядом с Configuration.xml).
+            // Configuration.xml триггером БОЛЬШЕ не служит: источник истины о
+            // составе объектов — опись, а не манифест. Дедуп областей батча.
+            if let Some(area_root) = p.parent() {
+                let ar = area_root.to_path_buf();
+                if !dump_info_areas.contains(&ar) {
+                    dump_info_areas.push(ar);
+                }
+            }
         } else if fname == "Form.xml" {
             form_xmls.push(p);
         } else if p
@@ -908,6 +1092,17 @@ pub fn run_incremental_extras(
         }
     }
 
+    // Перечень + синоним + владелец точечно на объектных событиях (ВСЕ типы
+    // верхнего уровня, а не только object_xmls со структурой): закрывает дыру,
+    // когда в батче нет Configuration.xml. Только changed — существующие файлы;
+    // удаление объектов ведёт отдельная ветка (Фаза 2), а upsert по несуществующим
+    // копиям и так самозащищён (any_copy).
+    for p in changed.iter() {
+        if object_full_name_any(p).is_some() {
+            all_object_xmls.push(p);
+        }
+    }
+
     // Структурное изменение состава объектов (Configuration.xml в батче): мог
     // добавиться/удалиться/переименоваться объект. Пересобираем ТОЛЬКО лёгкий
     // XML-слой (перечень + структура + связи + права + формы + подписки + модули,
@@ -916,9 +1111,30 @@ pub fn run_incremental_extras(
     // поэтому здесь НЕ делаем return и НЕ зовём полный run_index_extras — это
     // убирает многоминутный re-enrichment на ходу (зависание daemon на bulk git).
     let conn = storage.conn();
-    if config_changed {
-        if let Err(e) = run_index_extras_metadata_layer(repo_root, conn) {
-            tracing::warn!("incremental metadata-layer rebuild: {}", e);
+    // Фаза 3: сверка затронутых областей по свежей описи вместо квадратичного
+    // полного пересбора метаданного слоя. Каждая область → точечный diff реестра
+    // config_manifest; индексные действия — ТОЛЬКО на удалении объектов (каскад
+    // по дому / пере-сборка заимствователя). Добавление и изменение объектов
+    // приезжает своим ходом через пофайловые ветки ниже (upsert_metadata_object
+    // / update_*_for_*). reconcile_area ведёт собственные транзакции, поэтому
+    // безопасен до пофайловых веток; home объекта читается ДО их правок.
+    for area_root in &dump_info_areas {
+        match reconcile_area(repo_root, conn, area_root) {
+            Ok(s) => tracing::info!(
+                "reconcile_area {}: +{} ~{} -{} (объектов удалено {}, пере-собрано {})",
+                area_root.display(), s.added, s.updated, s.removed,
+                s.deleted_objects, s.remerged_objects,
+            ),
+            Err(e) => tracing::warn!("reconcile_area {}: {}", area_root.display(), e),
+        }
+    }
+    // Точечный upsert перечня/синонима/владельца по каждому изменённому объекту.
+    // Идёт ПОСЛЕ config_changed-блока: если тот сделал полный reinsert (sub_config
+    // там всегда '' — Configuration.xml не знает ObjectBelonging), upsert поверх
+    // выставит корректного владельца Native-объектам.
+    for p in &all_object_xmls {
+        if let Err(e) = upsert_metadata_object(repo_root, conn, p) {
+            tracing::warn!("upsert_metadata_object {}: {}", p.display(), e);
         }
     }
     for p in &object_xmls {
@@ -933,10 +1149,21 @@ pub fn run_incremental_extras(
     }
     // .bsl — точечный per-file апдейт слоя direct (O(рёбер файла)) + обратного
     // индекса использований объектов МД в коде (metadata_code_usages).
+    // Кэш configVersion по sub-config на время батча — ConfigDumpInfo.xml один
+    // на sub-config, парсить его на каждый .bsl большой пачки расточительно.
+    let mut cfgver_cache: std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashMap<String, String>,
+    > = std::collections::HashMap::new();
     for p in &bsl_paths {
         update_call_graph_direct_for_file(repo_root, conn, p)?;
         update_code_usages_for_file(repo_root, conn, p)?;
         update_procedure_terms_for_file(repo_root, conn, p)?;
+        // Точечное ведение metadata_modules (dbgs): завести/обновить строку
+        // модуля этого .bsl. Superset при живом config_changed-триггере.
+        if let Err(e) = update_metadata_module_for_file(repo_root, conn, p, &mut cfgver_cache) {
+            tracing::warn!("update_metadata_module_for_file {}: {}", p.display(), e);
+        }
     }
     // Слой extension_override зависит от functions.override_* (обновляется
     // core-индексатором при правке .bsl) — полный пересбор дёшев (один SELECT).
@@ -957,6 +1184,14 @@ pub fn run_incremental_extras(
     }
     if roles_dirty {
         index_role_rights(repo_root, conn)?;
+    }
+    // Освежить статистику планировщика, если графовые таблицы (data_links /
+    // proc_call_graph) разъехались со статистикой в ≥1.5× (например, bulk-залив
+    // расширений). Только когда рёбра реально могли измениться в этом батче.
+    if !dump_info_areas.is_empty() || !bsl_paths.is_empty() || !object_xmls.is_empty() || refs_dirty {
+        if let Err(e) = maybe_analyze_graph_tables(conn) {
+            tracing::warn!("maybe_analyze_graph_tables: {}", e);
+        }
     }
     Ok(())
 }
@@ -1546,6 +1781,278 @@ fn resolve_callee_keys_by_manager(conn: &rusqlite::Connection, file_scope: Optio
     }
     conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_mmeth; DROP TABLE IF EXISTS tmp_pcg_coll;")?;
     Ok(())
+}
+
+/// Наполнить реестр `config_manifest` строками ConfigDumpInfo.xml всех
+/// областей выгрузки (base + каждое расширение). Полный DELETE repo +
+/// reinsert — идемпотентно, как остальные фазы слоя метаданных. `area`
+/// вычисляется той же `compute_extension_name`, что и
+/// `metadata_objects.sub_config` (дом объекта), поэтому Фаза 2 отличит
+/// пропажу строки у дома (реальное удаление) от пропажи у заимствователя.
+/// Дёшево: читает только текст описей, объектные XML не трогает.
+fn index_config_manifest(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let roots = sub_config_roots(repo_root); // base-first
+
+    // Защита от cascade-ошибки (см. index_metadata_objects): закрыть
+    // возможную открытую транзакцию предыдущей фазы перед своей.
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM config_manifest WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO config_manifest (repo, area, full_name, config_version) \
+         VALUES (?, ?, ?, ?)",
+    )?;
+    let mut total = 0usize;
+    for sub_root in &roots {
+        let area = compute_extension_name(repo_root, sub_root);
+        let rows = match parse_config_dump_info_rows(sub_root) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("config_manifest parse {}: {}", sub_root.display(), e);
+                continue;
+            }
+        };
+        for (full_name, config_version) in rows {
+            stmt.execute(params![REPO_DEFAULT, &area, &full_name, &config_version])?;
+            total += 1;
+        }
+    }
+    drop(stmt);
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!(
+        "config_manifest: записано {} строк описи из {} областей",
+        total,
+        roots.len(),
+    );
+    Ok(())
+}
+
+/// Итог сверки одной области: сколько строк реестра добавлено/обновлено/убрано и
+/// сколько объектов реально удалено каскадом / пере-собрано после ухода
+/// заимствователя. Для логов и тестов.
+#[derive(Default, Debug)]
+struct ReconcileStats {
+    added: usize,
+    updated: usize,
+    removed: usize,
+    deleted_objects: usize,
+    remerged_objects: usize,
+}
+
+/// Множественная папка выгрузки по singular meta_type (обратный поиск в
+/// `ALL_OBJECT_FOLDERS`): `Document` → `Documents`, `Report` → `Reports`.
+/// `metadata_forms.owner_full_name` и `metadata_modules.object_name` хранят имя в
+/// формате `<PluralFolder>.<Имя>` (проверено на боевом индексе; комментарий в
+/// schema.rs про singular full_name модулей устарел — реально плюрал).
+fn plural_folder(meta_type: &str) -> Option<&'static str> {
+    ALL_OBJECT_FOLDERS
+        .iter()
+        .find(|(_folder, mt)| *mt == meta_type)
+        .map(|(folder, _mt)| *folder)
+}
+
+/// Экранировать спецсимволы LIKE (`\`, `%`, `_`) для поиска по префиксу имени —
+/// в именах 1С встречается `_` (например `ent_ВводНачислений`), без экранирования
+/// он схлопнулся бы в «любой символ».
+fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// Метаданные объекта по его singular full_name (`Catalog.X`) из
+/// `metadata_objects`: (meta_type, name-stem, дом = `sub_config`). `None` — если
+/// строки нет (значит full_name — под-элемент/модуль, а не самостоятельный объект).
+fn lookup_object_meta(
+    conn: &rusqlite::Connection,
+    full_name: &str,
+) -> Option<(String, String, String)> {
+    match conn.query_row(
+        "SELECT meta_type, name, sub_config FROM metadata_objects WHERE repo = ? AND full_name = ?",
+        params![REPO_DEFAULT, full_name],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => {
+            tracing::warn!("lookup_object_meta {}: {}", full_name, e);
+            None
+        }
+    }
+}
+
+/// Каскадное удаление объекта — когда его уронила ДОМАШНЯЯ область (реальное
+/// удаление). Сносит: строку объекта, связи данных в обе стороны, формы, модули
+/// и ВСЕ строки объекта (сам + под-элементы) во ВСЕХ областях реестра. Роли и
+/// конфиг-связи не трогаем — их ведут отдельные проходы. Граф вызовов модулей
+/// чистится по удалению .bsl-файлов (direct_edge_files).
+fn delete_object_cascade(
+    conn: &rusqlite::Connection,
+    full_name: &str,
+    meta_type: &str,
+    name: &str,
+) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_objects WHERE repo = ? AND full_name = ?",
+        params![REPO_DEFAULT, full_name],
+    )?;
+    conn.execute(
+        "DELETE FROM data_links WHERE repo = ? AND (from_object = ? OR to_object = ?)",
+        params![REPO_DEFAULT, full_name, full_name],
+    )?;
+    if let Some(folder) = plural_folder(meta_type) {
+        let plural = format!("{}.{}", folder, name);
+        conn.execute(
+            "DELETE FROM metadata_forms WHERE repo = ? AND owner_full_name = ?",
+            params![REPO_DEFAULT, &plural],
+        )?;
+        conn.execute(
+            "DELETE FROM metadata_modules WHERE repo = ? AND object_name = ?",
+            params![REPO_DEFAULT, &plural],
+        )?;
+    }
+    // Сам объект + его под-элементы/модули (`X.*`) во ВСЕХ областях реестра.
+    conn.execute(
+        "DELETE FROM config_manifest WHERE repo = ? AND (full_name = ? OR full_name LIKE ? ESCAPE '\\')",
+        params![REPO_DEFAULT, full_name, format!("{}.%", like_escape(full_name))],
+    )?;
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Пере-сборка объекта после ухода ЗАИМСТВОВАТЕЛЯ (дом жив): объект не удаляем,
+/// перечитываем перечень/синоним/владельца и структуру реквизитов по ОСТАВШИМСЯ
+/// на диске областям (упавшая копия расширения уже исчезла с диска, мердж её не
+/// подхватит). Переиспользует пофайловые `upsert_metadata_object` +
+/// `update_object_attributes_for_object` (каждая ведёт свою транзакцию).
+fn remerge_object(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    meta_type: &str,
+    name: &str,
+) -> Result<()> {
+    let folder = match plural_folder(meta_type) {
+        Some(f) => f,
+        None => return Ok(()),
+    };
+    let rel = format!("{}/{}.xml", folder, name);
+    let xml_path = sub_config_roots(repo_root)
+        .into_iter()
+        .map(|root| root.join(&rel))
+        .find(|p| p.is_file());
+    let xml_path = match xml_path {
+        Some(p) => p,
+        None => return Ok(()), // корневого XML нет (объект без структуры) — пере-сливать нечего
+    };
+    upsert_metadata_object(repo_root, conn, &xml_path)?;
+    update_object_attributes_for_object(repo_root, conn, &xml_path)?;
+    Ok(())
+}
+
+/// Сверка ОДНОЙ области: свежая опись `ConfigDumpInfo.xml` ↔ строки этой области
+/// в реестре. Появились/изменились → правим ТОЛЬКО реестр (объектные файлы
+/// приедут своим ходом через пофайловую обработку). Пропали → приводим реестр к
+/// свежему виду, а по индексу действуем ТОЛЬКО для пропавших ОБЪЕКТОВ по правилу
+/// дома (`metadata_objects.sub_config`): дом уронил → каскадное удаление;
+/// заимствователь уронил → пере-сборка. Пропавшие под-элементы — только реестр
+/// (их объект-владелец чинит своя пофайловая обработка, Вариант А).
+fn reconcile_area(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    area_root: &Path,
+) -> Result<ReconcileStats> {
+    let area = compute_extension_name(repo_root, area_root);
+    // Опись могла исчезнуть (область целиком удалена в этом батче) → трактуем как
+    // пустую: все прежние строки области — пропавшие, объекты чистятся по дому.
+    let fresh: std::collections::HashMap<String, String> =
+        if area_root.join("ConfigDumpInfo.xml").is_file() {
+            parse_config_dump_info_rows(area_root)?.into_iter().collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    let mut old: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT full_name, config_version FROM config_manifest WHERE repo = ? AND area = ?",
+        )?;
+        let rows = stmt.query_map(params![REPO_DEFAULT, &area], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (fnm, cv) = row?;
+            old.insert(fnm, cv);
+        }
+    }
+
+    let mut stats = ReconcileStats::default();
+
+    // 1) Пропавшие строки — индексные действия только для объектов (по дому).
+    //    Каскад/пере-сборка ведут собственные транзакции, поэтому делаем их ДО
+    //    транзакции синхронизации реестра (шаг 2).
+    for full_name in old.keys() {
+        if fresh.contains_key(full_name) {
+            continue;
+        }
+        stats.removed += 1;
+        if let Some((meta_type, name, home)) = lookup_object_meta(conn, full_name) {
+            if area == home {
+                delete_object_cascade(conn, full_name, &meta_type, &name)?;
+                stats.deleted_objects += 1;
+            } else {
+                remerge_object(repo_root, conn, &meta_type, &name)?;
+                stats.remerged_objects += 1;
+            }
+        }
+        // под-элемент/модуль → никаких индексных действий (Вариант А), только реестр ниже
+    }
+
+    // 2) Синхронизация реестра ЭТОЙ области под свежую опись (точечный diff).
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    {
+        let mut del = conn.prepare(
+            "DELETE FROM config_manifest WHERE repo = ? AND area = ? AND full_name = ?",
+        )?;
+        for full_name in old.keys() {
+            if !fresh.contains_key(full_name) {
+                del.execute(params![REPO_DEFAULT, &area, full_name])?;
+            }
+        }
+    }
+    {
+        let mut ins = conn.prepare(
+            "INSERT INTO config_manifest (repo, area, full_name, config_version) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(repo, area, full_name) DO UPDATE SET config_version = excluded.config_version",
+        )?;
+        for (full_name, cv) in &fresh {
+            match old.get(full_name) {
+                Some(oldcv) if oldcv == cv => {}
+                Some(_) => {
+                    ins.execute(params![REPO_DEFAULT, &area, full_name, cv])?;
+                    stats.updated += 1;
+                }
+                None => {
+                    ins.execute(params![REPO_DEFAULT, &area, full_name, cv])?;
+                    stats.added += 1;
+                }
+            }
+        }
+    }
+    conn.execute("COMMIT", [])?;
+
+    Ok(stats)
 }
 
 fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
@@ -2918,6 +3425,115 @@ fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connection) -> Resu
     Ok(())
 }
 
+/// Ближайший предок пути (в пределах `repo_root`), содержащий `Configuration.xml`
+/// — sub-config, которому принадлежит файл. Нужен точечным веткам, чтобы взять
+/// `extension_name`/`config_version` без полного обхода репо. `None`, если ни у
+/// одного предка (вплоть до `repo_root`) нет `Configuration.xml`.
+fn sub_root_for_path(repo_root: &Path, path: &Path) -> Option<std::path::PathBuf> {
+    let mut cur = path.parent();
+    while let Some(dir) = cur {
+        if dir.join("Configuration.xml").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        if dir == repo_root {
+            break;
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// Per-file точечное обновление `metadata_modules` для одного изменённого `.bsl`.
+/// Аналог одной итерации `index_metadata_modules` (те же хелперы classify/owner/
+/// uuid → полная эквивалентность), но по конкретному файлу: закрывает дыру
+/// «строка нового модуля не заводится без Configuration.xml в батче». `config_version`
+/// (только для точности dbgs-breakpoints, не для поиска) берётся из
+/// `ConfigDumpInfo.xml` sub-config'а с кэшем `cfgver_cache` на батч — чтобы не
+/// перечитывать один файл для каждого `.bsl` большой пачки. Не .bsl-модуль
+/// известного типа / без владельца / без UUID → no-op.
+fn update_metadata_module_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    bsl_path: &Path,
+    cfgver_cache: &mut std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashMap<String, String>,
+    >,
+) -> Result<()> {
+    let file_name = match bsl_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return Ok(()),
+    };
+    let module_type = match module_type_by_filename(file_name) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let (effective_type, owner_xml_kind) = classify_module(bsl_path, module_type);
+    let property_id = match property_id_by_type(effective_type) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let owner_info = match owner_xml_kind {
+        OwnerKind::Form => find_form_owner(bsl_path),
+        OwnerKind::Object => find_object_owner(bsl_path),
+    };
+    let (owner_xml_path, object_name) = match owner_info {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let uuid_opt = match owner_xml_kind {
+        OwnerKind::Form => extract_form_uuid_any_from_file(&owner_xml_path).ok().flatten(),
+        OwnerKind::Object => extract_object_uuid_from_file(&owner_xml_path).ok().flatten(),
+    };
+    let object_id = match uuid_opt {
+        Some(u) if !u.is_empty() => u,
+        _ => return Ok(()),
+    };
+
+    let sub_root = sub_root_for_path(repo_root, bsl_path).unwrap_or_else(|| repo_root.to_path_buf());
+    let extension_name = compute_extension_name(repo_root, &sub_root);
+    let config_versions = cfgver_cache
+        .entry(sub_root.clone())
+        .or_insert_with(|| parse_config_dump_info(&sub_root).unwrap_or_default());
+    let config_version = config_versions.get(&object_id).cloned();
+
+    let full_name = format!("{}.{}", object_name, effective_type);
+    let code_path_rel = bsl_path
+        .strip_prefix(repo_root)
+        .unwrap_or(bsl_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "INSERT INTO metadata_modules \
+         (repo, full_name, object_name, module_type, object_id, property_id, \
+          config_version, code_path, extension_name) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(repo, full_name, extension_name) DO UPDATE SET \
+             object_name = excluded.object_name, \
+             module_type = excluded.module_type, \
+             object_id = excluded.object_id, \
+             property_id = excluded.property_id, \
+             config_version = excluded.config_version, \
+             code_path = excluded.code_path",
+        params![
+            REPO_DEFAULT,
+            &full_name,
+            &object_name,
+            effective_type,
+            &object_id,
+            property_id,
+            config_version.as_deref(),
+            &code_path_rel,
+            &extension_name,
+        ],
+    )?;
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
 /// `extension_name` для записи в `metadata_modules` — относительный путь
 /// от корня репо до sub-config. Пустая строка для случая когда
 /// Configuration.xml лежит в самом корне (single-config выгрузка) или
@@ -2937,6 +3553,66 @@ fn compute_extension_name(repo_root: &Path, sub_root: &Path) -> String {
         return String::new();
     }
     s
+}
+
+/// Число строк в таблице, записанное в `sqlite_stat1` на момент последнего
+/// `ANALYZE` (первый токен колонки `stat`). `None` — статистики нет (таблицу
+/// ни разу не анализировали, либо самой `sqlite_stat1` ещё нет).
+fn analyzed_row_count(conn: &rusqlite::Connection, table: &str) -> Option<i64> {
+    let stat: Option<String> = conn
+        .query_row(
+            "SELECT stat FROM sqlite_stat1 WHERE tbl = ?1 LIMIT 1",
+            params![table],
+            |r| r.get(0),
+        )
+        .ok();
+    stat.and_then(|s| s.split_whitespace().next().and_then(|t| t.parse::<i64>().ok()))
+}
+
+/// Разошлась ли реальная величина таблицы со статистикой настолько, что пора
+/// пересчитать `ANALYZE`. Планировщик SQLite меняет план (seek по индексу ↔
+/// перебор всех рёбер) при кратном расхождении, поэтому порог — дрейф в 1.5×
+/// в любую сторону. Пол `FLOOR`: на мелких таблицах статистика неважна.
+fn stats_drifted(current: i64, recorded: Option<i64>) -> bool {
+    const FLOOR: i64 = 1000;
+    match recorded {
+        // Статистики нет: анализируем, только если таблица уже крупная.
+        None => current >= FLOOR,
+        Some(rec) => {
+            if current < FLOOR && rec < FLOOR {
+                return false;
+            }
+            // current ≥ 1.5×rec  ⟺  current*2 ≥ rec*3 (без плавающей точки);
+            // current ≤ rec/1.5  ⟺  current*3 ≤ rec*2.
+            current * 2 >= rec * 3 || current * 3 <= rec * 2
+        }
+    }
+}
+
+/// Пересчитать `ANALYZE`, если величина графовых таблиц (`data_links`,
+/// `proc_call_graph`) разошлась со статистикой в ≥1.5× — иначе рекурсивные
+/// обходы `find_data_path` / `find_path_bsl` деградируют (планировщик без свежей
+/// `sqlite_stat1` перебирает все рёбра вместо seek). Полный `ANALYZE` дёшев
+/// (~0.6 с) относительно этой деградации (сек→минуты), но зовём его лишь при
+/// реальном дрейфе, а не на каждый батч. `ANALYZE` идёт по всей БД (не только
+/// по этим двум таблицам) — это штатно и дёшево.
+fn maybe_analyze_graph_tables(conn: &rusqlite::Connection) -> Result<()> {
+    let mut need = false;
+    for table in ["data_links", "proc_call_graph"] {
+        let current: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM {}", table), [], |r| r.get(0))
+            .unwrap_or(0);
+        if stats_drifted(current, analyzed_row_count(conn, table)) {
+            need = true;
+            break;
+        }
+    }
+    if need {
+        let _ = conn.execute("ROLLBACK", []); // ANALYZE не может идти внутри транзакции
+        conn.execute("ANALYZE", [])?;
+        tracing::info!("ANALYZE: статистика графовых таблиц пересчитана (дрейф ≥1.5×)");
+    }
+    Ok(())
 }
 
 /// Что искать как XML-владелец .bsl-файла модуля.
@@ -3107,9 +3783,10 @@ mod tests {
 
     #[test]
     fn incremental_config_change_adds_new_object() {
-        // Изменение состава (Configuration.xml в батче) → инкрементальный путь
-        // синхронизирует перечень metadata_objects через XML-слой, БЕЗ тяжёлого
-        // полного пересбора. Результат эквивалентен полному run_index_extras.
+        // Фаза 3: добавление объекта в состав. Опись (ConfigDumpInfo.xml) в
+        // батче — триггер сверки реестра; сам объект индексируется своим
+        // корневым XML через пофайловую ветку (upsert_metadata_object).
+        // Результат эквивалентен полному run_index_extras.
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -3117,6 +3794,10 @@ mod tests {
             &repo.join("Configuration.xml"),
             r#"<?xml version="1.0"?>
 <MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="k1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
         );
         let mut storage = fresh_storage(&tmp);
         run_index_extras(&repo, &mut storage).unwrap();
@@ -3131,11 +3812,20 @@ mod tests {
         };
         assert_eq!(cnt(&storage), 1, "исходно один объект");
 
-        // Добавили новый объект Склады в состав (Configuration.xml + .bsl менеджера).
+        // Добавили Склады: Configuration.xml + опись + корневой XML объекта + .bsl.
         write(
             &repo.join("Configuration.xml"),
             r#"<?xml version="1.0"?>
 <MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog><Catalog>Склады</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="k1" configVersion="v1"/><Metadata name="Catalog.Склады" id="s1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
+        );
+        let sklady_xml = repo.join("Catalogs").join("Склады.xml");
+        write(
+            &sklady_xml,
+            r#"<MetaDataObject><Catalog><Properties><Name>Склады</Name></Properties></Catalog></MetaDataObject>"#,
         );
         let bsl = repo
             .join("Catalogs")
@@ -3144,27 +3834,21 @@ mod tests {
             .join("ManagerModule.bsl");
         write(&bsl, "Процедура П() Экспорт\nКонецПроцедуры");
 
-        // Инкрементальный путь с Configuration.xml в батче (как при реальной
-        // выгрузке) → config_changed=true → синхронизация перечня XML-слоем.
+        let dump = repo.join("ConfigDumpInfo.xml");
         run_incremental_extras(
             &repo,
             &mut storage,
-            &[repo.join("Configuration.xml"), bsl],
+            &[repo.join("Configuration.xml"), dump, sklady_xml, bsl],
             &[],
         )
         .unwrap();
 
-        // Эталон: полный пересбор свежей БД того же (изменённого) репо.
         let tmp2 = TempDir::new().unwrap();
         let mut full = fresh_storage(&tmp2);
         run_index_extras(&repo, &mut full).unwrap();
 
         assert_eq!(cnt(&storage), 2, "новый объект Склады заведён");
-        assert_eq!(
-            cnt(&storage),
-            cnt(&full),
-            "incremental metadata_objects == full"
-        );
+        assert_eq!(cnt(&storage), cnt(&full), "incremental metadata_objects == full");
     }
 
     // Набор full_name объектов репо (сортированный) — надёжнее COUNT: ловит и
@@ -3181,8 +3865,8 @@ mod tests {
 
     #[test]
     fn incremental_config_change_removes_object() {
-        // Удаление объекта из состава → инкрементальный путь убирает запись из
-        // metadata_objects (через XML-слой), не оставляя «призрак». Эквивалентно
+        // Фаза 3: удаление объекта из состава. Опись без объекта в батче →
+        // reconcile_area каскадно убирает объект (дом уронил). Эквивалентно
         // полному пересбору.
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("repo");
@@ -3191,6 +3875,18 @@ mod tests {
             &repo.join("Configuration.xml"),
             r#"<?xml version="1.0"?>
 <MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog><Catalog>Склады</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="k1" configVersion="v1"/><Metadata name="Catalog.Склады" id="s1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
+        );
+        write(
+            &repo.join("Catalogs").join("Контрагенты.xml"),
+            r#"<MetaDataObject><Catalog><Properties><Name>Контрагенты</Name></Properties></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("Catalogs").join("Склады.xml"),
+            r#"<MetaDataObject><Catalog><Properties><Name>Склады</Name></Properties></Catalog></MetaDataObject>"#,
         );
         let sklady_bsl = repo
             .join("Catalogs")
@@ -3202,18 +3898,25 @@ mod tests {
         run_index_extras(&repo, &mut storage).unwrap();
         assert_eq!(object_names(&storage).len(), 2, "исходно два объекта");
 
-        // Удалили Склады из состава.
+        // Удалили Склады: опись без него + удаление его файлов с диска.
         write(
             &repo.join("Configuration.xml"),
             r#"<?xml version="1.0"?>
 <MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
         );
+        write(
+            &repo.join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="k1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
+        );
+        let sklady_xml = repo.join("Catalogs").join("Склады.xml");
+        std::fs::remove_file(&sklady_xml).ok();
         std::fs::remove_file(&sklady_bsl).ok();
+        let dump = repo.join("ConfigDumpInfo.xml");
         run_incremental_extras(
             &repo,
             &mut storage,
-            &[repo.join("Configuration.xml")],
-            &[sklady_bsl],
+            &[repo.join("Configuration.xml"), dump],
+            &[sklady_xml, sklady_bsl],
         )
         .unwrap();
 
@@ -3230,9 +3933,9 @@ mod tests {
 
     #[test]
     fn incremental_config_change_reflects_rename() {
-        // Переименование объекта → инкрементальный путь отражает новое имя в
-        // metadata_objects (старое убрано, новое заведено). Число строк не
-        // меняется, поэтому сверяем НАБОР имён. Эквивалентно полному пересбору.
+        // Фаза 3: переименование = удаление старого + добавление нового. Опись
+        // со сменой имени в батче → reconcile_area каскадно сносит старый;
+        // новый объект индексируется своим корневым XML. Сверяем НАБОР имён.
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -3240,6 +3943,14 @@ mod tests {
             &repo.join("Configuration.xml"),
             r#"<?xml version="1.0"?>
 <MetaDataObject><Configuration><ChildObjects><Catalog>Старый</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Старый" id="o1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
+        );
+        write(
+            &repo.join("Catalogs").join("Старый.xml"),
+            r#"<MetaDataObject><Catalog><Properties><Name>Старый</Name></Properties></Catalog></MetaDataObject>"#,
         );
         let old_bsl = repo
             .join("Catalogs")
@@ -3257,18 +3968,30 @@ mod tests {
             r#"<?xml version="1.0"?>
 <MetaDataObject><Configuration><ChildObjects><Catalog>Новый</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
         );
+        write(
+            &repo.join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Новый" id="n1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
+        );
+        let old_xml = repo.join("Catalogs").join("Старый.xml");
+        std::fs::remove_file(&old_xml).ok();
         std::fs::remove_file(&old_bsl).ok();
+        let new_xml = repo.join("Catalogs").join("Новый.xml");
+        write(
+            &new_xml,
+            r#"<MetaDataObject><Catalog><Properties><Name>Новый</Name></Properties></Catalog></MetaDataObject>"#,
+        );
         let new_bsl = repo
             .join("Catalogs")
             .join("Новый")
             .join("Ext")
             .join("ManagerModule.bsl");
         write(&new_bsl, "Процедура П() Экспорт\nКонецПроцедуры");
+        let dump = repo.join("ConfigDumpInfo.xml");
         run_incremental_extras(
             &repo,
             &mut storage,
-            &[repo.join("Configuration.xml"), new_bsl],
-            &[old_bsl],
+            &[repo.join("Configuration.xml"), dump, new_xml, new_bsl],
+            &[old_xml, old_bsl],
         )
         .unwrap();
 
@@ -3313,6 +4036,517 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn all_object_folders_cover_known_meta_types() {
+        // upsert перечня должен покрывать те же типы, что index_metadata_objects
+        // вносит из Configuration.xml (все KNOWN_META_TYPES). Пропуск типа =
+        // тихая дыра после снятия config_changed-триггера (Фаза 2).
+        use crate::xml::configuration::KNOWN_META_TYPES;
+        for mt in KNOWN_META_TYPES {
+            assert!(
+                ALL_OBJECT_FOLDERS.iter().any(|(_folder, t)| t == mt),
+                "meta_type {} не покрыт ALL_OBJECT_FOLDERS — upsert перечня его пропустит",
+                mt
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_metadata_object_owner_and_synonym_base_first() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        // База: объект Контрагенты (без ObjectBelonging → владелец база).
+        write(
+            &repo.join("base").join("Configuration.xml"),
+            r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("Catalogs").join("Контрагенты.xml"),
+            r#"<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core"><Catalog><Properties><Name>Контрагенты</Name><Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Контрагенты база</v8:content></v8:item></Synonym></Properties></Catalog></MetaDataObject>"#,
+        );
+        // Расширение EF_A: Контрагенты заимствован (Adopted) + собственный Native.
+        write(
+            &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+            r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog><Catalog>МойОбъект</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml"),
+            r#"<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core"><Catalog><Properties><Name>Контрагенты</Name><Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Контрагенты расш</v8:content></v8:item></Synonym><ObjectBelonging>Adopted</ObjectBelonging></Properties></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("extensions").join("EF_A").join("Catalogs").join("МойОбъект.xml"),
+            r#"<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core"><Catalog><Properties><Name>МойОбъект</Name><Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Мой</v8:content></v8:item></Synonym><ObjectBelonging>Native</ObjectBelonging></Properties></Catalog></MetaDataObject>"#,
+        );
+
+        let storage = fresh_storage(&tmp);
+        let conn = storage.conn();
+
+        // Заимствованный объект (есть копия в base): владелец '', синоним base-first
+        // (base перебивает расширенческий "Контрагенты расш").
+        upsert_metadata_object(
+            &repo,
+            conn,
+            &repo.join("base").join("Catalogs").join("Контрагенты.xml"),
+        )
+        .unwrap();
+        let (syn, sub): (Option<String>, String) = conn
+            .query_row(
+                "SELECT synonym, sub_config FROM metadata_objects WHERE full_name = ?",
+                params!["Catalog.Контрагенты"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(syn.as_deref(), Some("Контрагенты база"), "синоним base-first");
+        assert_eq!(sub, "", "Adopted/base → владелец база ''");
+
+        // Собственный объект расширения (Native, только в ext): владелец = путь расширения.
+        upsert_metadata_object(
+            &repo,
+            conn,
+            &repo.join("extensions").join("EF_A").join("Catalogs").join("МойОбъект.xml"),
+        )
+        .unwrap();
+        let (syn2, sub2): (Option<String>, String) = conn
+            .query_row(
+                "SELECT synonym, sub_config FROM metadata_objects WHERE full_name = ?",
+                params!["Catalog.МойОбъект"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(syn2.as_deref(), Some("Мой"));
+        assert_eq!(sub2, "extensions/EF_A", "Native → владелец = путь расширения");
+    }
+
+    #[test]
+    fn fills_config_manifest_from_all_areas() {
+        // Реестр config_manifest наполняется из ConfigDumpInfo.xml каждой области
+        // (base + расширения). Проверяем: формат area совпадает с sub_config
+        // ('' / 'extensions/EF_A'), заимствованный объект попадает в ОБЕ области,
+        // под-элемент хранится с пустым config_version.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write(&repo.join("base").join("Configuration.xml"), "<MetaDataObject/>");
+        write(
+            &repo.join("base").join("ConfigDumpInfo.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ConfigDumpInfo><ConfigVersions>
+  <Metadata name="Catalog.Контрагенты" id="c-uuid" configVersion="cbase">
+    <Metadata name="Catalog.Контрагенты.Attribute.ИНН" id="a-uuid"/>
+  </Metadata>
+  <Metadata name="Document.ЗаказКлиента" id="d-uuid" configVersion="zbase"/>
+</ConfigVersions></ConfigDumpInfo>"#,
+        );
+        write(
+            &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+            "<MetaDataObject/>",
+        );
+        write(
+            &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ConfigDumpInfo><ConfigVersions>
+  <Metadata name="Catalog.Контрагенты" id="c-uuid" configVersion="cext"/>
+  <Metadata name="Catalog.МойОбъект" id="m-uuid" configVersion="mynative"/>
+</ConfigVersions></ConfigDumpInfo>"#,
+        );
+
+        let storage = fresh_storage(&tmp);
+        let conn = storage.conn();
+        index_config_manifest(&repo, conn).unwrap();
+
+        // Всего 5 строк: base(3) + ext(2).
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM config_manifest", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 5);
+
+        // area базы = '' с версией объекта.
+        let cv_base: String = conn
+            .query_row(
+                "SELECT config_version FROM config_manifest WHERE area = '' AND full_name = 'Catalog.Контрагенты'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cv_base, "cbase");
+
+        // area расширения = 'extensions/EF_A' — тот же формат, что metadata_objects.sub_config.
+        let cv_ext: String = conn
+            .query_row(
+                "SELECT config_version FROM config_manifest WHERE area = 'extensions/EF_A' AND full_name = 'Catalog.Контрагенты'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cv_ext, "cext");
+
+        // Заимствованный объект числится в ДВУХ областях (ключевая предпосылка Фазы 2).
+        let areas: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT area) FROM config_manifest WHERE full_name = 'Catalog.Контрагенты'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(areas, 2, "заимствованный объект — в base и в расширении");
+
+        // Под-элемент: config_version пустой.
+        let cv_sub: String = conn
+            .query_row(
+                "SELECT config_version FROM config_manifest WHERE full_name = 'Catalog.Контрагенты.Attribute.ИНН'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cv_sub, "", "под-элемент хранится без configVersion");
+
+        // Native-объект расширения — только в его области.
+        let native_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config_manifest WHERE full_name = 'Catalog.МойОбъект'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(native_rows, 1);
+    }
+
+    #[test]
+    fn reconcile_home_delete_cascades_object() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write(
+            &repo.join("base").join("Configuration.xml"),
+            r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Удаляемый</Catalog><Catalog>Живой</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("Catalogs").join("Удаляемый.xml"),
+            r#"<MetaDataObject><Catalog><Properties><Name>Удаляемый</Name></Properties></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("Catalogs").join("Живой.xml"),
+            r#"<MetaDataObject><Catalog><Properties><Name>Живой</Name></Properties></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions>
+  <Metadata name="Catalog.Удаляемый" id="u1" configVersion="v1">
+    <Metadata name="Catalog.Удаляемый.Attribute.Реквизит" id="a1"/>
+  </Metadata>
+  <Metadata name="Catalog.Живой" id="z1" configVersion="v2"/>
+</ConfigVersions></ConfigDumpInfo>"#,
+        );
+
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        let conn = storage.conn();
+        let cnt1 = |c: &rusqlite::Connection, sql: &str, p: &str| -> i64 {
+            c.query_row(sql, params![p], |r| r.get::<_, i64>(0)).unwrap()
+        };
+        assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM metadata_objects WHERE full_name = ?", "Catalog.Удаляемый"), 1);
+        assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM config_manifest WHERE full_name = ?", "Catalog.Удаляемый"), 1);
+
+        // Удаляемый пропал из свежей описи (Живой остался) — уронила домашняя область.
+        write(
+            &repo.join("base").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions>
+  <Metadata name="Catalog.Живой" id="z1" configVersion="v2"/>
+</ConfigVersions></ConfigDumpInfo>"#,
+        );
+        let stats = reconcile_area(&repo, conn, &repo.join("base")).unwrap();
+        assert_eq!(stats.deleted_objects, 1);
+
+        assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM metadata_objects WHERE full_name = ?", "Catalog.Удаляемый"), 0);
+        assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM config_manifest WHERE full_name LIKE ?", "Catalog.Удаляемый%"), 0);
+        assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM metadata_objects WHERE full_name = ?", "Catalog.Живой"), 1);
+    }
+
+    #[test]
+    fn reconcile_borrower_drop_keeps_object() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        // База: объект Общий (дом = база).
+        write(
+            &repo.join("base").join("Configuration.xml"),
+            r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Общий</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("Catalogs").join("Общий.xml"),
+            r#"<MetaDataObject><Catalog><Properties><Name>Общий</Name></Properties></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Общий" id="o1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
+        );
+        // Расширение EF_A заимствует Общий (Adopted).
+        write(
+            &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+            r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Общий</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("extensions").join("EF_A").join("Catalogs").join("Общий.xml"),
+            r#"<MetaDataObject><Catalog><Properties><Name>Общий</Name><ObjectBelonging>Adopted</ObjectBelonging></Properties></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Общий" id="o1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
+        );
+
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        let conn = storage.conn();
+        // до: объект в реестре в двух областях
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Общий'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            2
+        );
+
+        // EF_A перестало заимствовать: пропал из его описи И его копия XML удалена с диска.
+        std::fs::remove_file(repo.join("extensions").join("EF_A").join("Catalogs").join("Общий.xml")).unwrap();
+        write(
+            &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#,
+        );
+        let stats = reconcile_area(&repo, conn, &repo.join("extensions").join("EF_A")).unwrap();
+        assert_eq!(stats.remerged_objects, 1, "заимствователь уронил — пере-сборка, не удаление");
+        assert_eq!(stats.deleted_objects, 0);
+
+        let cnt2 = |c: &rusqlite::Connection, sql: &str, a: &str, b: &str| -> i64 {
+            c.query_row(sql, params![a, b], |r| r.get::<_, i64>(0)).unwrap()
+        };
+        // объект цел (дом — база); участие EF_A снято, база осталась
+        assert_eq!(cnt2(conn, "SELECT COUNT(*) FROM metadata_objects WHERE full_name=? AND sub_config=?", "Catalog.Общий", ""), 1);
+        assert_eq!(cnt2(conn, "SELECT COUNT(*) FROM config_manifest WHERE full_name=? AND area=?", "Catalog.Общий", ""), 1);
+        assert_eq!(cnt2(conn, "SELECT COUNT(*) FROM config_manifest WHERE full_name=? AND area=?", "Catalog.Общий", "extensions/EF_A"), 0);
+    }
+
+    #[test]
+    fn reconcile_subelement_disappearance_registry_only() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write(
+            &repo.join("base").join("Configuration.xml"),
+            r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Товар</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("Catalogs").join("Товар.xml"),
+            r#"<MetaDataObject><Catalog><Properties><Name>Товар</Name></Properties></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions>
+  <Metadata name="Catalog.Товар" id="t1" configVersion="v1">
+    <Metadata name="Catalog.Товар.Attribute.Цвет" id="c1"/>
+  </Metadata>
+</ConfigVersions></ConfigDumpInfo>"#,
+        );
+
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        let conn = storage.conn();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Товар.Attribute.Цвет'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            1
+        );
+
+        // Убрали реквизит Цвет; объект Товар остался.
+        write(
+            &repo.join("base").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions>
+  <Metadata name="Catalog.Товар" id="t1" configVersion="v1"/>
+</ConfigVersions></ConfigDumpInfo>"#,
+        );
+        let stats = reconcile_area(&repo, conn, &repo.join("base")).unwrap();
+        assert_eq!(stats.deleted_objects, 0, "реквизит — не удаление объекта (Вариант А)");
+        assert_eq!(stats.remerged_objects, 0);
+
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Товар'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Товар.Attribute.Цвет'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Товар'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn incremental_dumpinfo_change_dispatches_reconcile_cascade() {
+        // Фаза 3: изменение ConfigDumpInfo.xml в батче run_incremental_extras
+        // маршрутизируется в reconcile_area затронутой области. Объект пропал из
+        // свежей описи домашней (base) области → каскадное удаление из индекса,
+        // БЕЗ опоры на Configuration.xml как триггер.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write(
+            &repo.join("base").join("Configuration.xml"),
+            r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Удаляемый</Catalog><Catalog>Живой</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("Catalogs").join("Удаляемый.xml"),
+            r#"<MetaDataObject><Catalog><Properties><Name>Удаляемый</Name></Properties></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("Catalogs").join("Живой.xml"),
+            r#"<MetaDataObject><Catalog><Properties><Name>Живой</Name></Properties></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("base").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions>
+  <Metadata name="Catalog.Удаляемый" id="u1" configVersion="v1"/>
+  <Metadata name="Catalog.Живой" id="z1" configVersion="v2"/>
+</ConfigVersions></ConfigDumpInfo>"#,
+        );
+
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        {
+            let conn = storage.conn();
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Удаляемый'", [], |r| r.get::<_, i64>(0)).unwrap(),
+                1
+            );
+        }
+
+        // Удаляемый пропал из описи; его XML тоже удалён с диска. Батч: изменённая
+        // опись (триггер сверки) + удаление объектного XML.
+        write(
+            &repo.join("base").join("ConfigDumpInfo.xml"),
+            r#"<ConfigDumpInfo><ConfigVersions>
+  <Metadata name="Catalog.Живой" id="z1" configVersion="v2"/>
+</ConfigVersions></ConfigDumpInfo>"#,
+        );
+        let del_xml = repo.join("base").join("Catalogs").join("Удаляемый.xml");
+        std::fs::remove_file(&del_xml).unwrap();
+        let dump = repo.join("base").join("ConfigDumpInfo.xml");
+        run_incremental_extras(&repo, &mut storage, &[dump], &[del_xml]).unwrap();
+
+        let conn = storage.conn();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Удаляемый'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0,
+            "объект каскадно удалён через диспетчеризацию в reconcile_area"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM config_manifest WHERE full_name LIKE 'Catalog.Удаляемый%'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0,
+            "строки реестра удаляемого объекта убраны"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Живой'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            1,
+            "живой объект не задет"
+        );
+    }
+
+    #[test]
+    fn incremental_bsl_event_upserts_metadata_module_matches_full() {
+        // .bsl-событие БЕЗ Configuration.xml в батче (config_changed=false):
+        // строку metadata_modules нового модуля заводит точечная ветка
+        // update_metadata_module_for_file. Результат обязан совпасть с полным
+        // run_index_extras (те же classify/owner/uuid хелперы).
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?><MetaDataObject><Configuration><ChildObjects><Catalog>Склады</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("Catalogs").join("Склады.xml"),
+            r#"<?xml version="1.0"?><MetaDataObject><Catalog uuid="11111111-1111-1111-1111-111111111111"><Properties><Name>Склады</Name></Properties></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("ConfigDumpInfo.xml"),
+            r#"<?xml version="1.0"?><ConfigDumpInfo><ConfigVersions><Metadata id="11111111-1111-1111-1111-111111111111" configVersion="VER-1"/></ConfigVersions></ConfigDumpInfo>"#,
+        );
+        let bsl = repo
+            .join("Catalogs")
+            .join("Склады")
+            .join("Ext")
+            .join("ManagerModule.bsl");
+        write(&bsl, "Процедура П() Экспорт\nКонецПроцедуры");
+
+        let module_row = |st: &Storage| -> Option<(String, String, Option<String>, String)> {
+            st.conn()
+                .query_row(
+                    "SELECT full_name, object_id, config_version, extension_name \
+                     FROM metadata_modules WHERE repo=? AND module_type='ManagerModule'",
+                    params![REPO_DEFAULT],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .ok()
+        };
+
+        // Эталон: полный пересбор.
+        let tmp_full = TempDir::new().unwrap();
+        let mut full = fresh_storage(&tmp_full);
+        run_index_extras(&repo, &mut full).unwrap();
+        let full_row = module_row(&full).expect("полный пересбор завёл строку модуля");
+        assert_eq!(full_row.0, "Catalogs.Склады.ManagerModule");
+        assert_eq!(full_row.1, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(full_row.2.as_deref(), Some("VER-1"));
+
+        // Инкрементальный путь: baseline → убрали строку модуля → .bsl-событие её
+        // восстанавливает через точечную ветку (Configuration.xml в батче нет).
+        let tmp_inc = TempDir::new().unwrap();
+        let mut inc = fresh_storage(&tmp_inc);
+        run_index_extras(&repo, &mut inc).unwrap();
+        inc.conn()
+            .execute(
+                "DELETE FROM metadata_modules WHERE repo=? AND module_type='ManagerModule'",
+                params![REPO_DEFAULT],
+            )
+            .unwrap();
+        assert!(module_row(&inc).is_none(), "строку убрали для чистоты теста");
+
+        run_incremental_extras(&repo, &mut inc, &[bsl.clone()], &[]).unwrap();
+        let inc_row = module_row(&inc).expect("точечная ветка восстановила строку");
+        assert_eq!(inc_row, full_row, "инкрементальный upsert модуля == полный пересбор");
+    }
+
+    #[test]
+    fn stats_drifted_threshold_is_1_5x_with_floor() {
+        // Пол: мелкие таблицы (обе величины < 1000) не триггерят, даже кратно.
+        assert!(!stats_drifted(30, Some(10)), "3×, но обе < FLOOR");
+        assert!(!stats_drifted(500, None), "нет статы, но таблица < FLOOR");
+        // Рост крупной таблицы: 1.5× ровно — дрейф, 1.33× — нет.
+        assert!(stats_drifted(9000, Some(6000)), "1.5× ровно");
+        assert!(!stats_drifted(8000, Some(6000)), "1.33× — не дрейф");
+        // Срез: до /1.5 — дрейф, 0.75× — нет.
+        assert!(stats_drifted(4000, Some(6000)), "6000/1.5 = 4000 — дрейф вниз");
+        assert!(!stats_drifted(4500, Some(6000)), "0.75× — не дрейф");
+        // Нет статистики, но таблица уже крупная.
+        assert!(stats_drifted(5000, None));
+    }
+
+    #[test]
+    fn maybe_analyze_runs_when_graph_grows() {
+        let tmp = TempDir::new().unwrap();
+        let storage = fresh_storage(&tmp);
+        let conn = storage.conn();
+        // Наполняем data_links выше пола; статистики ещё нет.
+        for i in 0..1500 {
+            conn.execute(
+                "INSERT OR IGNORE INTO data_links \
+                 (repo, from_object, from_path, to_object, link_kind, is_composite, is_universal) \
+                 VALUES (?, 'Catalog.A', ?, ?, 'attr', 0, 0)",
+                params![REPO_DEFAULT, format!("p{}", i), format!("Catalog.T{}", i)],
+            )
+            .unwrap();
+        }
+        assert!(analyzed_row_count(conn, "data_links").is_none(), "до ANALYZE статы нет");
+
+        maybe_analyze_graph_tables(conn).unwrap();
+
+        let rec = analyzed_row_count(conn, "data_links");
+        assert!(rec.is_some(), "ANALYZE должен был записать sqlite_stat1");
+        assert!(rec.unwrap() >= 1000, "записанное число строк отражает реальный размер");
     }
 
     #[test]
