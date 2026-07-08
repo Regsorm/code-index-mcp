@@ -5,6 +5,35 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.44.4] — 2026-07-08
+
+**The incremental rebuild of an object when a borrower leaves is now fully symmetric with a full reindex: `data_links`, `attributes_json` and `metadata_modules` are restored by merging across ALL remaining copies (base + extensions), not from the single arriving file. On a real UT 11.5 the incremental result after a borrower leaves matched the full rebuild across all 9 extras tables (there was a mismatch in `data_links` and in form-module `config_version`).**
+
+**Separately, the quadratic degradation of the incremental call-graph rebuild on a bulk batch is eliminated: resolution of callee addresses (`callee_proc_key`) is moved out of the per-file loop into a single once-per-batch pass (a shared helper with the full rebuild). On a real UT 11.5 (git roll-forward of 2921 files, Update_20260623 -> Update_20260707) a batch of 3193 file events: 585 s -> 25.6 s (~23x faster); the previous >12 min hang is gone.**
+
+> **Scope of the fix — objects INSIDE extensions (a specific object stops being borrowed: its copy is removed, the dump info is updated). Removing an extension AS A WHOLE is NOT handled incrementally** (no reliable signal: the extension dump info is deleted, not modified, and the watcher delete event is unreliable) — that case is covered normally by a full reindex on daemon restart.
+
+> When a borrower leaves, `remerge_object` rebuilt the object from base+remaining copies for `metadata_objects.attributes_json`, but `data_links` was parsed from the single arriving file (phantom extension edges or lost base edges), and `metadata_modules` was not touched at all → the `config_version` of the borrower's form modules went stale (the orphan module was not rebuilt). A full reindex produced a different result.
+
+### Fixed
+
+- **`data_links` on a borrower leaving — merge across copies.** `update_data_links_for_object` (in `remerge_object`) deletes all edges of the object and rebuilds them from every existing copy across all sub-configs (symmetric to the bulk `index_data_links`); the departed copy is filtered out on its own (no file). Closes: A — copy delete delivered by the watcher (the per-file parse wiped ALL edges, including base ones); A2 — delete lost, only a dump-info MODIFY (phantom extension edges remained); B — an extension copy changed (the base edge was lost).
+- **`metadata_modules` on a borrower leaving — rebuild the object's modules.** New `update_metadata_modules_for_object` (in `remerge_object`): DELETE all modules of the object (by `object_name`, all `extension_name`) + walk the object's `.bsl` modules across ALL roots and re-insert against the fresh dump info. Without it the `config_version` of the borrower's form modules stayed stale (the per-file path does not touch them — the `.bsl` did not physically change). The common logic is extracted into `build_module_row`/`insert_module_row`, reused by the per-file `update_metadata_module_for_file`.
+- **`sub_config_roots` and the dump-info cache (`cfgver_cache`) are computed once per batch** — `parse_config_dump_info` is not re-read for each object/module.
+- **Quadratic degradation of the incremental call-graph on a bulk batch — `callee_proc_key` resolution moved to once-per-batch.** `update_call_graph_direct_for_file` no longer resolves target addresses per file: every `.bsl` re-scanned the entire `proc_call_graph` via `substr(caller_proc_key…)` (no index) and rebuilt the temp map of common-module exports with a full `files x functions` scan (~57K x 260K per file). Now the per-file step only maintains the file's raw edges (index-backed, `callee_proc_key = NULL`), while global resolution and pruning are extracted into a shared helper `resolve_and_prune_direct_edges` (the same one the full `build_call_graph` calls), run ONCE after the batch loop in `run_incremental_extras`. Incremental==full identity for `proc_call_graph` is preserved (shared code + parity tests).
+- **`procedure_enrichment` — full scan replaced by an index seek.** In `update_procedure_terms_for_file` the predicate `proc_key LIKE ?||'::%'` (SCAN of ~257K rows, LIKE did not use the index) is replaced by a range `proc_key >= '<rel>::' AND proc_key < '<rel>:;'` (SEARCH via `idx_pe_proc_key`, confirmed by `EXPLAIN QUERY PLAN`).
+
+### Testing
+
+- Incremental==full symmetry unit tests: `incremental_borrower_drop_keeps_data_links` (A), `..._opis_only_...` (A2), `incremental_ext_copy_change_keeps_base_data_links` (B), `incremental_massive_object_change_matches_full` (C, N=60), and the new `incremental_borrower_drop_rebuilds_metadata_modules`. For the call-graph resolver — a new multi-file parity test `incremental_call_graph_multifile_batch_matches_full` (a batch of 2 common modules cross-referencing exports, incremental==full) plus the existing `incremental_call_graph_direct_matches_full` / `incremental_direct_shared_edge_survives`. The whole workspace is green (538 tests: 192 core + 23 indexer + 323 bsl-extension, 0 failed, 0 warnings).
+- **Federated "evil" measurement on a real UT 11.5** (57k files, 43 sub-configs): a borrower `Document.ЗаказКлиента` leaving the `ent_УправлениеДоставками` extension → the incremental result **matched the full reindex across all 9 extras tables** (`data_links`, `metadata_objects`, `config_manifest`, `metadata_modules`, `metadata_forms`, `role_rights`, `event_subscriptions`, `metadata_code_usages`, `proc_call_graph`). Before the fix `metadata_modules` diverged on form-module `config_version`.
+- **Mass load measurement:** dropping the `МодульУОП` extension's borrowing entirely (1046 file events, 1036 objects rebuilt) — the incremental run took **5.4 s versus ~60 s for a full index** (×11 faster, no degradation from the rebuild).
+- **Mass git-based resolver measurement on a real UT 11.5** (clone of the production gitlab, roll-forward Update_20260623 -> Update_20260707, a 2921-file diff): an incremental batch of 3193 file events (1746 changed + 1447 deleted) processed in **25.6 s** versus **585 s** on the previous per-file resolver (and the previous >12 min hang on a repeat run). A full index of the clone for comparison — 163 s (core 71 + extras 92). The second batch (426 files, 39.7 s) is the cost of the config-level rebuild (`data_links` config, `role_rights`, base reconcile), not the call graph.
+
+### Compatibility
+
+- The data format and DB schema are unchanged — no reindex required. The change touches only the incremental reconcile-area path when a borrower leaves; the initial index, the bulk update, and the per-file path are untouched.
+
 ## [0.44.3] — 2026-07-05
 
 **Fixed the quadratic degradation of a bulk update of an existing DB: the old rows of changed files are deleted in a single batch pass while the indexes are still alive, instead of a per-file DELETE with no indexes. At UT scale (2M calls) the delete phase for a 500-file update went 260,385 ms → 234 ms (×1113); a reindex after a mass git pull: hours → minutes.**
