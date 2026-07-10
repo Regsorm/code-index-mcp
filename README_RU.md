@@ -50,7 +50,7 @@ AI-модели тратят десятки вызовов `grep`/`find` для 
 | Java | tree-sitter-java | `.java` |
 | Rust | tree-sitter-rust | `.rs` |
 | Go | tree-sitter-go | `.go` |
-| 1С (BSL) | tree-sitter-onescript | `.bsl`, `.os` |
+| 1С (BSL) | tree-sitter-bsl | `.bsl`, `.os` |
 | XML (1С) | quick-xml | `.xml` (метаданные конфигураций) |
 | HTML | tree-sitter-html | `.html`, `.htm` (v0.7.1, по запросу пользователя — см. маппинг ниже) |
 
@@ -722,7 +722,7 @@ MIT. См. [LICENSE](LICENSE).
 ## Благодарности
 
 - [tree-sitter](https://tree-sitter.github.io/) — инкрементальный парсер для множества языков
-- [tree-sitter-onescript](https://github.com/1c-syntax/tree-sitter-onescript) — грамматика BSL/OneScript от сообщества 1c-syntax
+- [tree-sitter-bsl](https://github.com/1c-syntax/tree-sitter-bsl) — грамматика BSL от сообщества 1c-syntax
 - [rusqlite](https://github.com/rusqlite/rusqlite) — SQLite для Rust
 - [rayon](https://github.com/rayon-rs/rayon) — параллелизм данных без лишних усилий
 - [rmcp](https://github.com/modelcontextprotocol/rust-sdk) — Rust MCP SDK

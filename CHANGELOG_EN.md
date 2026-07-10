@@ -5,6 +5,26 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.45.0] — 2026-07-10
+
+**The BSL parser is switched from `tree-sitter-onescript` to the dedicated `tree-sitter-bsl` grammar (0.1.7) with a `bsl-parse` normalization layer. The OneScript grammar was an approximation of the 1C built-in language; `tree-sitter-bsl` parses BSL more accurately, and `bsl-parse` works around known grammar defects (source normalization before parsing). The key effect — platform-type constructors (`Новый Массив`, `Новый ТаблицаЗначений`, `Новый Структура`) no longer enter the call graph as procedure calls. A full reindex is required.**
+
+### Changed
+
+- **BSL grammar: `tree-sitter-onescript` → `tree-sitter-bsl` 0.1.7.** The `tree-sitter-onescript` dependency is removed from the workspace, `code-index-core` and `bsl-extension`. `.bsl` and `.os` files are parsed by the `tree-sitter-bsl` grammar.
+- **Unified BSL parsing layer `bsl-parse` (crate `crates/bsl-parse`).** Source normalization for `tree-sitter-bsl` grammar defects (`normalize_for_parser`) before feeding the parser. The crate is vendored into the repository (a copy of the shared layer used by the bsl-context project) — code-index builds self-contained, without external path dependencies.
+- **Call graph: false edges from constructors removed.** `Новый Массив`/`ТаблицаЗначений`/`Структура`/`Соответствие` and other platform-type constructors are no longer resolved as calls to same-named procedures. On a real UT 11.5: `Массив` 3525 → 0 edges, `total_calls` 2,139,478 → 2,021,203 (−118k false). Symmetric on ZUP, BP Smak-sultana, BP TDK.
+
+### Testing
+
+- `cargo test --workspace --features enrichment` — 581 passed, 0 failed, 0 warnings.
+- Local live-smoke on a WMS dump (59 modules): indexing, call graph (`get-callees` resolves qualified calls), FTS, `grep-body` — green.
+- Federated rollout on the VM (musl ELF): reindex of all four production bases — `ut` (58k files), `zup` (40k), `bp-ss` (94k), `bp-tdk` (90k), `exit=0` each. Effect confirmed on all: `Массив` = 0, only genuine `ТаблицаЗначений` calls remain (4–5 edges).
+
+### Compatibility
+
+- **A full reindex is required** (`index --force`): the call graph is rebuilt by the new parser. The DB schema is unchanged.
+
 ## [0.44.4] — 2026-07-08
 
 **The incremental rebuild of an object when a borrower leaves is now fully symmetric with a full reindex: `data_links`, `attributes_json` and `metadata_modules` are restored by merging across ALL remaining copies (base + extensions), not from the single arriving file. On a real UT 11.5 the incremental result after a borrower leaves matched the full rebuild across all 9 extras tables (there was a mismatch in `data_links` and in form-module `config_version`).**

@@ -48,7 +48,7 @@ A compiled Rust binary with **one-writer / many-readers** architecture:
 | Java | tree-sitter-java | `.java` |
 | Rust | tree-sitter-rust | `.rs` |
 | Go | tree-sitter-go | `.go` |
-| 1C (BSL) | tree-sitter-onescript | `.bsl`, `.os` |
+| 1C (BSL) | tree-sitter-bsl | `.bsl`, `.os` |
 | XML (1C) | quick-xml | `.xml` (configuration metadata) |
 | HTML | tree-sitter-html | `.html`, `.htm` (v0.7.1, by user request — see HTML-specific mapping below) |
 
@@ -701,7 +701,7 @@ MIT. See [LICENSE](LICENSE).
 ## Acknowledgements
 
 - [tree-sitter](https://tree-sitter.github.io/tree-sitter/) — incremental parsing library
-- [tree-sitter-onescript](https://github.com/1c-syntax/tree-sitter-onescript) — BSL/OneScript grammar by the 1c-syntax community
+- [tree-sitter-bsl](https://github.com/1c-syntax/tree-sitter-bsl) — BSL grammar by the 1c-syntax community
 - [rusqlite](https://github.com/rusqlite/rusqlite) — SQLite bindings for Rust
 - [rayon](https://github.com/rayon-rs/rayon) — data parallelism for Rust
 - [rmcp](https://github.com/modelcontextprotocol/rust-sdk) — Rust MCP SDK
