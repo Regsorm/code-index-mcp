@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "bsl-extension"
-version = "0.44.4"
+version = "0.45.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -204,13 +204,12 @@ dependencies = [
  "tokio",
  "tracing",
  "tree-sitter",
- "tree-sitter-onescript",
  "walkdir",
 ]
 
 [[package]]
 name = "bsl-indexer"
-version = "0.44.4"
+version = "0.45.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -222,6 +221,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "bsl-parse"
+version = "0.7.0"
+dependencies = [
+ "tree-sitter",
+ "tree-sitter-bsl",
 ]
 
 [[package]]
@@ -337,7 +344,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "code-index"
-version = "0.44.4"
+version = "0.45.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -352,11 +359,12 @@ dependencies = [
 
 [[package]]
 name = "code-index-core"
-version = "0.44.4"
+version = "0.45.0"
 dependencies = [
  "anyhow",
  "arc-swap",
  "axum",
+ "bsl-parse",
  "chrono",
  "clap",
  "dirs",
@@ -384,11 +392,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tree-sitter",
+ "tree-sitter-bsl",
  "tree-sitter-go",
  "tree-sitter-html",
  "tree-sitter-java",
  "tree-sitter-javascript",
- "tree-sitter-onescript",
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
@@ -2489,6 +2497,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-bsl"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6a660bcc779bb599dddfc5ce17a120bc82eab86bf849194fec1dfb5d199c7e9"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-go"
 version = "0.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2533,16 +2551,6 @@ name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
-
-[[package]]
-name = "tree-sitter-onescript"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2dfdefdc8317e6168dab69be3974347f2ab37f44b733d249f8d614d0b70f5e48"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
 
 [[package]]
 name = "tree-sitter-python"

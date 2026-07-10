@@ -1,0 +1,10 @@
+[package]
+name = "bsl-parse"
+version = "0.7.0"
+edition = "2021"
+license = "MIT"
+description = "Единый слой разбора BSL: нормализация под грамматику, дерево tree-sitter-bsl, текстовая страховка"
+
+[dependencies]
+tree-sitter = { workspace = true }
+tree-sitter-bsl = { workspace = true }

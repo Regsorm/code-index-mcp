@@ -28,9 +28,14 @@ tree-sitter-javascript = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 tree-sitter-java = { workspace = true }
 tree-sitter-rust = { workspace = true }
-tree-sitter-onescript = { workspace = true }
+tree-sitter-bsl = { workspace = true }
 tree-sitter-go = { workspace = true }
 tree-sitter-html = { workspace = true }
+
+# Единый слой разбора BSL (нормализация под дефекты грамматики tree-sitter-bsl).
+# Вендоренная копия крейта из репозитория Bsl-context — code-index собирается
+# самодостаточно, без завязки на соседний каталог на диске.
+bsl-parse = { path = "../bsl-parse" }
 
 # XML-парсинг (для выгрузок 1С — пока в core, на этапе 2 переедет в bsl-extension)
 quick-xml = { workspace = true }

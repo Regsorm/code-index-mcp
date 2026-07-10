@@ -32,7 +32,6 @@ code-index-core = { path = "../code-index-core" }
 # парсеры остаются в core::parser до этапа 3, когда они переедут сюда
 # вместе с XML-парсером метаданных.
 tree-sitter = { workspace = true }
-tree-sitter-onescript = { workspace = true }
 quick-xml = { workspace = true }
 
 # Async-инфраструктура для tools.

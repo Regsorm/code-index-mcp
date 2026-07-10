@@ -6,7 +6,7 @@ use super::types::{
 };
 use super::LanguageParser;
 
-/// Парсер BSL-файлов (1С:Предприятие / OneScript) на основе tree-sitter
+/// Парсер BSL-файлов (1С:Предприятие / OneScript) на основе tree-sitter-bsl
 pub struct BslParser;
 
 impl BslParser {
@@ -48,77 +48,55 @@ fn find_child_by_kind<'a>(
     None
 }
 
-/// Проверить наличие Export/Экспорт в объявлении процедуры/функции или переменной модуля.
-/// Для proc/func_declaration: грамматика не создаёт именованный узел `export`,
-/// поэтому ищем через дочерний узел (для module_var_declaration) или по тексту первой строки.
-fn has_export_child(node: tree_sitter::Node, source: &[u8]) -> bool {
-    // Для module_var_declaration — `export` есть как именованный дочерний узел
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "export" {
-            return true;
-        }
-    }
-    // Для proc/func_declaration — ищем в тексте первой строки
-    // Берём текст до первого перевода строки (сигнатура объявления)
-    let full_text = node.utf8_text(source).unwrap_or("");
-    let first_line = full_text.lines().next().unwrap_or("");
-    // Проверяем наличие ключевого слова Экспорт/Export (регистронезависимо)
-    let lower = first_line.to_lowercase();
-    lower.contains("экспорт") || lower.contains("export")
-}
+/// Извлечь директиву компиляции и (для расширений) информацию о переопределении
+/// метода. В грамматике `tree-sitter-bsl` директива компиляции НЕ является
+/// дочерним узлом процедуры/функции — она лежит её ПРЕДЫДУЩИМ соседом в
+/// `source_file`: `&НаСервере` даёт узел `preprocessor`, внутри которого —
+/// `annotation` с текстом директивы (уже включающим `&`); `&Вместо("Foo")` —
+/// тот же `preprocessor`, но рядом с `annotation` ещё и `string(string_content)`
+/// с именем целевой процедуры. Возвращает (директива, тип_переопределения,
+/// цель_переопределения).
+fn extract_directive(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> (Option<String>, Option<String>, Option<String>) {
+    let prev = match node.prev_sibling() {
+        Some(p) if p.kind() == "preprocessor" => p,
+        _ => return (None, None, None),
+    };
 
-/// Извлечь директиву компиляции из annotation-дочернего узла.
-/// Ищем annotation среди непосредственных дочерних proc/func_declaration.
-/// Возвращает строку вида `"&НаСервере"`.
-fn extract_annotation(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "annotation" {
-            // Первый identifier внутри annotation — имя директивы
-            if let Some(ident) = find_child_by_kind(child, "identifier") {
-                let name = node_text(ident, source);
-                if !name.is_empty() {
-                    return Some(format!("&{}", name));
-                }
-            }
-        }
-    }
-    None
-}
+    let annotation = match find_child_by_kind(prev, "annotation") {
+        Some(a) => a,
+        None => return (None, None, None),
+    };
 
-/// Извлечь информацию о переопределении из аннотации расширения.
-/// Для &Перед("Foo"), &После("Foo"), &Вместо("Foo") возвращает (тип, цель).
-fn extract_override_info(node: tree_sitter::Node, source: &[u8]) -> (Option<String>, Option<String>) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "annotation" {
-            if let Some(ident) = find_child_by_kind(child, "identifier") {
-                let name = node_text(ident, source).to_lowercase();
-                let override_type = match name.as_str() {
-                    "перед" | "before" => Some("Перед"),
-                    "после" | "after"  => Some("После"),
-                    "вместо" | "instead" => Some("Вместо"),
-                    _ => None,
-                };
-                if let Some(otype) = override_type {
-                    // Ищем annotation_parameter → string (имя целевой процедуры)
-                    if let Some(param) = find_child_by_kind(child, "annotation_parameter") {
-                        if let Some(s) = find_child_by_kind(param, "string") {
-                            let raw = node_text(s, source);
-                            // Убираем кавычки: "Foo" → Foo
-                            let target = raw.trim_matches('"').to_string();
-                            if !target.is_empty() {
-                                return (Some(otype.to_string()), Some(target));
-                            }
-                        }
-                    }
-                    return (Some(otype.to_string()), None);
-                }
-            }
-        }
+    let directive = node_text(annotation, source).to_string();
+    if directive.is_empty() {
+        return (None, None, None);
     }
-    (None, None)
+
+    // Имя директивы без & и в нижнем регистре — для сопоставления с
+    // русским/английским названием переопределения расширения.
+    let name_lower = directive.trim_start_matches('&').to_lowercase();
+    let override_type = match name_lower.as_str() {
+        "перед" | "before" => Some("Перед"),
+        "после" | "after" => Some("После"),
+        "вместо" | "around" => Some("Вместо"),
+        "изменениеиконтроль" | "changeandvalidate" => Some("ИзменениеИКонтроль"),
+        _ => None,
+    };
+
+    match override_type {
+        Some(otype) => {
+            // Цель переопределения — string_content внутри string, лежащего
+            // рядом с annotation в том же preprocessor.
+            let target = find_child_by_kind(prev, "string")
+                .and_then(|s| find_child_by_kind(s, "string_content"))
+                .map(|sc| node_text(sc, source).to_string());
+            (Some(directive), Some(otype.to_string()), target)
+        }
+        None => (Some(directive), None, None),
+    }
 }
 
 /// Контекст обхода AST BSL
@@ -154,27 +132,14 @@ fn visit_node(
     }
 
     match node.kind() {
-        "proc_declaration" => {
+        "procedure_definition" => {
             visit_proc_or_func(node, ctx, "procedure");
         }
-        "func_declaration" => {
+        "function_definition" => {
             visit_proc_or_func(node, ctx, "function");
         }
-        "method_block" => {
-            // Блок методов — обходим дочерние proc/func
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                visit_node(child, ctx, current_func, depth + 1);
-            }
-        }
-        "module_var_block" => {
-            // Блок переменных модуля
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.kind() == "module_var_declaration" {
-                    visit_module_var(child, ctx);
-                }
-            }
+        "var_definition" => {
+            visit_module_var(node, ctx);
         }
         "method_call" => {
             record_method_call(node, ctx, current_func);
@@ -193,7 +158,7 @@ fn visit_node(
     }
 }
 
-/// Обработать proc_declaration или func_declaration
+/// Обработать procedure_definition или function_definition
 fn visit_proc_or_func(
     node: tree_sitter::Node,
     ctx: &mut VisitContext,
@@ -201,10 +166,8 @@ fn visit_proc_or_func(
 ) {
     let source = ctx.source;
 
-    // Имя: поля proc_name / func_name
-    let name_field = if proc_type == "procedure" { "proc_name" } else { "func_name" };
     let name = node
-        .child_by_field_name(name_field)
+        .child_by_field_name("name")
         .map(|n| node_text(n, source).to_string())
         .unwrap_or_default();
 
@@ -215,14 +178,15 @@ fn visit_proc_or_func(
     let line_start = node.start_position().row + 1;
     let line_end = node.end_position().row + 1;
 
-    // Параметры из argument_list
-    let arg_list_text = find_child_by_kind(node, "argument_list")
+    // Параметры из поля parameters
+    let arg_list_text = node
+        .child_by_field_name("parameters")
         .map(|n| node_text(n, source).to_string());
 
-    // Экспорт: есть ли дочерний узел export
-    let is_export = has_export_child(node, source);
+    // Экспорт: поле export (EXPORT_KEYWORD)
+    let is_export = node.child_by_field_name("export").is_some();
 
-    // Формируем строку аргументов: текст argument_list + суффикс "Экспорт" если нужно
+    // Формируем строку аргументов: текст parameters + суффикс "Экспорт" если нужно
     let args = match (arg_list_text, is_export) {
         (Some(args_str), true) => Some(format!("{} Экспорт", args_str)),
         (Some(args_str), false) => Some(args_str),
@@ -230,13 +194,11 @@ fn visit_proc_or_func(
         (None, false) => None,
     };
 
-    // Директива компиляции (annotation) → сохраняем в return_type
-    let directive = extract_annotation(node, source);
+    // Директива компиляции + переопределение расширения (annotation лежит в
+    // ПРЕДЫДУЩЕМ соседе-preprocessor, не внутри самой процедуры/функции)
+    let (directive, override_type, override_target) = extract_directive(node, source);
 
-    // Аннотация переопределения расширения (&Перед/&После/&Вместо)
-    let (override_type, override_target) = extract_override_info(node, source);
-
-    // Метаинформация BSL в docstring: тип + директива + экспорт
+    // Метаинформация BSL в docstring: тип + директива + экспорт + переопределение
     let docstring = {
         let mut parts = vec![proc_type.to_string()];
         if let Some(ref d) = directive {
@@ -251,7 +213,7 @@ fn visit_proc_or_func(
         Some(parts.join(" "))
     };
 
-    // Полный текст
+    // Полный текст (без предшествующей директивы — она лежит в соседнем узле)
     let body = node_text(node, source).to_string();
     let node_hash = sha256_hex(&body);
 
@@ -277,8 +239,9 @@ fn visit_proc_or_func(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "proc_declaration" | "func_declaration" | "argument_list" | "annotation" | "export" => {
-                // Не рекурсируем в определения и служебные узлы
+            "parameters" | "annotation" | "EXPORT_KEYWORD"
+            | "procedure_definition" | "function_definition" => {
+                // Не рекурсируем в служебные узлы и вложенные определения
             }
             _ => {
                 visit_body_for_calls(child, ctx, Some(&func_name), 1);
@@ -288,13 +251,11 @@ fn visit_proc_or_func(
 }
 
 /// Рекурсивный обход тела процедуры/функции для извлечения вызовов.
-/// Ловит КАЖДЫЙ узел `method_call` — это реальный вызов `Имя(args)` в грамматике
-/// onescript; встречается и как оператор-вызов (внутри call_statement), и внутри
-/// любых выражений (присваивания, условия, аргументы). Имя вызываемой процедуры/
-/// функции — первый `identifier` внутри method_call; квалификатор (`Модуль`)
-/// лежит соседом и приклеивается в record_method_call → `Модуль.Функция`.
-/// TASK-1: раньше ловился только call_statement → вызовы функций в выражениях
-/// (основная масса обращений к общим модулям) терялись, граф вызовов был почти пуст.
+/// Ловит КАЖДЫЙ узел `method_call` — это реальный вызов `Имя(args)`; встречается
+/// и как оператор-вызов, и внутри любых выражений (присваивания, условия,
+/// аргументы). Имя вызываемой процедуры/функции — первый `identifier` внутри
+/// method_call; квалификатор (`Модуль`) определяется в record_method_call через
+/// родителя (`call_expression`/`access`) → `Модуль.Функция`.
 fn visit_body_for_calls(
     node: tree_sitter::Node,
     ctx: &mut VisitContext,
@@ -317,11 +278,17 @@ fn visit_body_for_calls(
 
 /// Записать ребро вызова из узла `method_call`. callee — имя метода (первый
 /// `identifier` внутри method_call), СКЛЕЕННОЕ с квалификатором-receiver, если
-/// вызов идёт через точку (`Модуль.Метод` → `Модуль.Метод`). Так BSL хранит
-/// вызовы единообразно с остальными языками (Python `obj.method`, Rust
-/// `obj.method`). Голый вызов (точки нет) остаётся голым именем. caller — имя
-/// процедуры-контейнера. Используется и для вызовов в теле процедуры
-/// (visit_body_for_calls), и для кода модуля верхнего уровня (visit_node).
+/// вызов идёт через точку (`Модуль.Метод` → `Модуль.Метод`). Квалификатор
+/// вызова `ОбщийМодуль.Метод(1)` в грамматике tree-sitter-bsl:
+///   call_expression
+///     access( identifier «ОбщийМодуль» )
+///     "."
+///     method_call( identifier «Метод», arguments )
+/// receiver — ПЕРВЫЙ именованный ребёнок родителя (узел access), когда
+/// родитель — call_expression/access И у него больше одного именованного
+/// ребёнка. Голый вызов `ГолыйВызов(2)` — method_call, чей родитель НЕ
+/// call_expression/access, либо родитель access с единственным именованным
+/// ребёнком (голова цепочки `Ф().Метод()`). caller — имя процедуры-контейнера.
 fn record_method_call(
     node: tree_sitter::Node,
     ctx: &mut VisitContext,
@@ -332,24 +299,23 @@ fn record_method_call(
         if method.is_empty() {
             return;
         }
-        // Квалификатор вызова `Модуль.Метод()`: в грамматике onescript левый
-        // операнд лежит СОСЕДОМ от method_call — method_call.prev_sibling() это
-        // токен `.`, а его prev_sibling() — receiver (member_access/identifier).
-        // Склеиваем `receiver.method`; если точки нет — оставляем голое имя.
-        let callee = match node.prev_sibling() {
-            Some(dot) if dot.kind() == "." => match dot.prev_sibling() {
-                Some(recv) => {
-                    let q = node_text(recv, ctx.source);
-                    if q.is_empty() {
-                        method
-                    } else {
-                        format!("{q}.{method}")
-                    }
+
+        let callee = match node.parent() {
+            Some(parent)
+                if matches!(parent.kind(), "call_expression" | "access")
+                    && parent.named_child_count() > 1 =>
+            {
+                let receiver = parent.named_child(0).expect("named_child_count() > 1");
+                let q = node_text(receiver, ctx.source);
+                if q.is_empty() {
+                    method
+                } else {
+                    format!("{q}.{method}")
                 }
-                None => method,
-            },
+            }
             _ => method,
         };
+
         ctx.calls.push(ParsedCall {
             caller: current_func.unwrap_or("<module>").to_string(),
             callee,
@@ -358,22 +324,34 @@ fn record_method_call(
     }
 }
 
-/// Обработать module_var_declaration — объявление переменной модуля
+/// Обработать var_definition — объявление переменной(ых) модуля.
+/// `Перем А, Б;` даёт ОДИН var_definition с ДВУМЯ дочерними `variable_spec`
+/// (по одному на имя) — в отличие от старой грамматики, где на одно
+/// объявление приходилась одна переменная. Экспорт — общий для всего
+/// объявления (поле `export` у var_definition).
 fn visit_module_var(node: tree_sitter::Node, ctx: &mut VisitContext) {
     let source = ctx.source;
-    let line = node.start_position().row + 1;
 
-    // Имя переменной: первый identifier
-    if let Some(ident) = find_child_by_kind(node, "identifier") {
-        let name = node_text(ident, source).to_string();
-        if !name.is_empty() {
-            // Значение: признак экспорта
-            let value = if has_export_child(node, source) {
-                Some("Экспорт".to_string())
-            } else {
-                None
-            };
-            ctx.variables.push(ParsedVariable { name, value, line });
+    let value = if node.child_by_field_name("export").is_some() {
+        Some("Экспорт".to_string())
+    } else {
+        None
+    };
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "variable_spec" {
+            if let Some(name_node) = child.child_by_field_name("name") {
+                let name = node_text(name_node, source).to_string();
+                if !name.is_empty() {
+                    let line = child.start_position().row + 1;
+                    ctx.variables.push(ParsedVariable {
+                        name,
+                        value: value.clone(),
+                        line,
+                    });
+                }
+            }
         }
     }
 }
@@ -416,8 +394,8 @@ fn parse_bsl(source: &str) -> Result<ParseResult> {
 
     let mut ts_parser = tree_sitter::Parser::new();
     ts_parser
-        .set_language(&tree_sitter_onescript::LANGUAGE.into())
-        .map_err(|e| anyhow!("Ошибка установки языка tree-sitter-onescript: {}", e))?;
+        .set_language(&tree_sitter_bsl::LANGUAGE.into())
+        .map_err(|e| anyhow!("Ошибка установки языка tree-sitter-bsl: {}", e))?;
 
     // Защита 2: дедлайн на парсинг — страховка от любой будущей патологии.
     // При превышении parse() возвращает None; трактуем как пустой результат,
@@ -425,7 +403,16 @@ fn parse_bsl(source: &str) -> Result<ParseResult> {
     #[allow(deprecated)]
     ts_parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
 
-    let tree = match ts_parser.parse(source, None) {
+    // Нормализация обходит 6 дефектов грамматики tree-sitter-bsl 0.1.7 (буква ё,
+    // тернарный оператор `? (`, `ВызватьИсключение;` без аргумента вне первого
+    // оператора Исключения, неразрывный пробел, `# Если`, отрицательное значение
+    // параметра по умолчанию). Замены побайтовые с сохранением длины, поэтому
+    // смещения узлов совпадают с оригиналом — тексты узлов ниже читаем из
+    // ОРИГИНАЛЬНОГО source, а не из нормализованной копии. Без этой нормализации
+    // имена рвутся (например, «СчётаУчёта» → «Сч») и часть объявлений теряется.
+    let for_parser = bsl_parse::normalize_for_parser(source);
+
+    let tree = match ts_parser.parse(for_parser.as_ref(), None) {
         Some(t) => t,
         None => return Ok(empty_parse_result(source)),
     };
@@ -514,11 +501,43 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_bsl_calls_qualified_and_bare() {
+        // Простейший прямой случай из плана миграции: один квалифицированный
+        // и один голый вызов, оба операторы верхнего уровня тела процедуры.
+        let parser = BslParser::new();
+        let source = "Процедура Тест()\n    ОбщийМодуль.Метод(1);\n    ГолыйВызов(2);\nКонецПроцедуры";
+        let result = parser.parse(source, "test.bsl").unwrap();
+        let names: Vec<&str> = result.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(names.contains(&"ОбщийМодуль.Метод"), "callee: {:?}", names);
+        assert!(names.contains(&"ГолыйВызов"), "callee: {:?}", names);
+    }
+
+    #[test]
     fn test_parse_bsl_module_vars() {
         let parser = BslParser::new();
         let source = "Перем МояПеременная Экспорт;\nПерем ВтораяПеременная;\n\nПроцедура Тест()\nКонецПроцедуры";
         let result = parser.parse(source, "test.bsl").unwrap();
         assert!(result.variables.len() >= 2);
+    }
+
+    #[test]
+    fn test_parse_bsl_multiple_vars_single_declaration() {
+        // `Перем А, Б;` — одно объявление, но ДВЕ переменные (variable_spec
+        // каждая). В старой грамматике на объявление приходилась одна переменная.
+        let parser = BslParser::new();
+        let source = "Перем А, Б;";
+        let result = parser.parse(source, "test.bsl").unwrap();
+        let names: Vec<&str> = result.variables.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["А", "Б"], "переменные: {:?}", names);
+    }
+
+    #[test]
+    fn test_parse_bsl_var_export_value() {
+        let parser = BslParser::new();
+        let source = "Перем Г Экспорт;";
+        let result = parser.parse(source, "test.bsl").unwrap();
+        assert_eq!(result.variables.len(), 1);
+        assert_eq!(result.variables[0].value.as_deref(), Some("Экспорт"));
     }
 
     #[test]
@@ -608,6 +627,18 @@ mod tests {
         assert!(f.override_type.is_none());
         assert!(f.override_target.is_none());
         assert_eq!(f.return_type.as_deref(), Some("&НаСервере"));
+    }
+
+    #[test]
+    fn test_parse_bsl_normalizes_yo_letter() {
+        // Буква «ё» не входит в диапазон идентификатора грамматики tree-sitter-bsl
+        // (`[\wа-я_]`) — без нормализации имя рвётся на «Сч». Проверяем, что
+        // normalize_for_parser в parse_bsl восстанавливает полное имя.
+        let parser = BslParser::new();
+        let source = "Процедура СчётаУчёта()\nКонецПроцедуры";
+        let result = parser.parse(source, "test.bsl").unwrap();
+        assert_eq!(result.functions.len(), 1, "функция не найдена: {:?}", result.functions);
+        assert_eq!(result.functions[0].name, "СчётаУчёта");
     }
 
     #[test]
