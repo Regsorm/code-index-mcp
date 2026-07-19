@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::Result;
 use notify_debouncer_full::{
     new_debouncer,
-    notify::{RecommendedWatcher, RecursiveMode},
+    notify::{EventKind, RecommendedWatcher, RecursiveMode},
     DebounceEventResult, Debouncer, RecommendedCache,
 };
 use tokio::sync::mpsc;
@@ -115,6 +115,13 @@ async fn run_watch(server: CodeIndexServer, daemon_toml_path: PathBuf) -> Result
     Ok(())
 }
 
+/// Событие достойно перечитывания конфига? Да — только если это правка
+/// самого `daemon.toml`, а не события по соседним файлам каталога и не
+/// событие доступа (открытие/закрытие на чтение).
+fn is_config_change(kind: &EventKind, paths: &[PathBuf], target: &Path) -> bool {
+    !matches!(kind, EventKind::Access(_)) && paths.iter().any(|p| p == target)
+}
+
 /// Собрать `Debouncer` и подписать его на родительскую директорию
 /// `daemon.toml`. Подписываемся на директорию, а не на сам файл, потому
 /// что atomic-rename редактора (написать в .tmp → rename) удаляет
@@ -141,10 +148,18 @@ fn build_debouncer(
             // Фильтруем события — нам интересен только сам daemon.toml.
             // Debouncer прокидывает события на всю директорию, но мы
             // сидим только на daemon_toml_path.
+            //
+            // События доступа (открытие/закрытие на чтение) отбрасываем:
+            // на Linux inotify подписан в том числе на IN_OPEN и
+            // IN_CLOSE_NOWRITE, поэтому наше же чтение конфига в
+            // `reload_from_disk` порождало событие, которое запускало
+            // следующее чтение — бесконечная петля с периодом debounce
+            // (на ВМ rag: ~11800 перечитываний за два часа). На Windows
+            // не воспроизводилось — тамошний watcher о чтении не сообщает.
             let filtered: DebounceEventResult = match res {
                 Ok(events) => Ok(events
                     .into_iter()
-                    .filter(|e| e.paths.iter().any(|p| p == &target))
+                    .filter(|e| is_config_change(&e.kind, &e.paths, &target))
                     .collect()),
                 Err(errors) => Err(errors),
             };
@@ -245,6 +260,46 @@ mod tests {
             is_local: false,
             language: None,
         }
+    }
+
+    /// Событие «файл открыли/закрыли на чтение» не должно считаться
+    /// изменением конфига: наше же чтение в `reload_from_disk` порождает
+    /// такое событие (Linux inotify подписан на IN_OPEN/IN_CLOSE_NOWRITE),
+    /// и без фильтра получалась бесконечная петля перечитывания.
+    #[test]
+    fn access_events_do_not_trigger_reload() {
+        use notify_debouncer_full::notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
+
+        let target = PathBuf::from("/cfg/daemon.toml");
+        let paths = vec![target.clone()];
+
+        assert!(!is_config_change(
+            &EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            &paths,
+            &target
+        ));
+        assert!(!is_config_change(
+            &EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            &paths,
+            &target
+        ));
+        // Реальная правка — по-прежнему повод перечитать.
+        assert!(is_config_change(
+            &EventKind::Modify(ModifyKind::Any),
+            &paths,
+            &target
+        ));
+        assert!(is_config_change(
+            &EventKind::Create(CreateKind::File),
+            &paths,
+            &target
+        ));
+        // Событие по соседнему файлу каталога — не наше дело.
+        assert!(!is_config_change(
+            &EventKind::Modify(ModifyKind::Any),
+            &[PathBuf::from("/cfg/daemon.json")],
+            &target
+        ));
     }
 
     /// Прямой вызов `reload_from_disk` с подсунутым daemon.toml —

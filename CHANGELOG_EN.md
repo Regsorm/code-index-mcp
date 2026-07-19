@@ -5,6 +5,29 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.45.1] — 2026-07-19
+
+**Attribute indexing flag in `attributes_json` + fixed an infinite `daemon.toml` re-read loop in the MCP server on Linux.**
+
+### Added
+
+- **`indexing` in `metadata_objects.attributes_json`.** The `<Indexing>` tag inside `<Attribute>`/`<Dimension>`/`<Resource>` of the object XML now lands in the `indexing` field of `attributes[]`, `dimensions[]`, `resources[]` entries (values `Index`, `IndexWithAdditionalOrder`). `DontIndex` is not written — same rule as `required`: an absent field means «not indexed». Handled in both parsers — Designer format (`xml/object_attributes.rs`) and 1C:EDT format (`xml/edt_mdo.rs`, `<indexing>` tag).
+
+### Fixed
+
+- **`config_watch`: infinite `daemon.toml` re-read loop on Linux.** File access events (open/close for reading) were treated as a reason to re-read the config, while `reload_from_disk` opens that very file — a self-sustaining loop with the debounce period. On the rag VM — ~11,800 re-reads over two hours, continuously, starting at process start. Not reproducible on Windows: its watcher does not report file reads. `EventKind::Access(_)` events are now filtered out (`is_config_change`).
+
+### Testing
+
+- `cargo test --workspace` — 577 passed, 0 failed.
+- Local (`ut-test`, 57,060 files, `index --force` on a clean DB, 65 s): `Document.ЗаказКлиента` has exactly 7 fields with `indexing` — matches the XML (7 `Index` tags, 150 `DontIndex` not written); across the base — 891 objects with `Index`, 64 with `IndexWithAdditionalOrder`.
+- Federated rollout: reindex of all six VM bases (`ut`, `bp-ss`, `bp-tdk`, `zup`, `wms`, `bp-sonic`), `rc=0` each; the acceptance query on `ut` and `get_object_structure` over federation both return `indexing`.
+- The loop was verified empirically after the fix: start — 1 re-read, two real file edits — +2, two file reads — +0 (was: continuous, every 500 ms).
+
+### Compatibility
+
+- **A reindex is required** for `indexing` to appear in already-built indexes (object XML is otherwise skipped by the mtime fast path). The DB schema is unchanged.
+
 ## [0.45.0] — 2026-07-10
 
 **The BSL parser is switched from `tree-sitter-onescript` to the dedicated `tree-sitter-bsl` grammar (0.1.7) with a `bsl-parse` normalization layer. The OneScript grammar was an approximation of the 1C built-in language; `tree-sitter-bsl` parses BSL more accurately, and `bsl-parse` works around known grammar defects (source normalization before parsing). The key effect — platform-type constructors (`Новый Массив`, `Новый ТаблицаЗначений`, `Новый Структура`) no longer enter the call graph as procedure calls. A full reindex is required.**
