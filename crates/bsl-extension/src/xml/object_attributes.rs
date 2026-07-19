@@ -119,6 +119,8 @@ enum TextTarget {
     FieldSynContent,
     /// W9: `<FillChecking>` текущего поля (ShowError → required).
     FieldFillChecking,
+    /// `<Indexing>` текущего поля (Index / IndexWithAdditionalOrder).
+    FieldIndexing,
     /// W8: скалярное свойство шапки из белого списка (имя — в `cur_header_prop`).
     HeaderProp,
     /// Значение свойства проведения документа (Posting / RegisterRecordsDeletion
@@ -435,6 +437,10 @@ pub struct StructField {
     pub synonym: Option<String>,
     /// Обязательность заполнения: `<FillChecking>ShowError</FillChecking>` (W9).
     pub required: bool,
+    /// Признак индексирования: `<Indexing>` (`Index` /
+    /// `IndexWithAdditionalOrder`). `None` — не индексировано (`DontIndex`
+    /// либо тег отсутствует).
+    pub indexing: Option<String>,
 }
 
 /// Табличная часть: имя + её реквизиты.
@@ -513,6 +519,11 @@ impl ObjectStructure {
             }
             if f.required {
                 m.insert("required".into(), Value::Bool(true));
+            }
+            // Индексирование пишем только когда оно есть (DontIndex опускаем) —
+            // тем же правилом, что и required.
+            if let Some(ix) = &f.indexing {
+                m.insert("indexing".into(), Value::String(ix.clone()));
             }
             Value::Object(m)
         };
@@ -933,6 +944,8 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
         synonym: Option<String>,
         /// W9: FillChecking == ShowError.
         required: bool,
+        /// `<Indexing>`, если не DontIndex.
+        indexing: Option<String>,
     }
 
     // Индекс текущей табличной части (Some, пока мы внутри <TabularSection>).
@@ -973,6 +986,7 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                             types: Vec::new(),
                             synonym: None,
                             required: false,
+                            indexing: None,
                         });
                     }
                     "Name" => {
@@ -1012,6 +1026,10 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                     // W9: обязательность заполнения поля.
                     "FillChecking" if field.is_some() => {
                         text_target = TextTarget::FieldFillChecking;
+                    }
+                    // Признак индексирования реквизита/измерения/ресурса.
+                    "Indexing" if field.is_some() => {
+                        text_target = TextTarget::FieldIndexing;
                     }
                     // W8: скалярные свойства шапки из белого списка — вне
                     // реквизитов и стандартных атрибутов (там одноимённые теги).
@@ -1118,6 +1136,14 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                             f.required = txt == "ShowError";
                         }
                     }
+                    // Индексирование: DontIndex (и пустое) не сохраняем.
+                    TextTarget::FieldIndexing => {
+                        if let Some(f) = field.as_mut() {
+                            if !txt.is_empty() && txt != "DontIndex" {
+                                f.indexing = Some(txt);
+                            }
+                        }
+                    }
                     // W8: скалярное свойство шапки из белого списка.
                     TextTarget::HeaderProp => {
                         if let Some(prop) = cur_header_prop.take() {
@@ -1161,6 +1187,7 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                                         type_str: pretty_types(&fb.types),
                                         synonym: fb.synonym,
                                         required: fb.required,
+                                        indexing: fb.indexing,
                                     };
                                     match fb.kind.as_str() {
                                         "Dimension" => out.dimensions.push(f),
@@ -1340,6 +1367,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_structure_extracts_indexing_and_skips_dontindex() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <Document uuid="d1">
+    <Properties><Name>ЗаказКлиента</Name></Properties>
+    <ChildObjects>
+      <Attribute><Properties>
+        <Name>Партнер</Name>
+        <Type><v8:Type>cfg:CatalogRef.Партнеры</v8:Type></Type>
+        <Indexing>Index</Indexing>
+      </Properties></Attribute>
+      <Attribute><Properties>
+        <Name>Комментарий</Name>
+        <Type><v8:Type>xs:string</v8:Type></Type>
+        <Indexing>DontIndex</Indexing>
+      </Properties></Attribute>
+      <Attribute><Properties>
+        <Name>Сделка</Name>
+        <Type><v8:Type>xs:string</v8:Type></Type>
+        <Indexing>IndexWithAdditionalOrder</Indexing>
+      </Properties></Attribute>
+    </ChildObjects>
+  </Document>
+</MetaDataObject>"#;
+        let s = parse_object_structure_xml(xml).unwrap();
+        assert_eq!(s.attributes[0].indexing.as_deref(), Some("Index"));
+        assert_eq!(s.attributes[1].indexing, None, "DontIndex не сохраняем");
+        assert_eq!(
+            s.attributes[2].indexing.as_deref(),
+            Some("IndexWithAdditionalOrder")
+        );
+        // В JSON поле есть только у индексированных.
+        let j = s.to_json();
+        let a = j["attributes"].as_array().unwrap();
+        assert_eq!(a[0]["indexing"], "Index");
+        assert!(a[1].get("indexing").is_none());
+    }
+
     /// Тестовый конструктор поля без синонима/обязательности.
     fn sf(name: &str, type_str: &str) -> StructField {
         StructField {
@@ -1347,6 +1413,7 @@ mod tests {
             type_str: type_str.into(),
             synonym: None,
             required: false,
+            indexing: None,
         }
     }
 

@@ -91,6 +91,8 @@ struct FieldBuild {
     types: Vec<String>,
     synonym: Option<String>,
     required: bool,
+    /// `<indexing>`, если не DontIndex.
+    indexing: Option<String>,
 }
 
 impl FieldBuild {
@@ -101,6 +103,7 @@ impl FieldBuild {
             types: Vec::new(),
             synonym: None,
             required: false,
+            indexing: None,
         }
     }
 }
@@ -121,6 +124,7 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
         TypeValue,
         SynValue,
         FillChecking,
+        Indexing,
         PostingProp,
         HeaderProp,
     }
@@ -205,6 +209,11 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                             tt = T::FillChecking;
                         }
                     }
+                    "indexing" => {
+                        if field.is_some() {
+                            tt = T::Indexing;
+                        }
+                    }
                     "posting" | "realTimePosting" | "registerRecordsDeletion"
                     | "registerRecordsWritingOnPost" => {
                         if field.is_none() {
@@ -269,6 +278,14 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                             f.required = txt == "ShowError";
                         }
                     }
+                    // Индексирование: DontIndex (и пустое) не сохраняем.
+                    T::Indexing => {
+                        if let Some(f) = field.as_mut() {
+                            if !txt.is_empty() && txt != "DontIndex" {
+                                f.indexing = Some(txt);
+                            }
+                        }
+                    }
                     T::PostingProp => {
                         if let Some(p) = cur_posting_prop.take() {
                             if !txt.is_empty() {
@@ -322,6 +339,7 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                                             type_str: pretty_types(&fb.types),
                                             synonym: fb.synonym,
                                             required: fb.required,
+                                            indexing: fb.indexing,
                                         };
                                         match fb.kind {
                                             FieldKind::Dimension => out.dimensions.push(f),
