@@ -5,6 +5,26 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.45.2] — 2026-07-27
+
+**The indexer daemon no longer gets stuck in `indexing` status when a worker thread terminates abnormally. Previously, a panic or early exit during the batch-apply phase left the folder in "applying batch changes" status forever — `get_function`/`grep_body` returned the stub indefinitely, with no self-recovery (only a manual daemon restart helped). Added a worker watchdog and correct handling of transaction-commit failure.**
+
+### Fixed
+
+- **Stuck `indexing` status after a worker panic/abort.** A watchdog (`supervise_workers`, 5 s tick) was added to the daemon main loop: it detects abnormally finished worker threads (`JoinHandle::is_finished` during normal operation = panic or early exit), moves the folder to `Error`, and respawns the worker. The fresh worker re-indexes the changed files and returns the folder to `Ready`. Respawns are rate-limited via backoff — at most 5 attempts per 60 s per path, otherwise the folder stays in `Error` (respawn-storm guard).
+- **`Ready` is no longer set for an uncommitted batch.** On `commit_batch`/`begin_batch` failure the data is not in the database (transaction rolled back or never started), yet the worker still set `Ready` — the serve layer would then hand out a stale snapshot as current. Now a commit failure triggers a rollback (new `Storage::rollback_batch`, which clears a possibly hung transaction left after `SQLITE_BUSY` on COMMIT) and sets `Error` instead of a false `Ready`.
+
+### Testing
+
+- `cargo test --workspace` — 579 passed, 0 failed.
+- Unit: `rollback_batch` (idempotent rollback, clears a hung transaction), `allow_respawn` (backoff — 5 respawns allowed in-window, 6th denied, reset after window).
+- Live smoke via panic injection in an isolated daemon: a controlled worker panic right after the `ReindexingBatch` status was set (the exact point where status used to get stuck) → the watchdog caught it (`worker … crashed … respawn`) → re-index → `Ready`; the probe function landed in the index only thanks to the respawn (the first worker panics before applying the batch).
+- Local node (Windows, 46 repos) and federated node (VM rag, 6 repos) — deployed 0.45.2, both `healthy`; functional federated smoke against `bp-ss` (`get_object_structure Catalog.Валюты`) via federation — correct structure.
+
+### Compatibility
+
+- **No reindex required** — the change affects only the daemon worker lifecycle; the parser and DB schema are unchanged.
+
 ## [0.45.1] — 2026-07-19
 
 **Attribute indexing flag in `attributes_json` + fixed an infinite `daemon.toml` re-read loop in the MCP server on Linux.**
