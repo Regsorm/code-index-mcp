@@ -389,10 +389,19 @@ pub fn run_worker(
 
         if let Err(e) = storage.begin_batch() {
             eprintln!("[worker:{}] begin_batch: {}", path.display(), e);
+            // Транзакцию начать не удалось — данные батча НЕ применены. Не выдаём
+            // Ready (был бы ложный «готово» на старом срезе). Помечаем Error и
+            // выходим из воркера: сторож в runner перезапустит его со свежим
+            // соединением (лечит и возможное залипание открытой транзакции).
             tokio_block_on(async {
-                state.set_status(&path, PathStatus::Ready).await;
+                state
+                    .set_error(
+                        &path,
+                        "не удалось начать транзакцию батча — воркер перезапускается",
+                    )
+                    .await;
             });
-            continue;
+            break;
         }
 
         let mut done = 0usize;
@@ -413,6 +422,16 @@ pub fn run_worker(
             Ok(()) => true,
             Err(e) => {
                 eprintln!("[worker:{}] commit_batch: {}", path.display(), e);
+                // Фиксация не удалась — данных батча в базе НЕТ. Откатываем, чтобы
+                // соединение не осталось с открытой транзакцией (SQLITE_BUSY на
+                // COMMIT её не снимает) и следующий begin_batch не упал.
+                if let Err(re) = storage.rollback_batch() {
+                    eprintln!(
+                        "[worker:{}] rollback после провала commit: {}",
+                        path.display(),
+                        re
+                    );
+                }
                 false
             }
         };
@@ -482,8 +501,20 @@ pub fn run_worker(
             }
         }
 
+        // Батч отработан штатно. Ready выставляем ТОЛЬКО если фиксация прошла —
+        // иначе данных в базе нет, и Ready был бы ложным «готово» на старом
+        // срезе: сервер выдачи начал бы отдавать устаревшие тела как актуальные.
         tokio_block_on(async {
-            state.set_status(&path, PathStatus::Ready).await;
+            if commit_ok {
+                state.set_status(&path, PathStatus::Ready).await;
+            } else {
+                state
+                    .set_error(
+                        &path,
+                        "фиксация батча не удалась — данные не применены, см. журнал демона",
+                    )
+                    .await;
+            }
         });
     }
 

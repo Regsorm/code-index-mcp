@@ -2470,6 +2470,26 @@ impl Storage {
             .context("commit_batch: не удалось закоммитить транзакцию")?;
         Ok(())
     }
+
+    /// Откатить незавершённую батч-транзакцию.
+    ///
+    /// Нужен на пути обработки ошибки [`commit_batch`]: при `SQLITE_BUSY` на
+    /// COMMIT транзакция остаётся открытой, и следующий [`begin_batch`] упал бы
+    /// на «cannot start a transaction within a transaction». Если активной
+    /// транзакции уже нет (SQLite сам откатил при другой ошибке) — это не
+    /// ошибка: отсутствие транзакции проглатываем.
+    pub fn rollback_batch(&self) -> Result<()> {
+        match self.conn.execute_batch("ROLLBACK") {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if e.to_string().contains("no transaction is active") {
+                    Ok(())
+                } else {
+                    Err(e).context("rollback_batch: не удалось откатить транзакцию")
+                }
+            }
+        }
+    }
 }
 
 // ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -2734,6 +2754,20 @@ fn row_to_variable(row: &rusqlite::Row<'_>) -> rusqlite::Result<VariableRecord> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollback_batch_снимает_транзакцию_и_идемпотентен() {
+        let storage = Storage::open_in_memory().unwrap();
+        // Начатую транзакцию откат штатно снимает.
+        storage.begin_batch().unwrap();
+        storage.rollback_batch().unwrap();
+        // Повторный откат без активной транзакции — не ошибка (проглатывается).
+        storage.rollback_batch().unwrap();
+        // После отката снова можно начать транзакцию — соединение НЕ заклинило
+        // на «cannot start a transaction within a transaction».
+        storage.begin_batch().unwrap();
+        storage.rollback_batch().unwrap();
+    }
 
     #[test]
     fn unicode_lower_upper_handles_cyrillic() {

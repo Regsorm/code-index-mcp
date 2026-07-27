@@ -106,6 +106,12 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     daemon_state.apply_config(&wanted_canon).await;
 
     let mut workers: HashMap<PathBuf, tokio::task::JoinHandle<()>> = HashMap::new();
+    // Копии PathEntry по каноническому пути — чтобы сторож ниже мог перезапустить
+    // упавший/аварийно завершившийся worker с той же конфигурацией.
+    let mut worker_entries: HashMap<PathBuf, PathEntry> = HashMap::new();
+    // Backoff перезапусков: (число попыток, время последней) на путь. Защита от
+    // шторма перезапусков при устойчиво падающем worker'е.
+    let mut respawn_tracker: HashMap<PathBuf, (u32, std::time::Instant)> = HashMap::new();
     let indexer_section = cfg.indexer.clone();
 
     // Event-based cache invalidation (этап 3, v0.9.1+): создаём один общий
@@ -129,6 +135,7 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
             .path
             .canonicalize()
             .unwrap_or_else(|_| entry.path.clone());
+        worker_entries.insert(canonical.clone(), entry.clone());
         let handle = spawn_worker(
             entry,
             daemon_state.clone(),
@@ -141,7 +148,11 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
         workers.insert(canonical, handle);
     }
 
-    // Основной цикл: команды + Ctrl-C
+    // Сторож worker'ов тикает раз в 5 секунд — ищет аварийно завершившиеся потоки
+    // и перезапускает их (см. supervise_workers).
+    let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(5));
+
+    // Основной цикл: команды + Ctrl-C + сторож
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
@@ -150,6 +161,7 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
                         let resp = handle_reload(
                             &daemon_state,
                             &mut workers,
+                            &mut worker_entries,
                             &shutdown_tx,
                             processor_registry.clone(),
                         ).await;
@@ -160,6 +172,19 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
                         break;
                     }
                 }
+            }
+            _ = watchdog.tick() => {
+                supervise_workers(
+                    &daemon_state,
+                    &mut workers,
+                    &worker_entries,
+                    &mut respawn_tracker,
+                    &shutdown_tx,
+                    &initial_limiter,
+                    &indexer_section,
+                    &processor_registry,
+                    &cache_client,
+                ).await;
             }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("[daemon] Ctrl-C — завершение");
@@ -211,12 +236,134 @@ fn spawn_worker(
     })
 }
 
+/// Решение backoff для перезапуска пути. Обновляет счётчик в `tracker` и
+/// возвращает `true`, если перезапуск ещё разрешён (число попыток в пределах
+/// окна не превысило `max`). Счётчик сбрасывается, если с последней попытки
+/// прошло больше `window`. Вынесено чистой функцией ради модульного теста.
+fn allow_respawn(
+    tracker: &mut HashMap<PathBuf, (u32, std::time::Instant)>,
+    path: &PathBuf,
+    now: std::time::Instant,
+    window: std::time::Duration,
+    max: u32,
+) -> bool {
+    let slot = tracker.entry(path.clone()).or_insert((0, now));
+    if now.duration_since(slot.1) > window {
+        *slot = (0, now);
+    }
+    slot.0 += 1;
+    slot.1 = now;
+    slot.0 <= max
+}
+
+/// Сторож worker'ов. Перезапускает потоки, завершившиеся НЕ по общему shutdown
+/// (паника внутри батча или ранний выход из-за ошибки транзакции). В штатном
+/// режиме worker живёт до shutdown, поэтому `is_finished()` во время работы
+/// демона означает аварию: раньше статус папки при этом навсегда застревал на
+/// `ReindexingBatch` («indexing»), а самовосстановления не было.
+///
+/// Перезапуск ограничен backoff'ом (`allow_respawn`): устойчиво падающий путь
+/// после лимита попыток оставляется в `Error`, чтобы не крутить бесконечный
+/// цикл перезапусков.
+#[allow(clippy::too_many_arguments)]
+async fn supervise_workers(
+    state: &DaemonState,
+    workers: &mut HashMap<PathBuf, tokio::task::JoinHandle<()>>,
+    worker_entries: &HashMap<PathBuf, PathEntry>,
+    respawn_tracker: &mut HashMap<PathBuf, (u32, std::time::Instant)>,
+    shutdown_tx: &broadcast::Sender<()>,
+    initial_limiter: &Option<Arc<Semaphore>>,
+    indexer_section: &IndexerSection,
+    processor_registry: &Option<Arc<ProcessorRegistry>>,
+    cache_client: &Option<Arc<CacheClient>>,
+) {
+    const RESPAWN_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+    const MAX_RESPAWNS: u32 = 5;
+
+    // Сначала собрать пути завершившихся потоков, потом мутировать `workers`.
+    let finished: Vec<PathBuf> = workers
+        .iter()
+        .filter(|(_, h)| h.is_finished())
+        .map(|(p, _)| p.clone())
+        .collect();
+
+    for path in finished {
+        if let Some(handle) = workers.remove(&path) {
+            match handle.await {
+                Ok(()) => eprintln!(
+                    "[daemon] worker {} завершился сам (не shutdown) — перезапуск",
+                    path.display()
+                ),
+                Err(e) => {
+                    eprintln!("[daemon] worker {} упал ({}) — перезапуск", path.display(), e)
+                }
+            }
+        }
+
+        let entry = match worker_entries.get(&path) {
+            Some(e) => e.clone(),
+            None => {
+                eprintln!(
+                    "[daemon] worker {} завершился, но PathEntry не найден — перезапуск невозможен",
+                    path.display()
+                );
+                state
+                    .set_error(
+                        &path,
+                        "worker завершился, перезапуск невозможен (нет конфигурации пути)",
+                    )
+                    .await;
+                continue;
+            }
+        };
+
+        if !allow_respawn(
+            respawn_tracker,
+            &path,
+            std::time::Instant::now(),
+            RESPAWN_WINDOW,
+            MAX_RESPAWNS,
+        ) {
+            eprintln!(
+                "[daemon] worker {} аварийно завершался > {} раз за {}с — прекращаю перезапуски, статус Error",
+                path.display(),
+                MAX_RESPAWNS,
+                RESPAWN_WINDOW.as_secs()
+            );
+            state
+                .set_error(
+                    &path,
+                    "worker многократно аварийно завершается — см. журнал демона",
+                )
+                .await;
+            continue;
+        }
+
+        // Честный промежуточный статус до готовности свежего worker'а.
+        state
+            .set_error(&path, "worker перезапускается после аварийного завершения")
+            .await;
+
+        let handle = spawn_worker(
+            entry,
+            state.clone(),
+            shutdown_tx.subscribe(),
+            initial_limiter.clone(),
+            indexer_section.clone(),
+            processor_registry.clone(),
+            cache_client.clone(),
+        );
+        workers.insert(path, handle);
+    }
+}
+
 /// Обработка `POST /reload` в runner'е. Добавляем новые папки и запускаем для них
 /// worker'ы. Удаление папок в MVP требует рестарта демона — это зафиксировано в
 /// брифе и в поле `error` ответа.
 async fn handle_reload(
     state: &DaemonState,
     workers: &mut HashMap<PathBuf, tokio::task::JoinHandle<()>>,
+    worker_entries: &mut HashMap<PathBuf, PathEntry>,
     shutdown_tx: &broadcast::Sender<()>,
     processor_registry: Option<Arc<ProcessorRegistry>>,
 ) -> ReloadResponse {
@@ -268,6 +415,7 @@ async fn handle_reload(
             .canonicalize()
             .unwrap_or_else(|_| entry.path.clone());
         if added.contains(&canonical) {
+            worker_entries.insert(canonical.clone(), entry.clone());
             let handle = spawn_worker(
                 entry,
                 state.clone(),
@@ -404,6 +552,26 @@ mod migrate_tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn allow_respawn_разрешает_до_лимита_и_сбрасывается_после_окна() {
+        let mut tracker = HashMap::new();
+        let path = PathBuf::from("/tmp/repo");
+        let window = std::time::Duration::from_secs(60);
+        let t0 = std::time::Instant::now();
+        // Первые 5 попыток в пределах одного окна разрешены.
+        for i in 1..=5 {
+            assert!(
+                allow_respawn(&mut tracker, &path, t0, window, 5),
+                "попытка {i} должна быть разрешена"
+            );
+        }
+        // 6-я попытка в том же окне — запрещена (сработал backoff).
+        assert!(!allow_respawn(&mut tracker, &path, t0, window, 5));
+        // По прошествии окна счётчик сбрасывается — снова разрешено.
+        let later = t0 + std::time::Duration::from_secs(61);
+        assert!(allow_respawn(&mut tracker, &path, later, window, 5));
+    }
 
     fn make_repo_with_marker(tmp: &TempDir, name: &str, marker: &str) -> std::path::PathBuf {
         let dir = tmp.path().join(name);
