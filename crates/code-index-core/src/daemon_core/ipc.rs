@@ -163,6 +163,10 @@ pub enum ToolUnavailable {
     },
     /// Запрошенная папка не в конфиге демона.
     NotStarted { message: String },
+    /// Алиаса репозитория не существует — опечатка в имени.
+    /// Отдельный статус, потому что ждать и повторять запрос бессмысленно
+    /// (в отличие от `NotStarted`/`Indexing`, где ожидание уместно).
+    UnknownRepo { message: String },
     /// Демон не отвечает на health-IPC.
     DaemonOffline { message: String },
     /// Ошибка на стороне демона — прокинута в поле message.
@@ -185,6 +189,24 @@ mod tests {
     fn progress_percent_none_when_total_zero() {
         let p = Progress::new(0, 0);
         assert_eq!(p.percent, None);
+    }
+
+    /// «Такого репо нет» и «репо есть, но обход не начинался» — разные ситуации:
+    /// в первой ждать бессмысленно, во второй уместно. Значит и машинный
+    /// признак `status` у них обязан различаться.
+    #[test]
+    fn unknown_repo_status_differs_from_not_started() {
+        let unknown = serde_json::to_string(&ToolUnavailable::UnknownRepo {
+            message: "Неизвестный repo 'нетТакого'".to_string(),
+        })
+        .unwrap();
+        let not_started = serde_json::to_string(&ToolUnavailable::NotStarted {
+            message: "Путь не отслеживается демоном".to_string(),
+        })
+        .unwrap();
+
+        assert!(unknown.contains("\"status\":\"unknown_repo\""), "{}", unknown);
+        assert!(not_started.contains("\"status\":\"not_started\""), "{}", not_started);
     }
 
     #[test]

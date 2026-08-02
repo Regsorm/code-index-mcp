@@ -1359,7 +1359,7 @@ pub async fn get_stats(server: &CodeIndexServer, repo: Option<String>) -> String
     if let Some(alias) = repo {
         return match server.repos.get(&alias) {
             Some(entry) => to_json(&one_stats(server, &alias, entry).await),
-            None => format_unavailable(ToolUnavailable::NotStarted {
+            None => format_unavailable(ToolUnavailable::UnknownRepo {
                 message: format!(
                     "Неизвестный repo '{}'. Доступные: {:?}.",
                     alias,

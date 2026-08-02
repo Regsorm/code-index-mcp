@@ -786,10 +786,10 @@ impl CodeIndexServer {
         }
     }
 
-    /// Получить RepoEntry по alias или вернуть ToolUnavailable::NotStarted JSON.
+    /// Получить RepoEntry по alias или вернуть ToolUnavailable::UnknownRepo JSON.
     pub(crate) fn resolve_repo(&self, alias: &str) -> Result<&RepoEntry, String> {
         self.repos.get(alias).ok_or_else(|| {
-            tools::format_unavailable(crate::daemon_core::ipc::ToolUnavailable::NotStarted {
+            tools::format_unavailable(crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
                 message: format!(
                     "Неизвестный repo '{}'. Доступные: {:?}. Укажите один из алиасов, переданных в --path alias=dir при запуске сервера.",
                     alias,

@@ -248,7 +248,7 @@ async fn handle_get_stats(
             return ok_json(tools::get_stats(&server, Some(alias.clone())).await);
         }
         return ok_json(crate::mcp::tools::format_unavailable(
-            crate::daemon_core::ipc::ToolUnavailable::NotStarted {
+            crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
                 message: format!(
                     "Неизвестный repo '{}'. Доступные на этой ноде: {:?}.",
                     alias,
