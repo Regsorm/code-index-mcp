@@ -955,6 +955,7 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             // flush_to_disk копирует текущее SQLite-соединение в файл —
             // если бы мы дописали в conn после flush, записи остались бы
             // только в памяти и пропали бы при выходе.
+            let extras_start = std::time::Instant::now();
             if let Some(reg) = registry.as_ref() {
                 if let Some(proc) = reg.resolve(None, &abs_path) {
                     if let Err(e) = proc.index_extras(&abs_path, &mut storage) {
@@ -967,14 +968,27 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                     }
                 }
             }
+            let extras_ms = extras_start.elapsed().as_millis();
 
             // 7. Если работаем в in-memory режиме — сохранить результаты на диск.
             // Должно идти ПОСЛЕ index_extras, иначе записи расширения
             // попадут только в in-memory копию.
+            let flush_start = std::time::Instant::now();
             storage.flush_to_disk(&db_path)?;
+            let flush_ms = flush_start.elapsed().as_millis();
 
-            // 8. Вывести результат
-            println!("Индексация завершена за {} мс", result.elapsed_ms);
+            // 8. Вывести результат.
+            // `result.elapsed_ms` — только ядро (обход, парсинг, запись символов).
+            // На 1С-репо сопоставимое время уходит на extras (метаданные, формы,
+            // граф вызовов процедур), поэтому печатаем полное время и разбивку —
+            // иначе половина работы не видна ни в логе, ни в замерах.
+            println!(
+                "Индексация завершена за {} мс (ядро {} + extras {} + сброс на диск {})",
+                result.elapsed_ms as u128 + extras_ms + flush_ms,
+                result.elapsed_ms,
+                extras_ms,
+                flush_ms
+            );
             println!("  Найдено файлов:        {}", result.files_scanned);
             println!("  Проиндексировано:      {}", result.files_indexed);
             println!("  Пропущено (без изм.):  {}", result.files_skipped);
