@@ -40,7 +40,7 @@ Versioning — [SemVer](https://semver.org/).
 
 ### Compatibility
 
-- **A reindex is required only for repositories in the new languages** (PHP, C, C++, C#, Ruby, Swift) and for C++ projects where `.h` used to be parsed as C. Already-built indexes for the previous languages are unaffected; the DB schema is unchanged.
+- **A reindex is required** (`index --force`). The DB schema is unchanged.
 
 ## [0.45.2] — 2026-07-27
 
