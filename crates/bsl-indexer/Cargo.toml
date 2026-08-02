@@ -3,7 +3,7 @@ name = "bsl-indexer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Rust code index for 1C:Enterprise (BSL) with 7 native tools: object structure, form handlers, event subscriptions, call graph, data links."
+description = "Rust code index for 1C:Enterprise (BSL) with 11 native tools: object structure & profile, form handlers, event subscriptions, call graph, data links, impact map, read-only SQL. Tree-sitter AST for 14 languages."
 publish = false
 
 # Бинарник называется `bsl-indexer` (как и пакет). На VM RAG он
