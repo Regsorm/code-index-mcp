@@ -21,7 +21,7 @@ One static binary for Windows/Linux/macOS — no runtime, no dependencies. Index
 - **Native BSL/1C.** Parses both Configurator (XML) and 1C:EDT (`.mdo`) exports of 1C:Enterprise 8.3 configurations. Data-link graph (object→object edges via reference types in attributes) — ~60,000 edges in seconds for a typical accounting configuration.
 - **Federation.** One MCP server can serve multiple repositories across machines — pass `repo: "alias"` in each tool call.
 - **Compressed content storage.** File contents stored in SQLite via zstd, cheap random-access reads for AI agents.
-- **Tree-sitter AST.** 10 languages with full parsing (Rust, Python, JavaScript, TypeScript, Java, Kotlin, C#, Go, Objective-C, Zig) + fallback for 50+ formats.
+- **Tree-sitter AST.** 14 languages with full parsing (Python, JavaScript, TypeScript, Java, Rust, Go, PHP, C, C++, C#, Ruby, Swift, 1C (BSL), HTML) + full-text indexing for 50+ text formats.
 
 Connects to Claude Code, Cursor, any MCP client over HTTP.
 
@@ -48,9 +48,19 @@ A compiled Rust binary with **one-writer / many-readers** architecture:
 | Java | tree-sitter-java | `.java` |
 | Rust | tree-sitter-rust | `.rs` |
 | Go | tree-sitter-go | `.go` |
+| PHP | tree-sitter-php | `.php`, `.php5`, `.phtml` (v0.46.0) |
+| C | tree-sitter-c | `.c`, `.h` (v0.46.0) |
+| C++ | tree-sitter-cpp | `.cpp`, `.cxx`, `.cc`, `.hpp`, `.hxx`, `.hh` (v0.46.0) |
+| C# | tree-sitter-c-sharp | `.cs` (v0.46.0) |
+| Ruby | tree-sitter-ruby | `.rb` (v0.46.0) |
+| Swift | tree-sitter-swift | `.swift` (v0.46.0) |
 | 1C (BSL) | tree-sitter-bsl | `.bsl`, `.os` |
 | XML (1C) | quick-xml | `.xml` (configuration metadata) |
 | HTML | tree-sitter-html | `.html`, `.htm` (v0.7.1, by user request — see HTML-specific mapping below) |
+
+`.h` is ambiguous between C and C++: it is parsed as C++ when the repository language is `cpp`, otherwise as C. The repository language is taken from `daemon.toml` or auto-detected by the prevailing extension.
+
+PHP, C, C++, C#, Ruby and Swift are dual-indexed (like HTML): AST parsing plus raw content in `text_files`, so `search_text` / `grep_text` keep working on them alongside structured queries.
 
 Text files (`.md`, `.json`, `.yaml`, `.toml`, `.xml`, `.sql`, `.env`, etc.) are also indexed for full-text search.
 
@@ -524,7 +534,7 @@ If the daemon is offline:
   "max_file_size": 1048576,
   "max_files": 0,
   "bulk_threshold": 10,
-  "languages": ["python", "javascript", "typescript", "java", "rust", "go", "bsl"],
+  "languages": ["python", "javascript", "typescript", "java", "rust", "go", "bsl", "php", "c", "cpp", "csharp", "ruby", "swift", "html"],
   "batch_size": 500,
   "storage_mode": "auto",
   "memory_max_percent": 25,

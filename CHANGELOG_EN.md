@@ -5,6 +5,43 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.46.0] — 2026-08-02
+
+**Six new languages with AST parsing: PHP, C, C++, C#, Ruby, Swift. There were 8 languages (Python, JavaScript, TypeScript, Java, Rust, Go, BSL, HTML) — now there are 14. The full universal toolset works for the new languages: `get_function`/`get_class`, `find_symbol`, the call graph (`get_callers`/`get_callees`/`find_path`/`get_call_tree`), `get_imports`, `get_file_summary`, `grep_code`/`grep_body`. Plus two serve-layer fixes: a meaningful status for an unknown repo alias, and `.h` language detection based on the repository language.**
+
+### Added
+
+- **PHP, C, C++, C#, Ruby and Swift parsers** (`crates/code-index-core/src/parser/{php,c,cpp,c_sharp,ruby,swift}.rs`). Functions/methods, classes (structs, interfaces, protocols, enums — per language), imports and call-graph edges are extracted; module-level variables for PHP, C#, Ruby and Swift (C/C++ do not emit them). C++ is parsed by the same parser as C, in C++ mode. Extensions: `.php`/`.php5`/`.phtml`, `.c`/`.h`, `.cpp`/`.cxx`/`.cc`/`.hpp`/`.hxx`/`.hh`, `.cs`, `.rb`, `.swift`.
+- **Dual indexing for the new languages.** Like HTML, they are written both to the AST tables and to `text_files` (`is_dual_indexed_language`), so `search_text`/`grep_text`/`read_file` keep working on them alongside structured queries.
+- **`unknown_repo` status** (`ToolUnavailable::UnknownRepo`) for calls against a non-existent repository alias. Previously such a call returned `not_started` — the very same answer as a real repo whose indexing has not started yet, making a typo in the alias indistinguishable from "wait, it is indexing". Set in `mcp::resolve_repo`, `get_stats` and the federation server.
+
+### Changed
+
+- **Kotlin remains a text-only language.** The `tree-sitter-kotlin` 0.3.5 crate pulls in an incompatible tree-sitter 0.20 core — until a crate for 0.25 appears, `.kt` is indexed for full-text search only.
+
+### Fixed
+
+- **`.h` language is detected from the repository language.** The `.h` extension is ambiguous between C and C++; it used to always land in C, so headers in C++ projects were parsed by the C parser. Added `file_types::categorize_file_in_repo(path, repo_language)` — `.h` is treated as C++ only when `repo_language == "cpp"`, and stays C otherwise. The repository language is threaded through `IndexConfig.repo_language` and applied identically on initial indexing and in the file watcher.
+- **Repository language detection by prevailing extension only scanned the root.** `detect_by_extension_majority` looked one level deep, so projects with sources in subdirectories (rocksdb, for one) got no language at all. It now walks the tree, samples up to 4,000 files and skips excluded directories; `.h` is excluded from the vote as an extension shared by C and C++.
+- **`find_path` returned `found=true` for a non-existent symbol** when `from` equals `to`: the "path to itself" shortcut fired before the existence check. Added a `Storage::symbol_known` check (a symbol is known if it appears in `functions` or as a `caller`/`callee` in `calls`, language-aware).
+- **Swift: part of a file lost with CRLF line endings.** The `tree-sitter-swift` 0.7.3 grammar fails to parse a multi-line `"""` literal with a `\` continuation when line endings are CRLF — the parse falls apart and everything after it is lost. On Windows (`core.autocrlf`) this meant losing about 12% of symbols on a real repository (`SystemFileHandle.swift` from swift-nio: 2 functions out of 57). The source is normalized `\r\n` → `\n` before parsing; line numbers are unaffected.
+
+### Known limitations
+
+- **Ruby: a call with no parentheses, receiver or arguments** (`foo`) is parsed by the grammar as an `identifier` and is indistinguishable from reading a local variable — such calls do not enter the call graph. A grammar limitation, pinned by a negative test.
+
+### Testing
+
+- `cargo test --workspace` — 614 passed, 0 failed, 0 warnings.
+- A matrix of 20 universal tools × 3 scenarios (data / call variant / robustness) × 6 new languages = 360 checks against a live serve instance: no discrepancies.
+- Index-vs-source verification on six OSS repositories (laravel/framework, redis/redis, facebook/rocksdb, jellyfin/jellyfin, rails/rails, apple/swift-nio): 3,629 of 3,629 symbols confirmed in the source text at the reported line; missed declarations — 0 out of 1,024 checked.
+- Live `.h` check: redis (C) — `.h` detected as `c` (312 files); rocksdb (C++) — `.h` as `cpp` (614 files), while genuine `.c` files stayed C (3 files).
+- Local rollout (Windows, 45 repos `ready`) and a 5-of-5 smoke test: PHP class parsing, `unknown_repo` on a non-existent alias, `find_path` on a made-up symbol, `get_object_structure` on a BSL repo.
+
+### Compatibility
+
+- **A reindex is required only for repositories in the new languages** (PHP, C, C++, C#, Ruby, Swift) and for C++ projects where `.h` used to be parsed as C. Already-built indexes for the previous languages are unaffected; the DB schema is unchanged.
+
 ## [0.45.2] — 2026-07-27
 
 **The indexer daemon no longer gets stuck in `indexing` status when a worker thread terminates abnormally. Previously, a panic or early exit during the batch-apply phase left the folder in "applying batch changes" status forever — `get_function`/`grep_body` returned the stub indefinitely, with no self-recovery (only a manual daemon restart helped). Added a worker watchdog and correct handling of transaction-commit failure.**

@@ -21,7 +21,7 @@
 - **Native BSL/1С.** Парсит выгрузки конфигураций 1С:Предприятие 8.3 как из Конфигуратора (XML), так и из 1С:EDT (`.mdo`). Граф связей данных (рёбра объект→объект по ссылочным типам реквизитов) для типичной бухгалтерии — ~60 000 рёбер за пару секунд.
 - **Federation.** Один MCP-сервер обслуживает несколько репозиториев из разных машин — `repo: "alias"` в каждом tool-call.
 - **Сжатое хранилище content.** Содержимое файлов хранится в SQLite через zstd, дешёвый random-access read для AI-агента.
-- **Tree-sitter AST.** 10 языков с полным разбором (Rust, Python, JavaScript, TypeScript, Java, Kotlin, C#, Go, Objective-C, Zig) + fallback для 50+ форматов.
+- **Tree-sitter AST.** 14 языков с полным разбором (Python, JavaScript, TypeScript, Java, Rust, Go, PHP, C, C++, C#, Ruby, Swift, 1С (BSL), HTML) + полнотекстовая индексация 50+ текстовых форматов.
 
 Подключается к Claude Code, Cursor, любому MCP-клиенту по HTTP.
 
@@ -50,9 +50,19 @@ AI-модели тратят десятки вызовов `grep`/`find` для 
 | Java | tree-sitter-java | `.java` |
 | Rust | tree-sitter-rust | `.rs` |
 | Go | tree-sitter-go | `.go` |
+| PHP | tree-sitter-php | `.php`, `.php5`, `.phtml` (v0.46.0) |
+| C | tree-sitter-c | `.c`, `.h` (v0.46.0) |
+| C++ | tree-sitter-cpp | `.cpp`, `.cxx`, `.cc`, `.hpp`, `.hxx`, `.hh` (v0.46.0) |
+| C# | tree-sitter-c-sharp | `.cs` (v0.46.0) |
+| Ruby | tree-sitter-ruby | `.rb` (v0.46.0) |
+| Swift | tree-sitter-swift | `.swift` (v0.46.0) |
 | 1С (BSL) | tree-sitter-bsl | `.bsl`, `.os` |
 | XML (1С) | quick-xml | `.xml` (метаданные конфигураций) |
 | HTML | tree-sitter-html | `.html`, `.htm` (v0.7.1, по запросу пользователя — см. маппинг ниже) |
+
+Расширение `.h` неоднозначно между C и C++: оно разбирается как C++, если язык репозитория — `cpp`, иначе как C. Язык репозитория берётся из `daemon.toml` либо определяется автоматически по преобладающему расширению.
+
+PHP, C, C++, C#, Ruby и Swift индексируются двойным способом (как HTML): AST-разбор плюс сырое содержимое в `text_files`, поэтому `search_text` / `grep_text` продолжают работать по ним наряду со структурными запросами.
 
 Текстовые файлы (`.md`, `.json`, `.yaml`, `.toml`, `.xml`, `.sql`, `.env` и др.) индексируются для полнотекстового поиска.
 
@@ -528,7 +538,7 @@ code-index get-file-summary "src/auth/login.py" --path /my/project
   "max_file_size": 1048576,
   "max_files": 0,
   "bulk_threshold": 10,
-  "languages": ["python", "javascript", "typescript", "java", "rust", "go", "bsl"],
+  "languages": ["python", "javascript", "typescript", "java", "rust", "go", "bsl", "php", "c", "cpp", "csharp", "ruby", "swift", "html"],
   "batch_size": 500,
   "storage_mode": "auto",
   "memory_max_percent": 25,
