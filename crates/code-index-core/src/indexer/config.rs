@@ -128,7 +128,7 @@ fn default_bulk_threshold() -> usize {
 }
 
 /// Языки по умолчанию — все поддерживаемые
-fn default_languages() -> Vec<String> {
+pub(crate) fn default_languages() -> Vec<String> {
     vec![
         "python".to_string(),
         "javascript".to_string(),
@@ -137,6 +137,14 @@ fn default_languages() -> Vec<String> {
         "rust".to_string(),
         "go".to_string(),
         "bsl".to_string(),
+        "php".to_string(),
+        "c".to_string(),
+        "cpp".to_string(),
+        "csharp".to_string(),
+        "ruby".to_string(),
+        "swift".to_string(),
+        // html регистрируется в ParserRegistry безусловно, здесь — для полноты списка
+        "html".to_string(),
     ]
 }
 

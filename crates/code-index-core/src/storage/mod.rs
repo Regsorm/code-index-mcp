@@ -1415,6 +1415,45 @@ impl Storage {
     /// `find_path_bsl` (тот ходит по `proc_call_graph` с `call_type`).
     /// `language` — опциональный фильтр по языку файла-источника ребра.
     /// `max_depth` зажимается в [1, 10] для защиты от взрыва на густых графах.
+    /// Известен ли символ репозиторию: объявлен как функция либо участвует
+    /// в графе вызовов. Второе нужно для внешних имён (библиотечная функция
+    /// своего объявления в репозитории не имеет, но в `calls` присутствует).
+    /// `language` фильтрует так же, как в `find_call_path` — по языку файла.
+    fn symbol_known(&self, name: &str, language: Option<&str>) -> Result<bool> {
+        let queries: [&str; 3] = if language.is_some() {
+            [
+                "SELECT 1 FROM functions f JOIN files fi ON fi.id = f.file_id \
+                 WHERE f.name = ?1 AND fi.language = ?2 LIMIT 1",
+                "SELECT 1 FROM calls c JOIN files fi ON fi.id = c.file_id \
+                 WHERE c.caller = ?1 AND fi.language = ?2 LIMIT 1",
+                "SELECT 1 FROM calls c JOIN files fi ON fi.id = c.file_id \
+                 WHERE c.callee = ?1 AND fi.language = ?2 LIMIT 1",
+            ]
+        } else {
+            [
+                "SELECT 1 FROM functions WHERE name = ?1 LIMIT 1",
+                "SELECT 1 FROM calls WHERE caller = ?1 LIMIT 1",
+                "SELECT 1 FROM calls WHERE callee = ?1 LIMIT 1",
+            ]
+        };
+        for sql in queries {
+            let hit: Option<i64> = match language {
+                Some(lang) => self
+                    .conn
+                    .query_row(sql, params![name, lang], |r| r.get(0))
+                    .optional()?,
+                None => self
+                    .conn
+                    .query_row(sql, params![name], |r| r.get(0))
+                    .optional()?,
+            };
+            if hit.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn find_call_path(
         &self,
         from: &str,
@@ -1424,9 +1463,16 @@ impl Storage {
     ) -> Result<Option<Vec<CallEdge>>> {
         use std::collections::{HashMap, HashSet, VecDeque};
         let depth_limit = max_depth.clamp(1, 10);
-        // Путь к самому себе — пустая цепочка рёбер.
+        // Путь к самому себе — пустая цепочка рёбер, но только если символ
+        // репозиторию известен. Без этой проверки find_path("X","X") отвечал
+        // found=true для любой выдумки, то есть утверждал наличие пути между
+        // символами, которых в репозитории нет.
         if from == to {
-            return Ok(Some(Vec::new()));
+            return if self.symbol_known(from, language)? {
+                Ok(Some(Vec::new()))
+            } else {
+                Ok(None)
+            };
         }
         // Итеративный BFS по УНИКАЛЬНЫМ узлам графа `calls`: каждый узел
         // разворачивается ровно один раз (HashSet `visited`), поэтому циклы и
@@ -3182,6 +3228,39 @@ mod tests {
         assert!(storage.find_call_path("A", "D", 2, None).unwrap().is_none());
         // При max_depth=3 — путь из 3 рёбер.
         assert_eq!(storage.find_call_path("A", "D", 3, None).unwrap().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn find_call_path_self_requires_existing_symbol() {
+        let storage = Storage::open_in_memory().unwrap();
+        let fid = storage.upsert_file(&make_file("/g.py")).unwrap();
+        seed_calls(&storage, fid, &[("A", "B")]);
+
+        // Символ есть в графе — путь к самому себе пустой, но найден
+        let a = storage.find_call_path("A", "A", 5, None).unwrap();
+        assert!(
+            a.as_ref().is_some_and(|chain| chain.is_empty()),
+            "A вызывает B, путь A→A — найден и пуст"
+        );
+        // Вызываемый символ тоже считается известным
+        assert!(storage.find_call_path("B", "B", 5, None).unwrap().is_some());
+
+        // Выдуманного символа в репозитории нет — пути быть не может
+        assert!(
+            storage.find_call_path("НетТакого", "НетТакого", 5, None).unwrap().is_none(),
+            "find_path не должен подтверждать путь для несуществующего символа"
+        );
+    }
+
+    #[test]
+    fn find_call_path_self_respects_language_filter() {
+        let storage = Storage::open_in_memory().unwrap();
+        let py = storage.upsert_file(&make_file("/a.py")).unwrap();
+        seed_calls(&storage, py, &[("A", "B")]);
+
+        assert!(storage.find_call_path("A", "A", 5, Some("python")).unwrap().is_some());
+        // Того же символа в rust-файлах нет — путь к самому себе не подтверждаем
+        assert!(storage.find_call_path("A", "A", 5, Some("rust")).unwrap().is_none());
     }
 
     #[test]

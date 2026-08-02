@@ -81,6 +81,12 @@ pub fn detect_by_extension_majority(root: &Path) -> Option<&'static str> {
             Some("js") | Some("jsx") => "javascript",
             Some("ts") | Some("tsx") => "typescript",
             Some("bsl") | Some("os") => "bsl",
+            Some("php") | Some("php5") | Some("phtml") => "php",
+            Some("c") | Some("h") => "c",
+            Some("cpp") | Some("cxx") | Some("cc") | Some("hpp") | Some("hxx") | Some("hh") => "cpp",
+            Some("cs") => "csharp",
+            Some("rb") => "ruby",
+            Some("swift") => "swift",
             _ => continue,
         };
         *counts.entry(lang).or_insert(0) += 1;

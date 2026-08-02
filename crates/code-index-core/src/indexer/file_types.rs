@@ -23,6 +23,20 @@ const CODE_EXTENSIONS: &[(&str, &str)] = &[
     ("go", "go"),
     ("bsl", "bsl"),
     ("os", "bsl"),
+    ("php", "php"),
+    ("php5", "php"),
+    ("phtml", "php"),
+    ("c", "c"),
+    ("h", "c"),
+    ("cpp", "cpp"),
+    ("cxx", "cpp"),
+    ("cc", "cpp"),
+    ("hpp", "cpp"),
+    ("hxx", "cpp"),
+    ("hh", "cpp"),
+    ("cs", "csharp"),
+    ("rb", "ruby"),
+    ("swift", "swift"),
     ("html", "html"),
     ("htm", "html"),
 ];
@@ -34,7 +48,7 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "md", "txt", "rst",
     "json", "yaml", "yml", "toml",
     "xml", "css",
-    "c", "h", "cpp", "hpp", "cs", "rb", "php", "swift", "kt",
+    "kt",
     "csv", "env", "ini", "cfg",
     "sql", "sh", "bat", "ps1",
 ];
@@ -48,7 +62,10 @@ const TEXT_EXTENSIONS: &[&str] = &[
 /// structured queries (`get_class("cart")`, `find_symbol("submitOrder")`,
 /// `get_imports(module=...)`) добавляются сверху без регрессии.
 pub fn is_dual_indexed_language(language: &str) -> bool {
-    matches!(language, "html")
+    matches!(
+        language,
+        "html" | "php" | "c" | "cpp" | "csharp" | "ruby" | "swift"
+    )
 }
 
 /// Директории, которые следует исключать при обходе
@@ -131,6 +148,32 @@ mod tests {
         );
         assert!(is_dual_indexed_language("html"));
         assert!(!is_dual_indexed_language("python"));
+    }
+
+    #[test]
+    fn multilang_extensions_are_code_with_dual_indexing() {
+        // C/C++/C#/Ruby/Swift переведены из TEXT в CODE — AST плюс сохранение
+        // raw-content, чтобы grep_text/read_file по ним не потеряли покрытие.
+        for (path, lang) in [
+            ("main.c", "c"),
+            ("api.h", "c"),
+            ("engine.cpp", "cpp"),
+            ("engine.hpp", "cpp"),
+            ("Service.cs", "csharp"),
+            ("worker.rb", "ruby"),
+            ("View.swift", "swift"),
+        ] {
+            assert_eq!(
+                categorize_file(Path::new(path)),
+                FileCategory::Code(lang.to_string()),
+                "{} должен быть code/{}",
+                path,
+                lang
+            );
+            assert!(is_dual_indexed_language(lang), "{} — dual-indexed", lang);
+        }
+        // Kotlin пока без грамматики под tree-sitter 0.25 — остаётся текстовым
+        assert_eq!(categorize_file(Path::new("Main.kt")), FileCategory::Text);
     }
 
     #[test]

@@ -8,6 +8,12 @@ pub mod go;
 pub mod text;
 pub mod bsl;
 pub mod html;
+pub mod php;
+pub mod c;
+pub mod cpp;
+pub mod c_sharp;
+pub mod ruby;
+pub mod swift;
 /// Парсер XML-выгрузок 1С (quick-xml, не tree-sitter)
 /// Не регистрируется в ParserRegistry — вызывается напрямую из indexer
 pub mod xml_1c;
@@ -47,6 +53,14 @@ impl ParserRegistry {
         registry.register(Arc::new(rust_lang::RustParser::new()));
         registry.register(Arc::new(go::GoParser::new()));
         registry.register(Arc::new(bsl::BslParser::new()));
+        registry.register(Arc::new(php::PhpParser::new()));
+        // C++ регистрируем ПОСЛЕ C — заголовки `.h` достаются C++-парсеру.
+        // Он надмножество: тот же обход с is_cpp=true, плюс классы и namespace.
+        registry.register(Arc::new(c::CParser::new()));
+        registry.register(Arc::new(cpp::CppParser::new()));
+        registry.register(Arc::new(c_sharp::CSharpParser::new()));
+        registry.register(Arc::new(ruby::RubyParser::new()));
+        registry.register(Arc::new(swift::SwiftParser::new()));
         registry.register(Arc::new(html::HtmlParser::new()));
         registry
     }
@@ -74,6 +88,12 @@ impl ParserRegistry {
                 "rust" => registry.register(Arc::new(rust_lang::RustParser::new())),
                 "go" => registry.register(Arc::new(go::GoParser::new())),
                 "bsl" => registry.register(Arc::new(bsl::BslParser::new())),
+                "php" => registry.register(Arc::new(php::PhpParser::new())),
+                "c" => registry.register(Arc::new(c::CParser::new())),
+                "cpp" => registry.register(Arc::new(cpp::CppParser::new())),
+                "csharp" => registry.register(Arc::new(c_sharp::CSharpParser::new())),
+                "ruby" => registry.register(Arc::new(ruby::RubyParser::new())),
+                "swift" => registry.register(Arc::new(swift::SwiftParser::new())),
                 "html" => {} // ниже регистрируется безусловно
                 _ => {} // Неизвестный язык — пропускаем без ошибки
             }
@@ -112,6 +132,13 @@ pub fn get_parser_for_extension(ext: &str) -> Option<Box<dyn LanguageParser>> {
         "rs" => Some(Box::new(rust_lang::RustParser::new())),
         "go" => Some(Box::new(go::GoParser::new())),
         "bsl" | "os" => Some(Box::new(bsl::BslParser::new())),
+        "php" | "php5" | "phtml" => Some(Box::new(php::PhpParser::new())),
+        "c" => Some(Box::new(c::CParser::new())),
+        // `.h` — за C++-парсером: он надмножество C и разбирает оба варианта
+        "h" | "cpp" | "cxx" | "cc" | "hpp" | "hxx" | "hh" => Some(Box::new(cpp::CppParser::new())),
+        "cs" => Some(Box::new(c_sharp::CSharpParser::new())),
+        "rb" => Some(Box::new(ruby::RubyParser::new())),
+        "swift" => Some(Box::new(swift::SwiftParser::new())),
         "html" | "htm" => Some(Box::new(html::HtmlParser::new())),
         _ => None,
     }
@@ -168,6 +195,25 @@ mod tests {
         assert!(reg.get_parser("cob").is_none());
     }
 
+    /// Реестр строится из `IndexConfig::languages`, а не из `[[paths]] language`
+    /// в daemon.toml. Если язык добавлен в `from_languages`, но забыт в списке
+    /// по умолчанию — файлы попадут в code-категорию, но парситься не будут
+    /// (молча, без ошибки). Тест держит оба списка в согласии.
+    #[test]
+    fn default_languages_cover_all_parsers() {
+        let reg = ParserRegistry::from_languages(&crate::indexer::config::default_languages());
+        for ext in [
+            "py", "js", "ts", "java", "rs", "go", "bsl", "php", "c", "h", "cpp", "hpp", "cs", "rb",
+            "swift", "html",
+        ] {
+            assert!(
+                reg.get_parser(ext).is_some(),
+                ".{} должен парситься при языках по умолчанию",
+                ext
+            );
+        }
+    }
+
     #[test]
     fn test_get_parser_for_extension_compat() {
         // Функция обратной совместимости
@@ -175,6 +221,10 @@ mod tests {
         assert!(get_parser_for_extension("js").is_some());
         assert!(get_parser_for_extension("ts").is_some());
         assert!(get_parser_for_extension("java").is_some());
-        assert!(get_parser_for_extension("cpp").is_none());
+        assert!(get_parser_for_extension("cpp").is_some());
+        assert!(get_parser_for_extension("cs").is_some());
+        assert!(get_parser_for_extension("rb").is_some());
+        assert!(get_parser_for_extension("swift").is_some());
+        assert!(get_parser_for_extension("cob").is_none());
     }
 }

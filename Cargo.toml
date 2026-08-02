@@ -39,6 +39,14 @@ tree-sitter-rust = "0.23"
 tree-sitter-bsl = "0.1.7"
 tree-sitter-go = "0.23"
 tree-sitter-html = "0.23"
+tree-sitter-php = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-swift = "0.7"
+# tree-sitter-kotlin исключён: крейт 0.3.5 тянет несовместимое ядро tree-sitter 0.20.
+# Kotlin остаётся текстовым языком, пока не появится крейт под tree-sitter 0.25.
 
 # XML-парсинг (для выгрузок 1С)
 quick-xml = "0.37"

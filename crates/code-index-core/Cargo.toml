@@ -31,6 +31,12 @@ tree-sitter-rust = { workspace = true }
 tree-sitter-bsl = { workspace = true }
 tree-sitter-go = { workspace = true }
 tree-sitter-html = { workspace = true }
+tree-sitter-php = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+tree-sitter-ruby = { workspace = true }
+tree-sitter-swift = { workspace = true }
 
 # Единый слой разбора BSL (нормализация под дефекты грамматики tree-sitter-bsl).
 # Вендоренная копия крейта из репозитория Bsl-context — code-index собирается
