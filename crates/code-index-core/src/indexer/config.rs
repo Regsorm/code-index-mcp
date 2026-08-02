@@ -50,6 +50,13 @@ pub struct IndexConfig {
     #[serde(default = "default_languages")]
     pub languages: Vec<String>,
 
+    /// Язык репозитория целиком (из `[[paths]] language` в daemon.toml либо
+    /// автоопределения). Влияет только на неоднозначные расширения — сейчас
+    /// это `.h`, который в C-проекте относится к C, а в C++-проекте к C++.
+    /// `None` — считаем как раньше, по одной таблице расширений.
+    #[serde(default)]
+    pub repo_language: Option<String>,
+
     /// Размер батча транзакций при индексации (по умолчанию 500).
     ///
     /// Каждые `batch_size` файлов накопленные INSERT-ы коммитятся одной транзакцией,
@@ -159,6 +166,7 @@ impl Default for IndexConfig {
             max_files: 0,
             bulk_threshold: default_bulk_threshold(),
             languages: default_languages(),
+            repo_language: None,
             batch_size: default_batch_size(),
             storage_mode: default_storage_mode(),
             memory_max_percent: default_memory_max_percent(),

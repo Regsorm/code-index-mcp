@@ -12,7 +12,7 @@ use tokio::sync::Semaphore;
 
 use crate::extension::ProcessorRegistry;
 use crate::indexer::config::IndexConfig;
-use crate::indexer::file_types::{categorize_file, FileCategory};
+use crate::indexer::file_types::{categorize_file_in_repo, FileCategory};
 use crate::indexer::hasher;
 use crate::indexer::Indexer;
 use crate::parser::text::TextParser;
@@ -93,6 +93,10 @@ pub fn run_worker(
     // глобальный `[indexer].max_code_file_size_bytes` → hardcoded 5 МБ.
     // Перетираем дефолт IndexConfig — переоформленные правила сильнее JSON-конфига проекта.
     index_config.max_code_file_size_bytes = entry.effective_max_code_file_size(&indexer_section);
+    // Язык репозитория из `[[paths]] language` — разрешает неоднозначные
+    // расширения (`.h`: заголовок C или C++). Демон заполняет это поле на
+    // старте автоопределением, если в конфиге его не указали.
+    index_config.repo_language = entry.language.clone();
     let storage_config = StorageConfig {
         mode: index_config.storage_mode.clone(),
         memory_max_percent: index_config.memory_max_percent,
@@ -341,6 +345,7 @@ pub fn run_worker(
     // Эффективный лимит для file_contents — пробросим в apply_event,
     // чтобы Indexer::with_config не пересоздавался на каждое событие.
     let max_code_file_size = index_config.max_code_file_size_bytes;
+    let repo_language = index_config.repo_language.clone();
 
     // Основной цикл обработки батчей. Idle-таймаут 500 мс даёт шанс проверить
     // shutdown-сигнал даже если файлов давно не меняли.
@@ -407,7 +412,14 @@ pub fn run_worker(
         let mut done = 0usize;
         let batch_len = batch.len();
         for event in &batch {
-            apply_event(&mut storage, &path, event, &registry, max_code_file_size);
+            apply_event(
+                &mut storage,
+                &path,
+                event,
+                &registry,
+                max_code_file_size,
+                repo_language.as_deref(),
+            );
             done += 1;
             if done % 50 == 0 || done == batch_len {
                 tokio_block_on(async {
@@ -625,6 +637,7 @@ fn apply_event(
     event: &FileEvent,
     registry: &ParserRegistry,
     max_code_file_size: usize,
+    repo_language: Option<&str>,
 ) {
     match event {
         FileEvent::Modified(abs) | FileEvent::Created(abs) => {
@@ -662,7 +675,7 @@ fn apply_event(
             let category = if is_binary {
                 FileCategory::Binary
             } else {
-                categorize_file(abs)
+                categorize_file_in_repo(abs, repo_language)
             };
             match category {
                 FileCategory::Code(language) => {

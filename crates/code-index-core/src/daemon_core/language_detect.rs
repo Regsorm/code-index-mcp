@@ -54,42 +54,80 @@ pub fn detect_by_root_markers(root: &Path) -> Option<&'static str> {
     None
 }
 
-/// Fallback: посчитать расширения файлов в корне (1 уровень) и выбрать
-/// язык с наибольшим количеством. Не рекурсивно — это первая прикидка,
-/// глубокий обход уже сделает индексер сам.
-///
-/// Если в корне ни одного файла известного расширения — `None`.
-pub fn detect_by_extension_majority(root: &Path) -> Option<&'static str> {
-    use std::collections::HashMap;
+/// Сколько файлов известных расширений достаточно набрать, чтобы судить
+/// о преобладающем языке. Дальше обход прекращается — полный проход по
+/// дереву ради этой прикидки не нужен.
+const MAJORITY_SAMPLE_CAP: usize = 4000;
 
-    let entries = fs::read_dir(root).ok()?;
+/// Fallback: посчитать расширения файлов и выбрать язык с наибольшим
+/// количеством.
+///
+/// Обход идёт по дереву, а не только по корню: в крупных проектах в корне
+/// нередко нет ни одного исходника (у rocksdb весь код в подкаталогах), и
+/// прикидка по одному уровню давала `None`. Выборка ограничена
+/// [`MAJORITY_SAMPLE_CAP`] файлами — для определения преобладания хватает.
+///
+/// Если ни одного файла известного расширения не нашлось — `None`.
+pub fn detect_by_extension_majority(root: &Path) -> Option<&'static str> {
+    use std::collections::{HashMap, VecDeque};
+
     let mut counts: HashMap<&'static str, usize> = HashMap::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase());
-        let lang = match ext.as_deref() {
-            Some("py") => "python",
-            Some("rs") => "rust",
-            Some("go") => "go",
-            Some("java") => "java",
-            Some("js") | Some("jsx") => "javascript",
-            Some("ts") | Some("tsx") => "typescript",
-            Some("bsl") | Some("os") => "bsl",
-            Some("php") | Some("php5") | Some("phtml") => "php",
-            Some("c") | Some("h") => "c",
-            Some("cpp") | Some("cxx") | Some("cc") | Some("hpp") | Some("hxx") | Some("hh") => "cpp",
-            Some("cs") => "csharp",
-            Some("rb") => "ruby",
-            Some("swift") => "swift",
-            _ => continue,
+    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+    queue.push_back(root.to_path_buf());
+    let mut counted = 0usize;
+
+    'walk: while let Some(dir) = queue.pop_front() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
         };
-        *counts.entry(lang).or_insert(0) += 1;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir {
+                let skip = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|name| {
+                        name.starts_with('.')
+                            || crate::indexer::file_types::EXCLUDE_DIRS.contains(&name)
+                    })
+                    .unwrap_or(true);
+                if !skip {
+                    queue.push_back(path);
+                }
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase());
+            let lang = match ext.as_deref() {
+                Some("py") => "python",
+                Some("rs") => "rust",
+                Some("go") => "go",
+                Some("java") => "java",
+                Some("js") | Some("jsx") => "javascript",
+                Some("ts") | Some("tsx") => "typescript",
+                Some("bsl") | Some("os") => "bsl",
+                Some("php") | Some("php5") | Some("phtml") => "php",
+                // `.h` в голосовании не участвует: расширение общее для C и
+                // C++, язык проекта по нему не определить. Решают `.c` против
+                // `.cpp`/`.cc`; однозначные C++-заголовки (`.hpp`) — тоже.
+                Some("c") => "c",
+                Some("cpp") | Some("cxx") | Some("cc") | Some("hpp") | Some("hxx")
+                | Some("hh") => "cpp",
+                Some("cs") => "csharp",
+                Some("rb") => "ruby",
+                Some("swift") => "swift",
+                _ => continue,
+            };
+            *counts.entry(lang).or_insert(0) += 1;
+            counted += 1;
+            if counted >= MAJORITY_SAMPLE_CAP {
+                break 'walk;
+            }
+        }
     }
     counts.into_iter().max_by_key(|(_, c)| *c).map(|(l, _)| l)
 }
@@ -220,6 +258,73 @@ mod tests {
         touch(tmp.path(), "c.go");
         // Маркеров нет, преобладают .py — должен вернуть python.
         assert_eq!(detect_language(tmp.path()), Some("python"));
+    }
+
+    /// Заголовки `.h` не голосуют: расширение общее для C и C++, и в
+    /// C++-проекте их обычно больше, чем файлов реализации — иначе такой
+    /// проект определялся бы как C.
+    #[test]
+    fn h_headers_do_not_vote_for_language() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["a.h", "b.h", "c.h", "d.h"] {
+            touch(tmp.path(), name);
+        }
+        touch(tmp.path(), "impl.cc");
+        assert_eq!(
+            detect_language(tmp.path()),
+            Some("cpp"),
+            "четыре .h против одного .cc — язык всё равно C++"
+        );
+
+        // Однозначные расширения голосуют как прежде
+        let tmp2 = TempDir::new().unwrap();
+        touch(tmp2.path(), "main.c");
+        touch(tmp2.path(), "util.c");
+        assert_eq!(detect_language(tmp2.path()), Some("c"));
+
+        // Из одних только заголовков язык не определить
+        let tmp3 = TempDir::new().unwrap();
+        touch(tmp3.path(), "only.h");
+        assert_eq!(detect_language(tmp3.path()), None);
+    }
+
+    /// В крупных проектах в корне часто нет ни одного исходника — весь код
+    /// в подкаталогах (rocksdb). Прикидка обязана смотреть вглубь.
+    #[test]
+    fn extension_majority_looks_into_subdirectories() {
+        let tmp = TempDir::new().unwrap();
+        // В корне — только служебные файлы без известных расширений
+        touch(tmp.path(), "Makefile");
+        touch(tmp.path(), "LICENSE");
+        let db = tmp.path().join("db").join("impl");
+        fs::create_dir_all(&db).unwrap();
+        for name in ["a.cc", "b.cc", "c.cc"] {
+            touch(&db, name);
+        }
+        touch(&db, "a.h");
+        assert_eq!(
+            detect_language(tmp.path()),
+            Some("cpp"),
+            "исходники лежат в подкаталогах — язык всё равно должен определиться"
+        );
+    }
+
+    /// Исключённые каталоги (зависимости, сборка) в голосовании не участвуют,
+    /// иначе язык репо определялся бы по чужому коду.
+    #[test]
+    fn extension_majority_skips_excluded_dirs() {
+        let tmp = TempDir::new().unwrap();
+        touch(tmp.path(), "main.py");
+        let vendored = tmp.path().join("node_modules").join("pkg");
+        fs::create_dir_all(&vendored).unwrap();
+        for name in ["a.js", "b.js", "c.js", "d.js"] {
+            touch(&vendored, name);
+        }
+        assert_eq!(
+            detect_language(tmp.path()),
+            Some("python"),
+            "node_modules не должен перевешивать собственный код"
+        );
     }
 
     #[test]

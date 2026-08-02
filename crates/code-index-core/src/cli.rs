@@ -859,7 +859,16 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
 
             // 3. Загрузить конфигурацию проекта
             let db_path = db_dir.join("index.db");
-            let config = IndexConfig::load(&abs_path)?;
+            let mut config = IndexConfig::load(&abs_path)?;
+            // Язык репозитория нужен для неоднозначных расширений (`.h` —
+            // заголовок C или C++). У демона он берётся из `[[paths]] language`;
+            // здесь конфига демона нет, поэтому определяем сами — тем же
+            // способом, каким демон заполняет это поле на старте. Так результат
+            // не зависит от того, кто индексировал: демон или эта команда.
+            if config.repo_language.is_none() {
+                config.repo_language = crate::daemon_core::language_detect::detect_language(&abs_path)
+                    .map(|s| s.to_string());
+            }
 
             // A2: PID-lock на целевую БД — два `index --force` по одному пути
             // не должны драться за SQLite. RAII, держится до конца команды.

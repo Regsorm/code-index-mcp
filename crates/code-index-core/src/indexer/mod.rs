@@ -17,7 +17,7 @@ use crate::parser::text::TextParser;
 use crate::storage::models::*;
 use crate::storage::Storage;
 use config::IndexConfig;
-use file_types::{categorize_file, FileCategory};
+use file_types::FileCategory;
 
 /// Результат одного прохода индексации
 #[derive(Debug)]
@@ -794,7 +794,8 @@ impl<'a> Indexer<'a> {
                 }
             }
 
-            let category = categorize_file(path);
+            let category =
+                file_types::categorize_file_in_repo(path, self.config.repo_language.as_deref());
 
             if matches!(category, FileCategory::Binary) {
                 continue;

@@ -75,6 +75,33 @@ pub const EXCLUDE_DIRS: &[&str] = &[
     ".tox", "dist", "build", "venv", "env", ".env",
 ];
 
+/// Категория файла с учётом языка репозитория.
+///
+/// Нужно ровно для одного расширения — `.h`. Оно принадлежит сразу двум
+/// языкам: в C-проекте это заголовок C, в C++-проекте — заголовок C++
+/// (`.hpp` завели не все, крупные проекты вроде rocksdb пишут просто `.h`).
+/// По имени файла отличить нельзя, поэтому спрашиваем язык репозитория.
+///
+/// Все остальные расширения определяются как раньше — язык репозитория
+/// на них не влияет.
+pub fn categorize_file_in_repo(path: &Path, repo_language: Option<&str>) -> FileCategory {
+    let category = categorize_file(path);
+    if repo_language != Some("cpp") {
+        return category;
+    }
+    let is_h = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("h"))
+        .unwrap_or(false);
+    match category {
+        FileCategory::Code(ref lang) if is_h && lang == "c" => {
+            FileCategory::Code("cpp".to_string())
+        }
+        other => other,
+    }
+}
+
 /// Определить категорию файла по расширению пути
 pub fn categorize_file(path: &Path) -> FileCategory {
     // `ConfigDumpInfo.xml` — служебная опись выгрузки 1С (uuid + configVersion
@@ -174,6 +201,64 @@ mod tests {
         }
         // Kotlin пока без грамматики под tree-sitter 0.25 — остаётся текстовым
         assert_eq!(categorize_file(Path::new("Main.kt")), FileCategory::Text);
+    }
+
+    /// `.h` — единственное расширение, принадлежащее сразу двум языкам.
+    /// В C-проекте это C, в C++-проекте — C++; решает язык репозитория.
+    #[test]
+    fn h_header_follows_repo_language() {
+        let h = Path::new("db/db_impl.h");
+        assert_eq!(
+            categorize_file_in_repo(h, Some("cpp")),
+            FileCategory::Code("cpp".to_string()),
+            "в C++-проекте .h — заголовок C++"
+        );
+        assert_eq!(
+            categorize_file_in_repo(h, Some("c")),
+            FileCategory::Code("c".to_string()),
+            "в C-проекте .h — заголовок C"
+        );
+        assert_eq!(
+            categorize_file_in_repo(h, None),
+            FileCategory::Code("c".to_string()),
+            "язык репо неизвестен — как раньше, по таблице расширений"
+        );
+        assert_eq!(
+            categorize_file_in_repo(Path::new("SRC/SERVER.H"), Some("cpp")),
+            FileCategory::Code("cpp".to_string()),
+            "регистр расширения значения не имеет"
+        );
+    }
+
+    /// Язык репозитория трогает ТОЛЬКО `.h`. Остальные расширения
+    /// определяются как раньше, даже в C++-проекте.
+    #[test]
+    fn repo_language_touches_only_h_extension() {
+        for (path, lang) in [
+            ("main.c", "c"),
+            ("engine.cpp", "cpp"),
+            ("engine.hpp", "cpp"),
+            ("script.py", "python"),
+            ("app.rb", "ruby"),
+            ("Service.cs", "csharp"),
+            ("mod.rs", "rust"),
+        ] {
+            assert_eq!(
+                categorize_file_in_repo(Path::new(path), Some("cpp")),
+                FileCategory::Code(lang.to_string()),
+                "{} не должен зависеть от языка репозитория",
+                path
+            );
+        }
+        // Текстовые и двоичные тоже не затрагиваются
+        assert_eq!(
+            categorize_file_in_repo(Path::new("readme.md"), Some("cpp")),
+            FileCategory::Text
+        );
+        assert_eq!(
+            categorize_file_in_repo(Path::new("image.png"), Some("cpp")),
+            FileCategory::Binary
+        );
     }
 
     #[test]
