@@ -12,6 +12,13 @@ use std::path::Path;
 
 use models::*;
 
+/// Ёмкость кэша подготовленных запросов соединения. Горячий путь записи —
+/// это ~15 разных INSERT/SELECT, повторяемых на КАЖДЫЙ файл; при дефолтной
+/// ёмкости (16) кэш вытесняется и SQL разбирается заново десятки тысяч раз.
+fn set_stmt_cache(conn: &Connection) {
+    conn.set_prepared_statement_cache_capacity(64);
+}
+
 /// Зарегистрировать scalar-функцию REGEXP для поддержки оператора REGEXP в SQL.
 /// Использует crate `regex` — никаких внешних расширений SQLite не нужно.
 /// Кеширует скомпилированный Regex через RefCell — компиляция один раз за запрос.
@@ -107,6 +114,7 @@ impl Storage {
             .with_context(|| format!("Не удалось открыть БД: {}", path.display()))?;
         schema::initialize(&conn).context("Ошибка инициализации схемы БД")?;
         register_sql_functions(&conn)?;
+        set_stmt_cache(&conn);
         Ok(Self { conn })
     }
 
@@ -157,6 +165,7 @@ impl Storage {
         let conn = Connection::open_in_memory().context("Не удалось создать in-memory БД")?;
         schema::initialize(&conn).context("Ошибка инициализации схемы in-memory БД")?;
         register_sql_functions(&conn)?;
+        set_stmt_cache(&conn);
         Ok(Self { conn })
     }
 
@@ -248,7 +257,7 @@ impl Storage {
 
     /// Вставить или обновить запись файла; возвращает id строки
     pub fn upsert_file(&self, record: &FileRecord) -> Result<i64> {
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO files (path, content_hash, ast_hash, language, lines_total, indexed_at, mtime, file_size)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(path) DO UPDATE SET
@@ -259,25 +268,24 @@ impl Storage {
                  indexed_at   = excluded.indexed_at,
                  mtime        = COALESCE(excluded.mtime, files.mtime),
                  file_size    = COALESCE(excluded.file_size, files.file_size)",
-            params![
-                record.path,
-                record.content_hash,
-                record.ast_hash,
-                record.language,
-                record.lines_total as i64,
-                record.indexed_at,
-                record.mtime,
-                record.file_size,
-            ],
-        )
+        )?;
+        stmt.execute(params![
+            record.path,
+            record.content_hash,
+            record.ast_hash,
+            record.language,
+            record.lines_total as i64,
+            record.indexed_at,
+            record.mtime,
+            record.file_size,
+        ])
         .context("upsert_file: ошибка выполнения запроса")?;
 
         // Получаем id — либо только что вставленной, либо существующей строки
-        let id: i64 = self.conn.query_row(
-            "SELECT id FROM files WHERE path = ?1",
-            params![record.path],
-            |row| row.get(0),
-        )?;
+        let mut id_stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM files WHERE path = ?1")?;
+        let id: i64 = id_stmt.query_row(params![record.path], |row| row.get(0))?;
         Ok(id)
     }
 
@@ -361,7 +369,7 @@ impl Storage {
 
     /// Пакетная вставка функций
     pub fn insert_functions(&self, records: &[FunctionRecord]) -> Result<()> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO functions
                  (file_id, name, qualified_name, line_start, line_end,
                   args, return_type, docstring, body, is_async, node_hash,
@@ -401,7 +409,7 @@ impl Storage {
 
     /// Пакетная вставка классов
     pub fn insert_classes(&self, records: &[ClassRecord]) -> Result<()> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO classes
                  (file_id, name, line_start, line_end, bases, docstring, body, node_hash)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -434,7 +442,7 @@ impl Storage {
 
     /// Пакетная вставка импортов
     pub fn insert_imports(&self, records: &[ImportRecord]) -> Result<()> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO imports (file_id, module, name, alias, line, kind)
              VALUES (?1,?2,?3,?4,?5,?6)",
         )?;
@@ -464,7 +472,7 @@ impl Storage {
 
     /// Пакетная вставка вызовов
     pub fn insert_calls(&self, records: &[CallRecord]) -> Result<()> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO calls (file_id, caller, callee, line) VALUES (?1,?2,?3,?4)",
         )?;
         for r in records {
@@ -486,7 +494,7 @@ impl Storage {
 
     /// Пакетная вставка переменных
     pub fn insert_variables(&self, records: &[VariableRecord]) -> Result<()> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO variables (file_id, name, value, line) VALUES (?1,?2,?3,?4)",
         )?;
         for r in records {
@@ -514,22 +522,19 @@ impl Storage {
     fn fts_text_delete(&self, file_id: i64) -> Result<()> {
         let row: Option<Option<Vec<u8>>> = self
             .conn
-            .query_row(
-                "SELECT content_blob FROM text_contents WHERE file_id = ?1",
-                params![file_id],
-                |r| r.get::<_, Option<Vec<u8>>>(0),
-            )
+            .prepare_cached("SELECT content_blob FROM text_contents WHERE file_id = ?1")?
+            .query_row(params![file_id], |r| r.get::<_, Option<Vec<u8>>>(0))
             .optional()
             .context("fts_text_delete: SELECT text_contents")?;
         if let Some(Some(blob)) = row {
             let bytes = Self::decode_zstd_safe(&blob).context("fts_text_delete: zstd decode")?;
             if let Ok(content) = String::from_utf8(bytes) {
                 self.conn
-                    .execute(
+                    .prepare_cached(
                         "INSERT INTO fts_text_files(fts_text_files, rowid, content) \
                          VALUES ('delete', ?1, ?2)",
-                        params![file_id, content],
-                    )
+                    )?
+                    .execute(params![file_id, content])
                     .context("fts_text_delete: FTS delete")?;
             }
         }
@@ -541,23 +546,29 @@ impl Storage {
     /// (rowid = file_id). Идемпотентно: если запись уже была — старый токен
     /// указателя снимается, чтобы не задвоить.
     pub fn insert_text_file(&self, record: &TextFileRecord) -> Result<()> {
-        // Снять старый FTS-токен, если запись существовала (повтор без delete).
-        self.fts_text_delete(record.file_id)?;
-        let blob = zstd::encode_all(record.content.as_bytes(), Self::FILE_CONTENTS_ZSTD_LEVEL)
+        let blob = Self::compress_content(&record.content)
             .context("insert_text_file: zstd encode")?;
+        self.insert_text_file_blob(record.file_id, &blob, &record.content)
+    }
+
+    /// То же, что [`insert_text_file`], но принимает УЖЕ сжатый blob.
+    /// Нужен на пути массовой индексации: сжатие вынесено в фазу параллельного
+    /// парсинга, писатель только пишет. `fts_text` — сырой текст для FTS5
+    /// (contentless-индексу нужен разжатый текст, blob для него не годится).
+    pub fn insert_text_file_blob(&self, file_id: i64, blob: &[u8], fts_text: &str) -> Result<()> {
+        // Снять старый FTS-токен, если запись существовала (повтор без delete).
+        self.fts_text_delete(file_id)?;
         self.conn
-            .execute(
+            .prepare_cached(
                 "INSERT OR REPLACE INTO text_contents (file_id, content_blob, oversize) \
                  VALUES (?1, ?2, 0)",
-                params![record.file_id, blob],
-            )
-            .context("insert_text_file: INSERT text_contents")?;
+            )?
+            .execute(params![file_id, blob])
+            .context("insert_text_file_blob: INSERT text_contents")?;
         self.conn
-            .execute(
-                "INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)",
-                params![record.file_id, record.content],
-            )
-            .context("insert_text_file: FTS insert")?;
+            .prepare_cached("INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)")?
+            .execute(params![file_id, fts_text])
+            .context("insert_text_file_blob: FTS insert")?;
         Ok(())
     }
 
@@ -583,7 +594,7 @@ impl Storage {
 
     /// zstd-уровень сжатия для file_contents. 3 — стандартный баланс
     /// скорости и коэффициента (~5× для текстового кода).
-    const FILE_CONTENTS_ZSTD_LEVEL: i32 = 3;
+    pub const FILE_CONTENTS_ZSTD_LEVEL: i32 = 3;
 
     /// Максимальный размер разжатого buffer'а из `file_contents.content_blob`.
     /// Защита от zstd-bomb: вредоносный или повреждённый blob не сможет
@@ -637,15 +648,39 @@ impl Storage {
                 .context("upsert_file_content: INSERT oversize")?;
             return Ok(());
         }
-        let blob = zstd::encode_all(content.as_bytes(), Self::FILE_CONTENTS_ZSTD_LEVEL)
-            .context("upsert_file_content: zstd encode")?;
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO file_contents (file_id, content_blob, oversize)
-                 VALUES (?1, ?2, 0)",
-                params![file_id, blob],
-            )
-            .context("upsert_file_content: INSERT blob")?;
+        let blob = Self::compress_content(content).context("upsert_file_content: zstd encode")?;
+        self.upsert_file_content_blob(file_id, Some(&blob))
+    }
+
+    /// Сжать content для хранения в `file_contents`/`text_contents`.
+    /// Вынесено отдельной функцией, чтобы массовая индексация могла сжимать
+    /// в фазе параллельного парсинга (rayon), а не в единственном потоке-писателе.
+    pub fn compress_content(content: &str) -> Result<Vec<u8>> {
+        zstd::encode_all(content.as_bytes(), Self::FILE_CONTENTS_ZSTD_LEVEL)
+            .context("compress_content: zstd encode")
+    }
+
+    /// Записать УЖЕ сжатый content. `None` — файл крупнее лимита: пишется
+    /// oversize-запись без blob (тот же контракт, что у `upsert_file_content`).
+    pub fn upsert_file_content_blob(&self, file_id: i64, blob: Option<&[u8]>) -> Result<()> {
+        match blob {
+            Some(b) => self
+                .conn
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO file_contents (file_id, content_blob, oversize)
+                     VALUES (?1, ?2, 0)",
+                )?
+                .execute(params![file_id, b])
+                .context("upsert_file_content_blob: INSERT blob")?,
+            None => self
+                .conn
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO file_contents (file_id, content_blob, oversize)
+                     VALUES (?1, NULL, 1)",
+                )?
+                .execute(params![file_id])
+                .context("upsert_file_content_blob: INSERT oversize")?,
+        };
         Ok(())
     }
 

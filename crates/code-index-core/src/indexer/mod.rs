@@ -52,10 +52,13 @@ pub enum ParsedFile {
         /// для дополнительной записи в text_files (FTS+regex+read_file).
         /// Для остальных языков — None.
         text_for_fts: Option<String>,
-        /// Phase 2 (v0.8.0): исходный content для записи в `file_contents`
-        /// с zstd-сжатием. Хранится здесь, а не вычисляется на лету, потому
-        /// что после parse-этапа исходный буфер `candidate_files` теряется.
+        /// Phase 2 (v0.8.0): исходный content. Нужен сборщику extras
+        /// (bsl-indexer) в фазе 2b; после сжатия в фазе 2c освобождается.
         raw_content: String,
+        /// Content для `file_contents`, сжатый zstd параллельно в фазе 2c
+        /// (v0.47.0; раньше сжималось в потоке-писателе). `None` до фазы 2c
+        /// и для файлов крупнее `max_code_file_size_bytes` (oversize-запись).
+        content_blob: Option<Vec<u8>>,
     },
     /// Текстовый файл (без AST)
     Text {
@@ -71,6 +74,18 @@ pub enum ParsedFile {
         rel_path: String,
         error: String,
     },
+}
+
+/// Что писать в `file_contents` для очередного файла.
+pub enum ContentInput<'a> {
+    /// Сырой текст — сжимается на месте (одиночные файлы: watcher, backfill).
+    Raw(&'a str),
+    /// Уже сжатый blob из фазы параллельного парсинга (массовая индексация).
+    Blob(&'a [u8]),
+    /// Файл крупнее лимита — oversize-запись без содержимого.
+    Oversize,
+    /// Содержимое не сохранять.
+    None,
 }
 
 /// Индексатор файловой системы
@@ -217,7 +232,10 @@ impl<'a> Indexer<'a> {
         // tree-sitter парсинг выполняется в нескольких потоках через rayon.
         // Чтение файлов уже выполнено в collect_candidates — здесь только AST.
         let parse_start = std::time::Instant::now();
-        let parse_results: Vec<ParsedFile> = candidate_files
+        // Лимит для `file_contents` — копия в замыкание: сжатие идёт здесь же,
+        // в rayon-потоках, а не в единственном потоке-писателе (v0.47.0).
+        let max_code_size = self.config.max_code_file_size_bytes;
+        let mut parse_results: Vec<ParsedFile> = candidate_files
             .par_iter()
             .map(|(rel_path, content, hash, category, mtime, file_size)| {
                 match category {
@@ -247,6 +265,7 @@ impl<'a> Indexer<'a> {
                                             None
                                         },
                                         raw_content: content.clone(),
+                                        content_blob: None,
                                     },
                                     Err(e) => ParsedFile::Error {
                                         rel_path: rel_path.clone(),
@@ -284,6 +303,7 @@ impl<'a> Indexer<'a> {
                                         file_size: *file_size,
                                         text_for_fts: None,
                                         raw_content: content.clone(),
+                                        content_blob: None,
                                     };
                                 }
                             }
@@ -334,6 +354,38 @@ impl<'a> Indexer<'a> {
             });
         }
 
+        // ── Этап 2c: параллельное сжатие content (v0.47.0) ───────────────────
+        // Раньше zstd вызывался в фазе записи, то есть в единственном потоке-
+        // писателе: на боевом PHP-сайте (151 тыс. файлов) это 37 с из 65 с
+        // записи. Здесь то же сжатие раскладывается на все ядра rayon, а
+        // исходная строка сразу освобождается — пик RAM не растёт.
+        // Сборщику extras (фаза 2b) сырой content уже отдан.
+        let compress_start = std::time::Instant::now();
+        // Компрессор создаётся ОДИН раз на поток (`for_each_init`), а не на файл:
+        // при 151 тыс. мелких файлов инициализация zstd-контекста на каждый вызов
+        // стоила дороже самого сжатия. `clear()` без `shrink_to_fit()` — намеренно:
+        // возврат буфера аллокатору на каждой итерации сериализует потоки.
+        parse_results.par_iter_mut().for_each_init(
+            || zstd::bulk::Compressor::new(Storage::FILE_CONTENTS_ZSTD_LEVEL).ok(),
+            |compressor, pf| {
+                if let ParsedFile::Code { raw_content, content_blob, .. } = pf {
+                    *content_blob = if raw_content.len() > max_code_size {
+                        None
+                    } else {
+                        match compressor {
+                            Some(c) => c.compress(raw_content.as_bytes()).ok(),
+                            None => Storage::compress_content(raw_content).ok(),
+                        }
+                    };
+                    raw_content.clear();
+                }
+            },
+        );
+        eprintln!(
+            "[timing] Сжатие content (rayon): {} мс",
+            compress_start.elapsed().as_millis()
+        );
+
         // ── Этап 3: последовательная запись в SQLite ──────────────────────────
         // SQLite не поддерживает параллельную запись — пишем из основного потока.
         let write_start = std::time::Instant::now();
@@ -367,7 +419,8 @@ impl<'a> Indexer<'a> {
                     mtime,
                     file_size,
                     text_for_fts,
-                    raw_content,
+                    content_blob,
+                    raw_content: _,
                 } => {
                     match self.write_code_to_db(
                         rel_path,
@@ -380,7 +433,10 @@ impl<'a> Indexer<'a> {
                         Some(*mtime),
                         Some(*file_size),
                         text_for_fts.as_deref(),
-                        Some(raw_content.as_str()),
+                        match content_blob {
+                            Some(b) => ContentInput::Blob(b),
+                            None => ContentInput::Oversize,
+                        },
                     ) {
                         Ok(_) => {
                             result.files_indexed += 1;
@@ -534,10 +590,10 @@ impl<'a> Indexer<'a> {
 
     /// Записать код-файл в БД: метаданные + символы (функции, классы, импорты и т.д.)
     /// skip_delete: при первичной индексации пропускать DELETE (БД пуста, удалять нечего)
-    /// raw_content: Phase 2 (v0.8.0). Если задан — content сохраняется в `file_contents`
-    /// с zstd-сжатием. Файлы крупнее `config.max_code_file_size_bytes` получают
-    /// «oversize»-запись (см. `Storage::upsert_file_content`). `None` отключает
-    /// сохранение (используется в тестах и местах, где content недоступен).
+    /// content: Phase 2 (v0.8.0). `Raw` — сжать на месте (одиночные файлы),
+    /// `Blob` — content уже сжат в фазе параллельного парсинга (v0.47.0),
+    /// `Oversize` — файл крупнее `config.max_code_file_size_bytes`,
+    /// `None` — не сохранять содержимое (тесты и места, где content недоступен).
     pub fn write_code_to_db(
         &self,
         rel_path: &str,
@@ -552,8 +608,8 @@ impl<'a> Indexer<'a> {
         // Для языков с двойной индексацией (html в v0.7.1) — raw-content,
         // который дополнительно записывается в text_files. Для остальных — None.
         text_for_fts: Option<&str>,
-        // Phase 2: исходный content для записи в `file_contents` (zstd).
-        raw_content: Option<&str>,
+        // Phase 2: content для записи в `file_contents` (см. `ContentInput`).
+        content: ContentInput<'_>,
     ) -> Result<()> {
         // Сохраняем запись о файле
         let file_record = FileRecord {
@@ -675,19 +731,31 @@ impl<'a> Indexer<'a> {
         // Двойная индексация: для html (и других языков из is_dual_indexed_language)
         // дополнительно сохраняем сырой контент в text_files, чтобы продолжали
         // работать search_text/grep_text/read_file как раньше.
-        if let Some(content) = text_for_fts {
-            self.storage.insert_text_file(&crate::storage::models::TextFileRecord {
-                id: None,
-                file_id,
-                content: content.to_string(),
-            })?;
+        // Для dual-indexed языков content хранится дважды — в `file_contents` и
+        // в `text_contents`. Сжимаем его ОДИН раз: готовый blob кладём в обе
+        // таблицы (v0.47.0; до этого один и тот же текст жался дважды).
+        if let Some(fts_text) = text_for_fts {
+            match content {
+                ContentInput::Blob(b) => self.storage.insert_text_file_blob(file_id, b, fts_text)?,
+                _ => self.storage.insert_text_file(&crate::storage::models::TextFileRecord {
+                    id: None,
+                    file_id,
+                    content: fts_text.to_string(),
+                })?,
+            }
         }
 
-        // Phase 2: сохраняем исходный content в `file_contents` (zstd).
+        // Phase 2: сохраняем content в `file_contents` (zstd).
         // Файлы крупнее `max_code_file_size_bytes` получают oversize-запись (без blob).
-        if let Some(raw) = raw_content {
-            self.storage
-                .upsert_file_content(file_id, raw, self.config.max_code_file_size_bytes)?;
+        match content {
+            ContentInput::Raw(raw) => self.storage.upsert_file_content(
+                file_id,
+                raw,
+                self.config.max_code_file_size_bytes,
+            )?,
+            ContentInput::Blob(b) => self.storage.upsert_file_content_blob(file_id, Some(b))?,
+            ContentInput::Oversize => self.storage.upsert_file_content_blob(file_id, None)?,
+            ContentInput::None => {}
         }
 
         Ok(())

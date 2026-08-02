@@ -713,7 +713,7 @@ fn apply_event(
                                     mtime,
                                     file_size,
                                     text_for_fts,
-                                    Some(content.as_str()),
+                                    crate::indexer::ContentInput::Raw(content.as_str()),
                                 ) {
                                     eprintln!("[worker:{}] write_code {}: {}",
                                         root.display(), rel_path, e);
@@ -756,7 +756,7 @@ fn apply_event(
                                         mtime,
                                         file_size,
                                         None,
-                                        Some(content.as_str()),
+                                        crate::indexer::ContentInput::Raw(content.as_str()),
                                     )
                                     .is_ok()
                             } else {
