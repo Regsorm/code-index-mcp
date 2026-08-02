@@ -16,7 +16,7 @@ One static binary for Windows/Linux/macOS — no runtime, no dependencies. Index
 
 ## What's inside
 
-- **Performance.** 62,000 files indexed in 43 seconds, sub-ms search per query. Production-grade for 100K+ file monorepos.
+- **Performance.** 151,000 files indexed in 41 seconds (v0.47.0, production PHP site), sub-ms search per query. Production-grade for 100K+ file monorepos.
 - **31 MCP tools.** 20 universal (functions, classes, callers/callees, file content, grep) + 11 BSL-tools (object structure & profile, form handlers, event subscriptions, call graph, data links, register writers, impact map, read-only SQL).
 - **Native BSL/1C.** Parses both Configurator (XML) and 1C:EDT (`.mdo`) exports of 1C:Enterprise 8.3 configurations. Data-link graph (object→object edges via reference types in attributes) — ~60,000 edges in seconds for a typical accounting configuration.
 - **Federation.** One MCP server can serve multiple repositories across machines — pass `repo: "alias"` in each tool call.

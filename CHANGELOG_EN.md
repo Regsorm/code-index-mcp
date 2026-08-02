@@ -5,6 +5,30 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.47.0] — 2026-08-02
+
+**Indexing is twice as fast on repositories with a large volume of sources. Content compression moved out of the single writer thread into a parallel phase, the zstd compressor is created once per thread instead of once per file, and for dual-indexed languages the same text is no longer compressed twice. Plus a prepared-statement cache on the hot write paths. Profile of a production PHP site (151,341 files): indexing core 86.1 → 41.2 s, of which the write phase 64.6 → 17.5 s. On a 1C base (57,060 files) the core went 59.8 → 46.3 s.**
+
+### Changed
+
+- **Content compression is a separate parallel phase.** `zstd::encode_all` used to be called inside `Storage`, i.e. in the writer thread: on the production PHP site that was 37.3 s out of a 64.6 s write phase while the other cores idled. Content is now compressed in a rayon phase (`Indexer`, stage 2c) — after the extras collector, which needs the raw text, and with the source string released immediately, so peak memory does not grow. The writer receives a ready blob.
+- **The zstd compressor is created once per thread** (`for_each_init`), not per file. This was the main source of the loss: with 151k small files, context initialization cost more than the compression itself — the compression phase went 18.2 s → 0.275 s.
+- **One blob instead of two for dual-indexed languages** (PHP, HTML, C, C++, C#, Ruby, Swift). The same text is stored in both `file_contents` and `text_contents`; previously it was compressed separately for each table. The new `Storage::upsert_file_content_blob` and `Storage::insert_text_file_blob` accept a ready blob; `ContentInput` in `Indexer::write_code_to_db` distinguishes raw text (single files from the watcher), a ready blob (bulk indexing) and oversize.
+- **Prepared-statement cache on the hot write paths** (`prepare_cached` in `upsert_file`, the function/class/import/call/variable inserts, content writes and the old FTS token removal; the connection cache capacity raised to 64). SQL is no longer re-parsed for every file: the write phase went 25.5 → 17.4 s on the PHP site and 20.5 → 18.5 s on the 1C base.
+- **Full time in the `index` output.** Only the core time was printed, while on 1C repos a comparable amount of time goes into extras (metadata, forms, rights, call graph) and flushing the database to disk — half the work appeared in neither the log nor the measurements. The output now shows the full time broken down as "core + extras + flush to disk", plus a separate timing line for the compression phase.
+
+### Testing
+
+- `cargo test --workspace` — 614 passed, 0 failed, 0 warnings.
+- **Before/after data verification — the key check.** The 1C base (`RepoUT-test`, 57,060 files) was indexed by both binaries and all 20 index tables compared: **0 discrepancies**, including `metadata_code_usages` (280,449), `proc_call_graph` (593,514), `data_links` (64,764), `procedure_enrichment` (261,487). On the PHP site the symbol counters matched as well (168,024 functions, 1,458,420 calls), the zstd blob signature is intact and full-text search works.
+- Live smoke of the BSL tools on the re-indexed base: object structure, data links (109 edges for `Document.ЗаказКлиента`), impact map (3,801 code usages for `Catalog.Номенклатура`), term search, read-only SQL.
+- Federated rollout: `bsl-indexer:0.47.0` image on the rag VM, both containers `healthy`; re-index of the `wms` base with the new binary — 20 tables compared, 0 discrepancies; smoke over federation against five VM bases (`bp-ss`, `ut`, `zup`, `bp-tdk`, `bp-sonic`).
+- Local node — 51 repositories `ready`, MCP reports version 0.47.0.
+
+### Compatibility
+
+- **No reindex required** — the storage format is unchanged, the same zstd at the same level; the before/after table comparison confirms it. The DB schema is unchanged.
+
 ## [0.46.0] — 2026-08-02
 
 **Six new languages with AST parsing: PHP, C, C++, C#, Ruby, Swift. There were 8 languages (Python, JavaScript, TypeScript, Java, Rust, Go, BSL, HTML) — now there are 14. The full universal toolset works for the new languages: `get_function`/`get_class`, `find_symbol`, the call graph (`get_callers`/`get_callees`/`find_path`/`get_call_tree`), `get_imports`, `get_file_summary`, `grep_code`/`grep_body`. Plus two serve-layer fixes: a meaningful status for an unknown repo alias, and `.h` language detection based on the repository language.**
