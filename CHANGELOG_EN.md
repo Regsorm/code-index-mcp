@@ -5,6 +5,41 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.48.0] — 2026-08-06
+
+**Fixed silent row loss in responses over http: a repeated call to any tool that returns an array (`get_callers`, `get_function`, `search_function`, `list_files` and four more) came back as an empty list with no indication whatsoever that rows had been dropped. An empty response is indistinguishable from an honest "no data", so the model concluded "this code is unused" — and edited live code on that basis. The cause was the session-level re-delivery filter, which could not attach a marker to a bare array and therefore dropped rows silently. The marker is now mandatory for both response shapes, the row fingerprint accounts for repository and tool, the mechanism can be turned off from the config, and its memory can be cleared via `POST /dedup-reset`. Issue #5 (reported by @Ailirag).**
+
+> Context. Thanks to **@Ailirag** for an exemplary report: a ready reproduction script, a cross-check against the CLI output and an stdio-versus-http comparison pointed straight at the serve layer rather than the index or the queries themselves. That removed half the diagnosis — what remained was locating the spot in the code.
+
+### Fixed
+
+- **Silent row loss in tools returning a bare array** — `get_callers`, `get_callees`, `get_function`, `get_class`, `search_function`, `search_class`, `search_text`, `list_files`. The session filter (`serve_dedup`) does not re-deliver rows already sent within the same session and marks what it dropped with `rows_elided_already_delivered`. For the tabular shape `{result:{rows:[…]}}` the marker went inside `result`, but for a bare array `result:[…]` it was not set at all: a service field cannot be inserted into an array without breaking the shape. Rows were dropped regardless, so a repeated call arrived empty and unannotated. The marker is now placed next to `result`, in the enclosing object where `hint` and `truncated/total/limit` already live (`tools::wrap_with_meta_extra`) — the response shape is unchanged. This only manifested under `--transport http`: the filter is keyed by the `mcp-session-id` header, which does not exist in stdio, so there the filter never engaged and stdio/CLI returned full responses.
+- **Rows from different repositories and tools no longer cancel each other out.** The fingerprint was computed from row content alone, while the set of delivered rows was shared across the whole session. As a result the **very first** query against a neighbouring base came back empty whenever rows matched textually: records delivered from `ut-test` suppressed identical ones from `ut` (1C object names are literally the same across UT bases). This hurt most in exactly the task where matches are the point — comparing two configurations. The fingerprint now includes a scope — "tool\|repo". Call arguments are deliberately left out of the scope: models frequently re-ask the same question with a refined `limit`/`path_glob`, and an argument-aware scope would let such repeats slip through.
+
+### Added
+
+- **`[mcp].dedup_enabled` in `daemon.toml`** — turns the session filter on and off; enabled by default (the section may be absent). Previously the mechanism was hard-wired on in the server constructor with no way to disable it. Applied via the `apply_dedup_enabled` builder in both `serve` branches, federated and mono.
+- **`POST /dedup-reset`** — clears the filter's memory across all sessions; sits alongside `/mark-dirty`, `/invalidate` and `/cache-stats`. Needed where the model lost part of its context (history compaction on the client side) while the MCP session stayed alive: that event is not observable from inside the protocol for any client, so the signal has to come from outside. The reset covers all sessions at once — the caller does not know the `mcp-session-id`; the cost is a one-off re-delivery of rows, correctness is unaffected. Available to any client; in Claude Code the endpoint is conveniently driven by a `PostCompact` hook.
+
+### Changed
+
+- **The hint accompanying dropped rows is in English.** Server responses are read by any model and any client, not just a Russian-speaking setup, and weaker models handle an English phrasing far more reliably. The text is direct and jargon-free because the "dead code or not" conclusion hangs on it: it states that rows existed, that they were dropped as already shown, and that an empty or shortened list does not mean the data is absent. A foreign hint is never overwritten — under a limit cutoff `hint` is already taken and carries a different meaning, in which case only the dropped-row count is added.
+- **An originally empty response gets no marker.** If a tool returned an empty list on its own, the response is not rewritten at all — the tool's own hint stays (for example "0 callers ≠ dead code" from `get_callers`). "No data" and "already delivered" are told apart by the presence of `rows_elided_already_delivered`.
+
+### Testing
+
+- `cargo test --workspace` — 621 passed, 0 failed. `serve_dedup` has 11 tests, 6 of them new: marker on a bare array, originally empty result without a marker, foreign hint preserved, scope isolation, memory reset, disabled flag.
+- **Live check of all 31 tools before and after the fix** — serve layer against real bases, each tool called twice within one session. Response shapes: 9 array-based, 22 object-based or without `result`. Silent losses went from 8 to 0; all eight array tools now carry the dropped-row count and the hint (`get_callees` 29 → 0 with marker 29, `search_function` 20 → 0 with marker 20, and so on). `bsl_sql` with its `rows` shape behaves as before.
+- Scope isolation live: `bsl_sql(ut-test)` → 2 rows, then `bsl_sql(ut)` with the same query → its own 2 rows (before the fix an empty list arrived), a repeat on `ut` → 0 rows with marker 2.
+- `POST /dedup-reset` → `{"ok":true,"sessions_reset":2}`, the next call delivers rows in full.
+- The flag: a temporary serve instance with `dedup_enabled = false` — `/cache-stats` reports `dedup_enabled=false`, and three identical calls in a row each return the full response.
+
+### Compatibility
+
+- **No reindex required** — the DB schema and storage format are unchanged; the fix lives entirely in the serve layer.
+- **Tool response shapes are unchanged**: `rows_elided_already_delivered` and `hint` appear only when rows were actually dropped; existing fields are untouched.
+- **No federated node update required** — calls to remote repositories go through `/federate/<tool>` without an MCP session, so the filter never engages there; the marker is applied by the local serve layer on the final response.
+
 ## [0.47.0] — 2026-08-02
 
 **Indexing is twice as fast on repositories with a large volume of sources. Content compression moved out of the single writer thread into a parallel phase, the zstd compressor is created once per thread instead of once per file, and for dual-indexed languages the same text is no longer compressed twice. Plus a prepared-statement cache on the hot write paths. Profile of a production PHP site (151,341 files): indexing core 86.1 → 41.2 s, of which the write phase 64.6 → 17.5 s. On a 1C base (57,060 files) the core went 59.8 → 46.3 s.**
