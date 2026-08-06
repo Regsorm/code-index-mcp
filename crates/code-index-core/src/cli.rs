@@ -41,6 +41,16 @@ fn mass_mode_tools_from_daemon_cfg(config: Option<&Path>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Извлечь `daemon_cfg.mcp.dedup_enabled` (моно-ветка). При ошибке чтения —
+/// `true`, то есть дефолт секции `[mcp]`: сессионный отсев повторной выдачи
+/// включён. Дальнейшая логика — в [`CodeIndexServer::apply_dedup_enabled`].
+fn dedup_enabled_from_daemon_cfg(config: Option<&Path>) -> bool {
+    config
+        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
+        .map(|cfg| cfg.mcp.dedup_enabled)
+        .unwrap_or(true)
+}
+
 /// Извлечь `daemon_cfg.cap.max_response_bytes` (моно-ветка). `None` при ошибке
 /// чтения/отсутствии секции → страж `mcp::cap` работает на дефолтном бюджете.
 fn response_cap_from_daemon_cfg(config: Option<&Path>) -> Option<usize> {
@@ -490,6 +500,7 @@ async fn serve_http(
     let cache_routes = axum::Router::new()
         .route("/mark-dirty", axum::routing::post(mark_dirty_route))
         .route("/invalidate", axum::routing::post(invalidate_route))
+        .route("/dedup-reset", axum::routing::post(dedup_reset_route))
         .route("/cache-stats", axum::routing::get(cache_stats_route))
         .with_state(server.clone());
     app = app.merge(cache_routes);
@@ -605,6 +616,24 @@ async fn invalidate_route(
         None => 0,
     };
     axum::Json(serde_json::json!({ "removed": removed, "repo": repo, "files": paths.len() }))
+}
+
+/// `POST /dedup-reset` — забыть, что уже отдавалось в сессиях (`serve_dedup`).
+/// Нужна, когда модель потеряла часть контекста (сжатие истории на стороне
+/// клиента): изнутри MCP это событие не наблюдаемо ни у одного клиента, поэтому
+/// сигнал приходит снаружи. Доступна любому клиенту; в Claude Code ручку удобно
+/// дёргать хуком `PostCompact`. Сброс идёт по всем сессиям сразу —
+/// `mcp-session-id` вызывающему неизвестен; цена — разовая повторная отдача
+/// строк, корректность не страдает.
+async fn dedup_reset_route(
+    axum::extract::State(server): axum::extract::State<crate::mcp::CodeIndexServer>,
+) -> axum::Json<serde_json::Value> {
+    let sessions = server.dedup.reset_all();
+    tracing::info!(
+        "POST /dedup-reset — память сессионного отсева сброшена ({} сессий)",
+        sessions
+    );
+    axum::Json(serde_json::json!({ "ok": true, "sessions_reset": sessions }))
 }
 
 /// Точка входа для бинарных wrapper'ов. Принимает уже собранный реестр
@@ -728,7 +757,8 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                     serve_cfg.pool.resolve(),
                 )?
                 .apply_tools_whitelist(&daemon_cfg.tools.enabled)
-                .apply_mass_mode_tools(&daemon_cfg.mcp.mass_mode_tools);
+                .apply_mass_mode_tools(&daemon_cfg.mcp.mass_mode_tools)
+                .apply_dedup_enabled(daemon_cfg.mcp.dedup_enabled);
                 crate::mcp::cap::set_response_cap(daemon_cfg.cap.max_response_bytes);
                 crate::mcp::cap::set_function_body_cap(daemon_cfg.cap.max_function_body_chars);
                 crate::mcp::cap::set_cap_tools(Some(daemon_cfg.cap.cap_tools.clone()));
@@ -799,7 +829,8 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             // helper вернёт пустой список → фильтр выключен.
             let server = server
                 .apply_tools_whitelist(&tools_whitelist_from_daemon_cfg(config.as_deref()))
-                .apply_mass_mode_tools(&mass_mode_tools_from_daemon_cfg(config.as_deref()));
+                .apply_mass_mode_tools(&mass_mode_tools_from_daemon_cfg(config.as_deref()))
+                .apply_dedup_enabled(dedup_enabled_from_daemon_cfg(config.as_deref()));
             crate::mcp::cap::set_response_cap(response_cap_from_daemon_cfg(config.as_deref()));
             crate::mcp::cap::set_function_body_cap(function_body_cap_from_daemon_cfg(config.as_deref()));
             crate::mcp::cap::set_cap_tools(Some(cap_tools_from_daemon_cfg(config.as_deref())));

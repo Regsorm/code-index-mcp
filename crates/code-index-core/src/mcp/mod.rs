@@ -689,6 +689,21 @@ impl CodeIndexServer {
         self.with_mass_mode_tools(set)
     }
 
+    /// Применить настройку сессионного отсева повторной выдачи из
+    /// `daemon.toml [mcp].dedup_enabled`. Секции нет → включён (дефолт).
+    /// Единственная точка интеграции для обеих веток serve.
+    pub fn apply_dedup_enabled(mut self, enabled: bool) -> Self {
+        if enabled {
+            tracing::info!("[mcp].dedup_enabled = true — сессионный отсев повторной выдачи включён");
+        } else {
+            tracing::info!(
+                "[mcp].dedup_enabled = false — сессионный отсев выключен, результаты идут как есть"
+            );
+        }
+        self.dedup = Arc::new(SessionDedup::new(enabled));
+        self
+    }
+
     /// Проверить, какие имена из whitelist'а НЕ соответствуют ни одному
     /// зарегистрированному tool (опечатки, удалённые tools).
     ///
@@ -1351,6 +1366,7 @@ impl CodeIndexServer {
     fn finish(
         &self,
         session_id: &Option<String>,
+        dedup_scope: &str,
         result: Result<CallToolResult, ErrorData>,
     ) -> Result<CallToolResult, ErrorData> {
         let Ok(res) = &result else {
@@ -1365,7 +1381,7 @@ impl CodeIndexServer {
         // 1. Сессионный дедуп ре-доставки (опустить уже отданные в этой сессии
         //    строки табличного результата). Выключен → проходим без изменений.
         let (s, elided) = if self.dedup.enabled() {
-            self.dedup.process(session_id.as_deref(), &s)
+            self.dedup.process(session_id.as_deref(), dedup_scope, &s)
         } else {
             (s, 0)
         };
@@ -1511,6 +1527,15 @@ impl ServerHandler for CodeIndexServer {
             .get("repo")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        // Область сессионного отсева — «инструмент|репо». Без неё строки разных
+        // репо с одинаковым текстом гасят друг друга: первый же запрос к соседней
+        // базе приходит пустым (наблюдалось на `ut` против `ut-test`). Считаем до
+        // перемещения `request` в ToolCallContext.
+        let dedup_scope = format!(
+            "{}|{}",
+            request.name.as_ref(),
+            repo_opt.as_deref().unwrap_or("")
+        );
         let cache_key = self.cache_key_if_local(request.name.as_ref(), &args_val);
         if let Some(ref key) = cache_key {
             if let Some(payload) = self.cache.get(key) {
@@ -1519,7 +1544,7 @@ impl ServerHandler for CodeIndexServer {
                 let repo = repo_opt.as_deref().unwrap_or("");
                 if !self.response_is_stale(repo, &payload) {
                     if let Ok(res) = serde_json::from_str::<CallToolResult>(&payload) {
-                        return self.finish(&session_id, Ok(res));
+                        return self.finish(&session_id, &dedup_scope, Ok(res));
                     }
                 }
             }
@@ -1534,7 +1559,7 @@ impl ServerHandler for CodeIndexServer {
             );
             let r = self.tool_router.call(tcc).await;
             self.maybe_cache(&cache_key, repo_opt.as_deref().unwrap_or(""), &r);
-            return self.finish(&session_id, r);
+            return self.finish(&session_id, &dedup_scope, r);
         }
         // 2. Иначе — extension-tools. Ищем по имени.
         let tool_name = request.name.as_ref();
@@ -1598,7 +1623,7 @@ impl ServerHandler for CodeIndexServer {
             .await;
             let value: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"raw": body}));
-            return self.finish(&session_id, Ok(CallToolResult::structured(value)));
+            return self.finish(&session_id, &dedup_scope, Ok(CallToolResult::structured(value)));
         }
         let storage = entry.storage_pool();
         let root_path: Option<&Path> = entry.root_path.as_deref();
@@ -1615,7 +1640,7 @@ impl ServerHandler for CodeIndexServer {
         let value = ext.execute(args, ctx).await;
         let r = Ok(CallToolResult::structured(value));
         self.maybe_cache(&cache_key, repo_opt.as_deref().unwrap_or(""), &r);
-        self.finish(&session_id, r)
+        self.finish(&session_id, &dedup_scope, r)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

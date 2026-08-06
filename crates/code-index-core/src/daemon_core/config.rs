@@ -188,12 +188,35 @@ pub struct ToolsSection {
 /// убирает plural-параметр из схемы и отбивает `tools/call` с ним
 /// (`-32602 Invalid params`). Имена — короткие (`get_function`, не
 /// `mcp__...`). Имена вне набора массовых инструментов игнорируются с warning.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSection {
     /// Белый список инструментов, которым разрешён массовый режим. Пусто или
     /// отсутствует → массовый режим выключен у всех (дефолт).
     #[serde(default)]
     pub mass_mode_tools: Vec<String>,
+    /// Сессионный отсев повторной выдачи строк (`serve_dedup`): не отдавать
+    /// повторно строки, уже доставленные в этой же сессии. Отсутствует →
+    /// включён (дефолт). `false` → результаты идут как есть.
+    ///
+    /// ```toml
+    /// [mcp]
+    /// dedup_enabled = false
+    /// ```
+    #[serde(default = "default_dedup_enabled")]
+    pub dedup_enabled: bool,
+}
+
+impl Default for McpSection {
+    fn default() -> Self {
+        Self {
+            mass_mode_tools: Vec::new(),
+            dedup_enabled: default_dedup_enabled(),
+        }
+    }
+}
+
+fn default_dedup_enabled() -> bool {
+    true
 }
 
 /// Секция `[cap]` из конфига демона — параметры стража размера выдачи
@@ -764,6 +787,25 @@ mod tests {
     fn mcp_mass_mode_default_empty() {
         // Нет секции [mcp] → массовый режим выключен у всех (дефолт v0.28.0).
         let cfg: DaemonFileConfig = parse_str("").unwrap();
+        assert!(cfg.mcp.mass_mode_tools.is_empty());
+    }
+
+    #[test]
+    fn mcp_dedup_enabled_default_true() {
+        // Нет секции [mcp] → сессионный отсев повторной выдачи включён (дефолт).
+        let cfg: DaemonFileConfig = parse_str("").unwrap();
+        assert!(cfg.mcp.dedup_enabled);
+    }
+
+    #[test]
+    fn parses_mcp_dedup_enabled() {
+        // Секция задана только под отсев — массовый режим остаётся дефолтным.
+        let text = r#"
+            [mcp]
+            dedup_enabled = false
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert!(!cfg.mcp.dedup_enabled);
         assert!(cfg.mcp.mass_mode_tools.is_empty());
     }
 

@@ -4,23 +4,52 @@
 //! доставленные ранее в этой же сессии (модель их уже видела в своём контексте).
 //! Ключ — session id (из заголовка `mcp-session-id`, см. `call_tool`).
 //!
-//! Гранулярность — ЭЛЕМЕНТ (строка табличного результата). Замер показал, что
-//! единственный заметный источник перекрытия — повторные строки табличных
-//! ответов (`bsl_sql` и пр., форма `{result:{rows:[...]}}`); тела файлов и
-//! идентичные ответы целиком в сессии почти не повторяются. Поэтому дедуп
-//! применяется ТОЛЬКО к табличной форме; всё остальное проходит без изменений
-//! (консервативно — не трогаем то, что не умеем безопасно переписать).
+//! Гранулярность — ЭЛЕМЕНТ (строка результата). Обрабатываются обе формы
+//! списка: `result: {rows:[...]}` (таблица `bsl_sql`) и `result: [...]` (голый
+//! массив — так отвечает большинство инструментов: `get_callers`,
+//! `get_function`, `find_symbol`, `list_files` и др.). Прочие формы проходят
+//! без изменений (консервативно — не трогаем то, что не умеем безопасно
+//! переписать).
 //!
-//! Маркер вместо тишины: опущенные строки заменяются НЕ молча, а полем
-//! `rows_elided_already_delivered: N` в `result`, чтобы модель понимала, что N
-//! строк уже отдавались в этой сессии (и при необходимости нашла их в контексте).
-//! Это correctness-sensitive (в отличие от прозрачного кэша) — потому маркер явный.
+//! Маркер вместо тишины — обязателен для ОБЕИХ форм: опущенные строки
+//! сопровождаются полем `rows_elided_already_delivered: N` и подсказкой
+//! [`HINT_ELIDED`]. Для таблицы маркер кладётся внутрь `result` рядом с `rows`;
+//! для голого массива — рядом с самим `result`, в объемлющий объект (внутрь
+//! массива служебное поле не вставить, не сломав форму; рядом с `result` уже
+//! живут `hint` и `truncated/total/limit`, см. `tools::wrap_with_meta_extra`).
+//!
+//! Это correctness-sensitive (в отличие от прозрачного кэша): молча опущенный
+//! результат неотличим от честного «данных нет», и модель по нему делает вывод
+//! «код не используется» и правит живое. Ровно этот случай — issue #5 (0.47.0),
+//! где по http повторный `get_callers` отдавал пустой список без признаков.
+//!
+//! ОБЛАСТЬ отпечатка — «инструмент|репо» (см. [`fingerprint`]). Строки разных
+//! репо и разных инструментов в одно множество не смешиваются: без этого первый
+//! же запрос к соседней базе приходил пустым, если строки текстуально совпали
+//! (`ut` против `ut-test` — одинаковые имена объектов 1С). Аргументы вызова в
+//! область НЕ входят намеренно: модель часто переспрашивает то же самое с
+//! уточнённым `limit`/`path_glob`, и по аргументам отсев такие повторы бы
+//! пропускал. Плата — разные вызовы одного инструмента могут гасить строки друг
+//! друга; это безопасно ровно потому, что каждое опущение теперь помечено.
+//!
+//! Включение/выключение — `daemon.toml [mcp].dedup_enabled` (дефолт `true`);
+//! полный сброс памяти — `POST /dedup-reset` (доступен любому клиенту: изнутри
+//! MCP сжатие контекста модели не наблюдаемо ни у одного из них).
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+
+/// Подсказка, сопровождающая опущенные строки. Намеренно по-английски: ответы
+/// сервера читают любые модели и клиенты, а не только русскоязычная связка, и
+/// слабые модели понимают английскую формулировку заметно надёжнее. От этой
+/// фразы зависит вывод «мёртвый код или нет» — потому она прямая и без терминов.
+const HINT_ELIDED: &str = "Some rows were omitted here because they were already \
+delivered earlier in THIS session. An empty or shortened list does NOT mean the data \
+is absent — do not conclude that the code is unused. Look for the earlier result \
+above in your context; if it is no longer there, query again by other means.";
 
 pub struct SessionDedup {
     enabled: bool,
@@ -58,6 +87,20 @@ impl SessionDedup {
         self.sessions.write().unwrap().remove(session_id);
     }
 
+    /// Забыть состояние ВСЕХ сессий (ручка `POST /dedup-reset`). Возвращает
+    /// число забытых сессий. Нужна там, где модель потеряла часть контекста
+    /// (сжатие истории у клиента), а сессия MCP при этом не рвалась: изнутри
+    /// протокола это событие не наблюдаемо, поэтому сброс инициируется снаружи.
+    /// Сброс по всем сессиям сразу — `mcp-session-id` клиенту неизвестен;
+    /// цена — разовая повторная отдача строк, корректность не страдает (тем же
+    /// приёмом сбрасывается карта при переполнении).
+    pub fn reset_all(&self) -> usize {
+        let mut guard = self.sessions.write().unwrap();
+        let n = guard.len();
+        guard.clear();
+        n
+    }
+
     /// (сессий в памяти, всего опущено строк) — для /cache-stats.
     pub fn stats(&self) -> (usize, u64) {
         (
@@ -71,7 +114,9 @@ impl SessionDedup {
     /// Возвращает (возможно переписанный payload, число опущенных строк).
     /// Если форма не табличная / session_id нет / дедуп выключен — payload без
     /// изменений и 0.
-    pub fn process(&self, session_id: Option<&str>, payload: &str) -> (String, usize) {
+    /// `scope` — область строки («инструмент|репо»): строки разных репо и разных
+    /// инструментов в одно множество не смешиваются (см. модульный комментарий).
+    pub fn process(&self, session_id: Option<&str>, scope: &str, payload: &str) -> (String, usize) {
         if !self.enabled {
             return (payload.to_string(), 0);
         }
@@ -91,7 +136,7 @@ impl SessionDedup {
         if let Some(text_idx) = find_text_content_index(&outer) {
             if let Some(text) = outer["content"][text_idx]["text"].as_str() {
                 if let Ok(mut inner) = serde_json::from_str::<Value>(text) {
-                    elided += self.dedup_rows_in_result(sid, &mut inner);
+                    elided += self.dedup_rows_in_result(sid, scope, &mut inner);
                     if elided > 0 {
                         if let Ok(s) = serde_json::to_string(&inner) {
                             outer["content"][text_idx]["text"] = Value::String(s);
@@ -104,7 +149,7 @@ impl SessionDedup {
         // 2) structuredContent (rmcp structured output, дублирует данные)
         if outer.get("structuredContent").is_some() {
             let mut sc = outer["structuredContent"].take();
-            let e2 = self.dedup_rows_in_result(sid, &mut sc);
+            let e2 = self.dedup_rows_in_result(sid, scope, &mut sc);
             outer["structuredContent"] = sc;
             // structuredContent дублирует content[0].text — НЕ суммируем в elided,
             // считаем по первому источнику; но переписать обязаны для консистентности.
@@ -123,67 +168,100 @@ impl SessionDedup {
 
     /// Найти `result.rows` (или `result` как массив) в объекте `{result, _meta}`,
     /// опустить уже отданные строки, добавить маркер. Возвращает число опущенных.
-    fn dedup_rows_in_result(&self, sid: &str, obj: &mut Value) -> usize {
-        // result.rows: Vec<Value> | result: Vec<Value>
-        let rows_owner: &mut Value = match obj.get_mut("result") {
-            Some(r) => r,
-            None => return 0,
-        };
-        let rows: &mut Vec<Value> = match rows_owner {
-            Value::Object(map) => match map.get_mut("rows").and_then(|v| v.as_array_mut()) {
-                Some(arr) => arr,
+    fn dedup_rows_in_result(&self, sid: &str, scope: &str, obj: &mut Value) -> usize {
+        // Форма результата решает, КУДА ляжет маркер: в таблице — внутрь
+        // `result` рядом с `rows`, у голого массива — рядом с самим `result`
+        // (запоминаем до мутабельного заимствования ниже).
+        let bare_array = matches!(obj.get("result"), Some(Value::Array(_)));
+
+        let elided = {
+            // result.rows: Vec<Value> | result: Vec<Value>
+            let rows_owner: &mut Value = match obj.get_mut("result") {
+                Some(r) => r,
                 None => return 0,
-            },
-            Value::Array(arr) => arr,
-            _ => return 0,
-        };
-        if rows.is_empty() {
-            return 0;
-        }
-
-        let mut guard = self.sessions.write().unwrap();
-        // Защита от утечки: новая сессия при переполнении карты → полный сброс.
-        if !guard.contains_key(sid) && guard.len() >= self.max_sessions {
-            guard.clear();
-        }
-        let seen = guard.entry(sid.to_string()).or_default();
-        let mut kept: Vec<Value> = Vec::with_capacity(rows.len());
-        let mut elided = 0usize;
-        for row in rows.drain(..) {
-            let fp = fingerprint(&row);
-            if seen.contains(&fp) {
-                elided += 1;
-            } else {
-                if seen.len() < self.max_rows_per_session {
-                    seen.insert(fp);
-                }
-                kept.push(row);
+            };
+            let rows: &mut Vec<Value> = match rows_owner {
+                Value::Object(map) => match map.get_mut("rows").and_then(|v| v.as_array_mut()) {
+                    Some(arr) => arr,
+                    None => return 0,
+                },
+                Value::Array(arr) => arr,
+                _ => return 0,
+            };
+            if rows.is_empty() {
+                return 0;
             }
-        }
-        *rows = kept;
-        drop(guard);
 
-        if elided > 0 {
-            // Явный маркер рядом с rows (или на уровне result-массива — в объект).
-            if let Value::Object(map) = rows_owner {
+            let mut guard = self.sessions.write().unwrap();
+            // Защита от утечки: новая сессия при переполнении карты → полный сброс.
+            if !guard.contains_key(sid) && guard.len() >= self.max_sessions {
+                guard.clear();
+            }
+            let seen = guard.entry(sid.to_string()).or_default();
+            let mut kept: Vec<Value> = Vec::with_capacity(rows.len());
+            let mut elided = 0usize;
+            for row in rows.drain(..) {
+                let fp = fingerprint(scope, &row);
+                if seen.contains(&fp) {
+                    elided += 1;
+                } else {
+                    if seen.len() < self.max_rows_per_session {
+                        seen.insert(fp);
+                    }
+                    kept.push(row);
+                }
+            }
+            *rows = kept;
+            drop(guard);
+
+            // Табличная форма: маркер внутрь `result`, рядом с `rows`.
+            if elided > 0 {
+                if let Value::Object(map) = rows_owner {
+                    map.insert(
+                        "rows_elided_already_delivered".to_string(),
+                        Value::from(elided),
+                    );
+                    map.entry("hint".to_string())
+                        .or_insert_with(|| Value::from(HINT_ELIDED));
+                }
+            }
+            elided
+        };
+
+        // Голый массив: внутрь массива служебное поле не вставить, не сломав
+        // форму, — кладём рядом с `result`, в объемлющий объект. Там уже живут
+        // `hint` и `truncated/total/limit` (`tools::wrap_with_meta_extra`), так
+        // что форма ответа не меняется. Чужой `hint` не затираем: при обрезке
+        // по лимиту он занят и несёт другой смысл.
+        if elided > 0 && bare_array {
+            if let Some(map) = obj.as_object_mut() {
                 map.insert(
                     "rows_elided_already_delivered".to_string(),
                     Value::from(elided),
                 );
-            } else if let Value::Array(_) = rows_owner {
-                // result — голый массив: обернуть в объект нельзя без слома формы,
-                // поэтому маркер не вставляем, но строки опущены (число вернём).
+                map.entry("hint".to_string())
+                    .or_insert_with(|| Value::from(HINT_ELIDED));
             }
         }
         elided
     }
 }
 
-/// Усечённый до u64 sha256 канонической (с сортировкой ключей) сериализации
-/// строки таблицы. Коллизия на 50k строк ≈ 1e-10 — пренебрежимо для дедупа.
-fn fingerprint(row: &Value) -> u64 {
+/// Усечённый до u64 sha256 от ОБЛАСТИ и канонической (с сортировкой ключей)
+/// сериализации строки таблицы. Коллизия на 50k строк ≈ 1e-10 — пренебрежимо.
+///
+/// Область («инструмент|репо») входит в отпечаток обязательно: без неё строка
+/// «AccumulationRegister.ent_Инвентарь», отданная из одного репо, гасила такую
+/// же строку из другого — первый же запрос к соседней базе приходил пустым
+/// (наблюдалось на `ut` против `ut-test`). Бьёт как раз по сравнению двух
+/// конфигураций, где совпадения и есть предмет интереса.
+fn fingerprint(scope: &str, row: &Value) -> u64 {
     let canon = serde_json::to_string(&sort_keys(row.clone())).unwrap_or_default();
-    let digest = Sha256::digest(canon.as_bytes());
+    let mut hasher = Sha256::new();
+    hasher.update(scope.as_bytes());
+    hasher.update([0u8]); // разделитель: область не должна «слипаться» с телом
+    hasher.update(canon.as_bytes());
+    let digest = hasher.finalize();
     u64::from_le_bytes(digest[..8].try_into().unwrap())
 }
 
@@ -218,6 +296,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Область строки в тестах — «инструмент|репо» (см. [`fingerprint`]).
+    const SCOPE: &str = "get_callers|ut";
+
     fn mcp_payload(rows: Value) -> String {
         // Имитация CallToolResult: content[0].text = вложенный {result:{rows}}
         let inner = json!({ "result": { "rows": rows } }).to_string();
@@ -234,7 +315,7 @@ mod tests {
     fn first_delivery_keeps_all() {
         let d = SessionDedup::new(true);
         let p = mcp_payload(json!([["A", 1], ["B", 2]]));
-        let (out, elided) = d.process(Some("s1"), &p);
+        let (out, elided) = d.process(Some("s1"), SCOPE, &p);
         assert_eq!(elided, 0);
         assert_eq!(rows_of(&out).len(), 2);
     }
@@ -243,9 +324,9 @@ mod tests {
     fn second_delivery_elides_repeats() {
         let d = SessionDedup::new(true);
         let p = mcp_payload(json!([["A", 1], ["B", 2]]));
-        d.process(Some("s1"), &p); // первая доставка
+        d.process(Some("s1"), SCOPE, &p); // первая доставка
         let p2 = mcp_payload(json!([["A", 1], ["B", 2], ["C", 3]]));
-        let (out, elided) = d.process(Some("s1"), &p2);
+        let (out, elided) = d.process(Some("s1"), SCOPE, &p2);
         assert_eq!(elided, 2); // A,B уже отданы
         let kept = rows_of(&out);
         assert_eq!(kept.len(), 1); // только C
@@ -259,17 +340,35 @@ mod tests {
     fn sessions_are_isolated() {
         let d = SessionDedup::new(true);
         let p = mcp_payload(json!([["A", 1]]));
-        d.process(Some("s1"), &p);
-        let (_, elided) = d.process(Some("s2"), &p); // другая сессия — не опускаем
+        d.process(Some("s1"), SCOPE, &p);
+        let (_, elided) = d.process(Some("s2"), SCOPE, &p); // другая сессия — не опускаем
         assert_eq!(elided, 0);
+    }
+
+    /// Области не смешиваются: одинаковая строка из другого репо (и от другого
+    /// инструмента) не считается уже отданной. Без этого первый же запрос к
+    /// соседней базе приходил пустым — имена объектов 1С в `ut` и `ut-test`
+    /// совпадают дословно.
+    #[test]
+    fn scopes_are_isolated() {
+        let d = SessionDedup::new(true);
+        let p = mcp_payload(json!([["AccumulationRegister.ent_Инвентарь"]]));
+        d.process(Some("s1"), "bsl_sql|ut-test", &p);
+        let (_, other_repo) = d.process(Some("s1"), "bsl_sql|ut", &p);
+        assert_eq!(other_repo, 0);
+        let (_, other_tool) = d.process(Some("s1"), "search_text|ut-test", &p);
+        assert_eq!(other_tool, 0);
+        // Та же область — отсев работает как прежде.
+        let (_, same_scope) = d.process(Some("s1"), "bsl_sql|ut", &p);
+        assert_eq!(same_scope, 1);
     }
 
     #[test]
     fn no_session_no_dedup() {
         let d = SessionDedup::new(true);
         let p = mcp_payload(json!([["A", 1]]));
-        d.process(None, &p);
-        let (_, elided) = d.process(None, &p);
+        d.process(None, SCOPE, &p);
+        let (_, elided) = d.process(None, SCOPE, &p);
         assert_eq!(elided, 0);
     }
 
@@ -277,8 +376,8 @@ mod tests {
     fn disabled_passthrough() {
         let d = SessionDedup::new(false);
         let p = mcp_payload(json!([["A", 1]]));
-        d.process(Some("s1"), &p);
-        let (out, elided) = d.process(Some("s1"), &p);
+        d.process(Some("s1"), SCOPE, &p);
+        let (out, elided) = d.process(Some("s1"), SCOPE, &p);
         assert_eq!(elided, 0);
         assert_eq!(rows_of(&out).len(), 1);
     }
@@ -290,8 +389,72 @@ mod tests {
         // под другим ключом) → не трогаем
         let inner = json!({ "result": { "functions": [{"name": "X"}] } }).to_string();
         let p = json!({ "content": [ { "type": "text", "text": inner } ] }).to_string();
-        let (out, elided) = d.process(Some("s1"), &p);
+        let (out, elided) = d.process(Some("s1"), SCOPE, &p);
         assert_eq!(elided, 0);
         assert_eq!(out, p);
+    }
+
+    /// Голый массив `result: [...]` — форма ответа большинства инструментов
+    /// (get_callers/get_function/find_symbol/list_files). Маркер обязан
+    /// появиться РЯДОМ с `result`: без него повтор молча пуст и неотличим от
+    /// «данных нет» — issue #5 (0.47.0).
+    #[test]
+    fn bare_array_marks_elided_next_to_result() {
+        let d = SessionDedup::new(true);
+        let inner = json!({ "result": [{"caller": "A"}, {"caller": "B"}] }).to_string();
+        let p = json!({ "content": [ { "type": "text", "text": inner } ] }).to_string();
+        d.process(Some("s1"), SCOPE, &p); // первая доставка — отданы обе строки
+        let (out, elided) = d.process(Some("s1"), SCOPE, &p);
+        assert_eq!(elided, 2);
+        let outer: Value = serde_json::from_str(&out).unwrap();
+        let inner: Value =
+            serde_json::from_str(outer["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["result"].as_array().unwrap().len(), 0);
+        assert_eq!(inner["rows_elided_already_delivered"], json!(2));
+        assert!(inner["hint"].as_str().unwrap().contains("does NOT mean"));
+    }
+
+    /// Изначально пустой список — это НЕ результат отсева: пометки быть не
+    /// должно, иначе «данных нет» не отличить от «всё уже отдавали».
+    #[test]
+    fn originally_empty_result_gets_no_marker() {
+        let d = SessionDedup::new(true);
+        let inner = json!({ "result": [], "hint": "0 вызывателей" }).to_string();
+        let p = json!({ "content": [ { "type": "text", "text": inner } ] }).to_string();
+        let (out, elided) = d.process(Some("s1"), SCOPE, &p);
+        assert_eq!(elided, 0);
+        assert_eq!(out, p);
+    }
+
+    /// Чужой `hint` (обрезка по лимиту) не затирается — он несёт другой смысл;
+    /// число опущенных строк при этом всё равно проставляется.
+    #[test]
+    fn foreign_hint_is_kept() {
+        let d = SessionDedup::new(true);
+        let inner =
+            json!({ "result": [{"caller": "A"}], "hint": "truncated", "truncated": true })
+                .to_string();
+        let p = json!({ "content": [ { "type": "text", "text": inner } ] }).to_string();
+        d.process(Some("s1"), SCOPE, &p);
+        let (out, elided) = d.process(Some("s1"), SCOPE, &p);
+        assert_eq!(elided, 1);
+        let outer: Value = serde_json::from_str(&out).unwrap();
+        let inner: Value =
+            serde_json::from_str(outer["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["hint"], json!("truncated"));
+        assert_eq!(inner["rows_elided_already_delivered"], json!(1));
+    }
+
+    /// `POST /dedup-reset` → память забыта, строки приходят снова (клиент сжал
+    /// контекст, а сессия MCP при этом не рвалась).
+    #[test]
+    fn reset_all_returns_rows_again() {
+        let d = SessionDedup::new(true);
+        let inner = json!({ "result": [{"caller": "A"}] }).to_string();
+        let p = json!({ "content": [ { "type": "text", "text": inner } ] }).to_string();
+        d.process(Some("s1"), SCOPE, &p);
+        assert_eq!(d.reset_all(), 1);
+        let (_, elided) = d.process(Some("s1"), SCOPE, &p);
+        assert_eq!(elided, 0);
     }
 }
