@@ -5,6 +5,42 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.49.0] — 2026-08-15
+
+**Size capping no longer carries away the list of what was found. A search for configuration objects by name substring (`get_object_structure` with `name_like`) returned three numbers on the slightest budget overrun — `{matched: 38, results_omitted: true}` — and not a single name: the heaviest section in such a response was the results array itself, so it was the first thing dropped. Identification of what was found is now untouchable: heavy sections inside the items are removed first, and only then is the array itself shortened, with honest `results_total`/`results_shown`. Added a per-call budget parameter `max_response_bytes` with a server-side ceiling, and a names-only mode `names_only`.**
+
+> Context. The defect surfaced during a planner run: the model received three numbers, did not realise objects had been found, and burned every turn on blindly guessing metadata types. The budget overrun was a few percent (48,814 bytes against 48,000); the loss was a hundred percent.
+
+### Fixed
+
+- **A search response no longer loses the list of what was found.** The per-section guard `omit_oversize_sections` looked for the heaviest array section and dropped it wholesale. For a single object's structure that rule is right (hundreds of enum values go, the object's passport stays), but in a search response the heaviest section is the outer `results` array, with no other contenders nearby. So it went first, taking every name with it; the algorithm never descended into the items. A separate degradation path `shrink_search_results` now handles search responses (`name_like`, `full_names`): `full_name`, `meta_type`, `name` and `synonym` survive on every item at any budget above zero, and the array is never emptied — at the harshest budget at least one item is still returned.
+- **Degradation goes top-down, each step only if the previous one was not enough.** Heavy sections INSIDE the items are removed first, each marked with `<section>_omitted` + `<section>_count` (the `counts` block stays, so the number of attributes is visible even without the attributes). If that is still not enough, the array itself is shortened and `results_total` (how many were found) and `results_shown` (how many were returned) appear next to it. Exactly as much is removed as the budget requires: objects that fit come back with their sections intact.
+
+### Added
+
+- **`max_response_bytes` — a size budget for ONE call** (`get_object_structure`), overriding the server-wide `[cap].max_response_bytes`. A request above the ceiling is not rejected but clamped to it; the applied value comes back in `response_budget_applied`. The value `0` (disable the guard) is not allowed per call — the guard can only be lifted from the server config, otherwise a client tears its own context apart with a single parameter.
+- **`[cap].max_response_bytes_hard` in `daemon.toml`** — the ceiling for a requested budget. Absent or `0` → default of 4x the regular budget (192,000 bytes with the default 48,000). Zero means "default", not "zero ceiling": otherwise every client request would be clamped to zero, disabling the guard instead of tightening it.
+- **`names_only` — passport-only mode** (`get_object_structure`): return `full_name`, `meta_type`, `name`, `synonym` without the structure. The cheapest search mode: on the analysed case of 38 objects, 13,353 bytes instead of 48,814. A dedicated parameter was needed because `sections=[]` means "all sections" (backwards compatibility), leaving no way to ask for names alone.
+- **`response_shrink_hint` — a hint that names the knob and the price.** The previous text suggested `grep_code`/`grep_body` — tools the calling agent may not even have allowed — and named neither the actual size nor the parameter. The hint now carries both numbers (what the full response would weigh and what the budget was), a ready-to-use `max_response_bytes=N`, the server ceiling, and the list of next moves: `names_only=true`, requesting a single object by `full_name` from the list, narrowing `name_like`/`meta_type`.
+
+### Changed
+
+- **Markers on a shrunk search response.** Alongside the existing `response_sections_omitted` there are now `response_results_shortened` (the array itself was shortened) and `response_budget_applied` (which budget was in force). For search responses the generic `response_sections_omitted_hint` is no longer attached — `response_shrink_hint`, with concrete numbers and knobs, takes its place.
+
+### Testing
+
+- `cargo test --workspace` — 628 passed, 0 failed, 0 warnings. Seven new tests in `mcp::cap`, the key one being `search_results_never_dropped_wholesale`: at budgets of 50, 500, 5,000, 20,000 and 48,000 bytes the results array is never dropped wholesale, and every returned item still carries `full_name` and `meta_type`.
+- **Live verification on the serve layer at both levels — locally (`ut-test`) and federated (`ut` on a remote node), with identical results.** The exact call from the report (`name_like="Соглашения"`, `sections=["attributes"]`, default budget): it used to return `{matched: 38, results_omitted: true}` with no names, and now returns 38 items each with its passport, the wanted `Catalog.СоглашенияСКлиентами` present, and the heaviest object's section marked `attributes_omitted` + `attributes_count: 70`.
+- `names_only=true` → 38 items, passport only, 13,353 bytes. `max_response_bytes=70000` → full sections, 50,801 bytes, `response_budget_applied: 70000`. A request of 5,000,000 → response delivered, budget clamped to 192,000. A budget of 1,200 (not even the names fit) → 3 items out of 38, `results_total: 38` / `results_shown: 3`, and no `results_omitted` marker.
+- A single object's structure is unchanged: `Enum.ХозяйственныеОперации` (816 values) still comes back as before — `enum_values_omitted: true` + `enum_values_count: 816`, with the object's passport in place.
+
+### Compatibility
+
+- **No reindex required** — the DB schema and storage format are unchanged; the fix lives entirely in the output layer.
+- **The meaning of `sections=[]` is unchanged** — an empty list still means "all sections".
+- **The response shape for a SINGLE object's structure is unchanged** — the existing per-section `omit_oversize_sections` behaves exactly as before.
+- **Federated nodes must be updated together** — the new `names_only`/`max_response_bytes` parameters are handled by the node that owns the repository; a node on an older version simply ignores them and answers the old way.
+
 ## [0.48.0] — 2026-08-06
 
 **Fixed silent row loss in responses over http: a repeated call to any tool that returns an array (`get_callers`, `get_function`, `search_function`, `list_files` and four more) came back as an empty list with no indication whatsoever that rows had been dropped. An empty response is indistinguishable from an honest "no data", so the model concluded "this code is unused" — and edited live code on that basis. The cause was the session-level re-delivery filter, which could not attach a marker to a bare array and therefore dropped rows silently. The marker is now mandatory for both response shapes, the row fingerprint accounts for repository and tool, the mechanism can be turned off from the config, and its memory can be cleared via `POST /dedup-reset`. Issue #5 (reported by @Ailirag).**
