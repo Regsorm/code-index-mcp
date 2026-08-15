@@ -120,7 +120,7 @@ pub(crate) fn wrap_error(error_value: Value) -> Value {
 pub(crate) fn object_value(args: &Value) -> Option<&str> {
     const SERVICE: &[&str] = &[
         "repo", "depth", "limit", "direction", "sections", "language", "max_depth", "name_like",
-        "meta_type",
+        "meta_type", "names_only", "max_response_bytes",
     ];
     args.as_object()?
         .iter()

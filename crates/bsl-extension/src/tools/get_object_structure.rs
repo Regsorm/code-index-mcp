@@ -15,6 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use code_index_core::extension::{IndexTool, ToolContext};
+use code_index_core::mcp::cap;
 use rusqlite::params;
 use serde_json::{json, Value};
 
@@ -39,7 +40,7 @@ impl IndexTool for GetObjectStructureTool {
          (attributes/dimensions/resources/tabular_sections) присутствуют всегда (пустые — []). \
          Это единственный источник структуры объекта — XML объектов НЕ индексируется как \
          текст, не ищите его через list_files/grep_text. For BSL/1C repositories only. \
-         МАССОВЫЙ РЕЖИМ ('full_names'): батчи список ТОЛЬКО когда точно нужен ВЕСЬ набор и структура одного объекта не отменит надобность в остальных (например, разбираешь уже подтверждённый список). Если ОТБИРАЕШЬ, какие из объектов релевантны, или результат одного может сделать остальные ненужными — НЕ батчи, запрашивай по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в том же порядке. КРИТЕРИЙ-СЕЛЕКТОР ('name_like' + опц. 'meta_type'): когда нужны структуры ВСЕХ объектов одной темы — не зови по одному и не перечисляй имена, передай подстроку имени: name_like='ЭДО' вернёт структуры всех объектов, чьё имя содержит 'ЭДО', ОДНИМ вызовом. Сочетай с sections= (узкие секции на каждый объект). Лимит 50 объектов (truncated=true, если совпало больше — уточни критерий). Ответ — {matched:N, truncated, results:[...]}."
+         МАССОВЫЙ РЕЖИМ ('full_names'): батчи список ТОЛЬКО когда точно нужен ВЕСЬ набор и структура одного объекта не отменит надобность в остальных (например, разбираешь уже подтверждённый список). Если ОТБИРАЕШЬ, какие из объектов релевантны, или результат одного может сделать остальные ненужными — НЕ батчи, запрашивай по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в том же порядке. КРИТЕРИЙ-СЕЛЕКТОР ('name_like' + опц. 'meta_type'): когда нужны структуры ВСЕХ объектов одной темы — не зови по одному и не перечисляй имена, передай подстроку имени: name_like='ЭДО' вернёт структуры всех объектов, чьё имя содержит 'ЭДО', ОДНИМ вызовом. Сочетай с sections= (узкие секции на каждый объект). Лимит 50 объектов (truncated=true, если совпало больше — уточни критерий). Ответ — {matched:N, truncated, results:[...]}. РАЗМЕР ОТВЕТА: опознание найденного (full_name/meta_type/name/synonym) сохраняется всегда — при нехватке бюджета опускаются тяжёлые секции ВНУТРИ элементов (`<секция>_omitted` + `<секция>_count`), список объектов не пропадает. Дёшево искать — 'names_only=true' (только паспорта); нужны полные секции — повтори вызов с 'max_response_bytes' побольше."
     }
 
     fn input_schema(&self) -> Value {
@@ -71,6 +72,14 @@ impl IndexTool for GetObjectStructureTool {
                     "type": "array",
                     "items": { "type": "string", "enum": ["attributes", "tabular_sections", "dimensions", "resources", "posting", "enum_values", "predefined", "owners", "value_types", "properties", "enum_synonyms", "commands"] },
                     "description": "Узкая выборка секций структуры (как sections у get_object_profile): вернуть ТОЛЬКО указанные ключи. Без параметра — все секции. Рычаг экономии контекста: ['posting'] (поведение проведения, ~0.2 КБ вместо полного объекта), ['attributes'] (только реквизиты шапки без табличных частей), ['tabular_sections'], ['dimensions','resources'] (для регистров)."
+                },
+                "names_only": {
+                    "type": "boolean",
+                    "description": "Вернуть ТОЛЬКО паспорт каждого объекта (full_name, meta_type, name, synonym) без структуры. Самый дешёвый режим поиска: с name_like на 38 объектах ~9 КБ вместо ~63 КБ. Бери, когда нужно СНАЧАЛА понять, какие объекты подходят, а структуру запросить потом по конкретному full_name. Учти: sections=[] означает «все секции» (обратная совместимость), а не «только имена» — для имён нужен именно этот параметр."
+                },
+                "max_response_bytes": {
+                    "type": "integer",
+                    "description": "Бюджет размера ЭТОГО ответа в байтах — перекрывает серверный [cap].max_response_bytes на один вызов. Применяй, когда ответ пришёл ужатым и нужны полные секции: повтори тот же вызов с большим значением. Запрос сверх серверного потолка не отклоняется, а зажимается до потолка; фактически применённое значение возвращается полем response_budget_applied. Ноль (снять ограничение) на вызов не разрешён."
                 }
             },
             "required": ["repo"]
@@ -92,6 +101,21 @@ impl IndexTool for GetObjectStructureTool {
                 .get("sections")
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+            // Явный режим «только имена». Отдельный вход, потому что sections=[]
+            // означает «все секции» (обратная совместимость, тест
+            // apply_sections_filters_top_level_keys) — попросить одни имена
+            // через sections клиент не может.
+            let names_only = args
+                .get("names_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Бюджет размера этого ответа: клиентский max_response_bytes
+            // поверх серверного, но не выше серверного потолка.
+            let budget = code_index_core::mcp::cap::resolve_request_budget(
+                args.get("max_response_bytes")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize),
+            );
             // Критерий-селектор (name_like) приоритетен: сервер сам разворачивает
             // плоский предикат в список объектов и отдаёт их структуры за 1 ход
             // (общая конвенция объектно-ключевых инструментов). Массовый режим
@@ -154,7 +178,7 @@ impl IndexTool for GetObjectStructureTool {
                         ctx.storage,
                         full_names,
                         move |st, fqn| {
-                            resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref())
+                            resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only)
                         },
                     )
                     .await;
@@ -194,7 +218,7 @@ impl IndexTool for GetObjectStructureTool {
                 let sections_c = sections.clone();
                 let rows =
                     code_index_core::mcp::tools::mass_map(ctx.storage, items, move |st, fqn| {
-                        resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref())
+                        resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only)
                     })
                     .await;
                 for (pos, row) in positions.into_iter().zip(rows) {
@@ -213,7 +237,7 @@ impl IndexTool for GetObjectStructureTool {
                         }));
                     }
                 };
-                resolve_one(storage.conn(), ctx.repo, fqn, sections.as_deref())
+                resolve_one(storage.conn(), ctx.repo, fqn, sections.as_deref(), names_only)
             } else {
                 json!({
                     "error": "missing parameter: передайте 'full_name' — полное имя вида '<MetaType>.<Name>' (строка)"
@@ -223,17 +247,116 @@ impl IndexTool for GetObjectStructureTool {
             // cap_response — посекционный omit (тяжёлую секцию ЦЕЛИКОМ, не обрезая
             // частично), затем wrap БЕЗ cap. Так enum_synonyms (сотни ключей)
             // выкидывается с count, а enum_values/имена остаются полными.
-            if code_index_core::mcp::cap::is_structural_tool("get_object_structure") {
-                let (result_value, omitted) = code_index_core::mcp::cap::omit_oversize_sections(
+            if !code_index_core::mcp::cap::is_structural_tool("get_object_structure") {
+                return crate::tools::wrap_with_meta(
+                    "get_object_structure",
                     result_value,
-                    code_index_core::mcp::cap::response_cap(),
+                    Vec::new(),
                 );
-                crate::tools::wrap_with_meta_structural(result_value, Vec::new(), omitted)
-            } else {
-                crate::tools::wrap_with_meta("get_object_structure", result_value, Vec::new())
             }
+            // Ответ-ПОИСК (name_like/full_names) ужимается иначе, чем структура
+            // одного объекта: там самая тяжёлая секция — сам массив results, и
+            // общий omit выбрасывал его первым же шагом, оставляя клиенту три
+            // числа вместо списка найденного. Опознание объектов неприкосновенно.
+            if result_value.get("results").is_some() {
+                let (result_value, shrink) = code_index_core::mcp::cap::shrink_search_results(
+                    result_value,
+                    budget.applied,
+                );
+                // Маркеры ставим свои: общий OMIT_HINT здесь не годится (советует
+                // grep_code/grep_body и не называет ни размера, ни ручки).
+                let mut out =
+                    crate::tools::wrap_with_meta_structural(result_value, Vec::new(), false);
+                if let Some(obj) = out.as_object_mut() {
+                    if shrink.sections_omitted {
+                        obj.insert("response_sections_omitted".to_string(), json!(true));
+                    }
+                    if shrink.results_shortened {
+                        obj.insert("response_results_shortened".to_string(), json!(true));
+                    }
+                    if shrink.any() {
+                        obj.insert(
+                            "response_shrink_hint".to_string(),
+                            json!(shrink_hint(&shrink, &budget)),
+                        );
+                    }
+                    if shrink.any() || budget.requested.is_some() {
+                        obj.insert("response_budget_applied".to_string(), json!(budget.applied));
+                    }
+                }
+                return out;
+            }
+            // Структура ОДНОГО объекта — прежнее поведение: тяжёлая секция
+            // (сотни значений перечисления) опускается целиком с `_count`.
+            let (result_value, omitted) =
+                code_index_core::mcp::cap::omit_oversize_sections(result_value, budget.applied);
+            let mut out = crate::tools::wrap_with_meta_structural(result_value, Vec::new(), omitted);
+            if budget.requested.is_some() {
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert("response_budget_applied".to_string(), json!(budget.applied));
+                }
+            }
+            out
         })
     }
+}
+
+/// Подсказка при ужатом ответе-поиске. Обязательны ОБА числа (сколько весил бы
+/// полный ответ и каков был бюджет) и КОНКРЕТНАЯ ручка: из ответа «38 объектов,
+/// секции опущены» слабая модель не понимает, что делать дальше, — на этом и
+/// сорвался разобранный прогон. Совет про grep_code сюда не годится: этих
+/// инструментов у вызывающего агента может не быть в разрешённых.
+fn shrink_hint(shrink: &cap::SearchShrink, budget: &cap::RequestBudget) -> String {
+    let kb = |b: usize| (b + 512) / 1024;
+    let hard = cap::response_cap_hard();
+    // Запас сверх фактического размера, округлённый до килобайта.
+    let suggested = (shrink.full_bytes / 1000 + 2) * 1000;
+    let mut s = format!(
+        "Ответ ужат под бюджет: полный ответ ≈{} КБ ({} байт) при бюджете {} КБ ({} байт). \
+         Опознание объектов (full_name/meta_type/name/synonym) сохранено полностью — \
+         работай по нему. ",
+        kb(shrink.full_bytes),
+        shrink.full_bytes,
+        kb(budget.applied),
+        budget.applied
+    );
+    if shrink.sections_omitted {
+        s.push_str(
+            "Тяжёлые секции внутри элементов опущены — рядом `<секция>_omitted` + \
+             `<секция>_count`. ",
+        );
+    }
+    if shrink.results_shortened {
+        s.push_str(&format!(
+            "Отдано {} элементов из {} (`results_shown` / `results_total`). ",
+            shrink.results_shown, shrink.results_total
+        ));
+    }
+    if budget.clamped {
+        s.push_str(&format!(
+            "Запрошенный `max_response_bytes`={} зажат до потолка сервера {}. ",
+            budget.requested.unwrap_or_default(),
+            hard
+        ));
+    }
+    if suggested <= hard {
+        s.push_str(&format!(
+            "Нужны полные секции — повтори ТОТ ЖЕ вызов с `max_response_bytes={}` \
+             (потолок сервера {}). ",
+            suggested, hard
+        ));
+    } else {
+        s.push_str(&format!(
+            "Полный ответ не влезает даже в потолок сервера ({} байт) — сузь набор. ",
+            hard
+        ));
+    }
+    s.push_str(
+        "Нужны только имена — повтори с `names_only=true` (самый дешёвый режим). \
+         Нужен ОДИН объект из списка — вызови с его `full_name`. \
+         Сузить набор — `name_like` поточнее и/или `meta_type`.",
+    );
+    s
 }
 
 /// Обработка ОДНОГО объекта по full_name → Value (структура либо
@@ -259,6 +382,7 @@ fn resolve_one(
     repo_label: &str,
     full_name: &str,
     sections: Option<&[String]>,
+    names_only: bool,
 ) -> Value {
     // Нормализация типа метаданных: 'Документ.X' → 'Document.X' (RU/EN, регистр неважен).
     // В metadata_objects.full_name хранится canonical (англ.) тип; без этого
@@ -287,6 +411,15 @@ fn resolve_one(
 
     match row {
         Ok((meta_type, name, synonym, attrs)) => {
+            // Режим «только паспорт»: структуру даже не разбираем.
+            if names_only {
+                return json!({
+                    "full_name": full_name,
+                    "meta_type": meta_type,
+                    "name": name,
+                    "synonym": synonym,
+                });
+            }
             let attrs_value = attrs
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
@@ -395,5 +528,35 @@ mod tests {
         assert!(!obj.contains_key("attributes"));
         // Не-объект (Null) → без изменений (ненайденный объект отдаёт error-Value).
         assert_eq!(apply_sections(Value::Null, Some(&only)), Value::Null);
+    }
+
+    /// `names_only=true` → только паспорт объекта, структуры нет.
+    /// Отдельный вход нужен именно потому, что `sections=[]` означает
+    /// «все секции» (см. тест выше) и попросить одни имена через него нельзя.
+    #[test]
+    fn names_only_returns_identity_without_structure() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for ddl in crate::schema::SCHEMA_EXTENSIONS {
+            conn.execute_batch(ddl).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym, attributes_json) \
+             VALUES ('default', 'Catalog.СоглашенияСКлиентами', 'Catalog', 'СоглашенияСКлиентами', \
+             'Соглашения с клиентами', ?)",
+            params![r#"{"attributes":[{"name":"Партнер"},{"name":"Организация"}]}"#],
+        )
+        .unwrap();
+
+        let v = resolve_one(&conn, "ut", "Catalog.СоглашенияСКлиентами", None, true);
+        assert_eq!(v["full_name"], json!("Catalog.СоглашенияСКлиентами"));
+        assert_eq!(v["meta_type"], json!("Catalog"));
+        assert_eq!(v["name"], json!("СоглашенияСКлиентами"));
+        assert_eq!(v["synonym"], json!("Соглашения с клиентами"));
+        assert!(v.get("attributes").is_none(), "структура не должна отдаваться");
+        assert!(v.get("counts").is_none());
+
+        // names_only=false → структура на месте (прежнее поведение).
+        let full = resolve_one(&conn, "ut", "Catalog.СоглашенияСКлиентами", None, false);
+        assert_eq!(full["counts"]["attributes"], json!(2));
     }
 }

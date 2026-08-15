@@ -59,6 +59,14 @@ fn response_cap_from_daemon_cfg(config: Option<&Path>) -> Option<usize> {
         .and_then(|cfg| cfg.cap.max_response_bytes)
 }
 
+/// Извлечь `daemon_cfg.cap.max_response_bytes_hard` (моно-ветка). `None` →
+/// потолок запрашиваемого бюджета на дефолте (`cap::DEFAULT_MAX_RESPONSE_BYTES_HARD`).
+fn response_cap_hard_from_daemon_cfg(config: Option<&Path>) -> Option<usize> {
+    config
+        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
+        .and_then(|cfg| cfg.cap.max_response_bytes_hard)
+}
+
 /// Извлечь `daemon_cfg.cap.max_function_body_chars` (моно-ветка). `None` →
 /// порог тела функции/класса на дефолте (`cap::DEFAULT_MAX_FUNCTION_BODY_CHARS`).
 fn function_body_cap_from_daemon_cfg(config: Option<&Path>) -> Option<usize> {
@@ -760,6 +768,7 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                 .apply_mass_mode_tools(&daemon_cfg.mcp.mass_mode_tools)
                 .apply_dedup_enabled(daemon_cfg.mcp.dedup_enabled);
                 crate::mcp::cap::set_response_cap(daemon_cfg.cap.max_response_bytes);
+                crate::mcp::cap::set_response_cap_hard(daemon_cfg.cap.max_response_bytes_hard);
                 crate::mcp::cap::set_function_body_cap(daemon_cfg.cap.max_function_body_chars);
                 crate::mcp::cap::set_cap_tools(Some(daemon_cfg.cap.cap_tools.clone()));
                 crate::mcp::cap::set_cap_enabled(daemon_cfg.cap.cap_enabled);
@@ -832,6 +841,7 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                 .apply_mass_mode_tools(&mass_mode_tools_from_daemon_cfg(config.as_deref()))
                 .apply_dedup_enabled(dedup_enabled_from_daemon_cfg(config.as_deref()));
             crate::mcp::cap::set_response_cap(response_cap_from_daemon_cfg(config.as_deref()));
+            crate::mcp::cap::set_response_cap_hard(response_cap_hard_from_daemon_cfg(config.as_deref()));
             crate::mcp::cap::set_function_body_cap(function_body_cap_from_daemon_cfg(config.as_deref()));
             crate::mcp::cap::set_cap_tools(Some(cap_tools_from_daemon_cfg(config.as_deref())));
             crate::mcp::cap::set_cap_enabled(cap_enabled_from_daemon_cfg(config.as_deref()));

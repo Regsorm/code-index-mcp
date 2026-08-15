@@ -239,6 +239,19 @@ pub struct CapSection {
     #[serde(default)]
     pub max_response_bytes: Option<usize>,
 
+    /// Потолок бюджета, который клиент вправе запросить на ОДИН вызов
+    /// параметром `max_response_bytes` (структурные tools). Запрос выше потолка
+    /// не отклоняется, а зажимается до него — применённое значение возвращается
+    /// в ответе полем `response_budget_applied`. Отсутствует или `0` → дефолт
+    /// `cap::DEFAULT_MAX_RESPONSE_BYTES_HARD` (4× обычного бюджета). Пример:
+    ///
+    /// ```toml
+    /// [cap]
+    /// max_response_bytes_hard = 192000
+    /// ```
+    #[serde(default)]
+    pub max_response_bytes_hard: Option<usize>,
+
     /// Порог тела функции/класса в СИМВОЛАХ для `get_function`/`get_class`.
     /// Тело длиннее → навигационный стаб (голова+хвост+маркер+hint на read_file)
     /// вместо полного тела — чтобы крупная процедура не уходила в disk-offload
