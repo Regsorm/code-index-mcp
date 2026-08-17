@@ -5,6 +5,28 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.49.2] — 2026-08-17
+
+**A single long-past panic in an unrelated thread no longer takes the serving layer down for good, and shutting the daemon down no longer looks like a crash in the log. The lock guarding the list of idle connections was handled two different ways: returning a connection survived poisoning, while taking one called `unwrap()` and brought down the whole serving layer. Separately: closing the semaphore on shutdown is a normal event, yet both the indexing worker and the connection pool met it with a panic.**
+
+> Context. Findings G-1 and S-4 of the codebase audit — registry in [docs/audit-2026-08.md](docs/audit-2026-08.md). Second small release from that audit.
+
+### Fixed
+
+- **Poisoned lock in the connection pool (G-1).** Poisoning does not mean corrupted data — only that a panic happened somewhere else: the lock guards an ordinary list of idle connections, and operations on it never leave it half-done. Both places that touch the list now go through a single `StoragePool::lock_idle`, which takes the contents and carries on. The return path is fixed too: the previous branch dropped the connection on the floor when poisoned, and the pool silently degraded into opening a fresh connection per request.
+- **Panic instead of a quiet exit on semaphore close (S-4).** There turned out to be two such places, not one — the same pattern lived in the connection pool, which surfaced while reading the code before the fix. Indexing worker: slot acquisition moved into `acquire_initial_slot`; on a closed semaphore the worker logs a line and exits quietly — no redundant restart by the supervisor thread and no panic masking real failures. Connection pool: a closed semaphore is now an ordinary error to the caller, since `get()` already returned a `Result`.
+
+### Testing
+
+- `cargo test --workspace` — 641 passed, 0 failed (was 635; 6 added), no warnings.
+- The lock is poisoned for real in the tests: a thread panics while holding it, after which both taking and returning a connection are verified.
+- Local rollout and a live check of the serving layer: concurrent calls across different repositories, including remote ones over federation.
+
+### Compatibility
+
+- **No reindex required** — the database schema did not change; the fix is in the connection layer and in worker startup.
+- Behaviour under normal operation is unchanged: both fixes touch exceptional situations only — a panic in an unrelated thread, and service shutdown.
+
 ## [0.49.1] — 2026-08-17
 
 **Renaming a directory no longer desynchronises the index, and a failure inside a batch of changes is no longer reported as a successful update. A renamed folder went missing for the watcher twice over: files under the old name stayed in the index forever, and the contents of the new name were not indexed until the daemon restarted. On top of that, a write error on a single file and a failed rebuild of the add-on data (call graph, data links, object structure) were only logged — the folder still got the "ready" status, so a desynchronised snapshot looked fresh.**
