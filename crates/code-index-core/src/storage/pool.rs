@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::Storage;
@@ -107,16 +107,36 @@ impl StoragePool {
         })
     }
 
+    /// Захватить замок списка свободных соединений.
+    ///
+    /// Единая политика на оба места работы со списком (взятие и возврат):
+    /// отравление замка — паника другого потока, который его держал — НЕ
+    /// означает порчу данных. Под замком лежит обычный список соединений, и
+    /// операции над ним не оставляют его в промежуточном состоянии. Поэтому
+    /// берём содержимое и работаем дальше.
+    ///
+    /// Раньше здесь было расхождение: взятие соединения делало `unwrap()` и
+    /// роняло весь слой выдачи, а возврат по Drop отравление переживал. Одна
+    /// давняя паника в стороннем потоке навсегда выводила сервер из строя.
+    fn lock_idle(&self) -> std::sync::MutexGuard<'_, Vec<Storage>> {
+        self.idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Взять соединение. Ждёт свободный permit (одновременно не более
     /// `max_size`), переиспользует idle-соединение либо лениво открывает новое
     /// (только если задан `db_path`). Гость возвращает соединение в пул по Drop.
     pub async fn get(self: &Arc<Self>) -> Result<PooledStorage> {
+        // Семафор закрывается только при остановке сервера выдачи. Это штатное
+        // завершение, а не нарушенный инвариант: отдаём ошибку вызывающему,
+        // паника здесь маскировала бы настоящие аварии в журнале.
         let permit = Arc::clone(&self.sem)
             .acquire_owned()
             .await
-            .expect("StoragePool semaphore закрыт — этого не должно происходить");
+            .map_err(|_| anyhow!("пул соединений закрыт — сервер выдачи останавливается"))?;
 
-        let existing = self.idle.lock().unwrap().pop();
+        let existing = self.lock_idle().pop();
         let storage = match existing {
             Some(s) => s,
             None => {
@@ -156,11 +176,10 @@ impl std::ops::Deref for PooledStorage {
 impl Drop for PooledStorage {
     fn drop(&mut self) {
         if let Some(s) = self.storage.take() {
-            // Вернуть соединение в пул. Если Mutex отравлен — просто роняем
-            // соединение (оно закроется), не паникуем повторно.
-            if let Ok(mut idle) = self.pool.idle.lock() {
-                idle.push(s);
-            }
+            // Вернуть соединение в пул. Отравление замка переживаем той же
+            // политикой, что и при взятии (см. `lock_idle`): соединение
+            // возвращается в список, а не теряется.
+            self.pool.lock_idle().push(s);
         }
         // permit освобождается автоматически при Drop _permit.
     }
@@ -215,6 +234,79 @@ mod tests {
         // После возврата соединения переиспользуются (idle не пуст).
         let c = pool.get().await.unwrap();
         let _ = c.conn().execute_batch("SELECT 1;");
+    }
+
+    /// Отравить замок списка свободных соединений: поток паникует, удерживая его.
+    fn отравить_замок(pool: &Arc<StoragePool>) {
+        let p = Arc::clone(pool);
+        let прежний_хук = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // не засорять вывод теста
+        let res = std::thread::spawn(move || {
+            let _guard = p.idle.lock().unwrap();
+            panic!("искусственная паника ради отравления замка");
+        })
+        .join();
+        std::panic::set_hook(прежний_хук);
+        assert!(res.is_err(), "поток должен был упасть и отравить замок");
+        assert!(pool.idle.lock().is_err(), "замок должен быть отравлен");
+    }
+
+    /// Регресс G-1: взятие соединения делало `unwrap()` на отравленном замке и
+    /// роняло весь слой выдачи, хотя возврат по Drop то же отравление переживал.
+    /// Одна давняя паника в стороннем потоке выводила сервер из строя навсегда.
+    #[tokio::test]
+    async fn отравленный_замок_не_мешает_взять_соединение() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        Storage::open_file(&db_path).unwrap();
+
+        let pool = StoragePool::open_file_readonly(&db_path, PoolConfig::default()).unwrap();
+        отравить_замок(&pool);
+
+        let s = pool.get().await.expect("пул обязан работать на отравленном замке");
+        s.conn().execute_batch("SELECT 1;").unwrap();
+    }
+
+    /// Вторая половина той же политики: соединение возвращается в список даже
+    /// после отравления, а не теряется — иначе пул молча деградировал бы до
+    /// открытия нового соединения на каждый запрос.
+    #[tokio::test]
+    async fn отравленный_замок_не_теряет_возвращаемое_соединение() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        Storage::open_file(&db_path).unwrap();
+
+        let pool = StoragePool::open_file_readonly(&db_path, PoolConfig::default()).unwrap();
+        let s = pool.get().await.unwrap();
+        assert_eq!(pool.lock_idle().len(), 0, "соединение выдано — список пуст");
+
+        отравить_замок(&pool);
+        drop(s);
+
+        assert_eq!(
+            pool.lock_idle().len(),
+            1,
+            "соединение должно вернуться в список несмотря на отравление"
+        );
+    }
+
+    /// Вторая паника из S-4, парная к воркеру: на закрытом семафоре пул отдаёт
+    /// ошибку вызывающему, а не роняет процесс.
+    #[tokio::test]
+    async fn закрытый_семафор_даёт_ошибку_а_не_панику() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        Storage::open_file(&db_path).unwrap();
+
+        let pool = StoragePool::open_file_readonly(&db_path, PoolConfig::default()).unwrap();
+        pool.sem.close();
+
+        // `expect_err` тут не подходит: `PooledStorage` не реализует Debug.
+        let err = match pool.get().await {
+            Ok(_) => panic!("на закрытом пуле ожидалась ошибка"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("закрыт"), "текст ошибки: {err}");
     }
 
     #[tokio::test]

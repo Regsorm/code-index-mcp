@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::extension::ProcessorRegistry;
 use crate::indexer::config::IndexConfig;
@@ -105,11 +105,22 @@ pub fn run_worker(
     // 3. Взять permit из семафора. Permit держится на всё время initial reindex,
     // включая открытие in-memory Storage — чтобы в памяти одновременно жил
     // максимум ОДИН in-memory storage (ограничено max_concurrent_initial).
-    let _permit = initial_limiter.as_ref().map(|sem| {
+    if let Some(sem) = initial_limiter.as_ref() {
         eprintln!("[worker:{}] ждём слота initial reindex (доступно {})", path.display(), sem.available_permits());
-        let sem = sem.clone();
-        tokio_block_on_value(async move { sem.acquire_owned().await.expect("semaphore closed") })
-    });
+    }
+    let _permit = match tokio_block_on_value(acquire_initial_slot(initial_limiter)) {
+        Ok(permit) => permit,
+        Err(SlotClosed) => {
+            // Семафор закрывают при остановке демона. Это штатное завершение:
+            // выходим тихо. Паника здесь давала бы лишний перезапуск воркера
+            // сторожем и мусорную запись в журнале, маскирующую настоящие аварии.
+            eprintln!(
+                "[worker:{}] слот initial reindex недоступен — демон останавливается, воркер завершается",
+                path.display()
+            );
+            return;
+        }
+    };
 
     // 4. Выставить статус InitialIndexing ПОСЛЕ получения permit — иначе
     // папки-кандидаты показываются как активно индексируются, хотя на самом
@@ -544,6 +555,29 @@ pub fn run_worker(
     }
 }
 
+/// Семафор слотов initial reindex закрыт — демон останавливается.
+#[derive(Debug)]
+struct SlotClosed;
+
+/// Взять слот initial reindex. Вынесено отдельной функцией ради модульного
+/// теста — тем же приёмом, что `batch_outcome` и `allow_respawn`.
+///
+/// * `Ok(None)` — ограничение не задано, слот не нужен;
+/// * `Ok(Some(permit))` — слот получен, держится на всё время initial reindex;
+/// * `Err(SlotClosed)` — семафор закрыт, воркеру надо тихо завершиться.
+///
+/// Закрытие семафора бывает только при остановке демона, поэтому это штатный
+/// исход, а не нарушенный инвариант: паника на нём давала лишний перезапуск
+/// воркера сторожем и запись в журнале, маскирующую настоящие аварии.
+async fn acquire_initial_slot(
+    limiter: Option<Arc<Semaphore>>,
+) -> Result<Option<OwnedSemaphorePermit>, SlotClosed> {
+    match limiter {
+        None => Ok(None),
+        Some(sem) => sem.acquire_owned().await.map(Some).map_err(|_| SlotClosed),
+    }
+}
+
 /// Решение о статусе папки по итогам батча. Вынесено чистой функцией ради
 /// модульного теста: «готово» допустимо ТОЛЬКО когда прошли все три шага —
 /// применение каждого события, фиксация транзакции и пересборка extras.
@@ -587,6 +621,32 @@ mod tests {
     #[test]
     fn готово_только_когда_прошли_все_три_шага() {
         assert!(batch_outcome(true, 0, 5, true).is_ok());
+    }
+
+    /// Ограничение не задано — слот не нужен, воркер идёт дальше без ожидания.
+    #[tokio::test]
+    async fn без_ограничения_слот_не_требуется() {
+        assert!(acquire_initial_slot(None).await.unwrap().is_none());
+    }
+
+    /// Обычный ход: свободный слот выдаётся.
+    #[tokio::test]
+    async fn свободный_слот_выдаётся() {
+        let sem = Arc::new(Semaphore::new(1));
+        assert!(acquire_initial_slot(Some(sem)).await.unwrap().is_some());
+    }
+
+    /// Регресс S-4: на закрытом семафоре раньше была паника `expect("semaphore
+    /// closed")`. Закрывают его только при остановке демона — это штатный
+    /// исход, воркер обязан выйти тихо.
+    #[tokio::test]
+    async fn закрытый_семафор_даёт_ошибку_а_не_панику() {
+        let sem = Arc::new(Semaphore::new(1));
+        sem.close();
+        assert!(matches!(
+            acquire_initial_slot(Some(sem)).await,
+            Err(SlotClosed)
+        ));
     }
 
     #[test]
