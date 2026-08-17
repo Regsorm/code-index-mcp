@@ -365,6 +365,37 @@ impl Storage {
         Ok(())
     }
 
+    /// Удалить из индекса путь и всё поддерево под ним. Возвращает число
+    /// удалённых записей.
+    ///
+    /// Нужно для исчезновения КАТАЛОГА: при переименовании папки ОС присылает
+    /// одно событие на саму папку, а файлы внутри своих событий не получают.
+    /// Точечное [`Self::delete_file`] по пути каталога не находит ничего (записи
+    /// для каталога в `files` нет), и содержимое остаётся фантомом в выдаче до
+    /// полной переиндексации.
+    ///
+    /// Префикс сравнивается через `substr`, а не `LIKE`: в путях встречаются
+    /// `_` и `%`, а для `LIKE` это шаблонные символы — они дали бы лишние
+    /// удаления (`my_dir/` совпал бы с `myXdir/`).
+    pub fn delete_files_under_prefix(&self, rel_path: &str) -> Result<usize> {
+        let prefix = format!("{}/", rel_path.trim_end_matches('/'));
+        let ids: Vec<i64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM files WHERE path = ?1 OR substr(path, 1, ?2) = ?3")?;
+            let rows = stmt.query_map(
+                params![rel_path, prefix.chars().count() as i64, prefix],
+                |r| r.get(0),
+            )?;
+            rows.collect::<std::result::Result<Vec<i64>, _>>()?
+        };
+        for id in &ids {
+            self.delete_file(*id)
+                .context("delete_files_under_prefix: ошибка удаления файла поддерева")?;
+        }
+        Ok(ids.len())
+    }
+
     // ── Functions ────────────────────────────────────────────────────────────
 
     /// Пакетная вставка функций
@@ -3171,6 +3202,69 @@ mod tests {
 
         let classes = storage.get_class_by_name("Bar").unwrap();
         assert!(classes.is_empty(), "классы должны быть удалены каскадно");
+    }
+
+    /// Регресс S-1: исчезновение КАТАЛОГА. Записи для самого каталога в `files`
+    /// нет, поэтому точечное удаление по его пути ничего не находило — файлы
+    /// внутри оставались фантомами в выдаче до полной переиндексации.
+    #[test]
+    fn delete_files_under_prefix_убирает_поддерево_и_не_задевает_соседей() {
+        let storage = Storage::open_in_memory().unwrap();
+        for p in [
+            "src/dirA/a1.py",
+            "src/dirA/nested/a2.py",
+            "src/dirA_renamed/a1.py",
+            "src/dirB/b1.py",
+            "src/dirA.py",
+        ] {
+            storage.upsert_file(&make_file(p)).unwrap();
+        }
+
+        let removed = storage.delete_files_under_prefix("src/dirA").unwrap();
+        assert_eq!(removed, 2, "каталог src/dirA удаляется целиком, включая вложенный");
+
+        let left: Vec<String> = storage
+            .get_all_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert!(
+            left.contains(&"src/dirA_renamed/a1.py".to_string()),
+            "каталог с похожим началом имени не тронут: {left:?}"
+        );
+        assert!(
+            left.contains(&"src/dirB/b1.py".to_string()),
+            "чужой каталог не тронут: {left:?}"
+        );
+        assert!(
+            left.contains(&"src/dirA.py".to_string()),
+            "файл с совпадающим началом имени не тронут: {left:?}"
+        );
+        assert!(
+            !left.iter().any(|p| p.starts_with("src/dirA/")),
+            "поддерево удалено полностью: {left:?}"
+        );
+    }
+
+    /// Подчёркивание — шаблонный символ для `LIKE`. Сравнение префикса должно
+    /// быть точным, иначе снесётся соседний каталог с другим символом на его месте.
+    #[test]
+    fn delete_files_under_prefix_не_трактует_подчёркивание_как_шаблон() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_file(&make_file("my_dir/x.py")).unwrap();
+        storage.upsert_file(&make_file("myXdir/y.py")).unwrap();
+
+        let removed = storage.delete_files_under_prefix("my_dir").unwrap();
+        assert_eq!(removed, 1, "удалён только каталог с точным именем");
+
+        let left: Vec<String> = storage
+            .get_all_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(left, vec!["myXdir/y.py".to_string()]);
     }
 
     #[test]

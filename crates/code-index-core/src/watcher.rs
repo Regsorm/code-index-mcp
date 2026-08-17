@@ -60,9 +60,20 @@ fn build_file_matcher(patterns: &[String]) -> GlobSet {
 /// `Modify(Name(RenameMode::From))` уже после того, как путь исчез. Без этого
 /// строка старого имени осталась бы фантомом в индексе до полного reindex.
 fn classify_event(kind: &notify::EventKind, path: &Path) -> Option<FileEvent> {
-    // Каталоги не индексируем (события создания/переименования папок).
+    // Каталог на месте. Обычные события на папке (запись внутрь) пропускаем —
+    // файлы пришлют свои события сами. НО создание и переименование каталога ОС
+    // отдаёт ОДНИМ событием на саму папку, без событий на файлы внутри. Такой
+    // каталог надо раскрыть обходом, иначе его содержимое не попадёт в индекс
+    // до перезапуска демона. Проверено на стенде: `rename` папки давал сразу два
+    // расхождения — фантомы по старому пути и полную слепоту к новому.
     if path.is_dir() {
-        return None;
+        return match kind {
+            notify::EventKind::Create(_)
+            | notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+                Some(FileEvent::Created(path.to_path_buf()))
+            }
+            _ => None,
+        };
     }
     match kind {
         notify::EventKind::Create(_) if path.is_file() => {
@@ -299,8 +310,20 @@ mod tests {
             Some(FileEvent::Deleted(_))
         ));
 
-        // Каталог игнорируется.
-        assert!(classify_event(&EventKind::Create(CreateKind::Folder), &dir).is_none());
+        // Каталог: создание и переименование папки ОС отдаёт одним событием на
+        // саму папку, без событий на файлы внутри — раскрываем такой каталог
+        // обходом (Created). Иначе его содержимое не попадёт в индекс.
+        assert!(matches!(
+            classify_event(&EventKind::Create(CreateKind::Folder), &dir),
+            Some(FileEvent::Created(_))
+        ));
+        assert!(matches!(
+            classify_event(&EventKind::Modify(ModifyKind::Name(RenameMode::To)), &dir),
+            Some(FileEvent::Created(_))
+        ));
+        // Прочие события на существующей папке игнорируем: запись внутрь неё
+        // порождает собственные события на файлах.
+        assert!(classify_event(&EventKind::Modify(ModifyKind::Any), &dir).is_none());
     }
 
     #[test]

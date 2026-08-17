@@ -5,7 +5,7 @@
 // tokio-миром только через `DaemonState` (асинхронный RwLock) и через
 // `shutdown_rx` (broadcast).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::Semaphore;
@@ -410,16 +410,21 @@ pub fn run_worker(
         }
 
         let mut done = 0usize;
+        // Сколько событий батча применить не удалось. Ненулевой счётчик означает
+        // неполный срез: часть файлов осталась в индексе прежней версии.
+        let mut failed = 0usize;
         let batch_len = batch.len();
         for event in &batch {
-            apply_event(
+            if !apply_event(
                 &mut storage,
                 &path,
                 event,
                 &registry,
                 max_code_file_size,
                 repo_language.as_deref(),
-            );
+            ) {
+                failed += 1;
+            }
             done += 1;
             if done % 50 == 0 || done == batch_len {
                 tokio_block_on(async {
@@ -447,6 +452,11 @@ pub fn run_worker(
                 false
             }
         };
+
+        // Пересобрался ли слой extras для этого батча. Провал означает, что тела
+        // функций свежие, а граф вызовов и связи данных отстают — такой срез
+        // нельзя объявлять готовым.
+        let mut extras_ok = true;
 
         // 8a. Инкрементальное обновление extras-слоя (граф вызовов, data_links,
         //     структура объектов, формы, подписки) для файлов этого батча.
@@ -478,11 +488,14 @@ pub fn run_worker(
                         path.display(), t0.elapsed().as_millis(),
                         changed_paths.len(), deleted_paths.len()
                     ),
-                    Err(e) => eprintln!(
-                        "[worker:{}] index_extras_for_files процессора '{}' упал: {}. \
-                         Базовая индексация при этом сохранена.",
-                        path.display(), proc.name(), e
-                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "[worker:{}] index_extras_for_files процессора '{}' упал: {}. \
+                             Базовая индексация при этом сохранена.",
+                            path.display(), proc.name(), e
+                        );
+                        extras_ok = false;
+                    }
                 }
             }
         }
@@ -513,19 +526,14 @@ pub fn run_worker(
             }
         }
 
-        // Батч отработан штатно. Ready выставляем ТОЛЬКО если фиксация прошла —
-        // иначе данных в базе нет, и Ready был бы ложным «готово» на старом
-        // срезе: сервер выдачи начал бы отдавать устаревшие тела как актуальные.
+        // Батч отработан. Ready выставляем ТОЛЬКО если прошли ВСЕ три шага:
+        // применение каждого события, фиксация транзакции и пересборка extras.
+        // Провал любого из них означает неполный срез, а Ready на нём — ложное
+        // «готово»: сервер выдачи начал бы отдавать устаревшее как актуальное.
         tokio_block_on(async {
-            if commit_ok {
-                state.set_status(&path, PathStatus::Ready).await;
-            } else {
-                state
-                    .set_error(
-                        &path,
-                        "фиксация батча не удалась — данные не применены, см. журнал демона",
-                    )
-                    .await;
+            match batch_outcome(commit_ok, failed, batch_len, extras_ok) {
+                Ok(()) => state.set_status(&path, PathStatus::Ready).await,
+                Err(msg) => state.set_error(&path, msg).await,
             }
         });
     }
@@ -533,6 +541,82 @@ pub fn run_worker(
     eprintln!("[worker:{}] shutdown, финальный checkpoint", path.display());
     if let Err(e) = storage.checkpoint_truncate() {
         eprintln!("[worker:{}] финальный checkpoint_truncate: {}", path.display(), e);
+    }
+}
+
+/// Решение о статусе папки по итогам батча. Вынесено чистой функцией ради
+/// модульного теста: «готово» допустимо ТОЛЬКО когда прошли все три шага —
+/// применение каждого события, фиксация транзакции и пересборка extras.
+///
+/// Провал любого из них означает неполный или рассогласованный срез. Ready на
+/// нём был бы ложным «готово»: сервер выдачи начал бы отдавать устаревшее как
+/// актуальное, и признака этого в ответе нет.
+///
+/// `Ok(())` — можно выставлять Ready. `Err(текст)` — причина, по которой папка
+/// помечается сбойной; текст уходит в поле `error` состояния демона.
+fn batch_outcome(
+    commit_ok: bool,
+    failed: usize,
+    batch_len: usize,
+    extras_ok: bool,
+) -> Result<(), String> {
+    if !commit_ok {
+        return Err(
+            "фиксация батча не удалась — данные не применены, см. журнал демона".to_string(),
+        );
+    }
+    if failed > 0 {
+        return Err(format!(
+            "батч применён частично: {} из {} событий не удалось — эти файлы \
+             остались в индексе прежней версии, см. журнал демона",
+            failed, batch_len
+        ));
+    }
+    if !extras_ok {
+        return Err("базовый индекс обновлён, но слой extras не пересобран — граф вызовов \
+             и связи данных отстают, см. журнал демона"
+            .to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn готово_только_когда_прошли_все_три_шага() {
+        assert!(batch_outcome(true, 0, 5, true).is_ok());
+    }
+
+    #[test]
+    fn провал_фиксации_не_даёт_готово() {
+        let err = batch_outcome(false, 0, 5, true).unwrap_err();
+        assert!(err.contains("фиксация"), "текст: {err}");
+    }
+
+    /// Регресс S-2: одна неудачная запись раньше молча тонула в журнале, а папка
+    /// объявлялась готовой на неполном срезе.
+    #[test]
+    fn частично_применённый_батч_не_даёт_готово() {
+        let err = batch_outcome(true, 2, 7, true).unwrap_err();
+        assert!(err.contains("2 из 7"), "текст: {err}");
+    }
+
+    /// Регресс S-3: тела функций свежие, граф вызовов отстал — «готово» на таком
+    /// срезе вводит в заблуждение, и признака рассогласования в выдаче нет.
+    #[test]
+    fn провал_пересборки_extras_не_даёт_готово() {
+        let err = batch_outcome(true, 0, 3, false).unwrap_err();
+        assert!(err.contains("extras"), "текст: {err}");
+    }
+
+    /// Когда провалено несколько шагов сразу — сообщаем о самом раннем:
+    /// без фиксации остальные причины вторичны.
+    #[test]
+    fn провал_фиксации_важнее_прочих_причин() {
+        let err = batch_outcome(false, 3, 3, false).unwrap_err();
+        assert!(err.contains("фиксация"), "текст: {err}");
     }
 }
 
@@ -631,6 +715,15 @@ fn tokio_block_on_value<T, F: std::future::Future<Output = T>>(fut: F) -> T {
 }
 
 /// Обработать одно событие файловой системы: пересчитать хеш, записать/удалить в БД.
+///
+/// Возвращает `false`, если применить событие не удалось: файл не прочитан по
+/// причине кроме NotFound, не разобран парсером, не записан в БД или не удалён
+/// из неё. Вызывающий считает такие случаи и не выдаёт по батчу статус «готово»:
+/// индекс в этом месте остался на прежнем срезе, и «готово» было бы ложным.
+///
+/// Исчезнувший файл (NotFound) ошибкой НЕ считается — это штатный ход
+/// atomic-save через `.tmp` → rename, иначе каждое сохранение из редактора
+/// помечало бы папку сбойной.
 fn apply_event(
     storage: &mut Storage,
     root: &PathBuf,
@@ -638,9 +731,22 @@ fn apply_event(
     registry: &ParserRegistry,
     max_code_file_size: usize,
     repo_language: Option<&str>,
-) {
+) -> bool {
     match event {
         FileEvent::Modified(abs) | FileEvent::Created(abs) => {
+            // Событие на существующем каталоге = папку создали или переименовали.
+            // Файлы внутри своих событий не получили — раскрываем обходом, иначе
+            // содержимое новой папки не попадёт в индекс до перезапуска демона.
+            if abs.is_dir() {
+                return apply_dir_scan(
+                    storage,
+                    root,
+                    abs,
+                    registry,
+                    max_code_file_size,
+                    repo_language,
+                );
+            }
             let (content, hash, is_binary) = match hasher::file_hash(abs) {
                 Ok(triple) => triple,
                 Err(e) => {
@@ -649,11 +755,11 @@ fn apply_event(
                     // NotFound — не ошибка, тихо игнорируем.
                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                         if io_err.kind() == std::io::ErrorKind::NotFound {
-                            return;
+                            return true;
                         }
                     }
                     eprintln!("[worker:{}] file_hash {}: {}", root.display(), abs.display(), e);
-                    return;
+                    return false;
                 }
             };
 
@@ -677,6 +783,9 @@ fn apply_event(
             } else {
                 categorize_file_in_repo(abs, repo_language)
             };
+            // Исход применения события. Ошибка записи не должна молча
+            // превращаться в «готово» на уровне батча — см. run_worker.
+            let mut ok = true;
             match category {
                 FileCategory::Code(language) => {
                     let ext = abs
@@ -717,10 +826,14 @@ fn apply_event(
                                 ) {
                                     eprintln!("[worker:{}] write_code {}: {}",
                                         root.display(), rel_path, e);
+                                    ok = false;
                                 }
                             }
-                            Err(e) => eprintln!("[worker:{}] parse {}: {}",
-                                root.display(), rel_path, e),
+                            Err(e) => {
+                                eprintln!("[worker:{}] parse {}: {}",
+                                    root.display(), rel_path, e);
+                                ok = false;
+                            }
                         }
                     }
                 }
@@ -782,11 +895,13 @@ fn apply_event(
                         ) {
                             eprintln!("[worker:{}] write_text {}: {}",
                                 root.display(), rel_path, e);
+                            ok = false;
                         }
                     }
                 }
                 FileCategory::Binary => {}
             }
+            ok
         }
         FileEvent::Deleted(abs) => {
             let rel_path = abs
@@ -794,11 +909,98 @@ fn apply_event(
                 .unwrap_or(abs)
                 .to_string_lossy()
                 .replace('\\', "/");
+            let mut ok = true;
             if let Ok(Some(file)) = storage.get_file_by_path(&rel_path) {
                 if let Some(id) = file.id {
-                    let _ = storage.delete_file(id);
+                    // Провал удаления оставляет файл фантомом в выдаче —
+                    // это расхождение индекса с диском, а не мелочь для тишины.
+                    if let Err(e) = storage.delete_file(id) {
+                        eprintln!("[worker:{}] delete_file {}: {}",
+                            root.display(), rel_path, e);
+                        ok = false;
+                    }
+                }
+            } else {
+                // Точной записи нет — значит исчез КАТАЛОГ: при переименовании
+                // папки ОС шлёт одно событие на неё саму, файлы внутри своих
+                // событий не получают. Без этого прохода они остались бы
+                // фантомами в выдаче до полной переиндексации.
+                match storage.delete_files_under_prefix(&rel_path) {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!(
+                        "[worker:{}] каталог {} исчез — удалено файлов из индекса: {}",
+                        root.display(), rel_path, n
+                    ),
+                    Err(e) => {
+                        eprintln!("[worker:{}] delete_files_under_prefix {}: {}",
+                            root.display(), rel_path, e);
+                        ok = false;
+                    }
                 }
             }
+            ok
         }
     }
+}
+
+/// Раскрыть каталог: применить «файл создан» к каждому файлу внутри, рекурсивно.
+///
+/// Вызывается, когда событие пришло на существующий каталог — так ОС сообщает о
+/// созданной или переименованной папке, не присылая событий на файлы внутри.
+///
+/// Исключённые каталоги (`.git`, `.code-index` и прочие из `EXCLUDE_DIRS`)
+/// пропускаем: без этого демон поймал бы собственные записи WAL и ушёл в петлю
+/// переиндексации.
+///
+/// Возвращает `false`, если хотя бы один файл внутри применить не удалось.
+fn apply_dir_scan(
+    storage: &mut Storage,
+    root: &PathBuf,
+    dir: &Path,
+    registry: &ParserRegistry,
+    max_code_file_size: usize,
+    repo_language: Option<&str>,
+) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            // Каталог мог исчезнуть между событием и обходом — это гонка, а не
+            // поломка индекса: сообщение о его удалении придёт своим событием.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return true;
+            }
+            eprintln!("[worker:{}] read_dir {}: {}", root.display(), dir.display(), e);
+            return false;
+        }
+    };
+
+    let mut ok = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let excluded = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| crate::indexer::file_types::EXCLUDE_DIRS.contains(&n))
+                .unwrap_or(false);
+            if excluded {
+                continue;
+            }
+            if !apply_dir_scan(storage, root, &path, registry, max_code_file_size, repo_language) {
+                ok = false;
+            }
+        } else if path.is_file()
+            && !apply_event(
+                storage,
+                root,
+                &FileEvent::Created(path.clone()),
+                registry,
+                max_code_file_size,
+                repo_language,
+            )
+        {
+            ok = false;
+        }
+    }
+    ok
 }
