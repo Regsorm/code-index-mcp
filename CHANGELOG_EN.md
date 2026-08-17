@@ -5,6 +5,29 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.49.1] — 2026-08-17
+
+**Renaming a directory no longer desynchronises the index, and a failure inside a batch of changes is no longer reported as a successful update. A renamed folder went missing for the watcher twice over: files under the old name stayed in the index forever, and the contents of the new name were not indexed until the daemon restarted. On top of that, a write error on a single file and a failed rebuild of the add-on data (call graph, data links, object structure) were only logged — the folder still got the "ready" status, so a desynchronised snapshot looked fresh.**
+
+> Context. Findings S-1, S-2, S-3 of the codebase audit — registry in [docs/audit-2026-08.md](docs/audit-2026-08.md). From here on, fixes from that audit ship as small releases.
+
+### Fixed
+
+- **Directory rename (S-1).** File-by-file deletion, `rmdir`/`rm -rf` and branch switching produce an event per file inside, so the index cleaned itself within a couple of seconds. A rename, however, emits a SINGLE event on the folder itself, and two things broke at once. First: the event on the vanished name looked for an exact path match in the files table, and there is no row for a directory — so nothing was deleted. Deletion by path prefix did not exist in storage at all; `delete_files_under_prefix` was added, removing the path together with its whole subtree. The prefix is compared with `substr`, not `LIKE`: `_` and `%` in folder names are wildcards for `LIKE`, so `my_dir/` would have matched `myXdir/`. Second: the event on the new name was discarded by the "this is a directory" check, while the files inside never got events of their own. Directory creation and rename are now expanded by a recursive walk (with `.git` and `.code-index` excluded, otherwise the daemon picks up its own database journal writes and loops); other events on folders are still ignored.
+- **A failure inside a batch no longer yields "ready" (S-2, S-3).** On a read, parse or write failure the event handler only logged, the commit went through normally, the status was set to "ready" and the cache was told to drop stale data — the file in the index stayed as it was while the snapshot counted as current. Same for the add-on rebuild: function bodies fresh, call graph and data links from the previous version, with no sign of it in the responses. The status decision is now a pure function, `batch_outcome`: "ready" is allowed only when all three steps went through — applying the events, committing, and rebuilding the add-on data. Otherwise the folder is marked failed with a concrete reason in its `error` field. The status does not stick: the next successful batch returns the folder to "ready".
+- **A vanished file does not count as a failure.** A missing file at parse time is the normal course of an editor save (write to a temporary file, rename over the target). Otherwise every save would mark the folder as failed.
+
+### Testing
+
+- `cargo test --workspace` — 635 passed, 0 failed (was 628; 7 added: five for `batch_outcome`, two for `delete_files_under_prefix`).
+- **Live-daemon test bed on Windows and on Linux — both green.** A separate daemon instance with its own state directory; the production one was left alone. Scenarios: directory rename, directory removal by the OS, single-file deletion, a whole new folder appearing. Before the fix, a rename left 2 phantoms and complete blindness to the new path; after it — 0 phantoms, both new paths in the index including the nested one, index matching the disk exactly.
+- **A separate check under Linux.** There the watch is bound to the directory as a filesystem object rather than to its name, which allows a failure mode of its own: an edit to a file inside a renamed directory can arrive under the old name and recreate a phantom. Covered by a fifth scenario — it does not happen: the new content is picked up under the new path, with no phantoms.
+
+### Compatibility
+
+- **No reindex required** — the database schema did not change; the fix is entirely in the synchronisation layer.
+- **Not verified on macOS** — the watch there goes through FSEvents with its own set of events. The fix does no harm regardless: both new branches only fire on events that were previously discarded outright.
+
 ## [0.49.0] — 2026-08-15
 
 **Size capping no longer carries away the list of what was found. A search for configuration objects by name substring (`get_object_structure` with `name_like`) returned three numbers on the slightest budget overrun — `{matched: 38, results_omitted: true}` — and not a single name: the heaviest section in such a response was the results array itself, so it was the first thing dropped. Identification of what was found is now untouchable: heavy sections inside the items are removed first, and only then is the array itself shortened, with honest `results_total`/`results_shown`. Added a per-call budget parameter `max_response_bytes` with a server-side ceiling, and a names-only mode `names_only`.**
