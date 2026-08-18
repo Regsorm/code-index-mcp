@@ -5,6 +5,37 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.50.0] — 2026-08-18
+
+**Line numbers for objects from 1C XML exports are no longer byte offsets, deeply nested expressions no longer kill the indexing process, and doc comments now show up for Go and C. The AST hash computation, which nothing ever read, has been removed.**
+
+> Context. Findings P-1 … P-6 and P-9 of the parser audit.
+
+### Fixed
+
+- **Line numbers for 1C attributes and tabular sections were byte offsets.** The XML export parser stored the reader's position in bytes instead of a line number: in a catalog of 488 lines, a tabular section was reported at line 15 268 and attributes at 17 932 and 19 273 (the real ones being 350, 405 and 442). Following such a pointer led nowhere, and a wrong value was indistinguishable from a correct one. Line numbers are now counted incrementally over the source text, and attributes, tabular sections and forms remember the line of their opening tag. All 1C export files in the index were affected.
+- **A deeply nested expression brought down the whole indexing process.** Traversal depth was capped only for some languages, and with different numbers (50 for Java, JavaScript and TypeScript, 80 for BSL and Rust, 100 for Go), while Python, PHP, C, C++, C#, Ruby, Swift and HTML had no cap at all. A chain of `1 + 1 + …` with five thousand terms — a 20 KB file — overflowed the stack, which is an abort of the entire daemon rather than a parse error on one file. The cap is now a single `MAX_VISIT_DEPTH` of 500 in every parser, and it is four times higher than the old ones, so deeply nested code now yields more calls.
+- **Only BSL was protected against pathological input.** The parse deadline and the binary-input filter were introduced for 1C protected modules, but neither is language-specific: non-linear parser degradation is just as reachable on minified JavaScript, and a binary file under a source extension shows up anywhere build artifacts sit next to sources. Both protections moved to a shared place: the deadline (10 s) is set by all thirteen parsers, and the binary filter lives in the common parse method that both indexing paths call.
+- **Go and C never extracted doc comments at all.** The description field for functions in these languages was always empty — not "when there is no comment", but by construction, even though a comment before a declaration is the standard way to document them. It is now collected the same way as in PHP, Ruby, Swift and C#.
+- **BSL compilation directives were stored in the "return type" field.** `&НаСервере` and `&НаКлиенте` were served where a declared result type is expected and read as one. The same information was already in the procedure description next to the export flag, so the field is now simply left empty. Selecting client-side procedures through `bsl_sql` still works — via the description.
+
+### Changed
+
+- **AST hash computation removed.** It ran for every file on every reindex (a full recursive traversal plus hashing of every node), was written to the `files.ast_hash` column and took part in no decision: "has the file changed" is answered by the content hash, and the field was stripped from tool output as plumbing. The column is dropped by a schema migration on first open.
+- **Doc-comment lookup sped up** in JavaScript, TypeScript, Java and Rust: instead of scanning all siblings from the start of the file, the immediately preceding node is taken — as was already done in PHP, Ruby, Swift and C#.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 675 passed, 0 failed, 0 build warnings (was 672; three new ones: XML line numbers on a file of known layout, doc comments in Go and in C).
+- **Depth bench** (release build, 2 MB worker stack). Before the fix: the Python traversal handled a chain of 2 000 terms and overflowed the stack at 5 000; on BSL, which had a cap, the overflow appeared around 10 000 — that is, the parser traversal overflowed first and AST hashing held out roughly twice as long. After the fix both languages parse a chain of 100 000 terms (a 400 KB file) without crashing.
+- **Live check on a local database** (1C configuration, 57 060 files, forced reindex in 106 s): for the catalog above, the tabular section and attributes landed on lines 350, 405 and 442; for a procedure with a directive the result-type field is empty and the directive is in the description; the AST hash column is gone from the files table. Index volume matched the previous state exactly for files, functions, classes, variables and imports; calls grew by 479, which is consistent with the higher depth cap.
+- **Cost of the removed hash, measured** on a copy of the same database (clean database before each run, warm-up plus alternating binaries): 106.0 and 102.5 s before the fix against 100.8 and 100.4 s after — a 2% saving on best times, with a 3.5 s spread between runs. The expectation of a "noticeable saving" was not confirmed: most of the time goes to the extension layer and database writes, not to tree traversal.
+
+### Compatibility
+
+- **A reindex is required.** The changes are in parsing, so in already built databases the line numbers of 1C objects, the BSL result-type field and Go/C descriptions stay as they were until the database is rebuilt. The schema itself updates on first open with the new binary.
+- The `ast_hash` field disappears from the files table. It never appeared in tool output — it was stripped as plumbing.
+
 ## [0.49.9] — 2026-08-18
 
 **Line anchors now work in files with CRLF endings, and the path-prefix filter works on paths containing an underscore. Both failures were silent: the tool returned zero, indistinguishable from an honest "nothing found".**
