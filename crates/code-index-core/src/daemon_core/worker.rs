@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::extension::ProcessorRegistry;
+use crate::extension::{LanguageProcessor, ProcessorRegistry};
 use crate::indexer::config::IndexConfig;
 use crate::indexer::file_types::{categorize_file_in_repo, FileCategory};
 use crate::indexer::hasher;
@@ -26,6 +26,214 @@ use super::cache_client::CacheClient;
 use super::config::{IndexerSection, PathEntry};
 use super::ipc::{PathStatus, Progress};
 use super::state::DaemonState;
+
+/// Что делать циклу слежения после обработки пакета.
+enum BatchStep {
+    /// Пакет отработан (успешно или с отмеченной ошибкой) — ждём следующий.
+    Continue,
+    /// Дальше работать нельзя: транзакцию начать не удалось. Воркер выходит,
+    /// сторож в runner поднимет его со свежим соединением.
+    Stop,
+}
+
+/// Неизменная обвязка воркера: всё, что нужно обработке пакета, кроме самого
+/// пакета и хранилища. Ссылки, а не владение — цикл слежения владеет этими
+/// значениями и переиспользует их от пакета к пакету.
+struct BatchContext<'a> {
+    path: &'a PathBuf,
+    entry: &'a PathEntry,
+    state: &'a DaemonState,
+    registry: &'a ParserRegistry,
+    max_code_file_size: usize,
+    repo_language: Option<&'a str>,
+    resolved_processor: Option<&'a Arc<dyn LanguageProcessor>>,
+    cache_client: Option<&'a Arc<CacheClient>>,
+}
+
+/// Обработать один пакет событий файловой системы: пометить пути «грязными» в
+/// кэше выдачи, применить каждое событие, зафиксировать транзакцию, пересобрать
+/// надстройку по изменившимся файлам, сбросить кэш и выставить итоговый статус.
+///
+/// Вынесено из `run_worker` (находка G-2): цикл слежения теперь читается как
+/// «взять пакет → обработать → решить, продолжать ли», а сама обработка стала
+/// самостоятельной единицей.
+fn process_batch(
+    ctx: &BatchContext<'_>,
+    storage: &mut Storage,
+    batch: &[FileEvent],
+) -> BatchStep {
+    // Ранний mark-dirty (#1471): сообщаем cache-ci об изменённых путях с
+    // observed-mtime ДО переразбора/commit. Это даёт прокси сразу пометить
+    // зависимые записи «грязными» и не отдавать их как HIT, пока индекс не
+    // догнал диск. В дополнение к invalidate после commit (ниже); снимается
+    // сверкой mtime на стороне cache-ci. Best-effort.
+    if let Some(cc) = ctx.cache_client {
+        if !cc.is_empty() {
+            let dirty = collect_dirty_paths(ctx.path, &batch);
+            if !dirty.is_empty() {
+                let cc_clone = cc.clone();
+                let repo = ctx.entry.effective_alias();
+                tokio_block_on(async move {
+                    cc_clone.mark_dirty_files(&repo, &dirty).await;
+                });
+            }
+        }
+    }
+
+    tokio_block_on(async {
+        ctx.state.set_status(ctx.path, PathStatus::ReindexingBatch).await;
+        ctx.state
+            .set_progress(ctx.path, Progress::new(0, batch.len()))
+            .await;
+    });
+
+    if let Err(e) = storage.begin_batch() {
+        eprintln!("[worker:{}] begin_batch: {}", ctx.path.display(), e);
+        // Транзакцию начать не удалось — данные батча НЕ применены. Не выдаём
+        // Ready (был бы ложный «готово» на старом срезе). Помечаем Error и
+        // выходим из воркера: сторож в runner перезапустит его со свежим
+        // соединением (лечит и возможное залипание открытой транзакции).
+        tokio_block_on(async {
+            ctx.state
+                .set_error(
+                    ctx.path,
+                    "не удалось начать транзакцию батча — воркер перезапускается",
+                )
+                .await;
+        });
+        return BatchStep::Stop;
+    }
+
+    let mut done = 0usize;
+    // Сколько событий батча применить не удалось. Ненулевой счётчик означает
+    // неполный срез: часть файлов осталась в индексе прежней версии.
+    let mut failed = 0usize;
+    let batch_len = batch.len();
+    for event in batch {
+        if !apply_event(
+            storage,
+            ctx.path,
+            event,
+            ctx.registry,
+            ctx.max_code_file_size,
+            ctx.repo_language,
+        ) {
+            failed += 1;
+        }
+        done += 1;
+        if done % 50 == 0 || done == batch_len {
+            tokio_block_on(async {
+                ctx.state
+                    .set_progress(ctx.path, Progress::new(done, batch_len))
+                    .await;
+            });
+        }
+    }
+
+    let commit_ok = match storage.commit_batch() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[worker:{}] commit_batch: {}", ctx.path.display(), e);
+            // Фиксация не удалась — данных батча в базе НЕТ. Откатываем, чтобы
+            // соединение не осталось с открытой транзакцией (SQLITE_BUSY на
+            // COMMIT её не снимает) и следующий begin_batch не упал.
+            if let Err(re) = storage.rollback_batch() {
+                eprintln!(
+                    "[worker:{}] rollback после провала commit: {}",
+                    ctx.path.display(),
+                    re
+                );
+            }
+            false
+        }
+    };
+
+    // Пересобрался ли слой extras для этого батча. Провал означает, что тела
+    // функций свежие, а граф вызовов и связи данных отстают — такой срез
+    // нельзя объявлять готовым.
+    let mut extras_ok = true;
+
+    // 8a. Инкрементальное обновление extras-слоя (граф вызовов, data_links,
+    //     структура объектов, формы, подписки) для файлов этого батча.
+    //     Базовый индекс уже закоммичен (calls/AST/file_contents свежие),
+    //     поэтому slice-rebuild графа из `calls` корректен. Для
+    //     универсальных языков — no-op (default-impl trait'а). Функция ведёт
+    //     свои BEGIN/COMMIT внутри, поэтому вызывается после commit_batch.
+    if commit_ok {
+        if let Some(proc) = ctx.resolved_processor {
+            let mut changed_paths: Vec<PathBuf> = Vec::new();
+            let mut deleted_paths: Vec<PathBuf> = Vec::new();
+            for event in batch {
+                match event {
+                    FileEvent::Modified(p) | FileEvent::Created(p) => {
+                        changed_paths.push(p.clone())
+                    }
+                    FileEvent::Deleted(p) => deleted_paths.push(p.clone()),
+                }
+            }
+            let t0 = std::time::Instant::now();
+            match proc.index_extras_for_files(
+                ctx.path,
+                storage,
+                &changed_paths,
+                &deleted_paths,
+            ) {
+                Ok(()) => eprintln!(
+                    "[worker:{}] index_extras_for_files (инкремент): {} мс (changed={}, deleted={})",
+                    ctx.path.display(), t0.elapsed().as_millis(),
+                    changed_paths.len(), deleted_paths.len()
+                ),
+                Err(e) => {
+                    eprintln!(
+                        "[worker:{}] index_extras_for_files процессора '{}' упал: {}. \
+                         Базовая индексация при этом сохранена.",
+                        ctx.path.display(), proc.name(), e
+                    );
+                    extras_ok = false;
+                }
+            }
+        }
+    }
+
+    // В disk-режиме (а worker сюда попадает всегда в disk после reopen на шаге 7)
+    // flush_to_disk через Connection::backup() — бесполезное копирование БД самой
+    // в себя, WAL не уменьшает. checkpoint_truncate реально схлопывает WAL.
+    if let Err(e) = storage.checkpoint_truncate() {
+        eprintln!("[worker:{}] checkpoint_truncate: {}", ctx.path.display(), e);
+    }
+
+    // Event-based cache invalidation (v0.9.1+): после успешного commit
+    // отправляем cache-ci список затронутых относительных путей. Если
+    // commit упал — invalidate не шлём (новых данных в индексе нет;
+    // cache-ci пусть отдаёт что было, TTL подстрахует).
+    if commit_ok {
+        if let Some(cc) = ctx.cache_client {
+            if !cc.is_empty() {
+                let paths_to_invalidate = collect_invalidate_paths(ctx.path, &batch);
+                if !paths_to_invalidate.is_empty() {
+                    let cc_clone = cc.clone();
+                    let repo = ctx.entry.effective_alias();
+                    tokio_block_on(async move {
+                        cc_clone.invalidate_files(&repo, &paths_to_invalidate).await;
+                    });
+                }
+            }
+        }
+    }
+
+    // Батч отработан. Ready выставляем ТОЛЬКО если прошли ВСЕ три шага:
+    // применение каждого события, фиксация транзакции и пересборка extras.
+    // Провал любого из них означает неполный срез, а Ready на нём — ложное
+    // «готово»: сервер выдачи начал бы отдавать устаревшее как актуальное.
+    tokio_block_on(async {
+        match batch_outcome(commit_ok, failed, batch_len, extras_ok) {
+            Ok(()) => ctx.state.set_status(ctx.path, PathStatus::Ready).await,
+            Err(msg) => ctx.state.set_error(ctx.path, msg).await,
+        }
+    });
+
+    BatchStep::Continue
+}
 
 /// Выполнить initial reindex и запустить watcher-цикл для одной папки.
 ///
@@ -402,6 +610,18 @@ pub fn run_worker(
     // Основной цикл обработки батчей. Idle-таймаут 500 мс даёт шанс проверить
     // shutdown-сигнал даже если файлов давно не меняли.
     const IDLE_POLL_MS: u64 = 500;
+    // Обвязка для обработки пакетов — собирается один раз на весь цикл.
+    let ctx = BatchContext {
+        path: &path,
+        entry: &entry,
+        state: &state,
+        registry: &registry,
+        max_code_file_size,
+        repo_language: repo_language.as_deref(),
+        resolved_processor: resolved_processor.as_ref(),
+        cache_client: cache_client.as_ref(),
+    };
+
     loop {
         if shutdown_received(&mut shutdown_rx) {
             break;
@@ -419,175 +639,10 @@ pub fn run_worker(
             continue;
         }
 
-        // Ранний mark-dirty (#1471): сообщаем cache-ci об изменённых путях с
-        // observed-mtime ДО переразбора/commit. Это даёт прокси сразу пометить
-        // зависимые записи «грязными» и не отдавать их как HIT, пока индекс не
-        // догнал диск. В дополнение к invalidate после commit (ниже); снимается
-        // сверкой mtime на стороне cache-ci. Best-effort.
-        if let Some(cc) = &cache_client {
-            if !cc.is_empty() {
-                let dirty = collect_dirty_paths(&path, &batch);
-                if !dirty.is_empty() {
-                    let cc_clone = cc.clone();
-                    let repo = entry.effective_alias();
-                    tokio_block_on(async move {
-                        cc_clone.mark_dirty_files(&repo, &dirty).await;
-                    });
-                }
-            }
+        match process_batch(&ctx, &mut storage, &batch) {
+            BatchStep::Continue => {}
+            BatchStep::Stop => break,
         }
-
-        tokio_block_on(async {
-            state.set_status(&path, PathStatus::ReindexingBatch).await;
-            state
-                .set_progress(&path, Progress::new(0, batch.len()))
-                .await;
-        });
-
-        if let Err(e) = storage.begin_batch() {
-            eprintln!("[worker:{}] begin_batch: {}", path.display(), e);
-            // Транзакцию начать не удалось — данные батча НЕ применены. Не выдаём
-            // Ready (был бы ложный «готово» на старом срезе). Помечаем Error и
-            // выходим из воркера: сторож в runner перезапустит его со свежим
-            // соединением (лечит и возможное залипание открытой транзакции).
-            tokio_block_on(async {
-                state
-                    .set_error(
-                        &path,
-                        "не удалось начать транзакцию батча — воркер перезапускается",
-                    )
-                    .await;
-            });
-            break;
-        }
-
-        let mut done = 0usize;
-        // Сколько событий батча применить не удалось. Ненулевой счётчик означает
-        // неполный срез: часть файлов осталась в индексе прежней версии.
-        let mut failed = 0usize;
-        let batch_len = batch.len();
-        for event in &batch {
-            if !apply_event(
-                &mut storage,
-                &path,
-                event,
-                &registry,
-                max_code_file_size,
-                repo_language.as_deref(),
-            ) {
-                failed += 1;
-            }
-            done += 1;
-            if done % 50 == 0 || done == batch_len {
-                tokio_block_on(async {
-                    state
-                        .set_progress(&path, Progress::new(done, batch_len))
-                        .await;
-                });
-            }
-        }
-
-        let commit_ok = match storage.commit_batch() {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("[worker:{}] commit_batch: {}", path.display(), e);
-                // Фиксация не удалась — данных батча в базе НЕТ. Откатываем, чтобы
-                // соединение не осталось с открытой транзакцией (SQLITE_BUSY на
-                // COMMIT её не снимает) и следующий begin_batch не упал.
-                if let Err(re) = storage.rollback_batch() {
-                    eprintln!(
-                        "[worker:{}] rollback после провала commit: {}",
-                        path.display(),
-                        re
-                    );
-                }
-                false
-            }
-        };
-
-        // Пересобрался ли слой extras для этого батча. Провал означает, что тела
-        // функций свежие, а граф вызовов и связи данных отстают — такой срез
-        // нельзя объявлять готовым.
-        let mut extras_ok = true;
-
-        // 8a. Инкрементальное обновление extras-слоя (граф вызовов, data_links,
-        //     структура объектов, формы, подписки) для файлов этого батча.
-        //     Базовый индекс уже закоммичен (calls/AST/file_contents свежие),
-        //     поэтому slice-rebuild графа из `calls` корректен. Для
-        //     универсальных языков — no-op (default-impl trait'а). Функция ведёт
-        //     свои BEGIN/COMMIT внутри, поэтому вызывается после commit_batch.
-        if commit_ok {
-            if let Some(proc) = resolved_processor.as_ref() {
-                let mut changed_paths: Vec<PathBuf> = Vec::new();
-                let mut deleted_paths: Vec<PathBuf> = Vec::new();
-                for event in &batch {
-                    match event {
-                        FileEvent::Modified(p) | FileEvent::Created(p) => {
-                            changed_paths.push(p.clone())
-                        }
-                        FileEvent::Deleted(p) => deleted_paths.push(p.clone()),
-                    }
-                }
-                let t0 = std::time::Instant::now();
-                match proc.index_extras_for_files(
-                    &path,
-                    &mut storage,
-                    &changed_paths,
-                    &deleted_paths,
-                ) {
-                    Ok(()) => eprintln!(
-                        "[worker:{}] index_extras_for_files (инкремент): {} мс (changed={}, deleted={})",
-                        path.display(), t0.elapsed().as_millis(),
-                        changed_paths.len(), deleted_paths.len()
-                    ),
-                    Err(e) => {
-                        eprintln!(
-                            "[worker:{}] index_extras_for_files процессора '{}' упал: {}. \
-                             Базовая индексация при этом сохранена.",
-                            path.display(), proc.name(), e
-                        );
-                        extras_ok = false;
-                    }
-                }
-            }
-        }
-
-        // В disk-режиме (а worker сюда попадает всегда в disk после reopen на шаге 7)
-        // flush_to_disk через Connection::backup() — бесполезное копирование БД самой
-        // в себя, WAL не уменьшает. checkpoint_truncate реально схлопывает WAL.
-        if let Err(e) = storage.checkpoint_truncate() {
-            eprintln!("[worker:{}] checkpoint_truncate: {}", path.display(), e);
-        }
-
-        // Event-based cache invalidation (v0.9.1+): после успешного commit
-        // отправляем cache-ci список затронутых относительных путей. Если
-        // commit упал — invalidate не шлём (новых данных в индексе нет;
-        // cache-ci пусть отдаёт что было, TTL подстрахует).
-        if commit_ok {
-            if let Some(cc) = &cache_client {
-                if !cc.is_empty() {
-                    let paths_to_invalidate = collect_invalidate_paths(&path, &batch);
-                    if !paths_to_invalidate.is_empty() {
-                        let cc_clone = cc.clone();
-                        let repo = entry.effective_alias();
-                        tokio_block_on(async move {
-                            cc_clone.invalidate_files(&repo, &paths_to_invalidate).await;
-                        });
-                    }
-                }
-            }
-        }
-
-        // Батч отработан. Ready выставляем ТОЛЬКО если прошли ВСЕ три шага:
-        // применение каждого события, фиксация транзакции и пересборка extras.
-        // Провал любого из них означает неполный срез, а Ready на нём — ложное
-        // «готово»: сервер выдачи начал бы отдавать устаревшее как актуальное.
-        tokio_block_on(async {
-            match batch_outcome(commit_ok, failed, batch_len, extras_ok) {
-                Ok(()) => state.set_status(&path, PathStatus::Ready).await,
-                Err(msg) => state.set_error(&path, msg).await,
-            }
-        });
     }
 
     eprintln!("[worker:{}] shutdown, финальный checkpoint", path.display());

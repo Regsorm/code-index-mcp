@@ -674,557 +674,27 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Serve { path, transport, host, port, config, serve_config } => {
-            use crate::federation;
-            use crate::mcp::CodeIndexServer;
-
-            // Решаем, активен ли федеративный режим. Условия:
-            //   * transport == http (stdio не имеет адреса для bind/whitelist);
-            //   * --serve-config указан явно ИЛИ существует $CODE_INDEX_HOME/serve.toml;
-            //   * --path не передан (CLI-приоритет — это моно-режим, явный override).
-            let serve_cfg_path: Option<PathBuf> = if transport == "http" && path.is_empty() {
-                if let Some(p) = serve_config.clone() {
-                    if !p.exists() {
-                        return Err(anyhow::anyhow!(
-                            "--serve-config={} не существует.",
-                            p.display()
-                        ));
-                    }
-                    Some(p)
-                } else {
-                    let p = federation::config::default_path()?;
-                    if p.exists() { Some(p) } else { None }
-                }
-            } else {
-                None
-            };
-
-            if let Some(serve_cfg_path) = serve_cfg_path {
-                tracing::info!(
-                    "Федеративный режим: serve.toml={}",
-                    serve_cfg_path.display()
-                );
-                let serve_cfg = federation::config::load_from(&serve_cfg_path)?;
-                let daemon_cfg = match config.as_deref() {
-                    Some(p) => crate::daemon_core::config::load_from(p)?,
-                    None => crate::daemon_core::config::load_or_default()?,
-                };
-
-                // Создать пустые БД для local-репо, чтобы сервер мог открыть
-                // их read-only до индексации демоном.
-                for daemon_entry in &daemon_cfg.paths {
-                    let root = daemon_entry
-                        .path
-                        .canonicalize()
-                        .unwrap_or_else(|_| daemon_entry.path.clone());
-                    let db_path = root.join(".code-index").join("index.db");
-                    if !db_path.exists() {
-                        std::fs::create_dir_all(db_path.parent().unwrap())?;
-                        let storage = Storage::open_file(&db_path)?;
-                        drop(storage);
-                    }
-                }
-
-                let repos = federation::repos::merge(&serve_cfg, &daemon_cfg)?;
-                let aliases: Vec<&str> =
-                    repos.iter().map(|r| r.alias.as_str()).collect();
-                let local_count = repos.iter().filter(|r| r.is_local).count();
-                tracing::info!(
-                    "Реестр федерации: {} репо ({} local, {} remote): {:?}",
-                    repos.len(),
-                    local_count,
-                    repos.len() - local_count,
-                    aliases
-                );
-
-                // Этап 2.1: federation-конструктор принимает registry и
-                // мапу alias → language для local-репо из daemon.toml,
-                // чтобы extension-tools (`get_object_structure` и др.)
-                // регистрировались в `tools/list` сразу при старте,
-                // а не только после первого file-watch-события.
-                // remote-репо приходят без языка — для них tools
-                // зарегистрированы только если такой же язык уже активен
-                // у local-репо на этой ноде (что естественно для
-                // 1С-конфигураций, где BSL-репо есть и тут, и там).
-                let local_languages: std::collections::BTreeMap<String, String> = daemon_cfg
-                    .paths
-                    .iter()
-                    .filter_map(|p| {
-                        p.language
-                            .as_ref()
-                            .map(|lang| (p.effective_alias(), lang.clone()))
-                    })
-                    .collect();
-                // Whitelist tools из daemon.toml [tools].enabled применяется
-                // прямо в chain'е после конструктора. Логи и warning о
-                // неизвестных именах — внутри `apply_tools_whitelist`.
-                let server = CodeIndexServer::from_federated(
-                    repos,
-                    serve_cfg.me.ip.clone(),
-                    registry.take(),
-                    local_languages,
-                    serve_cfg.pool.resolve(),
-                )?
-                .apply_tools_whitelist(&daemon_cfg.tools.enabled)
-                .apply_mass_mode_tools(&daemon_cfg.mcp.mass_mode_tools)
-                .apply_dedup_enabled(daemon_cfg.mcp.dedup_enabled);
-                crate::mcp::cap::set_response_cap(daemon_cfg.cap.max_response_bytes);
-                crate::mcp::cap::set_response_cap_hard(daemon_cfg.cap.max_response_bytes_hard);
-                crate::mcp::cap::set_function_body_cap(daemon_cfg.cap.max_function_body_chars);
-                crate::mcp::cap::set_cap_tools(Some(daemon_cfg.cap.cap_tools.clone()));
-                crate::mcp::cap::set_cap_enabled(daemon_cfg.cap.cap_enabled);
-                let federate_router = federation::server::federate_router(server.clone());
-                let allowed = std::sync::Arc::new(federation::whitelist::build(&serve_cfg));
-
-                // File-watch на daemon.toml — реактивно подменяем
-                // active_languages при правке (этап 1.7). config может быть
-                // не задан — тогда watcher не запускаем (active set
-                // задаётся только содержимым serve.toml, который тут не
-                // меняется).
-                let _config_watch = if let Some(cfg_path) = config.as_deref() {
-                    Some(crate::mcp::config_watch::spawn_watch(
-                        server.clone(),
-                        cfg_path.to_path_buf(),
-                    ))
-                } else {
-                    None
-                };
-
-                // Bind: --host имеет приоритет, иначе [me].ip.
-                let bind_host = host.unwrap_or_else(|| serve_cfg.me.ip.clone());
-                serve_http(server, &bind_host, port, Some(federate_router), Some(allowed))
-                    .await?;
-                return Ok(());
-            }
-
-            // Моно-режим (rc5-совместимый): нет serve.toml или явно указан --path.
-            let entries = build_repo_entries(path, config.as_deref())?;
-            let aliases: Vec<&str> = entries.iter().map(|(a, _, _)| a.as_str()).collect();
-            tracing::info!("MCP read-only ({}), репо: {:?}", transport, aliases);
-
-            // Если передан реестр — собираем сервер сразу с ним. Если конфига
-            // нет (`--path`-режим), language ещё не известен — extension_tools
-            // окажутся пусты, file-watch их не активирует (нечему watch'ить),
-            // но это разумно: в `--path`-режиме оператор обычно знает что
-            // подключает (моно-репо без 1С-специфики).
-            // Если конфиг есть — daemon уже отработал auto-detect и записал
-            // language обратно в TOML; build_repo_entries прочитал свежий
-            // TOML, передал repos с пустым `language` (моно-конструктор не
-            // подцепляет language из конфига), но file-watch в spawn_watch
-            // ниже подхватит и сделает первый rebuild.
-            let server = match registry {
-                Some(reg) => {
-                    let mut map = std::collections::BTreeMap::new();
-                    for (alias, root_path, db_path) in entries {
-                        let storage = crate::storage::StoragePool::open_file_readonly(
-                            &db_path,
-                            crate::storage::PoolConfig::default(),
-                        )?;
-                        map.insert(alias, crate::mcp::RepoEntry {
-                            root_path: Some(root_path),
-                            storage: Some(storage),
-                            ip: "127.0.0.1".to_string(),
-                            port: crate::federation::client::DEFAULT_REMOTE_PORT,
-                            is_local: true,
-                            language: None,
-                        });
-                    }
-                    CodeIndexServer::with_repos_and_registry(map, reg)
-                }
-                None => CodeIndexServer::open_readonly_multi(entries)?,
-            };
-            // Whitelist tools из daemon.toml [tools].enabled. В моно-ветке
-            // конфиг нужно отдельно загрузить — `build_repo_entries` его
-            // внутри парсит, но наружу не отдаёт. При `--path` без `--config`
-            // helper вернёт пустой список → фильтр выключен.
-            let server = server
-                .apply_tools_whitelist(&tools_whitelist_from_daemon_cfg(config.as_deref()))
-                .apply_mass_mode_tools(&mass_mode_tools_from_daemon_cfg(config.as_deref()))
-                .apply_dedup_enabled(dedup_enabled_from_daemon_cfg(config.as_deref()));
-            crate::mcp::cap::set_response_cap(response_cap_from_daemon_cfg(config.as_deref()));
-            crate::mcp::cap::set_response_cap_hard(response_cap_hard_from_daemon_cfg(config.as_deref()));
-            crate::mcp::cap::set_function_body_cap(function_body_cap_from_daemon_cfg(config.as_deref()));
-            crate::mcp::cap::set_cap_tools(Some(cap_tools_from_daemon_cfg(config.as_deref())));
-            crate::mcp::cap::set_cap_enabled(cap_enabled_from_daemon_cfg(config.as_deref()));
-            let bind_host = host.unwrap_or_else(|| "127.0.0.1".to_string());
-
-            // Если запуск с --config — подписываемся на изменения daemon.toml,
-            // чтобы реактивно пересобирать active_languages/extension_tools
-            // при правке оператором (этап 1.7). Без --config нет файла,
-            // за которым наблюдать — режим --path даёт фиксированный набор
-            // репо, в нём перезагрузка не нужна.
-            let _config_watch = if let Some(cfg_path) = config.as_deref() {
-                Some(crate::mcp::config_watch::spawn_watch(
-                    server.clone(),
-                    cfg_path.to_path_buf(),
-                ))
-            } else {
-                None
-            };
-
-            match transport.as_str() {
-                "stdio" => {
-                    use rmcp::ServiceExt;
-                    let service = server
-                        .serve(rmcp::transport::io::stdio())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("MCP serve error: {}", e))?;
-                    service
-                        .waiting()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
-                }
-                "http" => {
-                    serve_http(server, &bind_host, port, None, None).await?;
-                }
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "Транспорт '{}' не поддерживается. Используйте 'stdio' или 'http'.",
-                        other
-                    ));
-                }
-            }
+            cmd_serve(path, transport, host, port, config, serve_config, registry).await?;
         }
 
         Commands::Index { path, force } => {
-            tracing::info!("Индексация: path={}, force={}", path, force);
-
-            // 1. Разрешить путь до абсолютного
-            let abs_path = Path::new(&path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(&path));
-
-            // 2. Создать директорию .code-index/ внутри проекта
-            let db_dir = abs_path.join(".code-index");
-            std::fs::create_dir_all(&db_dir)
-                .map_err(|e| anyhow::anyhow!("Не удалось создать директорию {:?}: {}", db_dir, e))?;
-
-            // 3. Загрузить конфигурацию проекта
-            let db_path = db_dir.join("index.db");
-            let mut config = IndexConfig::load(&abs_path)?;
-            // Язык репозитория нужен для неоднозначных расширений (`.h` —
-            // заголовок C или C++). У демона он берётся из `[[paths]] language`;
-            // здесь конфига демона нет, поэтому определяем сами — тем же
-            // способом, каким демон заполняет это поле на старте. Так результат
-            // не зависит от того, кто индексировал: демон или эта команда.
-            if config.repo_language.is_none() {
-                config.repo_language = crate::daemon_core::language_detect::detect_language(&abs_path)
-                    .map(|s| s.to_string());
-            }
-
-            // A2: PID-lock на целевую БД — два `index --force` по одному пути
-            // не должны драться за SQLite. RAII, держится до конца команды.
-            let _index_lock = crate::daemon_core::lock::acquire_at(
-                db_dir.join("index.lock"),
-                "Индексация пути",
-            )?;
-
-            // A1: при --force пересоздаём БД с нуля. full_reindex(force) поверх
-            // большой существующей index.db патологически медленный (грузит всю
-            // БД в RAM + upsert каждого файла). Удаление превращает force в
-            // быстрый fresh-путь — тот же итог (полная переиндексация) без деградации.
-            if force {
-                for p in [
-                    db_path.clone(),
-                    db_path.with_extension("db-wal"),
-                    db_path.with_extension("db-shm"),
-                ] {
-                    if p.exists() {
-                        if let Err(e) = std::fs::remove_file(&p) {
-                            tracing::warn!("A1: не удалось удалить {:?}: {}", p, e);
-                        }
-                    }
-                }
-            }
-
-            // 4. Открыть Storage с автоопределением режима
-            let storage_config = StorageConfig {
-                mode: config.storage_mode.clone(),
-                memory_max_percent: config.memory_max_percent,
-            };
-            let mut storage = Storage::open_auto(&db_path, &storage_config)?;
-
-            // 4a. Если язык репо известен и в реестре есть процессор для
-            // него — применить его schema_extensions. Это создаст
-            // специфичные таблицы (для BSL — metadata_objects, metadata_forms,
-            // event_subscriptions). DDL идемпотентен (CREATE IF NOT EXISTS),
-            // повторный вызов безвреден.
-            //
-            // Resolve через `ProcessorRegistry::resolve(None, root)` —
-            // CLI-команда `index` не знает явный `language` из daemon.toml
-            // (это standalone разовая индексация), поэтому работает только
-            // auto-detect по маркерам. Логика идентична daemon-режиму, что
-            // даёт единый контракт «индексация» независимо от запуска.
-            if let Some(reg) = registry.as_ref() {
-                if let Some(proc) = reg.resolve(None, &abs_path) {
-                    if let Err(e) = proc.migrate_schema(storage.conn()) {
-                        tracing::warn!(
-                            "migrate_schema процессора '{}' упал: {}",
-                            proc.name(),
-                            e
-                        );
-                    }
-                    let exts = proc.schema_extensions();
-                    if !exts.is_empty() {
-                        storage.apply_schema_extensions(exts)?;
-                        tracing::info!(
-                            "Применены schema_extensions процессора '{}' ({} DDL-statement'ов)",
-                            proc.name(),
-                            exts.len(),
-                        );
-                    }
-                }
-            }
-
-            // 5. Создать Indexer с конфигом. Сборщик extras (bsl-indexer)
-            //    берём заранее — он владеет собой, storage не занимает.
-            let parse_collector = registry
-                .as_ref()
-                .and_then(|reg| reg.resolve(None, &abs_path))
-                .and_then(|proc| proc.parse_collector());
-            let mut indexer = Indexer::with_config(&mut storage, config);
-
-            // 6. Запустить индексацию
-            let result =
-                indexer.full_reindex_with_collector(&abs_path, force, parse_collector.as_deref())?;
-
-            // 6a. Hook расширения: для BSL-репо здесь происходит
-            // парсинг XML-метаданных и заполнение специфичных таблиц
-            // (metadata_objects/metadata_forms/event_subscriptions/proc_call_graph).
-            // Для универсальных языков `index_extras` — no-op (default-impl).
-            //
-            // ВАЖНО: вызывается ДО flush_to_disk. В in-memory режиме
-            // flush_to_disk копирует текущее SQLite-соединение в файл —
-            // если бы мы дописали в conn после flush, записи остались бы
-            // только в памяти и пропали бы при выходе.
-            let extras_start = std::time::Instant::now();
-            if let Some(reg) = registry.as_ref() {
-                if let Some(proc) = reg.resolve(None, &abs_path) {
-                    if let Err(e) = proc.index_extras(&abs_path, &mut storage) {
-                        tracing::warn!(
-                            "index_extras процессора '{}' завершился с ошибкой: {}. \
-                             Базовая индексация при этом сохранена.",
-                            proc.name(),
-                            e
-                        );
-                    }
-                }
-            }
-            let extras_ms = extras_start.elapsed().as_millis();
-
-            // 7. Если работаем в in-memory режиме — сохранить результаты на диск.
-            // Должно идти ПОСЛЕ index_extras, иначе записи расширения
-            // попадут только в in-memory копию.
-            let flush_start = std::time::Instant::now();
-            storage.flush_to_disk(&db_path)?;
-            let flush_ms = flush_start.elapsed().as_millis();
-
-            // 8. Вывести результат.
-            // `result.elapsed_ms` — только ядро (обход, парсинг, запись символов).
-            // На 1С-репо сопоставимое время уходит на extras (метаданные, формы,
-            // граф вызовов процедур), поэтому печатаем полное время и разбивку —
-            // иначе половина работы не видна ни в логе, ни в замерах.
-            println!(
-                "Индексация завершена за {} мс (ядро {} + extras {} + сброс на диск {})",
-                result.elapsed_ms as u128 + extras_ms + flush_ms,
-                result.elapsed_ms,
-                extras_ms,
-                flush_ms
-            );
-            println!("  Найдено файлов:        {}", result.files_scanned);
-            println!("  Проиндексировано:      {}", result.files_indexed);
-            println!("  Пропущено (без изм.):  {}", result.files_skipped);
-            println!("  Удалено из индекса:    {}", result.files_deleted);
-
-            if !result.errors.is_empty() {
-                println!("  Ошибок:                {}", result.errors.len());
-                for (file, err) in &result.errors {
-                    println!("    [ERR] {}: {}", file, err);
-                }
-            }
+            cmd_index(path, force, registry)?;
         }
 
         Commands::Stats { path, json } => {
-            tracing::info!("Статистика: path={}", path);
-
-            // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
-            let db_path = get_db_path(&path);
-            let storage = Storage::open_file_readonly(&db_path)?;
-
-            // 2. Получить статистику
-            let stats = storage.get_stats()?;
-
-            if json {
-                // JSON-формат для программного использования
-                println!("{}", serde_json::to_string_pretty(&stats)?);
-            } else {
-                // Текстовый формат для человека
-                println!("Статистика индекса: {}", db_path.display());
-                println!("─────────────────────────────────────");
-                println!("  Файлов:        {}", stats.total_files);
-                println!("  Функций:       {}", stats.total_functions);
-                println!("  Классов:       {}", stats.total_classes);
-                println!("  Импортов:      {}", stats.total_imports);
-                println!("  Вызовов:       {}", stats.total_calls);
-                println!("  Переменных:    {}", stats.total_variables);
-                println!("  Текст. файлов: {}", stats.total_text_files);
-            }
+            cmd_stats(path, json)?;
         }
 
         Commands::Query { symbol, path, language, json } => {
-            tracing::info!("Поиск символа '{}': path={}", symbol, path);
-
-            // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
-            let db_path = get_db_path(&path);
-            let storage = Storage::open_file_readonly(&db_path)?;
-
-            // 2. Поиск символа
-            let result = storage.find_symbol(&symbol, language.as_deref())?;
-
-            if json {
-                // JSON-формат для программного использования
-                println!("{}", serde_json::to_string_pretty(&result)?);
-                return Ok(());
-            }
-
-            let total = result.functions.len()
-                + result.classes.len()
-                + result.variables.len()
-                + result.imports.len();
-
-            if total == 0 {
-                println!("Символ '{}' не найден в индексе.", symbol);
-                return Ok(());
-            }
-
-            println!("Результаты поиска символа '{}':", symbol);
-
-            // 3. Функции
-            if !result.functions.is_empty() {
-                println!("\n  Функции ({}):", result.functions.len());
-                for f in &result.functions {
-                    let qname = f.qualified_name.as_deref().unwrap_or(&f.name);
-                    let async_mark = if f.is_async { " [async]" } else { "" };
-                    let args = f.args.as_deref().unwrap_or("()");
-                    println!(
-                        "    {}{}  {}  строки {}-{}  (file_id={})",
-                        qname, async_mark, args, f.line_start, f.line_end, f.file_id
-                    );
-                }
-            }
-
-            // 4. Классы
-            if !result.classes.is_empty() {
-                println!("\n  Классы ({}):", result.classes.len());
-                for c in &result.classes {
-                    let bases = c.bases.as_deref().unwrap_or("");
-                    let bases_str = if bases.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", bases)
-                    };
-                    println!(
-                        "    {}{}  строки {}-{}  (file_id={})",
-                        c.name, bases_str, c.line_start, c.line_end, c.file_id
-                    );
-                }
-            }
-
-            // 5. Переменные
-            if !result.variables.is_empty() {
-                println!("\n  Переменные ({}):", result.variables.len());
-                for v in &result.variables {
-                    let val = v.value.as_deref().unwrap_or("<нет значения>");
-                    println!(
-                        "    {}  =  {}  строка {}  (file_id={})",
-                        v.name, val, v.line, v.file_id
-                    );
-                }
-            }
-
-            // 6. Импорты
-            if !result.imports.is_empty() {
-                println!("\n  Импорты ({}):", result.imports.len());
-                for i in &result.imports {
-                    let module = i.module.as_deref().unwrap_or("?");
-                    let name = i.name.as_deref().unwrap_or("*");
-                    let alias_str = match &i.alias {
-                        Some(a) => format!(" as {}", a),
-                        None => String::new(),
-                    };
-                    println!(
-                        "    {} from {}{}  строка {}  (file_id={})",
-                        name, module, alias_str, i.line, i.file_id
-                    );
-                }
-            }
+            cmd_query(symbol, path, language, json)?;
         }
 
         Commands::Clean { path } => {
-            tracing::info!("Очистка индекса: path={}", path);
-
-            // 1. Открыть БД
-            let db_path = get_db_path(&path);
-            let storage = Storage::open_file(&db_path)?;
-
-            // 2. Разрешить корневой путь проекта
-            let project_root = std::path::Path::new(&path)
-                .canonicalize()
-                .unwrap_or_else(|_| std::path::PathBuf::from(&path));
-
-            // 3. Получить все файлы из индекса
-            let files = storage.get_all_files()?;
-            let total = files.len();
-            let mut deleted = 0usize;
-
-            // 4. Для каждого файла проверить существование на диске
-            for file in files {
-                // Путь в индексе может быть абсолютным или относительным от корня проекта
-                let on_disk = if std::path::Path::new(&file.path).is_absolute() {
-                    std::path::PathBuf::from(&file.path)
-                } else {
-                    project_root.join(&file.path)
-                };
-
-                if !on_disk.exists() {
-                    if let Some(id) = file.id {
-                        storage.delete_file(id)?;
-                        deleted += 1;
-                        println!("  Удалён: {}", file.path);
-                    }
-                }
-            }
-
-            // 5. Итог
-            println!(
-                "Очистка завершена: проверено {} файлов, удалено {} записей.",
-                total, deleted
-            );
+            cmd_clean(path)?;
         }
 
         Commands::Init { path } => {
-            // 1. Разрешить путь до абсолютного
-            let abs_path = Path::new(&path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(&path));
-
-            let config_path = abs_path.join(".code-index").join("config.json");
-
-            if config_path.exists() {
-                println!("Конфигурация уже существует: {}", config_path.display());
-                println!("Для перезаписи удалите файл вручную.");
-                return Ok(());
-            }
-
-            // 2. Создать конфиг по умолчанию
-            let config = IndexConfig::default();
-            config.save(&abs_path)?;
-
-            println!("Создан файл конфигурации: {}", config_path.display());
-            println!("Отредактируйте его при необходимости:");
-            println!("  exclude_dirs          — дополнительные директории для исключения");
-            println!("  extra_text_extensions — дополнительные расширения для FTS-индексации");
-            println!("  max_file_size         — макс. размер текстового файла в байтах (по умолчанию 1 МБ, не влияет на код)");
-            println!("  max_files             — лимит файлов (0 = без лимита)");
+            cmd_init(path)?;
         }
 
         // ── Новые команды: JSON-вывод ─────────────────────────────────────────
@@ -1343,6 +813,591 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Ветка `serve`: поднять MCP-сервер. Выделена из `run` — в моно- и
+/// федеративном режимах это два разных пути сборки сервера.
+async fn cmd_serve(
+    path: Vec<String>,
+    transport: String,
+    host: Option<String>,
+    port: u16,
+    config: Option<PathBuf>,
+    serve_config: Option<PathBuf>,
+    mut registry: Option<ProcessorRegistry>,
+) -> anyhow::Result<()> {
+    use crate::federation;
+    use crate::mcp::CodeIndexServer;
+
+    // Решаем, активен ли федеративный режим. Условия:
+    //   * transport == http (stdio не имеет адреса для bind/whitelist);
+    //   * --serve-config указан явно ИЛИ существует $CODE_INDEX_HOME/serve.toml;
+    //   * --path не передан (CLI-приоритет — это моно-режим, явный override).
+    let serve_cfg_path: Option<PathBuf> = if transport == "http" && path.is_empty() {
+        if let Some(p) = serve_config.clone() {
+            if !p.exists() {
+                return Err(anyhow::anyhow!(
+                    "--serve-config={} не существует.",
+                    p.display()
+                ));
+            }
+            Some(p)
+        } else {
+            let p = federation::config::default_path()?;
+            if p.exists() { Some(p) } else { None }
+        }
+    } else {
+        None
+    };
+
+    if let Some(serve_cfg_path) = serve_cfg_path {
+        tracing::info!(
+            "Федеративный режим: serve.toml={}",
+            serve_cfg_path.display()
+        );
+        let serve_cfg = federation::config::load_from(&serve_cfg_path)?;
+        let daemon_cfg = match config.as_deref() {
+            Some(p) => crate::daemon_core::config::load_from(p)?,
+            None => crate::daemon_core::config::load_or_default()?,
+        };
+
+        // Создать пустые БД для local-репо, чтобы сервер мог открыть
+        // их read-only до индексации демоном.
+        for daemon_entry in &daemon_cfg.paths {
+            let root = daemon_entry
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| daemon_entry.path.clone());
+            let db_path = root.join(".code-index").join("index.db");
+            if !db_path.exists() {
+                std::fs::create_dir_all(db_path.parent().unwrap())?;
+                let storage = Storage::open_file(&db_path)?;
+                drop(storage);
+            }
+        }
+
+        let repos = federation::repos::merge(&serve_cfg, &daemon_cfg)?;
+        let aliases: Vec<&str> =
+            repos.iter().map(|r| r.alias.as_str()).collect();
+        let local_count = repos.iter().filter(|r| r.is_local).count();
+        tracing::info!(
+            "Реестр федерации: {} репо ({} local, {} remote): {:?}",
+            repos.len(),
+            local_count,
+            repos.len() - local_count,
+            aliases
+        );
+
+        // Этап 2.1: federation-конструктор принимает registry и
+        // мапу alias → language для local-репо из daemon.toml,
+        // чтобы extension-tools (`get_object_structure` и др.)
+        // регистрировались в `tools/list` сразу при старте,
+        // а не только после первого file-watch-события.
+        // remote-репо приходят без языка — для них tools
+        // зарегистрированы только если такой же язык уже активен
+        // у local-репо на этой ноде (что естественно для
+        // 1С-конфигураций, где BSL-репо есть и тут, и там).
+        let local_languages: std::collections::BTreeMap<String, String> = daemon_cfg
+            .paths
+            .iter()
+            .filter_map(|p| {
+                p.language
+                    .as_ref()
+                    .map(|lang| (p.effective_alias(), lang.clone()))
+            })
+            .collect();
+        // Whitelist tools из daemon.toml [tools].enabled применяется
+        // прямо в chain'е после конструктора. Логи и warning о
+        // неизвестных именах — внутри `apply_tools_whitelist`.
+        let server = CodeIndexServer::from_federated(
+            repos,
+            serve_cfg.me.ip.clone(),
+            registry.take(),
+            local_languages,
+            serve_cfg.pool.resolve(),
+        )?
+        .apply_tools_whitelist(&daemon_cfg.tools.enabled)
+        .apply_mass_mode_tools(&daemon_cfg.mcp.mass_mode_tools)
+        .apply_dedup_enabled(daemon_cfg.mcp.dedup_enabled);
+        crate::mcp::cap::set_response_cap(daemon_cfg.cap.max_response_bytes);
+        crate::mcp::cap::set_response_cap_hard(daemon_cfg.cap.max_response_bytes_hard);
+        crate::mcp::cap::set_function_body_cap(daemon_cfg.cap.max_function_body_chars);
+        crate::mcp::cap::set_cap_tools(Some(daemon_cfg.cap.cap_tools.clone()));
+        crate::mcp::cap::set_cap_enabled(daemon_cfg.cap.cap_enabled);
+        let federate_router = federation::server::federate_router(server.clone());
+        let allowed = std::sync::Arc::new(federation::whitelist::build(&serve_cfg));
+
+        // File-watch на daemon.toml — реактивно подменяем
+        // active_languages при правке (этап 1.7). config может быть
+        // не задан — тогда watcher не запускаем (active set
+        // задаётся только содержимым serve.toml, который тут не
+        // меняется).
+        let _config_watch = if let Some(cfg_path) = config.as_deref() {
+            Some(crate::mcp::config_watch::spawn_watch(
+                server.clone(),
+                cfg_path.to_path_buf(),
+            ))
+        } else {
+            None
+        };
+
+        // Bind: --host имеет приоритет, иначе [me].ip.
+        let bind_host = host.unwrap_or_else(|| serve_cfg.me.ip.clone());
+        serve_http(server, &bind_host, port, Some(federate_router), Some(allowed))
+            .await?;
+        return Ok(());
+    }
+
+    // Моно-режим (rc5-совместимый): нет serve.toml или явно указан --path.
+    let entries = build_repo_entries(path, config.as_deref())?;
+    let aliases: Vec<&str> = entries.iter().map(|(a, _, _)| a.as_str()).collect();
+    tracing::info!("MCP read-only ({}), репо: {:?}", transport, aliases);
+
+    // Если передан реестр — собираем сервер сразу с ним. Если конфига
+    // нет (`--path`-режим), language ещё не известен — extension_tools
+    // окажутся пусты, file-watch их не активирует (нечему watch'ить),
+    // но это разумно: в `--path`-режиме оператор обычно знает что
+    // подключает (моно-репо без 1С-специфики).
+    // Если конфиг есть — daemon уже отработал auto-detect и записал
+    // language обратно в TOML; build_repo_entries прочитал свежий
+    // TOML, передал repos с пустым `language` (моно-конструктор не
+    // подцепляет language из конфига), но file-watch в spawn_watch
+    // ниже подхватит и сделает первый rebuild.
+    let server = match registry {
+        Some(reg) => {
+            let mut map = std::collections::BTreeMap::new();
+            for (alias, root_path, db_path) in entries {
+                let storage = crate::storage::StoragePool::open_file_readonly(
+                    &db_path,
+                    crate::storage::PoolConfig::default(),
+                )?;
+                map.insert(alias, crate::mcp::RepoEntry {
+                    root_path: Some(root_path),
+                    storage: Some(storage),
+                    ip: "127.0.0.1".to_string(),
+                    port: crate::federation::client::DEFAULT_REMOTE_PORT,
+                    is_local: true,
+                    language: None,
+                });
+            }
+            CodeIndexServer::with_repos_and_registry(map, reg)
+        }
+        None => CodeIndexServer::open_readonly_multi(entries)?,
+    };
+    // Whitelist tools из daemon.toml [tools].enabled. В моно-ветке
+    // конфиг нужно отдельно загрузить — `build_repo_entries` его
+    // внутри парсит, но наружу не отдаёт. При `--path` без `--config`
+    // helper вернёт пустой список → фильтр выключен.
+    let server = server
+        .apply_tools_whitelist(&tools_whitelist_from_daemon_cfg(config.as_deref()))
+        .apply_mass_mode_tools(&mass_mode_tools_from_daemon_cfg(config.as_deref()))
+        .apply_dedup_enabled(dedup_enabled_from_daemon_cfg(config.as_deref()));
+    crate::mcp::cap::set_response_cap(response_cap_from_daemon_cfg(config.as_deref()));
+    crate::mcp::cap::set_response_cap_hard(response_cap_hard_from_daemon_cfg(config.as_deref()));
+    crate::mcp::cap::set_function_body_cap(function_body_cap_from_daemon_cfg(config.as_deref()));
+    crate::mcp::cap::set_cap_tools(Some(cap_tools_from_daemon_cfg(config.as_deref())));
+    crate::mcp::cap::set_cap_enabled(cap_enabled_from_daemon_cfg(config.as_deref()));
+    let bind_host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+
+    // Если запуск с --config — подписываемся на изменения daemon.toml,
+    // чтобы реактивно пересобирать active_languages/extension_tools
+    // при правке оператором (этап 1.7). Без --config нет файла,
+    // за которым наблюдать — режим --path даёт фиксированный набор
+    // репо, в нём перезагрузка не нужна.
+    let _config_watch = if let Some(cfg_path) = config.as_deref() {
+        Some(crate::mcp::config_watch::spawn_watch(
+            server.clone(),
+            cfg_path.to_path_buf(),
+        ))
+    } else {
+        None
+    };
+
+    match transport.as_str() {
+        "stdio" => {
+            use rmcp::ServiceExt;
+            let service = server
+                .serve(rmcp::transport::io::stdio())
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP serve error: {}", e))?;
+            service
+                .waiting()
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP wait error: {}", e))?;
+        }
+        "http" => {
+            serve_http(server, &bind_host, port, None, None).await?;
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Транспорт '{}' не поддерживается. Используйте 'stdio' или 'http'.",
+                other
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Ветка `index`: однократная индексация каталога.
+fn cmd_index(
+    path: String,
+    force: bool,
+    registry: Option<ProcessorRegistry>,
+) -> anyhow::Result<()> {
+    tracing::info!("Индексация: path={}, force={}", path, force);
+
+    // 1. Разрешить путь до абсолютного
+    let abs_path = Path::new(&path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&path));
+
+    // 2. Создать директорию .code-index/ внутри проекта
+    let db_dir = abs_path.join(".code-index");
+    std::fs::create_dir_all(&db_dir)
+        .map_err(|e| anyhow::anyhow!("Не удалось создать директорию {:?}: {}", db_dir, e))?;
+
+    // 3. Загрузить конфигурацию проекта
+    let db_path = db_dir.join("index.db");
+    let mut config = IndexConfig::load(&abs_path)?;
+    // Язык репозитория нужен для неоднозначных расширений (`.h` —
+    // заголовок C или C++). У демона он берётся из `[[paths]] language`;
+    // здесь конфига демона нет, поэтому определяем сами — тем же
+    // способом, каким демон заполняет это поле на старте. Так результат
+    // не зависит от того, кто индексировал: демон или эта команда.
+    if config.repo_language.is_none() {
+        config.repo_language = crate::daemon_core::language_detect::detect_language(&abs_path)
+            .map(|s| s.to_string());
+    }
+
+    // A2: PID-lock на целевую БД — два `index --force` по одному пути
+    // не должны драться за SQLite. RAII, держится до конца команды.
+    let _index_lock = crate::daemon_core::lock::acquire_at(
+        db_dir.join("index.lock"),
+        "Индексация пути",
+    )?;
+
+    // A1: при --force пересоздаём БД с нуля. full_reindex(force) поверх
+    // большой существующей index.db патологически медленный (грузит всю
+    // БД в RAM + upsert каждого файла). Удаление превращает force в
+    // быстрый fresh-путь — тот же итог (полная переиндексация) без деградации.
+    if force {
+        for p in [
+            db_path.clone(),
+            db_path.with_extension("db-wal"),
+            db_path.with_extension("db-shm"),
+        ] {
+            if p.exists() {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    tracing::warn!("A1: не удалось удалить {:?}: {}", p, e);
+                }
+            }
+        }
+    }
+
+    // 4. Открыть Storage с автоопределением режима
+    let storage_config = StorageConfig {
+        mode: config.storage_mode.clone(),
+        memory_max_percent: config.memory_max_percent,
+    };
+    let mut storage = Storage::open_auto(&db_path, &storage_config)?;
+
+    // 4a. Если язык репо известен и в реестре есть процессор для
+    // него — применить его schema_extensions. Это создаст
+    // специфичные таблицы (для BSL — metadata_objects, metadata_forms,
+    // event_subscriptions). DDL идемпотентен (CREATE IF NOT EXISTS),
+    // повторный вызов безвреден.
+    //
+    // Resolve через `ProcessorRegistry::resolve(None, root)` —
+    // CLI-команда `index` не знает явный `language` из daemon.toml
+    // (это standalone разовая индексация), поэтому работает только
+    // auto-detect по маркерам. Логика идентична daemon-режиму, что
+    // даёт единый контракт «индексация» независимо от запуска.
+    if let Some(reg) = registry.as_ref() {
+        if let Some(proc) = reg.resolve(None, &abs_path) {
+            if let Err(e) = proc.migrate_schema(storage.conn()) {
+                tracing::warn!(
+                    "migrate_schema процессора '{}' упал: {}",
+                    proc.name(),
+                    e
+                );
+            }
+            let exts = proc.schema_extensions();
+            if !exts.is_empty() {
+                storage.apply_schema_extensions(exts)?;
+                tracing::info!(
+                    "Применены schema_extensions процессора '{}' ({} DDL-statement'ов)",
+                    proc.name(),
+                    exts.len(),
+                );
+            }
+        }
+    }
+
+    // 5. Создать Indexer с конфигом. Сборщик extras (bsl-indexer)
+    //    берём заранее — он владеет собой, storage не занимает.
+    let parse_collector = registry
+        .as_ref()
+        .and_then(|reg| reg.resolve(None, &abs_path))
+        .and_then(|proc| proc.parse_collector());
+    let mut indexer = Indexer::with_config(&mut storage, config);
+
+    // 6. Запустить индексацию
+    let result =
+        indexer.full_reindex_with_collector(&abs_path, force, parse_collector.as_deref())?;
+
+    // 6a. Hook расширения: для BSL-репо здесь происходит
+    // парсинг XML-метаданных и заполнение специфичных таблиц
+    // (metadata_objects/metadata_forms/event_subscriptions/proc_call_graph).
+    // Для универсальных языков `index_extras` — no-op (default-impl).
+    //
+    // ВАЖНО: вызывается ДО flush_to_disk. В in-memory режиме
+    // flush_to_disk копирует текущее SQLite-соединение в файл —
+    // если бы мы дописали в conn после flush, записи остались бы
+    // только в памяти и пропали бы при выходе.
+    let extras_start = std::time::Instant::now();
+    if let Some(reg) = registry.as_ref() {
+        if let Some(proc) = reg.resolve(None, &abs_path) {
+            if let Err(e) = proc.index_extras(&abs_path, &mut storage) {
+                tracing::warn!(
+                    "index_extras процессора '{}' завершился с ошибкой: {}. \
+                     Базовая индексация при этом сохранена.",
+                    proc.name(),
+                    e
+                );
+            }
+        }
+    }
+    let extras_ms = extras_start.elapsed().as_millis();
+
+    // 7. Если работаем в in-memory режиме — сохранить результаты на диск.
+    // Должно идти ПОСЛЕ index_extras, иначе записи расширения
+    // попадут только в in-memory копию.
+    let flush_start = std::time::Instant::now();
+    storage.flush_to_disk(&db_path)?;
+    let flush_ms = flush_start.elapsed().as_millis();
+
+    // 8. Вывести результат.
+    // `result.elapsed_ms` — только ядро (обход, парсинг, запись символов).
+    // На 1С-репо сопоставимое время уходит на extras (метаданные, формы,
+    // граф вызовов процедур), поэтому печатаем полное время и разбивку —
+    // иначе половина работы не видна ни в логе, ни в замерах.
+    println!(
+        "Индексация завершена за {} мс (ядро {} + extras {} + сброс на диск {})",
+        result.elapsed_ms as u128 + extras_ms + flush_ms,
+        result.elapsed_ms,
+        extras_ms,
+        flush_ms
+    );
+    println!("  Найдено файлов:        {}", result.files_scanned);
+    println!("  Проиндексировано:      {}", result.files_indexed);
+    println!("  Пропущено (без изм.):  {}", result.files_skipped);
+    println!("  Удалено из индекса:    {}", result.files_deleted);
+
+    if !result.errors.is_empty() {
+        println!("  Ошибок:                {}", result.errors.len());
+        for (file, err) in &result.errors {
+            println!("    [ERR] {}: {}", file, err);
+        }
+    }
+    Ok(())
+}
+
+/// Ветка `stats`: статистика базы индекса.
+fn cmd_stats(path: String, json: bool) -> anyhow::Result<()> {
+    tracing::info!("Статистика: path={}", path);
+
+    // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
+    let db_path = get_db_path(&path);
+    let storage = Storage::open_file_readonly(&db_path)?;
+
+    // 2. Получить статистику
+    let stats = storage.get_stats()?;
+
+    if json {
+        // JSON-формат для программного использования
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else {
+        // Текстовый формат для человека
+        println!("Статистика индекса: {}", db_path.display());
+        println!("─────────────────────────────────────");
+        println!("  Файлов:        {}", stats.total_files);
+        println!("  Функций:       {}", stats.total_functions);
+        println!("  Классов:       {}", stats.total_classes);
+        println!("  Импортов:      {}", stats.total_imports);
+        println!("  Вызовов:       {}", stats.total_calls);
+        println!("  Переменных:    {}", stats.total_variables);
+        println!("  Текст. файлов: {}", stats.total_text_files);
+    }
+    Ok(())
+}
+
+/// Ветка `query`: быстрый поиск символа по точному имени.
+fn cmd_query(
+    symbol: String,
+    path: String,
+    language: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    tracing::info!("Поиск символа '{}': path={}", symbol, path);
+
+    // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
+    let db_path = get_db_path(&path);
+    let storage = Storage::open_file_readonly(&db_path)?;
+
+    // 2. Поиск символа
+    let result = storage.find_symbol(&symbol, language.as_deref())?;
+
+    if json {
+        // JSON-формат для программного использования
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    let total = result.functions.len()
+        + result.classes.len()
+        + result.variables.len()
+        + result.imports.len();
+
+    if total == 0 {
+        println!("Символ '{}' не найден в индексе.", symbol);
+        return Ok(());
+    }
+
+    println!("Результаты поиска символа '{}':", symbol);
+
+    // 3. Функции
+    if !result.functions.is_empty() {
+        println!("\n  Функции ({}):", result.functions.len());
+        for f in &result.functions {
+            let qname = f.qualified_name.as_deref().unwrap_or(&f.name);
+            let async_mark = if f.is_async { " [async]" } else { "" };
+            let args = f.args.as_deref().unwrap_or("()");
+            println!(
+                "    {}{}  {}  строки {}-{}  (file_id={})",
+                qname, async_mark, args, f.line_start, f.line_end, f.file_id
+            );
+        }
+    }
+
+    // 4. Классы
+    if !result.classes.is_empty() {
+        println!("\n  Классы ({}):", result.classes.len());
+        for c in &result.classes {
+            let bases = c.bases.as_deref().unwrap_or("");
+            let bases_str = if bases.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", bases)
+            };
+            println!(
+                "    {}{}  строки {}-{}  (file_id={})",
+                c.name, bases_str, c.line_start, c.line_end, c.file_id
+            );
+        }
+    }
+
+    // 5. Переменные
+    if !result.variables.is_empty() {
+        println!("\n  Переменные ({}):", result.variables.len());
+        for v in &result.variables {
+            let val = v.value.as_deref().unwrap_or("<нет значения>");
+            println!(
+                "    {}  =  {}  строка {}  (file_id={})",
+                v.name, val, v.line, v.file_id
+            );
+        }
+    }
+
+    // 6. Импорты
+    if !result.imports.is_empty() {
+        println!("\n  Импорты ({}):", result.imports.len());
+        for i in &result.imports {
+            let module = i.module.as_deref().unwrap_or("?");
+            let name = i.name.as_deref().unwrap_or("*");
+            let alias_str = match &i.alias {
+                Some(a) => format!(" as {}", a),
+                None => String::new(),
+            };
+            println!(
+                "    {} from {}{}  строка {}  (file_id={})",
+                name, module, alias_str, i.line, i.file_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Ветка `clean`: удалить из индекса файлы, которых нет на диске.
+fn cmd_clean(path: String) -> anyhow::Result<()> {
+    tracing::info!("Очистка индекса: path={}", path);
+
+    // 1. Открыть БД
+    let db_path = get_db_path(&path);
+    let storage = Storage::open_file(&db_path)?;
+
+    // 2. Разрешить корневой путь проекта
+    let project_root = std::path::Path::new(&path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+
+    // 3. Получить все файлы из индекса
+    let files = storage.get_all_files()?;
+    let total = files.len();
+    let mut deleted = 0usize;
+
+    // 4. Для каждого файла проверить существование на диске
+    for file in files {
+        // Путь в индексе может быть абсолютным или относительным от корня проекта
+        let on_disk = if std::path::Path::new(&file.path).is_absolute() {
+            std::path::PathBuf::from(&file.path)
+        } else {
+            project_root.join(&file.path)
+        };
+
+        if !on_disk.exists() {
+            if let Some(id) = file.id {
+                storage.delete_file(id)?;
+                deleted += 1;
+                println!("  Удалён: {}", file.path);
+            }
+        }
+    }
+
+    // 5. Итог
+    println!(
+        "Очистка завершена: проверено {} файлов, удалено {} записей.",
+        total, deleted
+    );
+    Ok(())
+}
+
+/// Ветка `init`: создать конфигурацию по умолчанию.
+fn cmd_init(path: String) -> anyhow::Result<()> {
+    // 1. Разрешить путь до абсолютного
+    let abs_path = Path::new(&path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&path));
+
+    let config_path = abs_path.join(".code-index").join("config.json");
+
+    if config_path.exists() {
+        println!("Конфигурация уже существует: {}", config_path.display());
+        println!("Для перезаписи удалите файл вручную.");
+        return Ok(());
+    }
+
+    // 2. Создать конфиг по умолчанию
+    let config = IndexConfig::default();
+    config.save(&abs_path)?;
+
+    println!("Создан файл конфигурации: {}", config_path.display());
+    println!("Отредактируйте его при необходимости:");
+    println!("  exclude_dirs          — дополнительные директории для исключения");
+    println!("  extra_text_extensions — дополнительные расширения для FTS-индексации");
+    println!("  max_file_size         — макс. размер текстового файла в байтах (по умолчанию 1 МБ, не влияет на код)");
+    println!("  max_files             — лимит файлов (0 = без лимита)");
+    Ok(())
+}
+
 
 /// На Windows Rust собирается как console-subsystem приложение. При запуске
 /// в пользовательской сессии (Scheduled Task LogonType=Interactive, ручной
