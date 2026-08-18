@@ -115,8 +115,30 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # Описание выпуска берём из журнала изменений: автосводка GitHub собирает
+      # список запросов на слияние, а здесь коммиты идут прямо в ветку — она
+      # выходила пустой, и страница выпуска не говорила, что исправлено.
+      - name: Build release notes from changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 - "$VERSION" > release-notes.md <<'PY'
+          import re, sys, pathlib
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG_EN.md").read_text(encoding="utf-8")
+          m = re.search(rf"^## \[{re.escape(version)}\].*?(?=^## \[|\Z)", text, re.M | re.S)
+          if m:
+              print(m.group(0).strip())
+              print()
+              print("Russian version of the changelog: [CHANGELOG.md](CHANGELOG.md).")
+          else:
+              print(f"See [CHANGELOG_EN.md](CHANGELOG_EN.md) for {version}.")
+          PY
+          echo "--- release notes ---"
+          head -5 release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           generate_release_notes: true
           files: artifacts/*
