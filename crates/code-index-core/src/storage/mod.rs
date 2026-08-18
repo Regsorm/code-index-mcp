@@ -938,7 +938,7 @@ impl Storage {
         let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(g) = path_glob {
             // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
-            let variants = expand_glob_braces(g);
+            let variants = expand_glob_variants(g);
             conds.push(format!(
                 "({})",
                 vec!["fi.path GLOB ?"; variants.len()].join(" OR ")
@@ -2012,7 +2012,7 @@ impl Storage {
         let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(g) = pattern {
             // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
-            let variants = expand_glob_braces(g);
+            let variants = expand_glob_variants(g);
             conds.push(format!(
                 "({})",
                 vec!["path GLOB ?"; variants.len()].join(" OR ")
@@ -2251,7 +2251,7 @@ impl Storage {
         let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(g) = path_glob {
             // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
-            let variants = expand_glob_braces(g);
+            let variants = expand_glob_variants(g);
             conds.push(format!(
                 "({})",
                 vec!["fi.path GLOB ?"; variants.len()].join(" OR ")
@@ -2304,7 +2304,7 @@ impl Storage {
         // Доп. условия для общей секции (применяются и к functions, и к classes)
         // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
         let glob_variants: Vec<String> = path_glob
-            .map(|g| expand_glob_braces(g).iter().map(|v| normalize_glob(v)).collect())
+            .map(|g| expand_glob_variants(g).iter().map(|v| normalize_glob(v)).collect())
             .unwrap_or_default();
         let mut extra_conds: Vec<String> = Vec::new();
         if language.is_some() {
@@ -2667,6 +2667,48 @@ pub(crate) fn normalize_glob(pattern: &str) -> String {
         s = s.replace("**", "*");
     }
     s
+}
+
+/// Раскрытие сегмента `**/` в два варианта: «через промежуточные каталоги» и
+/// «без них» (находка M-6).
+///
+/// И SQLite GLOB, и `globset` требуют буквального `/`, который остаётся в
+/// образце после схлопывания `**` в `*`. Из-за этого `**/*.md` переставал
+/// совпадать с файлами в КОРНЕ репозитория: путь `CHANGELOG.md` разделителя не
+/// содержит. Отказ молчаливый — пустая выдача неотличима от «такого нет».
+///
+/// Поэтому сегмент раскрывается заранее: `**/*.md` → [`*/*.md`, `*.md`],
+/// `src/**/mod.rs` → [`src/*/mod.rs`, `src/mod.rs`]. Вызывающая сторона уже
+/// соединяет варианты через `OR`, поэтому её менять не нужно.
+///
+/// Несколько сегментов — произведение вариантов (cap 64, как у brace-групп);
+/// при переполнении возвращается исходный образец.
+pub(crate) fn expand_doublestar(pattern: &str) -> Vec<String> {
+    const CAP: usize = 64;
+    let Some(pos) = pattern.find("**/") else {
+        return vec![pattern.to_string()];
+    };
+    let prefix = &pattern[..pos];
+    let suffix = &pattern[pos + 3..];
+    let mut out = Vec::new();
+    for tail in expand_doublestar(suffix) {
+        out.push(format!("{prefix}*/{tail}"));
+        out.push(format!("{prefix}{tail}"));
+        if out.len() > CAP {
+            return vec![pattern.to_string()];
+        }
+    }
+    out
+}
+
+/// Полное раскрытие образца пути: сначала brace-альтернативы `{a,b}`, затем
+/// сегменты `**/`. Единая точка для всех путевых фильтров — SQL-пушдаун
+/// (`grep_*`, `list_files`) и пост-фильтр через `globset` в MCP-слое.
+pub(crate) fn expand_glob_variants(pattern: &str) -> Vec<String> {
+    expand_glob_braces(pattern)
+        .iter()
+        .flat_map(|p| expand_doublestar(p))
+        .collect()
 }
 
 /// Раскрытие brace-альтернатив `{a,b}` в набор паттернов (W12-mini).
@@ -3714,6 +3756,47 @@ mod tests {
         assert_eq!(expand_glob_braces("a{}b"), vec!["a{}b"]);
         // Незакрытая скобка — литерально.
         assert_eq!(expand_glob_braces("a{b,c"), vec!["a{b,c"]);
+    }
+
+    /// M-6: сегмент `**/` раскрывается в два варианта — «через каталоги» и
+    /// «без них», иначе образец перестаёт совпадать с файлами в корне.
+    #[test]
+    fn doublestar_expands_to_with_and_without_segment() {
+        assert_eq!(expand_doublestar("**/*.md"), vec!["*/*.md", "*.md"]);
+        assert_eq!(
+            expand_doublestar("src/**/mod.rs"),
+            vec!["src/*/mod.rs", "src/mod.rs"]
+        );
+        // Без сегмента — образец как есть.
+        assert_eq!(expand_doublestar("*.py"), vec!["*.py"]);
+        // `**` без разделителя не трогаем — его схлопнёт normalize_glob.
+        assert_eq!(expand_doublestar("src/**"), vec!["src/**"]);
+        // Два сегмента — произведение вариантов. Порядок для OR-условий
+        // безразличен, поэтому сравниваем как множество.
+        let mut two = expand_doublestar("**/a/**/b.rs");
+        two.sort();
+        assert_eq!(
+            two,
+            vec!["*/a/*/b.rs", "*/a/b.rs", "a/*/b.rs", "a/b.rs"]
+        );
+    }
+
+    /// M-6: полное раскрытие — сначала скобки, затем `**/`; файл в корне
+    /// обязан попадать хотя бы в один вариант.
+    #[test]
+    fn glob_variants_cover_repository_root() {
+        let variants = expand_glob_variants("**/*.{md,toml}");
+        assert!(
+            variants.contains(&"*.md".to_string()),
+            "корневой .md должен покрываться, получено: {variants:?}"
+        );
+        assert!(
+            variants.contains(&"*.toml".to_string()),
+            "корневой .toml должен покрываться, получено: {variants:?}"
+        );
+        // Вложенные пути не потеряны.
+        assert!(variants.contains(&"*/*.md".to_string()));
+        assert!(variants.contains(&"*/*.toml".to_string()));
     }
 
     #[test]

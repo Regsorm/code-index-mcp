@@ -1173,10 +1173,76 @@ impl CodeIndexServer {
 // `LanguageProcessor`-ов. Поэтому пишем три метода руками, делегируя
 // core-tools в `tool_router`, а extension — в свой Vec.
 
-/// Инструменты, которые НЕ кэшируем: `health` (liveness) и `get_stats`
-/// (federation-опрос живости remote-нод — ответ должен быть свежим).
+/// Инструменты, которые НЕ кэшируем: `health` (liveness), `get_stats`
+/// (federation-опрос живости remote-нод — ответ должен быть свежим) и
+/// `stat_file`.
+///
+/// `stat_file` добавлен в 0.49.4 (M-7): он и задуман некэшируемым — отдаёт
+/// размер, mtime и признак oversize, то есть ровно то, что меняется первым, —
+/// и потому единственный из инструментов намеренно не заворачивается в `_meta`.
+/// Но в списке его не было, а без `_meta` у ответа нет зависимых файлов, значит
+/// точечная инвалидация до него не достаёт: устаревшие метаданные файла жили
+/// весь срок хранения записи.
 fn is_cacheable_tool(tool: &str) -> bool {
-    !matches!(tool, "health" | "get_stats")
+    !matches!(tool, "health" | "get_stats" | "stat_file")
+}
+
+/// Срок хранения ответа, у которого НЕТ зависимых файлов (M-7).
+///
+/// Точечная инвалидация вытесняет записи через обратный индекс `файл → ключи`.
+/// Ответ, не связанный ни с одним файлом (пустой результат поиска, обход графа
+/// вызовов), в этот индекс не попадает и обычным путём не вытесняется вообще —
+/// он доживает до конца базового срока (час). Практическое последствие:
+/// «ничего не найдено» продолжает отдаваться после того, как данные появились.
+/// Такие ответы дёшевы в пересчёте, поэтому храним их недолго.
+const DEPLESS_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Статусы служебных отказов `ToolUnavailable`. Отдаются как ОБЫЧНАЯ успешная
+/// строка (в теле ответа), поэтому по `is_error` их не отличить.
+const TRANSIENT_STATUSES: [&str; 5] = [
+    "not_started",
+    "indexing",
+    "error",
+    "daemon_offline",
+    "unknown_repo",
+];
+
+/// Достать содержательную часть ответа из сериализованного `CallToolResult`.
+/// Формы те же три, что у `extract_meta_obj`: вложенный JSON в `content[*].text`,
+/// `structuredContent`, плоский объект верхнего уровня.
+fn extract_inner_value(payload: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
+        for item in arr {
+            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                if let Ok(inner) = serde_json::from_str::<serde_json::Value>(t) {
+                    return Some(inner);
+                }
+            }
+        }
+    }
+    if let Some(sc) = v.get("structuredContent") {
+        return Some(sc.clone());
+    }
+    Some(v)
+}
+
+/// Ответ — служебный отказ, а не данные? (M-7)
+///
+/// Сюда попадают `ToolUnavailable` («демон недоступен», «идёт индексация», «путь
+/// не отслеживается», «неизвестный репозиторий») и ответы вида `{"error": …}`
+/// («файл не найден», ошибка разбора образца пути). Все они возвращаются
+/// успешным результатом, поэтому проверка `is_error` их пропускает, а зависимых
+/// файлов у них нет — точечная инвалидация бессильна. Кэшировать нельзя: демон
+/// поднялся минуту назад, а клиент до конца срока хранения получает отказ.
+fn is_transient_failure(inner: &serde_json::Value) -> bool {
+    if inner.get("error").is_some() {
+        return true;
+    }
+    match inner.get("status").and_then(|s| s.as_str()) {
+        Some(s) => TRANSIENT_STATUSES.contains(&s),
+        None => false,
+    }
 }
 
 /// Снять служебное поле `_meta` из сериализованного `CallToolResult` перед
@@ -1330,6 +1396,15 @@ impl CodeIndexServer {
         let Ok(s) = serde_json::to_string(res) else {
             return;
         };
+        // Служебный отказ, отданный успешным результатом (M-7): «демон
+        // недоступен», «идёт индексация», «файл не найден». Зависимых файлов у
+        // него нет, точечная инвалидация до него не достаёт — в кэш не берём,
+        // иначе отказ переживает устранение своей причины.
+        if let Some(inner) = extract_inner_value(&s) {
+            if is_transient_failure(&inner) {
+                return;
+            }
+        }
         let meta = extract_meta_obj(&s);
         if let Some(m) = &meta {
             if self.meta_has_stale(repo, m) {
@@ -1337,7 +1412,15 @@ impl CodeIndexServer {
             }
         }
         let deps = meta.as_ref().map(meta_dependent_files).unwrap_or_default();
-        self.cache.insert(k.clone(), Arc::new(s), repo, &deps);
+        if deps.is_empty() {
+            // Ответ ни к одному файлу не привязан (пустой результат поиска,
+            // обход графа вызовов) — обычной инвалидацией не вытесняется,
+            // поэтому кладём на короткий срок (M-7).
+            self.cache
+                .insert_with_ttl(k.clone(), Arc::new(s), repo, &deps, DEPLESS_TTL);
+        } else {
+            self.cache.insert(k.clone(), Arc::new(s), repo, &deps);
+        }
     }
 
     /// Ответ построен на НЕ догнавшем индексе? Проверка ПО ФАЙЛУ: для каждого
@@ -2033,6 +2116,82 @@ mod conditional_registration_tests {
         shrunk.insert("python".to_string());
         server.reload_extensions(shrunk).await;
         assert_eq!(server.extension_tools_count(), 0);
+    }
+}
+
+// ── Тесты политики кэширования (M-7, 0.49.4) ──────────────────────────────
+
+#[cfg(test)]
+mod cache_policy_tests {
+    use super::{extract_inner_value, is_cacheable_tool, is_transient_failure};
+    use serde_json::json;
+
+    /// Служебные отказы отдаются УСПЕШНЫМ результатом, поэтому распознаём их по
+    /// телу: `ToolUnavailable` по полю `status`, ошибки инструментов — по `error`.
+    #[test]
+    fn transient_failures_are_recognized() {
+        for status in [
+            "not_started",
+            "indexing",
+            "error",
+            "daemon_offline",
+            "unknown_repo",
+        ] {
+            let v = json!({ "status": status, "message": "..." });
+            assert!(is_transient_failure(&v), "статус {status} — отказ");
+        }
+        // Ответ инструмента об ошибке.
+        assert!(is_transient_failure(&json!({ "error": "Файл 'x' не найден" })));
+    }
+
+    /// Нормальные ответы под правило не подпадают — иначе кэш перестанет работать.
+    #[test]
+    fn normal_responses_are_not_failures() {
+        // Обычная обёртка данных.
+        assert!(!is_transient_failure(&json!({ "result": [1, 2, 3] })));
+        // Пустой результат — это данные, а не отказ (для него отдельное правило —
+        // короткий срок хранения, а не отказ от кэширования).
+        assert!(!is_transient_failure(&json!({ "result": [], "hint": "0 совпадений" })));
+        // Поле status со значением вне списка отказов.
+        assert!(!is_transient_failure(&json!({ "result": {}, "status": "ok" })));
+        // Плоский ответ stat_file.
+        assert!(!is_transient_failure(&json!({ "path": "a.rs", "exists": true })));
+    }
+
+    /// Содержательная часть достаётся из всех трёх форм ответа.
+    #[test]
+    fn inner_value_extracted_from_three_shapes() {
+        // 1) MCP: вложенный JSON в content[*].text
+        let inner = json!({ "status": "daemon_offline", "message": "демон не доступен" });
+        let mcp = json!({ "content": [{ "type": "text", "text": inner.to_string() }] }).to_string();
+        assert!(is_transient_failure(&extract_inner_value(&mcp).unwrap()));
+
+        // 2) structuredContent
+        let sc = json!({
+            "content": [],
+            "structuredContent": { "error": "storage pool: закрыт" }
+        })
+        .to_string();
+        assert!(is_transient_failure(&extract_inner_value(&sc).unwrap()));
+
+        // 3) плоский объект верхнего уровня
+        let top = json!({ "status": "indexing", "progress": 0.5 }).to_string();
+        assert!(is_transient_failure(&extract_inner_value(&top).unwrap()));
+
+        // Не JSON — None, вызывающая сторона просто не применяет правило.
+        assert!(extract_inner_value("не json").is_none());
+    }
+
+    /// `stat_file` объявлен некэшируемым в комментарии кода, но в списке его не
+    /// было — метаданные файла залипали на весь срок хранения.
+    #[test]
+    fn stat_file_is_not_cacheable() {
+        assert!(!is_cacheable_tool("stat_file"));
+        assert!(!is_cacheable_tool("health"));
+        assert!(!is_cacheable_tool("get_stats"));
+        // Инструменты данных кэшируются как прежде.
+        assert!(is_cacheable_tool("get_function"));
+        assert!(is_cacheable_tool("grep_code"));
     }
 }
 

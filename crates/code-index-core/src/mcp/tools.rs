@@ -432,13 +432,24 @@ pub(crate) fn collect_paths_via<R>(
 
 // ── Phase 1 helpers ─────────────────────────────────────────────────────────
 
-/// Скомпилировать glob → matcher через `globset`. Применяется к результатам
-/// после SQL-выборки в search_*/get_*. Использует `storage::normalize_glob`
-/// для приведения `**` к `*` (см. SQLite GLOB-семантику).
-pub(crate) fn build_path_matcher(glob: &str) -> Result<globset::GlobMatcher, String> {
-    let normalized = crate::storage::normalize_glob(glob);
-    globset::Glob::new(&normalized)
-        .map(|g| g.compile_matcher())
+/// Скомпилировать образец пути в набор сопоставителей через `globset`.
+/// Применяется к результатам после SQL-выборки в search_*/get_*.
+///
+/// Образец сначала раскрывается тем же способом, что и для SQL-пушдауна
+/// (`storage::expand_glob_variants`: brace-альтернативы `{a,b}` и сегменты
+/// `**/`), и только потом каждый вариант нормализуется под семантику `*`.
+/// Без раскрытия `**/` пост-фильтр терял файлы в корне репозитория так же,
+/// как их терял SQL-фильтр (находка M-6).
+pub(crate) fn build_path_matcher(glob: &str) -> Result<globset::GlobSet, String> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for variant in crate::storage::expand_glob_variants(glob) {
+        let normalized = crate::storage::normalize_glob(&variant);
+        let compiled = globset::Glob::new(&normalized)
+            .map_err(|e| format!("невалидный glob '{}': {}", glob, e))?;
+        builder.add(compiled);
+    }
+    builder
+        .build()
         .map_err(|e| format!("невалидный glob '{}': {}", glob, e))
 }
 
@@ -456,11 +467,44 @@ pub(crate) fn lookup_path(
         .unwrap_or_default()
 }
 
-pub(crate) fn matches_with(matcher: &globset::GlobMatcher, path: &str) -> bool {
+pub(crate) fn matches_with(matcher: &globset::GlobSet, path: &str) -> bool {
     if path.is_empty() {
         return false;
     }
     matcher.is_match(path)
+}
+
+/// Добавка к ПУСТОМУ ответу поиска (M-8).
+///
+/// `path_glob` в `search_*` фильтрует уже отобранные по релевантности записи:
+/// из индекса берётся `sql_limit` штук, и только потом применяется путь. Если
+/// предвыборка упёрлась в свой потолок, а после фильтрации не осталось ничего —
+/// «пусто» НЕ означает «совпадений нет»: подходящее могло стоять ниже в
+/// ранжировании. Без этой пометки такой ответ неотличим от честного нуля.
+///
+/// Когда потолок не достигнут (или сужения по пути не было) — обычная подсказка.
+fn empty_search_extra(
+    base_hint: &str,
+    has_glob: bool,
+    prefetched: usize,
+    sql_limit: usize,
+) -> serde_json::Value {
+    if has_glob && prefetched >= sql_limit {
+        serde_json::json!({
+            "hint": format!(
+                "{} ▸ ВАЖНО: сужение по path_glob применялось к первым {} записям, \
+                 отобранным по релевантности, и все они отсеялись по пути — \
+                 совпадения могут быть ниже в ранжировании. Уточните query, \
+                 поднимите limit либо возьмите grep_code/grep_text с тем же \
+                 path_glob: они фильтруют путь в самом запросе, а не после выборки.",
+                base_hint, sql_limit
+            ),
+            "prefilter_exhausted": true,
+            "prefetched": prefetched,
+        })
+    } else {
+        serde_json::json!({ "hint": base_hint })
+    }
 }
 
 // ── Реализации инструментов ─────────────────────────────────────────────────
@@ -531,6 +575,8 @@ pub async fn search_function(
     };
     match storage.search_functions(&query, sql_limit, language.as_deref()) {
         Ok(mut r) => {
+            // Размер предвыборки ДО сужения по пути — вход для пометки M-8.
+            let prefetched = r.len();
             if let Some(ref g) = path_glob {
                 let matcher = match build_path_matcher(g) {
                     Ok(m) => m,
@@ -541,8 +587,15 @@ pub async fn search_function(
             }
             let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
             // W-бенч 11.06: на BSL-репо пустой результат ведёт в search_terms.
-            let hint =
-                if r.is_empty() { Some(search_empty_hint(entry.language.as_deref())) } else { None };
+            // M-8: плюс признак, что пусто из-за исчерпанной предвыборки.
+            let extra = r.is_empty().then(|| {
+                empty_search_extra(
+                    search_empty_hint(entry.language.as_deref()),
+                    path_glob.is_some(),
+                    prefetched,
+                    sql_limit,
+                )
+            });
             // Поисковая выдача БЕЗ тел функций: только имя/путь/строки/сигнатура +
             // обрезанный docstring. Полные тела 20 результатов раздували ответ до
             // 20-45K символов (слабое место прогона УТ-11). Тело — get_function.
@@ -550,7 +603,7 @@ pub async fn search_function(
                 .iter()
                 .map(|fr| function_search_hit(fr, &lookup_path(&storage, fr.file_id)))
                 .collect();
-            wrap_with_meta_hint(&storage, &hits, deps, hint)
+            wrap_with_meta_extra(&storage, &hits, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"search_function: {}\"}}", e),
     }
@@ -573,6 +626,8 @@ pub async fn search_class(
     };
     match storage.search_classes(&query, sql_limit, language.as_deref()) {
         Ok(mut r) => {
+            // Размер предвыборки ДО сужения по пути — вход для пометки M-8.
+            let prefetched = r.len();
             if let Some(ref g) = path_glob {
                 let matcher = match build_path_matcher(g) {
                     Ok(m) => m,
@@ -582,14 +637,21 @@ pub async fn search_class(
                 r.truncate(want);
             }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            let hint = if r.is_empty() { Some(HINT_SEARCH_EMPTY) } else { None };
+            let extra = r.is_empty().then(|| {
+                empty_search_extra(
+                    HINT_SEARCH_EMPTY,
+                    path_glob.is_some(),
+                    prefetched,
+                    sql_limit,
+                )
+            });
             // Поисковая выдача БЕЗ тел классов: имя/путь/строки/базы + обрезанный
             // docstring. Тело — get_class/read_file.
             let hits: Vec<serde_json::Value> = r
                 .iter()
                 .map(|cr| class_search_hit(cr, &lookup_path(&storage, cr.file_id)))
                 .collect();
-            wrap_with_meta_hint(&storage, &hits, deps, hint)
+            wrap_with_meta_extra(&storage, &hits, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"search_class: {}\"}}", e),
     }
@@ -827,7 +889,9 @@ pub async fn get_callers(
                         "caller": cr.caller,
                         "callee": cr.callee,
                         "line": cr.line,
-                        "file_id": cr.file_id,
+                        // `file_id` не кладём: общий срез служебных полей
+                        // (strip_plumbing_recursive) всё равно удаляет этот ключ
+                        // перед отдачей — файл-источник несёт `path` (M-9).
                         "path": lookup_path(&storage, cr.file_id),
                     })
                 })
@@ -874,7 +938,9 @@ pub async fn get_callees(
                         "caller": cr.caller,
                         "callee": cr.callee,
                         "line": cr.line,
-                        "file_id": cr.file_id,
+                        // `file_id` не кладём: общий срез служебных полей
+                        // (strip_plumbing_recursive) всё равно удаляет этот ключ
+                        // перед отдачей — файл-источник несёт `path` (M-9).
                         "path": lookup_path(&storage, cr.file_id),
                     })
                 })
@@ -909,6 +975,10 @@ pub async fn find_path(
         Ok(opt) => {
             let found = opt.is_some();
             let path = opt.unwrap_or_default();
+            // Зависимые файлы — источники рёбер найденного пути (M-7). Без них
+            // ответ не попадал в обратный индекс и точечной инвалидацией не
+            // вытеснялся: после правки кода обход графа отдавал старую картину.
+            let deps: Vec<String> = path.iter().filter_map(|e| e.path.clone()).collect();
             let result = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -920,7 +990,7 @@ pub async fn find_path(
             let hint = (!found).then_some(
                 "Путь не найден в графе вызовов. Увеличьте max_depth, проверьте точные имена функций (get_function) или снимите language=.",
             );
-            wrap_with_meta_hint(&storage, &result, Vec::new(), hint)
+            wrap_with_meta_hint(&storage, &result, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"find_path: {}\"}}", e),
     }
@@ -944,6 +1014,8 @@ pub async fn get_call_tree(
         Ok((edges, truncated)) => {
             let tree = build_call_tree_json(&root, down, &edges);
             let empty = edges.is_empty();
+            // Зависимые файлы — источники рёбер дерева (M-7), см. find_path.
+            let deps: Vec<String> = edges.iter().filter_map(|e| e.path.clone()).collect();
             let result = serde_json::json!({
                 "root": root,
                 "direction": if down { "callees" } else { "callers" },
@@ -965,7 +1037,7 @@ pub async fn get_call_tree(
             } else {
                 None
             };
-            wrap_with_meta_extra(&storage, &result, Vec::new(), extra)
+            wrap_with_meta_extra(&storage, &result, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"get_call_tree: {}\"}}", e),
     }
@@ -1418,6 +1490,8 @@ pub async fn search_text(
     };
     match storage.search_text(&query, sql_limit, language.as_deref()) {
         Ok(mut results) => {
+            // Размер предвыборки ДО сужения по пути — вход для пометки M-8.
+            let prefetched = results.len();
             if let Some(ref g) = path_glob {
                 let matcher = match build_path_matcher(g) {
                     Ok(m) => m,
@@ -1431,8 +1505,15 @@ pub async fn search_text(
                 .into_iter()
                 .map(|(path, snippet)| serde_json::json!({ "path": path, "snippet": snippet }))
                 .collect();
-            let hint = if items.is_empty() { Some(HINT_SEARCH_TEXT_EMPTY) } else { None };
-            wrap_with_meta_hint(&storage, &items, deps, hint)
+            let extra = items.is_empty().then(|| {
+                empty_search_extra(
+                    HINT_SEARCH_TEXT_EMPTY,
+                    path_glob.is_some(),
+                    prefetched,
+                    sql_limit,
+                )
+            });
+            wrap_with_meta_extra(&storage, &items, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"search_text: {}\"}}", e),
     }
@@ -1792,6 +1873,51 @@ mod tests {
     use super::*;
     use crate::storage::{PoolConfig, Storage, StoragePool};
     use std::time::{Duration, Instant};
+
+    /// M-6: пост-фильтр по образцу пути обязан находить файлы в КОРНЕ репо.
+    /// До правки `**/` схлопывался в `*/`, разделитель оставался обязательным,
+    /// и `CHANGELOG.md` не совпадал — пустая выдача была неотличима от «нет».
+    #[test]
+    fn path_matcher_matches_repository_root() {
+        let m = build_path_matcher("**/*.md").expect("образец должен компилироваться");
+        assert!(matches_with(&m, "CHANGELOG.md"), "файл в корне");
+        assert!(matches_with(&m, "docs/audit.md"), "файл в подкаталоге");
+        assert!(matches_with(&m, "a/b/c/deep.md"), "глубокая вложенность");
+        assert!(!matches_with(&m, "src/main.rs"), "другое расширение");
+        assert!(!matches_with(&m, ""), "пустой путь");
+
+        // Образец с сегментом в середине: обе глубины.
+        let m2 = build_path_matcher("crates/**/mod.rs").expect("образец должен компилироваться");
+        assert!(matches_with(&m2, "crates/mod.rs"), "без промежуточных каталогов");
+        assert!(matches_with(&m2, "crates/core/src/mod.rs"), "с каталогами");
+
+        // Brace-альтернативы вместе с `**/` — и корень, и вложенность.
+        let m3 = build_path_matcher("**/*.{md,toml}").expect("образец должен компилироваться");
+        assert!(matches_with(&m3, "Cargo.toml"), "корневой toml");
+        assert!(matches_with(&m3, "crates/core/Cargo.toml"), "вложенный toml");
+    }
+
+    /// M-8: пустая выдача поиска, где сужение по пути съело всю предвыборку,
+    /// помечается отдельно — иначе она неотличима от честного «совпадений нет».
+    #[test]
+    fn empty_search_extra_marks_exhausted_prefilter() {
+        // Предвыборка упёрлась в потолок, после фильтра пусто → пометка есть.
+        let v = empty_search_extra("база", true, 100, 100);
+        assert_eq!(v["prefilter_exhausted"], serde_json::json!(true));
+        assert_eq!(v["prefetched"], serde_json::json!(100));
+        let hint = v["hint"].as_str().unwrap();
+        assert!(hint.starts_with("база"), "исходная подсказка сохранена");
+        assert!(hint.contains("path_glob"), "объяснено, почему пусто");
+
+        // Потолок не достигнут — значит отсеял действительно путь, пометки нет.
+        let v2 = empty_search_extra("база", true, 7, 100);
+        assert!(v2.get("prefilter_exhausted").is_none());
+        assert_eq!(v2["hint"], serde_json::json!("база"));
+
+        // Без сужения по пути пометка не появляется никогда.
+        let v3 = empty_search_extra("база", false, 100, 100);
+        assert!(v3.get("prefilter_exhausted").is_none());
+    }
 
     /// Срез плумбинга: 6 ключей исчезают на объекте, на элементах массива и
     /// во вложенности; полезные поля (name/body/path и пр.) сохраняются.

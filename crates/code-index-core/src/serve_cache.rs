@@ -157,12 +157,31 @@ impl ServeCache {
     /// от файлов `deps` (rel_path) в обратном индексе — для per-file инвалидации.
     /// No-op при `enabled=false`.
     pub fn insert(&self, key: String, payload: Arc<String>, repo: &str, deps: &[String]) {
+        self.insert_with_ttl(key, payload, repo, deps, self.ttl);
+    }
+
+    /// Как [`Self::insert`], но с явным сроком жизни записи.
+    ///
+    /// Нужно для ответов БЕЗ зависимых файлов (M-7): точечная инвалидация
+    /// работает через обратный индекс `файл → ключи`, поэтому ответ, не
+    /// связанный ни с одним файлом, ею не вытесняется в принципе и живёт весь
+    /// базовый срок. Для пустых результатов поиска это означает залипание
+    /// «ничего не найдено» уже после того, как данные появились. Такие записи
+    /// кладём на короткий срок — пересчитать их дёшево.
+    pub fn insert_with_ttl(
+        &self,
+        key: String,
+        payload: Arc<String>,
+        repo: &str,
+        deps: &[String],
+        ttl: std::time::Duration,
+    ) {
         if !self.enabled {
             return;
         }
         let entry = Entry {
             payload,
-            expires: Instant::now() + self.ttl,
+            expires: Instant::now() + ttl,
         };
         lock_w(&self.store).insert(key.clone(), entry);
         if !deps.is_empty() {
@@ -415,6 +434,37 @@ mod tests {
         assert!(c.get(&key).is_none());
         c.insert(key.clone(), Arc::new("payload".into()), "ut", &[]);
         assert_eq!(c.get(&key).as_deref().map(String::as_str), Some("payload"));
+    }
+
+    /// M-7: ответ без зависимых файлов кладётся на короткий срок. Точечная
+    /// инвалидация работает через обратный индекс «файл → ключи», поэтому такую
+    /// запись ею не вытеснить — единственная защита от залипания это срок.
+    #[test]
+    fn depless_entry_expires_by_its_own_ttl() {
+        use std::time::Duration;
+        let c = ServeCache::new(3600, true);
+        let short = ServeCache::key("ut", "grep_code", &json!({"regex": "нет-такого"}));
+        c.insert_with_ttl(
+            short.clone(),
+            Arc::new("{\"result\":{\"files\":{}}}".into()),
+            "ut",
+            &[],
+            Duration::from_millis(40),
+        );
+        assert!(c.get(&short).is_some(), "сразу после вставки — попадание");
+        std::thread::sleep(Duration::from_millis(90));
+        assert!(
+            c.get(&short).is_none(),
+            "после своего короткого срока запись перестаёт отдаваться"
+        );
+
+        // Запись с зависимостью живёт по базовому сроку и вытесняется по файлу.
+        let long = ServeCache::key("ut", "get_function", &json!({"name": "X"}));
+        c.insert(long.clone(), Arc::new("{}".into()), "ut", &["src/X.bsl".to_string()]);
+        std::thread::sleep(Duration::from_millis(90));
+        assert!(c.get(&long).is_some(), "базовый срок не истёк");
+        assert_eq!(c.invalidate_files("ut", &["src/X.bsl".to_string()]), 1);
+        assert!(c.get(&long).is_none(), "вытеснена точечной инвалидацией");
     }
 
     #[test]
