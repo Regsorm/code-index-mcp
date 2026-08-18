@@ -5,6 +5,31 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.49.9] — 2026-08-18
+
+**Line anchors now work in files with CRLF endings, and the path-prefix filter works on paths containing an underscore. Both failures were silent: the tool returned zero, indistinguishable from an honest "nothing found".**
+
+> Context. Findings H-1, H-2, H-5, H-6 of the storage audit.
+
+### Fixed
+
+- **The end-of-line anchor found nothing in files with CRLF.** The same expression was applied to two different representations of the text: the pre-filter to the whole text, where a line ends with carriage return plus line feed, and the line-by-line scan to lines with the carriage return already stripped. In multi-line mode `$` matches right before the line feed, and a carriage return sat there — so the file was discarded whole before the scan began. `grep_code`, `grep_text` and `grep_body` were all affected. Line endings are now normalised before the expression is applied — in the shared content-scanning path and in the SQL `REGEXP` function; the copy is made only when a carriage return is actually present.
+- **The path-prefix filter missed paths with an underscore or a percent sign.** Pattern-matching special characters were escaped with a backslash, but the query had no `ESCAPE` clause, so SQLite treated the backslash as an ordinary character and looked for a path literally containing it. There were never any matches: a `path_prefix` with an underscore — the norm for directories like `daemon_core` and for 1C external-processing names — silently returned an empty list. The escaping did not merely fail to help, it created the defect.
+- **Schema migrations were not applied on every database-opening path.** The set of migrations was listed twice — when creating a database and when loading an existing one into memory — and the second list lagged behind: the content-table migrations never made it there. A database from an older binary opened this way stayed without them, and the first content write failed with "no such table". The chain now lives in one function called by both paths; that path also explicitly enables foreign keys and sets the cache size, which it lacked entirely.
+- **A line longer than the soft limit made a file unreadable.** Line collection stopped as soon as one did not fit the budget; when the very first line exceeded it (minified js/css/json — the whole file on one line), empty content went out with a truncation flag. The file could not be read whole or by range — there is only one line. Its beginning is now returned, cut on a character boundary.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 672 passed, 0 failed (was 667; five new ones: anchors on content with CRLF specifically, for code and for bodies; a prefix with an underscore and with a percent sign; the full migration chain on a database whose content tables were dropped; a long line whole and by range).
+- **Live check on Windows (repository with CRLF endings):** `grep_code` for `^use std::sync::Arc;$` — 1 match, `grep_body` for `^\s+Ok\(\(\)\)$` — 30, `grep_text` for `^# Changelog$` — 1; before the fix all three returned zero. Prefix `crates/code-index-core/src/daemon_core/` — 13 files, exactly as many as the same directory by pattern; before the fix — zero.
+- **Checking the check:** the long-line test was run with the fix disabled and failed — so it catches this defect rather than passing incidentally.
+- **Live check through federation (remote node, a repository holding a 1C configuration):** a prefix for a directory whose name contains an underscore — 14 files against the previous zero, exactly as many as the same directory by pattern; on a repository with LF endings anchor search is unchanged, so normalisation broke nothing. The previous release's fixes were confirmed here too: the listing is capped and carries the total, path-scoped search returns 10 records with the incompleteness marker.
+- **What was NOT verified live:** the migration-chain divergence. All eight working databases are already migrated, so the defect is dormant — it can only be reproduced on an artificial database, which the unit test does.
+
+### Compatibility
+
+- No reindexing required: the changes live in the read path and in database opening. Search behaviour changes only where it previously returned a silent zero.
+
 ## [0.49.8] — 2026-08-18
 
 **Responses no longer pass off a partial answer as a complete one: the file listing and path-scoped search now say that not everything is shown, and how much there is in total.**
@@ -13,7 +38,7 @@ Versioning — [SemVer](https://semver.org/).
 
 ### Fixed
 
-- **The file listing was truncated silently (`list_files`).** The default is 500 files; beyond that the query simply stopped, and the answer was indistinguishable from a complete directory listing: on a 1C configuration a request for all modules returned 500 entries out of 18,298. The response now carries `truncated`, `total` (how many actually match), `shown` and `limit`. The extra count runs only when the query hit its ceiling — if there are fewer files, there is no second database round-trip. The default of 500 is now stated in the tool and parameter descriptions.
+- **The file listing was truncated silently (`list_files`).** The default is 500 files; beyond that the query simply stopped, and the answer was indistinguishable from a complete directory listing: on a 1C configuration a request for all modules returned 500 entries while many thousands matched. The response now carries `truncated`, `total` (how many actually match), `shown` and `limit`. The extra count runs only when the query hit its ceiling — if there are fewer files, there is no second database round-trip. The default of 500 is now stated in the tool and parameter descriptions.
 - **Path-scoped search stayed silent about incompleteness whenever anything was found (`search_function`, `search_class`, `search_text`).** The `prefilter_exhausted` marker arrived in 0.49.4 but hung on the "result is empty" condition. Yet the path filter is applied AFTER the top records are fetched by relevance: a dozen records out of many hundreds could remain, with nothing to indicate it. The marker is now emitted for non-empty results too, along with `prefetched` and `shown`. It sits next to `result` rather than in the internal field — that field is stripped before the response reaches the client.
 - **Mass mode lost the response's link to its source files.** A batched answer (`names[]` on `get_function`/`get_class`) was assembled without the internal field entirely. As a result its cache entry never entered the reverse index — per-file eviction could not reach it, and the "response built on a lagging index" check never ran for a batch. The dependencies of all elements are now merged into one internal field on the response.
 - **The `grep_body` truncation marker fired falsely.** In the branch without a path filter and without context it was derived from "matches are not fewer than requested": a request whose ceiling equalled the number of matches was marked truncated even though there were no more. It now fetches one match beyond the ceiling and sets the marker only if that extra one arrives.
@@ -21,8 +46,9 @@ Versioning — [SemVer](https://semver.org/).
 ### Testing
 
 - **Unit tests:** `cargo test --workspace` — 667 passed, 0 failed (was 664; three new tests: the marker on a non-empty result, counting files under the listing filters, merging dependencies in mass mode).
-- **Live check on Windows:** a listing of all configuration modules — 500 rows with `truncated: true` and `total: 18,298`; a complete four-file listing — no extra fields. Path-scoped search — 11 records with the incompleteness marker and `prefetched: 75`; search without scoping — 16 records, no marker. Per-file cache eviction after a single and a batched call removed 2 entries instead of the previous 1. `grep_body`: with 2 matches, a ceiling of 2 yields `truncated: false`, a ceiling of 1 yields `true`.
-- **Live check on Linux (federation node):** the same listing — 500 rows out of 14,905; path-scoped search — 12 records with the marker (exactly the case that started the audit); `grep_body` on a sample with 9 matches: ceiling 9 — `truncated: false`, ceiling 8 — `true`. Federation responds normally (57,060 files in the remote repository), local repositories unaffected.
+- **Live check on Windows:** a listing of all configuration modules — 500 rows with `truncated: true` and the real count in `total`; a complete four-file listing — no extra fields. Path-scoped search — 11 records with the incompleteness marker and `prefetched: 75`; search without scoping — 16 records, no marker. Per-file cache eviction after a single and a batched call removed 2 entries instead of the previous 1. `grep_body`: with 2 matches, a ceiling of 2 yields `truncated: false`, a ceiling of 1 yields `true`.
+- **Live check on a second local repository (1C configuration):** the same listing — 500 rows with the truncation flag and the total; path-scoped search — 12 records with the marker (exactly the case that started the audit); `grep_body` on a sample with 9 matches: ceiling 9 — `truncated: false`, ceiling 8 — `true`.
+- **Federation was verified separately, after the release** (figures in 0.49.9): while preparing the next release it turned out that the repository taken here as remote is in fact served locally, so those requests went to the local index. The conclusion "the fixes work on the federation node" was confirmed by re-checking against a genuinely remote repository.
 
 ### Compatibility
 
