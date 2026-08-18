@@ -20,9 +20,11 @@
 use anyhow::{anyhow, Result};
 
 use super::types::{
-    hash_ast, sha256_hex, ParseResult, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+    sha256_hex, ParseResult, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
 };
 use super::LanguageParser;
+use super::types::MAX_VISIT_DEPTH;
+use super::types::PARSE_TIMEOUT_MS;
 
 pub struct HtmlParser;
 
@@ -51,6 +53,11 @@ fn parse_html(source: &str) -> Result<ParseResult> {
     parser
         .set_language(&tree_sitter_html::LANGUAGE.into())
         .map_err(|e| anyhow!("set HTML language: {}", e))?;
+
+    // Дедлайн разбора — страховка от нелинейной деградации tree-sitter на
+    // патологическом вводе (минифицированные и сгенерированные файлы).
+    #[allow(deprecated)]
+    parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("tree-sitter-html: пустое дерево"))?;
@@ -59,11 +66,10 @@ fn parse_html(source: &str) -> Result<ParseResult> {
     let root = tree.root_node();
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        visit_node(child, &mut ctx);
+        visit_node(child, &mut ctx, 0);
     }
 
     let lines_total = source.lines().count();
-    let ast_hash = hash_ast(root);
     Ok(ParseResult {
         functions: ctx.functions,
         classes: ctx.classes,
@@ -71,7 +77,6 @@ fn parse_html(source: &str) -> Result<ParseResult> {
         calls: Vec::new(), // у HTML нет «вызовов»
         variables: ctx.variables,
         lines_total,
-        ast_hash,
     })
 }
 
@@ -190,22 +195,27 @@ fn raw_inner_text<'a>(element: tree_sitter::Node<'a>, source: &'a [u8]) -> Strin
 }
 
 /// Главный обход.
-fn visit_node(node: tree_sitter::Node, ctx: &mut VisitContext) {
+fn visit_node(node: tree_sitter::Node, ctx: &mut VisitContext, depth: usize) {
+    // Предел глубины обхода — защита от переполнения стека (P-2).
+    // У битой разметки дерево бывает вложено намного глубже вёрстки.
+    if depth > MAX_VISIT_DEPTH {
+        return;
+    }
     match node.kind() {
         "script_element" => visit_script_element(node, ctx),
         "style_element" => visit_style_element(node, ctx),
-        "element" => visit_element(node, ctx),
+        "element" => visit_element(node, ctx, depth),
         // fragment / другие узлы — рекурсивно обходим детей
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit_node(child, ctx);
+                visit_node(child, ctx, depth + 1);
             }
         }
     }
 }
 
-fn visit_element(node: tree_sitter::Node, ctx: &mut VisitContext) {
+fn visit_element(node: tree_sitter::Node, ctx: &mut VisitContext, depth: usize) {
     let line_start = node.start_position().row + 1;
     let line_end = node.end_position().row + 1;
 
@@ -325,7 +335,7 @@ fn visit_element(node: tree_sitter::Node, ctx: &mut VisitContext) {
     // Рекурсия в детей — всегда, чтобы поймать вложенные элементы
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_node(child, ctx);
+        visit_node(child, ctx, depth + 1);
     }
 }
 

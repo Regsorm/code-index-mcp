@@ -99,6 +99,12 @@ struct ParseContext {
     current_attribute_name: Option<String>,
     /// Флаг: корневые <Properties> объекта ещё не прочитаны
     root_properties_done: bool,
+    /// Строка, на которой открылся текущий <Attribute> верхнего уровня
+    attribute_start_line: usize,
+    /// Строка, на которой открылась текущая <TabularSection>
+    tabular_start_line: usize,
+    /// Строка, на которой открылась текущая <Form>
+    form_start_line: usize,
 }
 
 impl ParseContext {
@@ -110,6 +116,11 @@ impl ParseContext {
         let len = self.tag_stack.len();
         self.tag_stack[len - 1] == "Name" && self.tag_stack[len - 2] == "Properties"
     }
+}
+
+/// Сколько переводов строк в срезе байтов.
+fn count_newlines(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == b'\n').count()
 }
 
 /// Нормализовать имя тега: убрать namespace-префикс (например, "v8:item" → "item")
@@ -132,7 +143,6 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
             calls: vec![],
             variables: vec![],
             lines_total: source.lines().count(),
-            ast_hash: String::new(),
         });
     }
 
@@ -145,10 +155,25 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
     let mut buf = Vec::new();
 
     let mut ctx = ParseContext::default();
+    let source_bytes = source.as_bytes();
+    // Номер строки текущего события и байтовая позиция, до которой счётчик уже
+    // досчитан. `buffer_position` даёт смещение в БАЙТАХ — номером строки оно не
+    // является, поэтому переводы строк считаем по исходному тексту нарастающим итогом.
     let mut current_line: usize = 1;
+    let mut counted_upto: usize = 0;
 
     loop {
-        match reader.read_event_into(&mut buf) {
+        let ev = reader.read_event_into(&mut buf);
+        // Счётчик двигаем ПОСЛЕ чтения: ридер стоит на конце разобранного тега,
+        // поэтому для однострочного тега (обычный случай в выгрузках 1С) это и есть
+        // его собственная строка.
+        let pos = (reader.buffer_position() as usize).min(source_bytes.len());
+        if pos > counted_upto {
+            current_line += count_newlines(&source_bytes[counted_upto..pos]);
+            counted_upto = pos;
+        }
+
+        match ev {
             Ok(Event::Start(ref e)) => {
                 // Получаем имя тега без namespace
                 let raw = String::from_utf8_lossy(e.name().as_ref()).to_string();
@@ -172,17 +197,20 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
                         // Сбрасываем имя реквизита при входе
                         if ctx.attribute_depth == 1 {
                             ctx.current_attribute_name = None;
+                            ctx.attribute_start_line = current_line;
                         }
                     }
                     "TabularSection" => {
                         if !ctx.in_tabular_section {
                             ctx.in_tabular_section = true;
                             ctx.tabular_section_name = None;
+                            ctx.tabular_start_line = current_line;
                         }
                     }
                     "Form" => {
                         ctx.in_form = true;
                         ctx.form_name = None;
+                        ctx.form_start_line = current_line;
                     }
                     "Synonym" => {
                         ctx.in_synonym = true;
@@ -229,7 +257,7 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
                                 variables.push(ParsedVariable {
                                     name: attr_name,
                                     value: parent,
-                                    line: current_line,
+                                    line: ctx.attribute_start_line,
                                 });
                             }
                             ctx.in_attribute = false;
@@ -245,7 +273,7 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
                             variables.push(ParsedVariable {
                                 name: format!("Форма.{}", form_name),
                                 value: ctx.object_name.clone(),
-                                line: current_line,
+                                line: ctx.form_start_line,
                             });
                         }
                         ctx.in_form = false;
@@ -264,21 +292,17 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
             }
 
             Ok(Event::Text(ref e)) => {
-                let text = match e.unescape() {
-                    Ok(t) => t.to_string(),
-                    Err(_) => {
-                        buf.clear();
-                        continue;
-                    }
-                };
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    buf.clear();
-                    continue;
-                }
+                // Нечитаемый текст (ошибка снятия экранирования) и пробельные узлы
+                // пропускаем — фактов в них нет.
+                let text = e
+                    .unescape()
+                    .map(|t| t.trim().to_string())
+                    .unwrap_or_default();
 
                 // <v8:content> внутри Synonym — синоним объекта
-                if ctx.reading_synonym && ctx.object_synonym.is_none() {
+                if text.is_empty() {
+                    // нечего разбирать
+                } else if ctx.reading_synonym && ctx.object_synonym.is_none() {
                     ctx.object_synonym = Some(text.clone());
                 }
                 // <Name> внутри <Properties>
@@ -294,8 +318,8 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
                         // Сохраняем табличную часть как класс
                         classes.push(ParsedClass {
                             name: format!("ТабличнаяЧасть.{}", ts_name),
-                            line_start: current_line,
-                            line_end: current_line,
+                            line_start: ctx.tabular_start_line,
+                            line_end: ctx.tabular_start_line,
                             bases: Some("TabularSection".to_string()),
                             docstring: None,
                             body: String::new(),
@@ -321,8 +345,6 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
             _ => {}
         }
 
-        // Обновляем примерный номер строки через позицию ридера
-        current_line = reader.buffer_position() as usize;
         buf.clear();
     }
 
@@ -343,14 +365,6 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
                 },
             );
 
-            // ast_hash — от имени объекта + количество реквизитов
-            let ast_hash = sha256_hex(&format!(
-                "{}:{}:{}",
-                obj_name,
-                classes.len(),
-                variables.len()
-            ));
-
             return Ok(ParseResult {
                 functions: vec![],
                 classes,
@@ -358,17 +372,11 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
                 calls: vec![],
                 variables,
                 lines_total,
-                ast_hash,
             });
         }
     }
 
-    // Тег MetaDataObject есть, но структура не распознана — возвращаем пустой результат
-    let fallback_hash = if !classes.is_empty() || !variables.is_empty() {
-        sha256_hex(source)
-    } else {
-        String::new()
-    };
+    // Тег MetaDataObject есть, но структура не распознана — отдаём что нашли
     Ok(ParseResult {
         functions: vec![],
         classes,
@@ -376,7 +384,6 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
         calls: vec![],
         variables,
         lines_total,
-        ast_hash: fallback_hash,
     })
 }
 
@@ -577,5 +584,71 @@ mod tests {
         // Реквизиты табличной части
         assert!(result.variables.iter().any(|v| v.name == "Номенклатура"));
         assert!(result.variables.iter().any(|v| v.name == "Количество"));
+    }
+
+    /// P-1: в `line` должен лежать НОМЕР СТРОКИ, а не смещение в байтах.
+    /// Раньше туда шёл `reader.buffer_position()`, и у реквизитов появлялись
+    /// «строки» в десятки тысяч при файле в несколько сотен строк.
+    #[test]
+    fn test_line_numbers_are_lines_not_byte_offsets() {
+        // Строки пронумерованы: 1 — объявление XML, 8 — <Attribute>, 11 — <TabularSection>.
+        let source = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\">\n\
+    <Catalog uuid=\"c1\">\n\
+        <Properties>\n\
+            <Name>Контрагенты</Name>\n\
+        </Properties>\n\
+        <ChildObjects>\n\
+            <Attribute uuid=\"a1\">\n\
+                <Properties><Name>ИНН</Name></Properties>\n\
+            </Attribute>\n\
+            <TabularSection uuid=\"t1\">\n\
+                <Properties><Name>Контакты</Name></Properties>\n\
+            </TabularSection>\n\
+        </ChildObjects>\n\
+    </Catalog>\n\
+</MetaDataObject>";
+        let parser = Xml1CParser;
+        let result = parser.parse(source, "Catalogs/Контрагенты.xml").unwrap();
+        let total = source.lines().count();
+
+        let inn = result
+            .variables
+            .iter()
+            .find(|v| v.name == "ИНН")
+            .unwrap_or_else(|| panic!("реквизит ИНН не найден: {:?}", result.variables));
+        assert_eq!(inn.line, 8, "ИНН объявлен на строке 8, получено {}", inn.line);
+
+        let ts = result
+            .classes
+            .iter()
+            .find(|c| c.name == "ТабличнаяЧасть.Контакты")
+            .unwrap_or_else(|| panic!("табличная часть не найдена: {:?}", result.classes));
+        assert_eq!(
+            ts.line_start, 11,
+            "табличная часть открыта на строке 11, получено {}",
+            ts.line_start
+        );
+
+        // Ни один номер строки не должен выходить за пределы файла
+        for v in &result.variables {
+            assert!(
+                v.line >= 1 && v.line <= total,
+                "переменная {} вне файла ({} строк): строка {}",
+                v.name,
+                total,
+                v.line
+            );
+        }
+        for c in &result.classes {
+            assert!(
+                c.line_start >= 1 && c.line_start <= total && c.line_end <= total,
+                "класс {} вне файла ({} строк): {}..{}",
+                c.name,
+                total,
+                c.line_start,
+                c.line_end
+            );
+        }
     }
 }

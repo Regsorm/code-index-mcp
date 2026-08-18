@@ -394,12 +394,11 @@ pub(crate) fn wrap_with_meta_extra<T: serde::Serialize>(
 /// get_callers сериализуются в JSON-массив, а не объект). `mtime`/`file_size`
 /// НЕ трогаем намеренно — их смысл несёт stat_file.
 fn strip_plumbing_recursive(v: &mut serde_json::Value) {
-    const PLUMBING_KEYS: [&str; 6] = [
+    const PLUMBING_KEYS: [&str; 5] = [
         "id",
         "file_id",
         "node_hash",
         "content_hash",
-        "ast_hash",
         "indexed_at",
     ];
     match v {
@@ -2031,7 +2030,7 @@ mod tests {
         assert!(empty["hint"].as_str().unwrap().starts_with("база"));
     }
 
-    /// Срез плумбинга: 6 ключей исчезают на объекте, на элементах массива и
+    /// Срез плумбинга: 5 ключей исчезают на объекте, на элементах массива и
     /// во вложенности; полезные поля (name/body/path и пр.) сохраняются.
     #[test]
     fn strip_plumbing_removes_internal_keys_recursively() {
@@ -2043,7 +2042,7 @@ mod tests {
                 "node_hash": "abc",
                 "name": "ПолучитьСумму",
                 "body": "тело",
-                "nested": { "ast_hash": "z", "content_hash": "c", "keep": 7 }
+                "nested": { "node_hash": "z", "content_hash": "c", "keep": 7 }
             },
             {
                 "indexed_at": "2026-06-22",
@@ -2064,7 +2063,7 @@ mod tests {
         assert_eq!(first["body"], "тело");
         // вложенный объект тоже очищен, но keep остался
         let nested = first["nested"].as_object().unwrap();
-        assert!(!nested.contains_key("ast_hash"));
+        assert!(!nested.contains_key("node_hash"));
         assert!(!nested.contains_key("content_hash"));
         assert_eq!(nested["keep"], 7);
 

@@ -1,10 +1,12 @@
 use anyhow::{anyhow, Result};
 
 use super::types::{
-    hash_ast, sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport,
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport,
     ParsedVariable,
 };
 use super::LanguageParser;
+use super::types::MAX_VISIT_DEPTH;
+use super::types::PARSE_TIMEOUT_MS;
 
 /// Парсер C-файлов на основе tree-sitter.
 /// Функции — `function_definition`; «классы» для C — это `struct`/`union`/`enum`.
@@ -42,6 +44,26 @@ fn find_child_by_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tre
         }
     }
     None
+}
+
+/// Извлечь комментарий-документацию перед объявлением: подряд идущие узлы
+/// `comment` (`//` и `/* … */`) непосредственно над ним.
+fn extract_doc(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = node.prev_sibling();
+    while let Some(n) = cur {
+        if n.kind() != "comment" {
+            break;
+        }
+        lines.push(node_text(n, source).to_string());
+        cur = n.prev_sibling();
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        lines.reverse();
+        Some(lines.join("\n"))
+    }
 }
 
 /// Рекурсивно найти первый потомок с заданным kind (обход в глубину).
@@ -115,7 +137,13 @@ fn visit_node(
     ctx: &mut VisitContext,
     class_name: Option<&str>,
     current_func: Option<&str>,
+    depth: usize,
 ) {
+    // Предел глубины обхода — защита от переполнения стека (P-2)
+    if depth > MAX_VISIT_DEPTH {
+        return;
+    }
+
     match node.kind() {
         "function_definition" => {
             visit_function(node, ctx, class_name);
@@ -127,7 +155,7 @@ fn visit_node(
             visit_call(node, ctx, current_func);
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit_node(child, ctx, class_name, current_func);
+                visit_node(child, ctx, class_name, current_func, depth + 1);
             }
         }
         "preproc_include" => {
@@ -136,7 +164,7 @@ fn visit_node(
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit_node(child, ctx, class_name, current_func);
+                visit_node(child, ctx, class_name, current_func, depth + 1);
             }
         }
     }
@@ -170,6 +198,8 @@ fn visit_function(node: tree_sitter::Node, ctx: &mut VisitContext, class_name: O
     let body = node_text(node, source).to_string();
     let node_hash = sha256_hex(&body);
 
+    let docstring = extract_doc(node, source);
+
     ctx.functions.push(ParsedFunction {
         name: name.clone(),
         qualified_name,
@@ -177,7 +207,7 @@ fn visit_function(node: tree_sitter::Node, ctx: &mut VisitContext, class_name: O
         line_end,
         args,
         return_type,
-        docstring: None,
+        docstring,
         body,
         is_async: false,
         node_hash,
@@ -187,7 +217,7 @@ fn visit_function(node: tree_sitter::Node, ctx: &mut VisitContext, class_name: O
     if let Some(body_node) = body_node {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
-            visit_node(child, ctx, class_name, Some(&name));
+            visit_node(child, ctx, class_name, Some(&name), 1);
         }
     }
 }
@@ -211,12 +241,14 @@ fn visit_record(node: tree_sitter::Node, ctx: &mut VisitContext) {
     let body = node_text(node, source).to_string();
     let node_hash = sha256_hex(&body);
 
+    let docstring = extract_doc(node, source);
+
     ctx.classes.push(ParsedClass {
         name: name.clone(),
         line_start,
         line_end,
         bases: None,
-        docstring: None,
+        docstring,
         body,
         node_hash,
     });
@@ -226,7 +258,7 @@ fn visit_record(node: tree_sitter::Node, ctx: &mut VisitContext) {
         if let Some(body_node) = node.child_by_field_name("body") {
             let mut cursor = body_node.walk();
             for child in body_node.children(&mut cursor) {
-                visit_node(child, ctx, Some(&name), None);
+                visit_node(child, ctx, Some(&name), None, 1);
             }
         }
     }
@@ -279,19 +311,23 @@ pub(crate) fn parse_c(source: &str, is_cpp: bool) -> Result<ParseResult> {
         .set_language(&lang)
         .map_err(|e| anyhow!("Ошибка установки языка tree-sitter (C/C++): {}", e))?;
 
+    // Дедлайн разбора — страховка от нелинейной деградации tree-sitter на
+    // патологическом вводе (минифицированные и сгенерированные файлы).
+    #[allow(deprecated)]
+    ts_parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
+
     let tree = ts_parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("tree-sitter не смог распарсить файл"))?;
 
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
-    let ast_hash = hash_ast(root);
     let lines_total = source.lines().count();
 
     let mut ctx = VisitContext::new(source_bytes, is_cpp);
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        visit_node(child, &mut ctx, None, None);
+        visit_node(child, &mut ctx, None, None, 0);
     }
 
     Ok(ParseResult {
@@ -301,7 +337,6 @@ pub(crate) fn parse_c(source: &str, is_cpp: bool) -> Result<ParseResult> {
         calls: ctx.calls,
         variables: ctx.variables,
         lines_total,
-        ast_hash,
     })
 }
 
@@ -321,6 +356,24 @@ int add(int a, int b) {
         let result = parser.parse(source, "test.c").unwrap();
         assert_eq!(result.functions.len(), 1);
         assert_eq!(result.functions[0].name, "add");
+    }
+
+    /// P-5: в C комментарий перед объявлением раньше не извлекался вовсе.
+    #[test]
+    fn test_parse_c_doc_comment() {
+        let parser = CParser::new();
+        let source = "/* Складывает два числа. */\nint add(int a, int b) {\n    return a + b;\n}\n";
+        let result = parser.parse(source, "test.c").unwrap();
+        assert_eq!(result.functions.len(), 1);
+        assert!(
+            result.functions[0]
+                .docstring
+                .as_deref()
+                .unwrap_or("")
+                .contains("Складывает"),
+            "комментарий не извлечён: {:?}",
+            result.functions[0].docstring
+        );
     }
 
     #[test]

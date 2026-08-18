@@ -8,27 +8,6 @@ pub fn sha256_hex(data: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Инкрементальный SHA-256 хеш дерева AST — без материализации S-expression.
-/// Обходит дерево рекурсивно, кормит хешер kind + позициями каждого узла.
-/// Для файла 80K строк: ~100x быстрее чем to_sexp() + sha256.
-pub fn hash_ast(node: tree_sitter::Node) -> String {
-    let mut hasher = Sha256::new();
-    hash_ast_node(node, &mut hasher);
-    hex::encode(hasher.finalize())
-}
-
-fn hash_ast_node(node: tree_sitter::Node, hasher: &mut Sha256) {
-    // Кормим kind узла + границы (start_byte, end_byte)
-    hasher.update(node.kind().as_bytes());
-    hasher.update(&node.start_byte().to_le_bytes());
-    hasher.update(&node.end_byte().to_le_bytes());
-    // Рекурсивно обходим дочерние узлы
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        hash_ast_node(child, hasher);
-    }
-}
-
 /// Извлечённая функция из AST
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ParsedFunction {
@@ -96,7 +75,6 @@ pub struct ParseResult {
     pub calls: Vec<ParsedCall>,
     pub variables: Vec<ParsedVariable>,
     pub lines_total: usize,
-    pub ast_hash: String,
 }
 
 /// Результат парсинга текстового файла
@@ -104,4 +82,47 @@ pub struct ParseResult {
 pub struct TextParseResult {
     pub content: String,
     pub lines_total: usize,
+}
+
+/// Предел глубины рекурсивного обхода дерева разбора — защита от переполнения
+/// стека. Переполнение в Rust не паника, а аварийное завершение процесса: его
+/// нельзя перехватить, упадёт весь демон индексации, а не один файл.
+///
+/// Значение выбрано по замеру (сборка release, стек рабочего потока 2 МБ):
+/// обход парсера переполняет стек между глубиной 2 000 и 5 000, поэтому 500
+/// даёт запас в 4–10 раз. При этом он много выше прежних разрозненных пределов
+/// (50 у java/js/ts, 80 у bsl/rust, 100 у go), из-за которых факты в глубоко
+/// вложенном коде терялись молча.
+///
+/// Глубина отсчитывается заново для тела каждой функции, так что предел
+/// ограничивает одну цепочку вложенности, а не файл целиком.
+pub const MAX_VISIT_DEPTH: usize = 500;
+
+/// Порог времени на разбор ОДНОГО файла — страховка от нелинейной деградации
+/// tree-sitter на патологическом вводе. 10 с даёт многократный запас над самым
+/// медленным законным файлом и при этом обрывает деградацию за секунды, а не
+/// за минуты. Общий для всех языков: минифицированные и сгенерированные файлы
+/// встречаются не только в BSL, где защита появилась первой.
+pub const PARSE_TIMEOUT_MS: u64 = 10_000;
+
+/// Признак, что под расширением исходника лежат двоичные данные.
+/// NUL-байт в первых килобайтах — надёжный маркер не-текста (так же поступают
+/// git и file): в исходнике его не бывает, а tree-sitter на бесструктурном
+/// вводе деградирует квадратично по размеру.
+pub fn looks_binary(source: &str) -> bool {
+    source.as_bytes().iter().take(8192).any(|&b| b == 0)
+}
+
+/// Пустой результат — для файлов, пропущенных защитой (двоичные либо
+/// превысившие порог времени). Файл при этом остаётся в индексе как код,
+/// просто без извлечённых фактов.
+pub fn empty_parse_result(source: &str) -> ParseResult {
+    ParseResult {
+        functions: Vec::new(),
+        classes: Vec::new(),
+        imports: Vec::new(),
+        calls: Vec::new(),
+        variables: Vec::new(),
+        lines_total: source.lines().count(),
+    }
 }

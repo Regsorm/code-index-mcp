@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
 
 use super::types::{
-    sha256_hex, hash_ast,
-    ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер Python-файлов на основе tree-sitter
 pub struct PythonParser;
@@ -87,7 +87,13 @@ fn visit_node(
     class_name: Option<&str>,
     current_func: Option<&str>,
     parent_kind: &str,
+    depth: usize,
 ) {
+    // Предел глубины обхода — защита от переполнения стека (P-2)
+    if depth > MAX_VISIT_DEPTH {
+        return;
+    }
+
     match node.kind() {
         "function_definition" => {
             visit_function(node, ctx, class_name, current_func, parent_kind);
@@ -102,7 +108,7 @@ fn visit_node(
                     visit_class(child, ctx, current_func);
                 } else {
                     // Рекурсивно обходим остальные дочерние узлы (например, декораторы)
-                    visit_node(child, ctx, class_name, current_func, node.kind());
+                    visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
                 }
             }
         }
@@ -121,7 +127,7 @@ fn visit_node(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() != "function" && child.kind() != "identifier" && child.kind() != "attribute" {
-                    visit_node(child, ctx, class_name, current_func, node.kind());
+                    visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
                 }
             }
         }
@@ -138,7 +144,7 @@ fn visit_node(
             // В любом случае рекурсивно обходим дочерние узлы для поиска вызовов
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit_node(child, ctx, class_name, current_func, node.kind());
+                visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
             }
         }
         "assignment" => {
@@ -149,14 +155,14 @@ fn visit_node(
             // Рекурсивно обходим правую часть для вызовов
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit_node(child, ctx, class_name, current_func, node.kind());
+                visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
             }
         }
         _ => {
             // Рекурсивно обходим дочерние узлы
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit_node(child, ctx, class_name, current_func, node.kind());
+                visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
             }
         }
     }
@@ -254,7 +260,7 @@ fn visit_function(
     {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
-            visit_node(child, ctx, class_name, Some(&name.clone()), body_node.kind());
+            visit_node(child, ctx, class_name, Some(&name.clone()), body_node.kind(), 1);
         }
     }
 }
@@ -334,7 +340,7 @@ fn visit_class(
     {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
-            visit_node(child, ctx, Some(&name), current_func, body_node.kind());
+            visit_node(child, ctx, Some(&name), current_func, body_node.kind(), 1);
         }
     }
 }
@@ -507,6 +513,11 @@ fn parse_python(source: &str) -> Result<ParseResult> {
         .set_language(&tree_sitter_python::LANGUAGE.into())
         .map_err(|e| anyhow!("Ошибка установки языка tree-sitter-python: {}", e))?;
 
+    // Дедлайн разбора — страховка от нелинейной деградации tree-sitter на
+    // патологическом вводе (минифицированные и сгенерированные файлы).
+    #[allow(deprecated)]
+    ts_parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
+
     let tree = ts_parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("tree-sitter не смог распарсить файл"))?;
@@ -514,8 +525,6 @@ fn parse_python(source: &str) -> Result<ParseResult> {
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
 
-    // Хеш всего AST
-    let ast_hash = hash_ast(root);
 
     // Количество строк
     let lines_total = source.lines().count();
@@ -524,7 +533,7 @@ fn parse_python(source: &str) -> Result<ParseResult> {
     let mut ctx = VisitContext::new(source_bytes);
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        visit_node(child, &mut ctx, None, None, "module");
+        visit_node(child, &mut ctx, None, None, "module", 0);
     }
 
     Ok(ParseResult {
@@ -534,7 +543,6 @@ fn parse_python(source: &str) -> Result<ParseResult> {
         calls: ctx.calls,
         variables: ctx.variables,
         lines_total,
-        ast_hash,
     })
 }
 
@@ -648,4 +656,5 @@ def main():
         assert!(result.variables.len() >= 3);
         assert!(result.variables.iter().any(|v| v.name == "MAX_RETRIES"));
     }
+
 }

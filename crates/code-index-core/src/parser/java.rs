@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
 
 use super::types::{
-    sha256_hex, hash_ast,
-    ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер Java-файлов на основе tree-sitter
 pub struct JavaParser;
@@ -57,27 +57,18 @@ fn find_children_by_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Vec<tre
     result
 }
 
-/// Извлечь Javadoc-комментарий перед узлом (block_comment /** ... */)
+/// Извлечь Javadoc-комментарий перед узлом (block_comment /** ... */).
+/// Смотрим непосредственного предыдущего соседа: прежний вариант перебирал ВСЕХ
+/// детей родителя от начала файла до текущего узла.
 fn extract_javadoc(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-    let parent = node.parent()?;
-    let mut cursor = parent.walk();
-    let mut prev_comment: Option<tree_sitter::Node> = None;
-    for child in parent.children(&mut cursor) {
-        if child.id() == node.id() {
-            break;
-        }
-        if child.kind() == "block_comment" || child.kind() == "line_comment" {
-            let text = node_text(child, source);
-            if text.starts_with("/**") {
-                prev_comment = Some(child);
-            } else {
-                prev_comment = None;
-            }
-        } else if !child.is_extra() {
-            prev_comment = None;
+    let prev = node.prev_sibling()?;
+    if matches!(prev.kind(), "block_comment" | "line_comment") {
+        let text = node_text(prev, source);
+        if text.starts_with("/**") {
+            return Some(text.to_string());
         }
     }
-    prev_comment.map(|n| node_text(n, source).to_string())
+    None
 }
 
 /// Контекст обхода AST Java
@@ -112,7 +103,7 @@ fn visit_node(
     parent_kind: &str,
     depth: usize,
 ) {
-    if depth > 50 {
+    if depth > MAX_VISIT_DEPTH {
         return;
     }
 
@@ -479,6 +470,11 @@ fn parse_java(source: &str) -> Result<ParseResult> {
         .set_language(&tree_sitter_java::LANGUAGE.into())
         .map_err(|e| anyhow!("Ошибка установки языка tree-sitter-java: {}", e))?;
 
+    // Дедлайн разбора — страховка от нелинейной деградации tree-sitter на
+    // патологическом вводе (минифицированные и сгенерированные файлы).
+    #[allow(deprecated)]
+    ts_parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
+
     let tree = ts_parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("tree-sitter не смог распарсить файл"))?;
@@ -486,7 +482,6 @@ fn parse_java(source: &str) -> Result<ParseResult> {
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
 
-    let ast_hash = hash_ast(root);
     let lines_total = source.lines().count();
 
     let mut ctx = VisitContext::new(source_bytes);
@@ -502,7 +497,6 @@ fn parse_java(source: &str) -> Result<ParseResult> {
         calls: ctx.calls,
         variables: ctx.variables,
         lines_total,
-        ast_hash,
     })
 }
 

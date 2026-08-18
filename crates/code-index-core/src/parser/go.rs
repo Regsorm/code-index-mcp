@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
 
 use super::types::{
-    sha256_hex, hash_ast,
-    ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер Go-файлов на основе tree-sitter
 pub struct GoParser;
@@ -32,6 +32,27 @@ impl LanguageParser for GoParser {
 /// Получить текст узла AST из байтового среза
 fn node_text<'a>(node: tree_sitter::Node<'a>, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
+}
+
+/// Извлечь комментарий-документацию перед объявлением.
+/// В Go это подряд идущие узлы `comment` (и `//`, и `/* */`) непосредственно
+/// над объявлением — штатный способ документирования, эквивалент docstring.
+fn extract_doc(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = node.prev_sibling();
+    while let Some(n) = cur {
+        if n.kind() != "comment" {
+            break;
+        }
+        lines.push(node_text(n, source).to_string());
+        cur = n.prev_sibling();
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        lines.reverse();
+        Some(lines.join("\n"))
+    }
 }
 
 /// Найти первый дочерний узел с заданным kind
@@ -82,7 +103,7 @@ fn visit_node(
     depth: usize,
 ) {
     // Ограничение глубины для защиты от переполнения стека
-    if depth > 100 {
+    if depth > MAX_VISIT_DEPTH {
         return;
     }
 
@@ -164,6 +185,7 @@ fn visit_function_decl(
 
     let body_text = node_text(node, source).to_string();
     let node_hash = sha256_hex(&body_text);
+    let docstring = extract_doc(node, source);
 
     let func_name = name.clone();
     ctx.functions.push(ParsedFunction {
@@ -173,7 +195,7 @@ fn visit_function_decl(
         line_end,
         args,
         return_type,
-        docstring: None,
+        docstring,
         body: body_text,
         is_async: false, // В Go нет async keyword
         node_hash,
@@ -228,6 +250,7 @@ fn visit_method_decl(
 
     let body_text = node_text(node, source).to_string();
     let node_hash = sha256_hex(&body_text);
+    let docstring = extract_doc(node, source);
 
     let func_name = name.clone();
     ctx.functions.push(ParsedFunction {
@@ -237,7 +260,7 @@ fn visit_method_decl(
         line_end,
         args,
         return_type,
-        docstring: None,
+        docstring,
         body: body_text,
         is_async: false,
         node_hash,
@@ -288,17 +311,26 @@ fn extract_receiver_type(method_node: tree_sitter::Node, source: &[u8]) -> Optio
 fn visit_type_decl(node: tree_sitter::Node, ctx: &mut VisitContext) {
     let source = ctx.source;
 
+    // Комментарий стоит перед всем объявлением `type (...)`, а не перед его
+    // отдельными спецификациями — берём его один раз и раздаём всем.
+    let doc = extract_doc(node, source);
+
     // type_declaration может содержать несколько type_spec
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "type_spec" {
-            visit_type_spec(child, ctx, source);
+            visit_type_spec(child, ctx, source, doc.as_deref());
         }
     }
 }
 
 /// Обработать type_spec внутри type_declaration
-fn visit_type_spec(node: tree_sitter::Node, ctx: &mut VisitContext, source: &[u8]) {
+fn visit_type_spec(
+    node: tree_sitter::Node,
+    ctx: &mut VisitContext,
+    source: &[u8],
+    doc: Option<&str>,
+) {
     // Имя типа: поле name (type_identifier)
     let name = node
         .child_by_field_name("name")
@@ -332,7 +364,7 @@ fn visit_type_spec(node: tree_sitter::Node, ctx: &mut VisitContext, source: &[u8
         line_start,
         line_end,
         bases,
-        docstring: None,
+        docstring: doc.map(|s| s.to_string()),
         body: body_text,
         node_hash,
     });
@@ -502,6 +534,11 @@ fn parse_go(source: &str) -> Result<ParseResult> {
         .set_language(&tree_sitter_go::LANGUAGE.into())
         .map_err(|e| anyhow!("Ошибка установки языка tree-sitter-go: {}", e))?;
 
+    // Дедлайн разбора — страховка от нелинейной деградации tree-sitter на
+    // патологическом вводе (минифицированные и сгенерированные файлы).
+    #[allow(deprecated)]
+    ts_parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
+
     let tree = ts_parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("tree-sitter не смог распарсить Go-файл"))?;
@@ -509,8 +546,6 @@ fn parse_go(source: &str) -> Result<ParseResult> {
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
 
-    // Хеш AST
-    let ast_hash = hash_ast(root);
 
     // Количество строк
     let lines_total = source.lines().count();
@@ -529,7 +564,6 @@ fn parse_go(source: &str) -> Result<ParseResult> {
         calls: ctx.calls,
         variables: ctx.variables,
         lines_total,
-        ast_hash,
     })
 }
 
@@ -567,6 +601,48 @@ mod tests {
             method.unwrap().qualified_name,
             Some("Server.Start".to_string()),
             "qualified_name должен быть Server.Start"
+        );
+    }
+
+    /// P-5: комментарий перед объявлением — штатный способ документирования в Go.
+    /// Раньше `docstring` у Go был пуст всегда, независимо от наличия комментария.
+    #[test]
+    fn test_parse_go_doc_comment() {
+        let parser = GoParser::new();
+        let source = "package main\n\n\
+// Start запускает сервер.\n\
+// Вторая строка комментария.\n\
+func Start() {}\n\n\
+// Handler обрабатывает запросы.\n\
+type Handler interface {\n\tHandle()\n}\n";
+        let result = parser.parse(source, "test.go").unwrap();
+
+        let f = result
+            .functions
+            .iter()
+            .find(|f| f.name == "Start")
+            .unwrap_or_else(|| panic!("функция Start не найдена: {:?}", result.functions));
+        let doc = f.docstring.as_deref().unwrap_or("");
+        assert!(
+            doc.contains("Start запускает сервер"),
+            "комментарий функции не извлечён: {:?}",
+            f.docstring
+        );
+        assert!(
+            doc.contains("Вторая строка"),
+            "собраны не все строки комментария: {:?}",
+            f.docstring
+        );
+
+        let t = result
+            .classes
+            .iter()
+            .find(|c| c.name == "Handler")
+            .unwrap_or_else(|| panic!("тип Handler не найден: {:?}", result.classes));
+        assert!(
+            t.docstring.as_deref().unwrap_or("").contains("Handler обрабатывает"),
+            "комментарий типа не извлечён: {:?}",
+            t.docstring
         );
     }
 

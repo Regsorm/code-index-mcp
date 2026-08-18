@@ -950,7 +950,7 @@ fn apply_event(
                         .unwrap_or("")
                         .to_lowercase();
                     if let Some(parser) = registry.get_parser(&ext) {
-                        match parser.parse(&content, &rel_path) {
+                        match parser.parse_guarded(&content, &rel_path) {
                             Ok(pr) => {
                                 let indexer = Indexer::with_config(
                                     storage,
@@ -972,7 +972,6 @@ fn apply_event(
                                     &hash,
                                     &language,
                                     pr.lines_total,
-                                    &pr.ast_hash,
                                     &pr,
                                     false,
                                     mtime,
@@ -1019,7 +1018,6 @@ fn apply_event(
                                         &hash,
                                         "xml_1c",
                                         pr.lines_total,
-                                        &pr.ast_hash,
                                         &pr,
                                         false,
                                         mtime,

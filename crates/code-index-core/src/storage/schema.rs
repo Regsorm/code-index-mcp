@@ -77,7 +77,6 @@ CREATE TABLE IF NOT EXISTS files (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     path         TEXT    NOT NULL UNIQUE,
     content_hash TEXT    NOT NULL,
-    ast_hash     TEXT,
     language     TEXT    NOT NULL,
     lines_total  INTEGER NOT NULL DEFAULT 0,
     indexed_at   TEXT    NOT NULL DEFAULT (datetime('now')),
@@ -187,10 +186,9 @@ pub fn initialize_tables_only(conn: &rusqlite::Connection) -> rusqlite::Result<(
     ")?;
     // Только таблицы + FTS-виртуальные таблицы — без INDEXES_SQL и TRIGGERS_SQL
     conn.execute_batch(SQL_SCHEMA)?;
-    migrate_v2(conn)?;
-    migrate_v3(conn)?;
-    migrate_v4(conn)?;
-    migrate_v5(conn)?;
+    // Цепочку миграций зовём одной точкой — иначе этот путь снова начнёт
+    // отставать от остальных, как это было с v4 и v5 (H-1).
+    apply_all_migrations(conn)?;
     Ok(())
 }
 
@@ -207,6 +205,28 @@ pub fn apply_all_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<()>
     migrate_v3(conn)?;
     migrate_v4(conn)?;
     migrate_v5(conn)?;
+    migrate_v6(conn)?;
+    Ok(())
+}
+
+/// Миграция v6: убрать колонку `files.ast_hash`.
+///
+/// Хеш дерева считался на каждый файл при каждой переиндексации (полный
+/// рекурсивный обход плюс SHA-256 по каждому узлу), писался в эту колонку и не
+/// участвовал ни в одном решении: «изменился ли файл» определяется по
+/// `content_hash`, а из выдачи поле вырезалось как служебное. Расчёт снят —
+/// колонка больше не нужна.
+///
+/// `DROP COLUMN` доступен начиная с SQLite 3.35. Если сборка старше или колонка
+/// уже удалена, ошибка проглатывается: база остаётся рабочей, в ней просто
+/// сохранится неиспользуемый столбец.
+fn migrate_v6(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_column: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'ast_hash'")?
+        .exists([])?;
+    if has_column {
+        let _ = conn.execute("ALTER TABLE files DROP COLUMN ast_hash", []);
+    }
     Ok(())
 }
 

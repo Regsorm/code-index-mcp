@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
 
 use super::types::{
-    sha256_hex, hash_ast,
-    ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер TypeScript/TSX-файлов на основе tree-sitter
 pub struct TypeScriptParser;
@@ -47,27 +47,19 @@ fn find_child_by_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tre
     None
 }
 
-/// Извлечь JSDoc-комментарий перед узлом
+/// Извлечь JSDoc-комментарий перед узлом (comment, начинающийся с /**).
+/// Смотрим непосредственного предыдущего соседа: прежний вариант перебирал ВСЕХ
+/// детей родителя от начала файла до текущего узла, то есть стоил тем дороже,
+/// чем дальше объявление от начала.
 fn extract_jsdoc(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-    let parent = node.parent()?;
-    let mut cursor = parent.walk();
-    let mut prev_comment: Option<tree_sitter::Node> = None;
-    for child in parent.children(&mut cursor) {
-        if child.id() == node.id() {
-            break;
-        }
-        if child.kind() == "comment" {
-            let text = node_text(child, source);
-            if text.starts_with("/**") {
-                prev_comment = Some(child);
-            } else {
-                prev_comment = None;
-            }
-        } else if !child.is_extra() {
-            prev_comment = None;
+    let prev = node.prev_sibling()?;
+    if prev.kind() == "comment" {
+        let text = node_text(prev, source);
+        if text.starts_with("/**") {
+            return Some(text.to_string());
         }
     }
-    prev_comment.map(|n| node_text(n, source).to_string())
+    None
 }
 
 /// Определить, является ли функция/метод асинхронным
@@ -116,7 +108,7 @@ fn visit_node(
     parent_kind: &str,
     depth: usize,
 ) {
-    if depth > 50 {
+    if depth > MAX_VISIT_DEPTH {
         return;
     }
 
@@ -620,6 +612,11 @@ fn parse_typescript(source: &str, is_tsx: bool) -> Result<ParseResult> {
             .map_err(|e| anyhow!("Ошибка установки языка tree-sitter-typescript: {}", e))?;
     }
 
+
+    // Дедлайн разбора — страховка от нелинейной деградации tree-sitter на
+    // патологическом вводе (минифицированные и сгенерированные файлы).
+    #[allow(deprecated)]
+    ts_parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
     let tree = ts_parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("tree-sitter не смог распарсить файл"))?;
@@ -627,7 +624,6 @@ fn parse_typescript(source: &str, is_tsx: bool) -> Result<ParseResult> {
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
 
-    let ast_hash = hash_ast(root);
     let lines_total = source.lines().count();
 
     let mut ctx = VisitContext::new(source_bytes);
@@ -643,7 +639,6 @@ fn parse_typescript(source: &str, is_tsx: bool) -> Result<ParseResult> {
         calls: ctx.calls,
         variables: ctx.variables,
         lines_total,
-        ast_hash,
     })
 }
 

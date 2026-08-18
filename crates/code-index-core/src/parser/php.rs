@@ -1,10 +1,12 @@
 use anyhow::{anyhow, Result};
 
 use super::types::{
-    hash_ast, sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport,
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport,
     ParsedVariable,
 };
 use super::LanguageParser;
+use super::types::MAX_VISIT_DEPTH;
+use super::types::PARSE_TIMEOUT_MS;
 
 /// Парсер PHP-файлов на основе tree-sitter.
 ///
@@ -108,7 +110,13 @@ fn visit_node(
     class_name: Option<&str>,
     current_func: Option<&str>,
     parent_kind: &str,
+    depth: usize,
 ) {
+    // Предел глубины обхода — защита от переполнения стека (P-2)
+    if depth > MAX_VISIT_DEPTH {
+        return;
+    }
+
     match node.kind() {
         "function_definition" | "method_declaration" => {
             visit_function(node, ctx, class_name);
@@ -128,7 +136,7 @@ fn visit_node(
             // require/include может содержать вложенные вызовы в выражении пути
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit_node(child, ctx, class_name, current_func, node.kind());
+                visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
             }
         }
         "function_call_expression"
@@ -139,7 +147,7 @@ fn visit_node(
             // Рекурсивно обходим детей (аргументы, цепочки вызовов) для вложенных вызовов
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit_node(child, ctx, class_name, current_func, node.kind());
+                visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
             }
         }
         "expression_statement" => {
@@ -151,13 +159,13 @@ fn visit_node(
             }
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit_node(child, ctx, class_name, current_func, node.kind());
+                visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
             }
         }
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                visit_node(child, ctx, class_name, current_func, node.kind());
+                visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
             }
         }
     }
@@ -216,7 +224,7 @@ fn visit_function(node: tree_sitter::Node, ctx: &mut VisitContext, class_name: O
     if let Some(body_node) = body_node {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
-            visit_node(child, ctx, class_name, Some(&name), body_node.kind());
+            visit_node(child, ctx, class_name, Some(&name), body_node.kind(), 1);
         }
     }
 }
@@ -266,7 +274,7 @@ fn visit_class(node: tree_sitter::Node, ctx: &mut VisitContext) {
     if let Some(body_node) = find_body_node(node) {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
-            visit_node(child, ctx, Some(&name), None, body_node.kind());
+            visit_node(child, ctx, Some(&name), None, body_node.kind(), 1);
         }
     }
 }
@@ -388,6 +396,11 @@ fn parse_php(source: &str) -> Result<ParseResult> {
         .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
         .map_err(|e| anyhow!("Ошибка установки языка tree-sitter-php: {}", e))?;
 
+    // Дедлайн разбора — страховка от нелинейной деградации tree-sitter на
+    // патологическом вводе (минифицированные и сгенерированные файлы).
+    #[allow(deprecated)]
+    ts_parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
+
     let tree = ts_parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("tree-sitter не смог распарсить файл"))?;
@@ -395,13 +408,12 @@ fn parse_php(source: &str) -> Result<ParseResult> {
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
 
-    let ast_hash = hash_ast(root);
     let lines_total = source.lines().count();
 
     let mut ctx = VisitContext::new(source_bytes);
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        visit_node(child, &mut ctx, None, None, "program");
+        visit_node(child, &mut ctx, None, None, "program", 0);
     }
 
     Ok(ParseResult {
@@ -411,7 +423,6 @@ fn parse_php(source: &str) -> Result<ParseResult> {
         calls: ctx.calls,
         variables: ctx.variables,
         lines_total,
-        ast_hash,
     })
 }
 

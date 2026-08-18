@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
 
 use super::types::{
-    sha256_hex, hash_ast,
-    ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер Rust-файлов на основе tree-sitter
 pub struct RustParser;
@@ -48,44 +48,42 @@ fn find_child_by_kind<'a>(
     None
 }
 
-/// Извлечь doc-комментарий, предшествующий узлу.
-/// Ищем `line_comment` начинающиеся с `///` или `block_comment` с `/**`
-/// среди предыдущих сестринских узлов.
+/// Извлечь doc-комментарий, предшествующий узлу: цепочку `line_comment`,
+/// начинающихся с `///`, либо `block_comment` с `/**`.
+/// Идём вверх по предыдущим соседям и останавливаемся на первом узле, который
+/// цепочку прерывает. Прежний вариант перебирал ВСЕХ детей родителя от начала
+/// файла до текущего узла, то есть стоил тем дороже, чем дальше объявление.
 fn extract_doc_comment(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-    let parent = node.parent()?;
-    let mut cursor = parent.walk();
     let mut doc_lines: Vec<String> = Vec::new();
+    let mut cur = node.prev_sibling();
 
-    for child in parent.children(&mut cursor) {
-        if child.id() == node.id() {
-            break;
-        }
-        let kind = child.kind();
-        if kind == "line_comment" {
-            let text = node_text(child, source);
-            if text.starts_with("///") {
+    while let Some(n) = cur {
+        match n.kind() {
+            "line_comment" => {
+                let text = node_text(n, source);
+                if !text.starts_with("///") {
+                    // Обычный `//` прерывает цепочку doc-комментариев
+                    break;
+                }
                 doc_lines.push(text.to_string());
-            } else {
-                // Обычный `//` комментарий прерывает цепочку doc-комментариев
-                doc_lines.clear();
             }
-        } else if kind == "block_comment" {
-            let text = node_text(child, source);
-            if text.starts_with("/**") {
-                doc_lines.clear();
-                doc_lines.push(text.to_string());
-            } else {
-                doc_lines.clear();
+            "block_comment" => {
+                let text = node_text(n, source);
+                if text.starts_with("/**") {
+                    doc_lines.push(text.to_string());
+                }
+                break;
             }
-        } else if !child.is_extra() {
-            // Не-комментарный узел между doc-комментарием и определением — сбрасываем
-            doc_lines.clear();
+            // Любой другой узел между комментарием и определением обрывает цепочку
+            _ => break,
         }
+        cur = n.prev_sibling();
     }
 
     if doc_lines.is_empty() {
         None
     } else {
+        doc_lines.reverse();
         Some(doc_lines.join("\n"))
     }
 }
@@ -126,7 +124,7 @@ fn visit_node(
     depth: usize,
 ) {
     // Ограничение глубины для защиты от переполнения стека
-    if depth > 80 {
+    if depth > MAX_VISIT_DEPTH {
         return;
     }
 
@@ -724,6 +722,11 @@ fn parse_rust(source: &str) -> Result<ParseResult> {
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .map_err(|e| anyhow!("Ошибка установки языка tree-sitter-rust: {}", e))?;
 
+    // Дедлайн разбора — страховка от нелинейной деградации tree-sitter на
+    // патологическом вводе (минифицированные и сгенерированные файлы).
+    #[allow(deprecated)]
+    ts_parser.set_timeout_micros(PARSE_TIMEOUT_MS * 1000);
+
     let tree = ts_parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("tree-sitter не смог распарсить Rust-файл"))?;
@@ -731,8 +734,6 @@ fn parse_rust(source: &str) -> Result<ParseResult> {
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
 
-    // Хеш AST
-    let ast_hash = hash_ast(root);
 
     // Количество строк
     let lines_total = source.lines().count();
@@ -751,7 +752,6 @@ fn parse_rust(source: &str) -> Result<ParseResult> {
         calls: ctx.calls,
         variables: ctx.variables,
         lines_total,
-        ast_hash,
     })
 }
 

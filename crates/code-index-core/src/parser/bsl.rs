@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Result};
 
 use super::types::{
-    sha256_hex, hash_ast,
-    ParseResult, ParsedCall, ParsedFunction, ParsedVariable,
+    empty_parse_result, looks_binary, sha256_hex,
+    ParseResult, ParsedCall, ParsedFunction, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер BSL-файлов (1С:Предприятие / OneScript) на основе tree-sitter-bsl
 pub struct BslParser;
@@ -127,7 +128,7 @@ fn visit_node(
     depth: usize,
 ) {
     // Ограничение глубины для защиты от переполнения стека
-    if depth > 80 {
+    if depth > MAX_VISIT_DEPTH {
         return;
     }
 
@@ -225,7 +226,11 @@ fn visit_proc_or_func(
         line_start,
         line_end,
         args,
-        return_type: directive,
+        // Директива компиляции — не тип результата. Она уже лежит в docstring
+        // рядом с видом процедуры, признаком экспорта и переопределением;
+        // дублировать её в поле с чужим смыслом нельзя — модель читает
+        // `return_type` как объявленный тип возвращаемого значения.
+        return_type: None,
         docstring,
         body,
         is_async: false, // BSL не имеет async
@@ -262,7 +267,7 @@ fn visit_body_for_calls(
     current_func: Option<&str>,
     depth: usize,
 ) {
-    if depth > 80 {
+    if depth > MAX_VISIT_DEPTH {
         return;
     }
     if node.kind() == "method_call" {
@@ -356,37 +361,14 @@ fn visit_module_var(node: tree_sitter::Node, ctx: &mut VisitContext) {
     }
 }
 
-/// Главная функция парсинга BSL-файла
-/// Порог времени на парсинг одного BSL-файла — страховка от патологий tree-sitter.
-/// 10 с даёт ~5-кратный запас над самым медленным легитимным модулем (≈2 с на 8 МБ),
-/// при этом обрывает деградацию на аномальном вводе за секунды вместо минут.
-const PARSE_TIMEOUT_MS: u64 = 10_000;
-
-/// Признак, что под расширением `.bsl` лежит не исходник, а двоичные данные.
-/// EDT выгружает защищённые модули поставщика как `ObjectModule.bsl` с двоичным
-/// образом 1С (сигнатура `FF FF FF 7F`) вместо текста — конфигуратор для тех же
-/// модулей использует `.bin`. NUL-байт в первых килобайтах — надёжный маркер
-/// не-текста (как в git/file): валидный BSL-исходник его не содержит, а на таком
-/// вводе tree-sitter уходит в нелинейную деградацию (квадратично по размеру).
-fn looks_binary(source: &str) -> bool {
-    source.as_bytes().iter().take(8192).any(|&b| b == 0)
-}
-
-/// Пустой результат — для файлов, пропущенных защитой (двоичные либо превысившие таймаут).
-fn empty_parse_result(source: &str) -> ParseResult {
-    ParseResult {
-        functions: Vec::new(),
-        classes: Vec::new(),
-        imports: Vec::new(),
-        calls: Vec::new(),
-        variables: Vec::new(),
-        lines_total: source.lines().count(),
-        ast_hash: String::new(),
-    }
-}
-
+/// Главная функция парсинга BSL-файла.
+///
+/// Обе защиты (отсев двоичного ввода и дедлайн разбора) живут в `parser::types`
+/// и общие для всех языков. Здесь проверка двоичности повторяется намеренно:
+/// `parse` могут звать напрямую, минуя `parse_guarded`.
 fn parse_bsl(source: &str) -> Result<ParseResult> {
-    // Защита 1: двоичный .bsl (EDT-защищённые модули) — не отдаём в tree-sitter,
+    // Защита 1: двоичный .bsl (EDT выгружает защищённые модули поставщика как
+    // `ObjectModule.bsl` с двоичным образом 1С) — не отдаём в tree-sitter,
     // иначе он деградирует на бесструктурном вводе и вешает индексацию.
     if looks_binary(source) {
         return Ok(empty_parse_result(source));
@@ -420,8 +402,6 @@ fn parse_bsl(source: &str) -> Result<ParseResult> {
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
 
-    // Хеш AST
-    let ast_hash = hash_ast(root);
 
     // Количество строк
     let lines_total = source.lines().count();
@@ -440,7 +420,6 @@ fn parse_bsl(source: &str) -> Result<ParseResult> {
         calls: ctx.calls,
         variables: ctx.variables,
         lines_total,
-        ast_hash,
     })
 }
 
@@ -561,14 +540,24 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bsl_directive_in_return_type() {
+    fn test_parse_bsl_directive_in_docstring() {
         let parser = BslParser::new();
         let source = "&НаКлиенте\nПроцедура НаКлиенте()\nКонецПроцедуры";
         let result = parser.parse(source, "test.bsl").unwrap();
         assert_eq!(result.functions.len(), 1);
-        // Директива должна быть сохранена в return_type
-        assert!(result.functions[0].return_type.is_some());
-        assert!(result.functions[0].return_type.as_deref().unwrap().contains("НаКлиенте"));
+        let f = &result.functions[0];
+        // Директива компиляции хранится в docstring…
+        assert!(
+            f.docstring.as_deref().unwrap_or("").contains("&НаКлиенте"),
+            "директива не попала в docstring: {:?}",
+            f.docstring
+        );
+        // …и НЕ подменяет собой тип возвращаемого значения
+        assert!(
+            f.return_type.is_none(),
+            "директива не должна лежать в return_type: {:?}",
+            f.return_type
+        );
     }
 
     #[test]
@@ -591,8 +580,12 @@ mod tests {
         let f = &result.functions[0];
         assert_eq!(f.override_type.as_deref(), Some("Перед"));
         assert_eq!(f.override_target.as_deref(), Some("ОригинальнаяПроцедура"));
-        // Директива тоже должна быть извлечена
-        assert_eq!(f.return_type.as_deref(), Some("&Перед"));
+        // Директива тоже должна быть извлечена — в docstring
+        assert!(
+            f.docstring.as_deref().unwrap_or("").contains("&Перед"),
+            "директива не попала в docstring: {:?}",
+            f.docstring
+        );
     }
 
     #[test]
@@ -626,7 +619,11 @@ mod tests {
         let f = &result.functions[0];
         assert!(f.override_type.is_none());
         assert!(f.override_target.is_none());
-        assert_eq!(f.return_type.as_deref(), Some("&НаСервере"));
+        assert!(
+            f.docstring.as_deref().unwrap_or("").contains("&НаСервере"),
+            "директива не попала в docstring: {:?}",
+            f.docstring
+        );
     }
 
     #[test]
@@ -650,4 +647,5 @@ mod tests {
         let result = parser.parse(binary, "ObjectModule.bsl").unwrap();
         assert_eq!(result.functions.len(), 0);
     }
+
 }

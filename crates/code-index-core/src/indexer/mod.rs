@@ -88,7 +88,6 @@ pub enum ParsedFile {
         content_hash: String,
         language: String,
         lines_total: usize,
-        ast_hash: String,
         parse_result: ParseResult,
         mtime: i64,
         file_size: i64,
@@ -296,13 +295,12 @@ impl<'a> Indexer<'a> {
 
                         match registry.get_parser(&ext) {
                             Some(parser) => {
-                                match parser.parse(content, rel_path) {
+                                match parser.parse_guarded(content, rel_path) {
                                     Ok(pr) => ParsedFile::Code {
                                         rel_path: rel_path.clone(),
                                         content_hash: hash.clone(),
                                         language: language.clone(),
                                         lines_total: pr.lines_total,
-                                        ast_hash: pr.ast_hash.clone(),
                                         parse_result: pr,
                                         mtime: *mtime,
                                         file_size: *file_size,
@@ -344,7 +342,6 @@ impl<'a> Indexer<'a> {
                                         content_hash: hash.clone(),
                                         language: "xml_1c".to_string(),
                                         lines_total: pr.lines_total,
-                                        ast_hash: pr.ast_hash.clone(),
                                         parse_result: pr,
                                         mtime: *mtime,
                                         file_size: *file_size,
@@ -461,7 +458,6 @@ impl<'a> Indexer<'a> {
                     content_hash,
                     language,
                     lines_total,
-                    ast_hash,
                     parse_result,
                     mtime,
                     file_size,
@@ -474,7 +470,6 @@ impl<'a> Indexer<'a> {
                         content_hash,
                         language,
                         *lines_total,
-                        ast_hash,
                         parse_result,
                         skip_delete,
                         Some(*mtime),
@@ -668,7 +663,6 @@ impl<'a> Indexer<'a> {
         content_hash: &str,
         language: &str,
         lines_total: usize,
-        ast_hash: &str,
         parse_result: &ParseResult,
         skip_delete: bool,
         mtime: Option<i64>,
@@ -684,7 +678,6 @@ impl<'a> Indexer<'a> {
             id: None,
             path: rel_path.to_string(),
             content_hash: content_hash.to_string(),
-            ast_hash: Some(ast_hash.to_string()),
             language: language.to_string(),
             lines_total,
             indexed_at: chrono::Utc::now()
@@ -844,7 +837,6 @@ impl<'a> Indexer<'a> {
             id: None,
             path: rel_path.to_string(),
             content_hash: content_hash.to_string(),
-            ast_hash: None,
             language: "text".to_string(),
             lines_total,
             indexed_at: chrono::Utc::now()

@@ -6,7 +6,6 @@ pub struct FileRecord {
     pub id: Option<i64>,
     pub path: String,
     pub content_hash: String,
-    pub ast_hash: Option<String>,
     pub language: String,
     pub lines_total: usize,
     pub indexed_at: String,

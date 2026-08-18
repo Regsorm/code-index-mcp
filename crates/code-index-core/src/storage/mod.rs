@@ -288,11 +288,10 @@ impl Storage {
     /// Вставить или обновить запись файла; возвращает id строки
     pub fn upsert_file(&self, record: &FileRecord) -> Result<i64> {
         let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO files (path, content_hash, ast_hash, language, lines_total, indexed_at, mtime, file_size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO files (path, content_hash, language, lines_total, indexed_at, mtime, file_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(path) DO UPDATE SET
                  content_hash = excluded.content_hash,
-                 ast_hash     = excluded.ast_hash,
                  language     = excluded.language,
                  lines_total  = excluded.lines_total,
                  indexed_at   = excluded.indexed_at,
@@ -302,7 +301,6 @@ impl Storage {
         stmt.execute(params![
             record.path,
             record.content_hash,
-            record.ast_hash,
             record.language,
             record.lines_total as i64,
             record.indexed_at,
@@ -353,7 +351,7 @@ impl Storage {
     /// Получить запись файла по пути
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, ast_hash, language, lines_total, indexed_at, mtime, file_size
+            "SELECT id, path, content_hash, language, lines_total, indexed_at, mtime, file_size
              FROM files WHERE path = ?1",
         )?;
         let result = stmt.query_row(params![path], row_to_file);
@@ -367,7 +365,7 @@ impl Storage {
     /// Получить все файлы в индексе
     pub fn get_all_files(&self) -> Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, content_hash, ast_hash, language, lines_total, indexed_at, mtime, file_size
+            "SELECT id, path, content_hash, language, lines_total, indexed_at, mtime, file_size
              FROM files ORDER BY path",
         )?;
         let rows = stmt.query_map([], row_to_file)?;
@@ -2928,12 +2926,11 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         id:           Some(row.get(0)?),
         path:         row.get(1)?,
         content_hash: row.get(2)?,
-        ast_hash:     row.get(3)?,
-        language:     row.get(4)?,
-        lines_total:  row.get::<_, i64>(5)? as usize,
-        indexed_at:   row.get(6)?,
-        mtime:        row.get(7)?,
-        file_size:    row.get(8)?,
+        language:     row.get(3)?,
+        lines_total:  row.get::<_, i64>(4)? as usize,
+        indexed_at:   row.get(5)?,
+        mtime:        row.get(6)?,
+        file_size:    row.get(7)?,
     })
 }
 
@@ -3068,7 +3065,6 @@ mod tests {
             id: None,
             path: path.to_string(),
             content_hash: "abc123".to_string(),
-            ast_hash: None,
             language: "python".to_string(),
             lines_total: 100,
             indexed_at: "2026-01-01T00:00:00".to_string(),
@@ -3602,7 +3598,6 @@ mod tests {
             id: None,
             path: "/src/main.rs".to_string(),
             content_hash: "rustHash".to_string(),
-            ast_hash: None,
             language: "rust".to_string(),
             lines_total: 50,
             indexed_at: "2026-01-01T00:00:00".to_string(),
@@ -3733,7 +3728,6 @@ mod tests {
             id: None,
             path: "test.py".to_string(),
             content_hash: "abc".to_string(),
-            ast_hash: None,
             language: "python".to_string(),
             lines_total: 10,
             indexed_at: "2026-01-01".to_string(),
@@ -3873,7 +3867,6 @@ mod tests {
             id: None,
             path: path.to_string(),
             content_hash: format!("hash_{}", path),
-            ast_hash: None,
             language: language.to_string(),
             lines_total: lines,
             indexed_at: "2026-04-28T12:00:00".to_string(),
