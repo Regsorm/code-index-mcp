@@ -44,7 +44,14 @@ fn register_regexp(conn: &Connection) -> Result<()> {
                     // UserFunctionError, не InvalidParameterName: последний печатался
                     // как «Invalid parameter name: regex parse error…» и сбивал
                     // агента (выглядело как неверное ИМЯ параметра, а не regex).
-                    let new_re = regex::Regex::new(&pattern)
+                    // Многострочный режим обязателен: REGEXP отсеивает тела
+                    // функций целиком, а поиск по ним потом идёт построчно. Без
+                    // него `^`/`$` привязаны к границам всего тела, и отсев
+                    // выбрасывает тела, где построчный поиск нашёл бы совпадение
+                    // (M-10).
+                    let new_re = regex::RegexBuilder::new(&pattern)
+                        .multi_line(true)
+                        .build()
                         .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
                     *cached = Some((pattern, new_re));
                     &cached.as_ref().unwrap().1
@@ -928,7 +935,13 @@ impl Storage {
         context_lines: usize,
         max_total_bytes: usize,
     ) -> Result<(Vec<GrepTextMatch>, bool)> {
-        let compiled = regex::Regex::new(regex_pattern)
+        // Многострочный режим обязателен: то же выражение работает и как быстрый
+        // отказ по файлу целиком (grep_zstd_stream), и построчно. Без него `^`/`$`
+        // привязаны к границам всего файла, и отказ выбрасывает файлы, где
+        // построчный поиск нашёл бы совпадение (M-10).
+        let compiled = regex::RegexBuilder::new(regex_pattern)
+            .multi_line(true)
+            .build()
             .context("grep_code: невалидный regex")?;
 
         let mut conds: Vec<String> = vec![
@@ -2241,7 +2254,10 @@ impl Storage {
         context_lines: usize,
         max_total_bytes: usize,
     ) -> Result<(Vec<GrepTextMatch>, bool)> {
-        let compiled = regex::Regex::new(regex_pattern)
+        // Многострочный режим — по той же причине, что в grep_code (M-10).
+        let compiled = regex::RegexBuilder::new(regex_pattern)
+            .multi_line(true)
+            .build()
             .context("grep_text: невалидный regex")?;
 
         // Контент text-файлов теперь сжат (zstd) в text_contents — SQL REGEXP по
@@ -4009,6 +4025,63 @@ mod tests {
         assert_eq!(m[0].line, 2);
         assert!(m[0].content.contains("port: 8080"));
         assert!(m[0].context.is_empty());
+    }
+
+    /// M-10: якорь `^` обязан означать начало СТРОКИ, а не начало файла.
+    /// Раньше быстрый отказ в `grep_zstd_stream` применял выражение к тексту
+    /// целиком и выбрасывал файл до построчного обхода.
+    #[test]
+    fn test_grep_text_line_anchor_matches_inner_line() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/cfg.yaml", "yaml", 3)).unwrap();
+        storage.insert_text_file(&TextFileRecord {
+            id: None,
+            file_id: id,
+            content: "host: 10.0.0.1\nport: 8080\nname: example\n".to_string(),
+        }).unwrap();
+
+        let (m, _) = storage
+            .grep_text_filtered(r"^port:", None, None, 100, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(m.len(), 1, "^ должен совпадать с началом строки, а не файла");
+        assert_eq!(m[0].line, 2);
+
+        let (m_end, _) = storage
+            .grep_text_filtered(r"8080$", None, None, 100, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(m_end.len(), 1, "$ должен совпадать с концом строки, а не файла");
+        assert_eq!(m_end[0].line, 2);
+    }
+
+    /// M-10 для grep_code: то же на содержимом code-файла.
+    #[test]
+    fn test_grep_code_line_anchor_matches_inner_line() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/a.py", "python", 4)).unwrap();
+        storage
+            .upsert_file_content(id, "import os\n\ndef bar():\n    return 1\n", 4096)
+            .unwrap();
+
+        let (m, _) = storage
+            .grep_code_filtered(r"^def bar", None, None, 100, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(m.len(), 1, "^ должен совпадать с началом строки, а не файла");
+        assert_eq!(m[0].line, 3);
+    }
+
+    /// M-10 для grep_body: тела отсеиваются SQL-условием `body REGEXP`, и оно
+    /// тоже обязано понимать якоря построчно — иначе тело не дойдёт до обхода.
+    #[test]
+    fn test_grep_body_line_anchor_matches_inner_line() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file_full("/m.py", "python", 10)).unwrap();
+        storage.insert_functions(&[make_function(file_id, "foo")]).unwrap();
+
+        // Тело make_function: "def foo(x, y):\n    return x + y"
+        let m = storage
+            .grep_body(None, Some(r"^    return x"), None, 100)
+            .unwrap();
+        assert_eq!(m.len(), 1, "^ должен совпадать с началом строки тела");
     }
 
     #[test]
