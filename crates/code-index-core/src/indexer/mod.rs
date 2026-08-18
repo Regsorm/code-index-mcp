@@ -34,6 +34,50 @@ pub struct IndexResult {
     pub errors: Vec<(String, String)>,
     /// Время работы в миллисекундах
     pub elapsed_ms: u64,
+    /// Относительные пути записанных файлов — сырьё для точечного пересбора
+    /// надстройки на старте демона вместо полного (S-6). Копятся до
+    /// [`PATHS_CAP`]; на переполнении очищаются и взводится [`Self::paths_overflow`].
+    pub changed_paths: Vec<String>,
+    /// Относительные пути удалённых файлов — там же.
+    pub deleted_paths: Vec<String>,
+    /// Списки переполнились и очищены: точечный пересбор недоступен, нужен полный.
+    pub paths_overflow: bool,
+}
+
+/// Потолок на списки путей в [`IndexResult`]. Смысл потолка — не копить память
+/// на полной индексации (сотни тысяч файлов): за ним точечный пересбор всё
+/// равно дороже полного, поэтому списки очищаются, а вызывающий идёт полным
+/// путём.
+pub const PATHS_CAP: usize = 10_000;
+
+impl IndexResult {
+    /// Запомнить записанный файл. После переполнения ничего не копит.
+    fn note_changed(&mut self, rel_path: &str) {
+        if self.paths_overflow {
+            return;
+        }
+        if self.changed_paths.len() + self.deleted_paths.len() >= PATHS_CAP {
+            self.paths_overflow = true;
+            self.changed_paths.clear();
+            self.deleted_paths.clear();
+            return;
+        }
+        self.changed_paths.push(rel_path.to_string());
+    }
+
+    /// Запомнить удалённый файл. После переполнения ничего не копит.
+    fn note_deleted(&mut self, rel_path: &str) {
+        if self.paths_overflow {
+            return;
+        }
+        if self.changed_paths.len() + self.deleted_paths.len() >= PATHS_CAP {
+            self.paths_overflow = true;
+            self.changed_paths.clear();
+            self.deleted_paths.clear();
+            return;
+        }
+        self.deleted_paths.push(rel_path.to_string());
+    }
 }
 
 /// Результат параллельного парсинга одного файла
@@ -146,6 +190,9 @@ impl<'a> Indexer<'a> {
             files_deleted: 0,
             errors: vec![],
             elapsed_ms: 0,
+            changed_paths: Vec::new(),
+            deleted_paths: Vec::new(),
+            paths_overflow: false,
         };
 
         // ── Этап 0: загрузка состояния БД ─────────────────────────────────────
@@ -440,6 +487,7 @@ impl<'a> Indexer<'a> {
                     ) {
                         Ok(_) => {
                             result.files_indexed += 1;
+                            result.note_changed(rel_path);
                             batch_count += 1;
                         }
                         Err(e) => {
@@ -458,6 +506,7 @@ impl<'a> Indexer<'a> {
                     match self.write_text_to_db(rel_path, content_hash, *lines_total, content, skip_delete, Some(*mtime), Some(*file_size)) {
                         Ok(_) => {
                             result.files_indexed += 1;
+                            result.note_changed(rel_path);
                             batch_count += 1;
                         }
                         Err(e) => {
@@ -492,10 +541,28 @@ impl<'a> Indexer<'a> {
         // Обновляем mtime/file_size для файлов с неизменённым содержимым.
         if !metadata_updates.is_empty() {
             self.storage.begin_batch()?;
+            // Провал здесь не портит данные, но означает, что на следующем
+            // старте файл не пройдёт быстрый путь по времени изменения и будет
+            // разобран целиком. Молчать об этом нельзя: замедление выглядит
+            // беспричинным (G-5).
+            let mut meta_errors = 0usize;
             for (path, mtime, file_size) in &metadata_updates {
-                let _ = self.storage.update_file_metadata(path, *mtime, *file_size);
+                if let Err(e) = self.storage.update_file_metadata(path, *mtime, *file_size) {
+                    meta_errors += 1;
+                    if meta_errors <= 5 {
+                        eprintln!("[indexer] update_file_metadata {}: {}", path, e);
+                    }
+                }
             }
             self.storage.commit_batch()?;
+            if meta_errors > 0 {
+                eprintln!(
+                    "[indexer] метаданные не обновлены у {} файлов из {} — на следующем старте \
+                     они пойдут полным разбором вместо быстрого пути",
+                    meta_errors,
+                    metadata_updates.len()
+                );
+            }
         }
 
         // ── Этап 4: индексы + FTS rebuild ────────────────────────────────────
@@ -518,6 +585,7 @@ impl<'a> Indexer<'a> {
             if !seen_paths.contains(path) {
                 self.storage.delete_file(*id)?;
                 result.files_deleted += 1;
+                result.note_deleted(path);
             }
         }
         self.storage.commit_batch()?;
@@ -1039,6 +1107,71 @@ class App:
         assert!(stats.total_functions >= 2, "минимум 2 функции: hello + run");
         assert!(stats.total_classes >= 1, "минимум 1 класс: App");
         assert!(stats.total_text_files >= 1, "минимум 1 текстовый файл: readme.md");
+    }
+
+    /// S-6: списки путей нужны старту демона, чтобы звать точечный пересбор
+    /// надстройки вместо полного. Проверяем, что пути реально собираются —
+    /// и записанные, и удалённые.
+    #[test]
+    fn test_reindex_collects_changed_and_deleted_paths() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.py"), "def a():\n    pass\n").unwrap();
+        fs::write(tmp.path().join("b.py"), "def b():\n    pass\n").unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let first = {
+            let mut indexer = Indexer::new(&mut storage);
+            indexer.full_reindex(tmp.path(), false).unwrap()
+        };
+        assert!(!first.paths_overflow, "два файла в потолок не упираются");
+        let mut got: Vec<&str> = first.changed_paths.iter().map(|s| s.as_str()).collect();
+        got.sort();
+        assert_eq!(got, vec!["a.py", "b.py"], "оба файла должны попасть в changed_paths");
+        assert!(first.deleted_paths.is_empty(), "удалять нечего");
+
+        // Один файл меняем, другой убираем — второй проход должен показать оба
+        // события, а неизменённых файлов в списке быть не должно.
+        fs::write(tmp.path().join("a.py"), "def a():\n    return 1\n").unwrap();
+        fs::remove_file(tmp.path().join("b.py")).unwrap();
+        let second = {
+            let mut indexer = Indexer::new(&mut storage);
+            indexer.full_reindex(tmp.path(), false).unwrap()
+        };
+        assert_eq!(second.changed_paths, vec!["a.py"], "изменён только a.py");
+        assert_eq!(second.deleted_paths, vec!["b.py"], "удалён только b.py");
+    }
+
+    /// S-6: за потолком точечный пересбор дороже полного, поэтому списки
+    /// очищаются и взводится признак переполнения — вызывающий идёт полным путём.
+    #[test]
+    fn test_paths_overflow_clears_lists() {
+        let mut r = IndexResult {
+            files_scanned: 0,
+            files_indexed: 0,
+            files_skipped: 0,
+            files_deleted: 0,
+            errors: vec![],
+            elapsed_ms: 0,
+            changed_paths: Vec::new(),
+            deleted_paths: Vec::new(),
+            paths_overflow: false,
+        };
+        for i in 0..PATHS_CAP {
+            r.note_changed(&format!("f{i}.py"));
+        }
+        assert!(!r.paths_overflow, "ровно потолок — ещё не переполнение");
+        assert_eq!(r.changed_paths.len(), PATHS_CAP);
+
+        r.note_changed("one_more.py");
+        assert!(r.paths_overflow, "шаг за потолок взводит признак");
+        assert!(r.changed_paths.is_empty(), "списки очищены, память не копится");
+        assert!(r.deleted_paths.is_empty());
+
+        // После переполнения накопление прекращается — иначе память всё равно росла бы.
+        r.note_changed("and_another.py");
+        r.note_deleted("gone.py");
+        assert!(r.changed_paths.is_empty());
+        assert!(r.deleted_paths.is_empty());
     }
 
     #[test]

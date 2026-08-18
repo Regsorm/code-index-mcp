@@ -213,7 +213,7 @@ pub fn run_worker(
         let mut indexer = Indexer::with_config(&mut storage, index_config.clone());
         indexer.full_reindex_with_collector(&path, false, parse_collector.as_deref())
     };
-    let (reindex_indexed, reindex_deleted) = match indexer_result {
+    let reindex = match indexer_result {
         Ok(result) => {
             eprintln!(
                 "[worker:{}] initial reindex: {} файлов за {} мс (записано {}, пропущено {}, удалено {})",
@@ -224,7 +224,7 @@ pub fn run_worker(
                 result.files_skipped,
                 result.files_deleted
             );
-            (result.files_indexed, result.files_deleted)
+            result
         }
         Err(e) => {
             tokio_block_on(async {
@@ -254,16 +254,57 @@ pub fn run_worker(
         // проход как раньше. Инкрементальные правки покрывает watcher-цикл через
         // index_extras_for_files.
         let skip_extras = db_existed_before
-            && reindex_indexed == 0
-            && reindex_deleted == 0
+            && reindex.files_indexed == 0
+            && reindex.files_deleted == 0
             && proc.extras_present(&storage);
+
+        // Между «ничего не менялось» и «полный пересбор» есть третий случай:
+        // изменилась горстка файлов, и их пути известны. Тогда зовём тот же
+        // точечный путь, которым идёт watcher-цикл, — полный пересбор на
+        // больших конфигурациях стоит минуты недоступности (замер: 6 файлов из
+        // 94 650 → 15,7 минуты), точечный отрабатывает за секунды. Полный
+        // остаётся для новой БД, пустой надстройки и переполнения списка путей.
+        let incremental_extras = !skip_extras
+            && db_existed_before
+            && !reindex.paths_overflow
+            && proc.extras_present(&storage);
+
+        let mut need_full = !skip_extras;
         if skip_extras {
             eprintln!(
                 "[worker:{}] index_extras пропущен: данные не менялись (mtime fast-path), \
                  extras процессора '{}' уже на месте",
                 path.display(), proc.name()
             );
-        } else {
+        } else if incremental_extras {
+            let changed: Vec<PathBuf> =
+                reindex.changed_paths.iter().map(|p| path.join(p)).collect();
+            let deleted: Vec<PathBuf> =
+                reindex.deleted_paths.iter().map(|p| path.join(p)).collect();
+            let t0 = std::time::Instant::now();
+            match proc.index_extras_for_files(&path, &mut storage, &changed, &deleted) {
+                Ok(()) => {
+                    need_full = false;
+                    eprintln!(
+                        "[worker:{}] index_extras (точечно на старте) процессора '{}': {} мс \
+                         (changed={}, deleted={})",
+                        path.display(), proc.name(), t0.elapsed().as_millis(),
+                        changed.len(), deleted.len()
+                    );
+                }
+                Err(e) => {
+                    // Точечный путь оставляет надстройку в неизвестном состоянии,
+                    // поэтому падение лечится полным пересбором, а не пропуском.
+                    eprintln!(
+                        "[worker:{}] index_extras (точечно на старте) процессора '{}' упал: {}. \
+                         Переходим на полный пересбор.",
+                        path.display(), proc.name(), e
+                    );
+                }
+            }
+        }
+
+        if need_full {
             let t0 = std::time::Instant::now();
             if let Err(e) = proc.index_extras(&path, &mut storage) {
                 eprintln!(
