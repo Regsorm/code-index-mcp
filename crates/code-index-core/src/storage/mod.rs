@@ -36,6 +36,17 @@ fn register_regexp(conn: &Connection) -> Result<()> {
         move |ctx| {
             let pattern: String = ctx.get(0)?;
             let text: String = ctx.get(1)?;
+            // H-2: тело с окончаниями строк CRLF. Здесь выражение применяется к
+            // тексту ЦЕЛИКОМ (отсев), а построчный поиск выше идёт по строкам из
+            // `lines()`, где `\r` уже убран. В многострочном режиме `$` совпадает
+            // прямо перед `\n`, а там стоит `\r` — тело отсеивалось целиком, и
+            // поиск молча давал ноль. Нормализуем; копия делается, только если
+            // возврат каретки реально есть.
+            let text = if text.contains('\r') {
+                text.replace("\r\n", "\n")
+            } else {
+                text
+            };
 
             let mut cached = cache.borrow_mut();
             let re = match cached.as_ref() {
@@ -204,11 +215,23 @@ impl Storage {
                             .context("Ошибка при копировании БД disk→memory")?;
                     }
 
-                    // Миграции для существующей БД, загруженной в память
-                    schema::migrate_v2(&memory_conn)
-                        .context("Ошибка миграции v2 (in-memory)")?;
-                    schema::migrate_v3(&memory_conn)
-                        .context("Ошибка миграции v3 (in-memory)")?;
+                    // H-1: настройки соединения. У этого пути их не выставляли
+                    // вовсе — в отличие от `schema::initialize`. Журнал и запись
+                    // на диск здесь ни при чём (база в памяти), а вот внешние
+                    // ключи и размер кэша значимы: каскадные удаления держались
+                    // на умолчании сборки SQLite.
+                    memory_conn
+                        .execute_batch("PRAGMA foreign_keys=ON;")
+                        .context("Ошибка настройки foreign_keys (in-memory)")?;
+                    memory_conn
+                        .execute_batch("PRAGMA cache_size=-64000;")
+                        .context("Ошибка настройки cache_size (in-memory)")?;
+                    // H-1: вся цепочка миграций, а не только v2 и v3. Прежний
+                    // список отставал от `schema::initialize`, и база, поднятая
+                    // этим путём, оставалась без таблиц содержимого — первая же
+                    // запись падала с «no such table: file_contents».
+                    schema::apply_all_migrations(&memory_conn)
+                        .context("Ошибка применения миграций (in-memory)")?;
                     register_sql_functions(&memory_conn)?;
                     Ok(Self { conn: memory_conn })
                 } else {
@@ -879,6 +902,16 @@ impl Storage {
             let content = match String::from_utf8(bytes) {
                 Ok(s) => s,
                 Err(_) => continue,
+            };
+            // H-2: файлы с окончаниями строк CRLF. Отсев ниже применяет выражение
+            // к тексту ЦЕЛИКОМ, где строка кончается на `\r\n`, а построчный обход —
+            // к строкам из `lines()`, где `\r` уже убран. Из-за расхождения `$` не
+            // совпадал, и файл отсекался целиком ещё до обхода. Нормализуем один
+            // раз; копия делается, только если возврат каретки реально есть.
+            let content = if content.contains('\r') {
+                content.replace("\r\n", "\n")
+            } else {
+                content
             };
             // Быстрый отказ: если в файле нет ни одного совпадения — не
             // тратим время на построчный обход.
@@ -2031,8 +2064,12 @@ impl Storage {
             }
         }
         if let Some(p) = path_prefix {
-            conds.push("path LIKE ?".to_string());
-            // Экранируем спецсимволы LIKE (%, _) — пользователь может передать `path/with_underscore`.
+            // Экранируем спецсимволы LIKE (%, _) — пользователь может передать
+            // `path/with_underscore`. Обязательна оговорка ESCAPE: без неё SQLite
+            // считает обратный слэш обычным символом и ищет путь, в котором он
+            // буквально стоит, — совпадений не бывает никогда, отказ молчаливый
+            // (H-5). До правки экранирование не помогало, а само создавало дефект.
+            conds.push("path LIKE ? ESCAPE '\\'".to_string());
             let escaped = p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
             params_dyn.push(Box::new(format!("{}%", escaped)));
         }
@@ -2864,6 +2901,19 @@ pub(crate) fn slice_with_caps(
     }
     if byte_take_n < take_n {
         take_n = byte_take_n;
+    }
+    // H-6: не поместилась ни одна строка — значит первая строка диапазона сама
+    // длиннее мягкого лимита (минифицированный js/css/json — одна строка на весь
+    // файл). Раньше наружу уходило пустое содержимое при `truncated=true`, и файл
+    // был нечитаем ни целиком, ни диапазоном: строка-то одна. Отдаём её начало,
+    // обрезанное по границе символа, — пустая выдача неотличима от пустого файла.
+    if take_n == 0 && slice_len > 0 {
+        let first = all_lines[start_idx];
+        let mut cut = soft_cap_bytes.min(first.len());
+        while cut > 0 && !first.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        return Ok((first[..cut].to_string(), 1, true));
     }
     let truncated = take_n < slice_len;
 
@@ -3760,6 +3810,61 @@ mod tests {
         assert!(found.is_some(), "данные из файла должны быть доступны в in-memory БД");
     }
 
+    /// H-1: база от старого бинарника (без таблиц содержимого) при открытии в
+    /// память обязана получить ВСЮ цепочку миграций, а не только v2 и v3.
+    /// Раньше v4/v5 пропускались, и первая же запись содержимого падала с
+    /// «no such table: file_contents».
+    #[test]
+    fn test_open_auto_applies_all_migrations_to_existing_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        {
+            let s = Storage::open_file(&db_path).unwrap();
+            s.upsert_file(&make_file("/existing.py")).unwrap();
+        }
+        // Симулируем базу, созданную до появления таблиц содержимого.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS file_contents; DROP TABLE IF EXISTS text_contents;",
+            )
+            .unwrap();
+            let left: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                     AND name IN ('file_contents','text_contents')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "подготовка: таблиц содержимого быть не должно");
+        }
+
+        let config = memory::StorageConfig {
+            mode: "memory".to_string(),
+            memory_max_percent: 25,
+        };
+        let storage = Storage::open_auto(&db_path, &config).unwrap();
+
+        let restored: i64 = storage
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                 AND name IN ('file_contents','text_contents')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored, 2, "миграции v4 и v5 должны примениться при открытии в память");
+
+        // Настройки соединения на этом пути тоже выставляются (H-1).
+        let fk: i64 = storage
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "внешние ключи включены явно, а не по умолчанию сборки");
+    }
+
     // ── Phase 1 (v0.7.0) тесты ─────────────────────────────────────────────
 
     /// Создать FileRecord с произвольным путём и языком (mtime/file_size заполнены).
@@ -3882,6 +3987,32 @@ mod tests {
         let content: String = "x".repeat(1000);
         let res = slice_with_caps(&content, None, None, 10_000, 100_000, 100);
         assert!(res.is_err(), "превышение hard-cap должно дать Err");
+    }
+
+    /// H-6: единственная строка длиннее мягкого лимита (минифицированный
+    /// js/css/json). Раньше не влезала ни одна строка и наружу уходило пустое
+    /// содержимое — файл был нечитаем ни целиком, ни диапазоном.
+    #[test]
+    fn test_slice_with_caps_single_line_longer_than_soft_cap() {
+        let content: String = "z".repeat(3000);
+        let (body, n, truncated) =
+            slice_with_caps(&content, None, None, 10_000, 1000, 100_000).unwrap();
+        assert_eq!(body.len(), 1000, "отдаётся начало строки по мягкому лимиту");
+        assert_eq!(n, 1, "строка засчитана как возвращённая");
+        assert!(truncated, "выдача неполна — признак обязателен");
+
+        // Тот же файл диапазоном: раньше и это давало пустоту.
+        let (body2, n2, truncated2) =
+            slice_with_caps(&content, Some(1), Some(1), 10_000, 1000, 100_000).unwrap();
+        assert_eq!(body2.len(), 1000);
+        assert_eq!(n2, 1);
+        assert!(truncated2);
+
+        // Многобайтные символы: обрезка идёт по границе символа, не по байту.
+        let wide: String = "я".repeat(2000);
+        let (body3, _, _) = slice_with_caps(&wide, None, None, 10_000, 1001, 100_000).unwrap();
+        assert!(body3.chars().all(|c| c == 'я'), "строка не разрезана посреди символа");
+        assert_eq!(body3.len(), 1000, "1001 байт не делится на символы по 2 байта");
     }
 
     #[test]
@@ -4007,6 +4138,30 @@ mod tests {
         for f in &r { assert!(f.path.starts_with("/src/")); }
     }
 
+    /// H-5: префикс с подчёркиванием. Спецсимволы LIKE экранируются обратным
+    /// слэшем, но без оговорки ESCAPE SQLite считает его обычным символом и
+    /// ищет путь, где слэш стоит буквально, — совпадений не бывает никогда.
+    #[test]
+    fn test_list_files_path_prefix_with_underscore() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_file(&make_file_full("/src/daemon_core/worker.rs", "rust", 1)).unwrap();
+        storage.upsert_file(&make_file_full("/src/daemon_core/runner.rs", "rust", 1)).unwrap();
+        storage.upsert_file(&make_file_full("/src/storage/mod.rs", "rust", 1)).unwrap();
+
+        let r = storage.list_files_filtered(None, Some("/src/daemon_core/"), None, 100).unwrap();
+        assert_eq!(r.len(), 2, "путь с подчёркиванием обязан находиться");
+
+        // Подчёркивание — не «любой символ»: соседний каталог не подхватывается.
+        storage.upsert_file(&make_file_full("/src/daemonXcore/other.rs", "rust", 1)).unwrap();
+        let r2 = storage.list_files_filtered(None, Some("/src/daemon_core/"), None, 100).unwrap();
+        assert_eq!(r2.len(), 2, "подчёркивание не должно работать как шаблон");
+
+        // Процент в имени каталога — тот же класс.
+        storage.upsert_file(&make_file_full("/src/100%done/x.rs", "rust", 1)).unwrap();
+        let r3 = storage.list_files_filtered(None, Some("/src/100%done/"), None, 100).unwrap();
+        assert_eq!(r3.len(), 1, "путь с процентом обязан находиться");
+    }
+
     #[test]
     fn test_list_files_language_filter() {
         let storage = Storage::open_in_memory().unwrap();
@@ -4128,6 +4283,32 @@ mod tests {
         assert_eq!(m[0].line, 3);
     }
 
+    /// H-2 для grep_code: файл с окончаниями строк CRLF. Якорь конца строки
+    /// раньше не совпадал — отсев применял выражение к тексту целиком, где перед
+    /// переводом строки стоит возврат каретки, и файл отбрасывался до обхода.
+    /// Тест обязан быть именно на CRLF: на LF дефект не воспроизводится.
+    #[test]
+    fn test_grep_code_end_anchor_on_crlf_file() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage.upsert_file(&make_file_full("/crlf.rs", "rust", 4)).unwrap();
+        storage
+            .upsert_file_content(id, "use std::sync::Arc;\r\n\r\nfn bar() {\r\n    let x = 1;\r\n}\r\n", 4096)
+            .unwrap();
+
+        let (m, _) = storage
+            .grep_code_filtered(r"^use std::sync::Arc;$", None, None, 100, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(m.len(), 1, "$ обязан совпадать и в файле с CRLF");
+        assert_eq!(m[0].line, 1);
+
+        // Якорь начала строки на CRLF тоже работает (проверяем обе стороны).
+        let (m2, _) = storage
+            .grep_code_filtered(r"^fn bar\(\) \{$", None, None, 100, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(m2.len(), 1);
+        assert_eq!(m2[0].line, 3);
+    }
+
     /// M-10 для grep_body: тела отсеиваются SQL-условием `body REGEXP`, и оно
     /// тоже обязано понимать якоря построчно — иначе тело не дойдёт до обхода.
     #[test]
@@ -4141,6 +4322,23 @@ mod tests {
             .grep_body(None, Some(r"^    return x"), None, 100)
             .unwrap();
         assert_eq!(m.len(), 1, "^ должен совпадать с началом строки тела");
+    }
+
+    /// H-2 для grep_body: тело с окончаниями строк CRLF. Отсев идёт SQL-условием
+    /// `body REGEXP` по телу целиком, и до правки якорь конца строки там не
+    /// совпадал — тело выбрасывалось, поиск молча давал ноль.
+    #[test]
+    fn test_grep_body_end_anchor_on_crlf_body() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file_full("/m.py", "python", 10)).unwrap();
+        let mut f = make_function(file_id, "foo");
+        f.body = "def foo(x, y):\r\n    return x + y\r\n".to_string();
+        storage.insert_functions(&[f]).unwrap();
+
+        let m = storage
+            .grep_body(None, Some(r"^    return x \+ y$"), None, 100)
+            .unwrap();
+        assert_eq!(m.len(), 1, "$ обязан совпадать и в теле с CRLF");
     }
 
     #[test]

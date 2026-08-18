@@ -194,6 +194,22 @@ pub fn initialize_tables_only(conn: &rusqlite::Connection) -> rusqlite::Result<(
     Ok(())
 }
 
+/// Вся цепочка миграций схемы — единая точка для ОБОИХ путей открытия базы.
+///
+/// Раньше набор перечислялся дважды: в [`initialize`] (новая база) и в
+/// `Storage::open_auto` (существующая база, поднятая в память). Второй список
+/// отставал — v4 (`file_contents`) и v5 (`text_contents` + текстовый полнотекстовый
+/// поиск без хранения) туда так и не попали, и база, открытая этим путём,
+/// оставалась без таблиц содержимого (H-1). Новая миграция добавляется здесь и
+/// достаётся обоим путям сразу.
+pub fn apply_all_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    migrate_v2(conn)?;
+    migrate_v3(conn)?;
+    migrate_v4(conn)?;
+    migrate_v5(conn)?;
+    Ok(())
+}
+
 /// Инициализирует базу данных: применяет PRAGMA и создаёт схему
 pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // Включаем WAL для параллельного чтения/записи
@@ -214,10 +230,7 @@ pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA journal_size_limit=67108864;")?;
     // Применяем DDL-схему: таблицы и FTS-виртуальные таблицы
     conn.execute_batch(SQL_SCHEMA)?;
-    migrate_v2(conn)?;
-    migrate_v3(conn)?;
-    migrate_v4(conn)?;
-    migrate_v5(conn)?;
+    apply_all_migrations(conn)?;
     // Создаём триггеры
     conn.execute_batch(TRIGGERS_SQL)?;
     // Создаём индексы
