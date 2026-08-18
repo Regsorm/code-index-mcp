@@ -22,7 +22,9 @@ use rusqlite::params;
 use walkdir::WalkDir;
 
 use crate::module_constants::{module_type_by_filename, property_id_by_type};
-use crate::xml::config_dump_info::{parse_config_dump_info, parse_config_dump_info_rows};
+use crate::xml::config_dump_info::{
+    parse_config_dump_info, parse_config_dump_info_id_map, parse_config_dump_info_rows,
+};
 use crate::xml::configuration::parse_configuration_file;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
 use crate::xml::forms::parse_form_file;
@@ -95,6 +97,8 @@ const ALL_OBJECT_FOLDERS: &[(&str, &str)] = &[
     ("FunctionalOptionsParameters", "FunctionalOptionsParameter"),
     ("DefinedTypes", "DefinedType"),
     ("CommonAttributes", "CommonAttribute"),
+    ("DocumentNumerators", "DocumentNumerator"),
+    ("StyleItems", "StyleItem"),
     ("SettingsStorages", "SettingsStorage"),
     ("WSReferences", "WSReference"),
     ("WebServices", "WebService"),
@@ -2084,6 +2088,25 @@ fn reconcile_area(
     Ok(stats)
 }
 
+/// Общая карта «идентификатор объекта → полное имя» по описям всех областей.
+/// Заимствованный объект в составе подсистемы расширения указан идентификатором,
+/// а сам объект живёт в базовой конфигурации — поэтому карта общая, а не по
+/// одной области. Нечитаемая опись области пропускается с записью в журнал.
+fn build_id_map(roots: &[std::path::PathBuf]) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for root in roots {
+        match parse_config_dump_info_id_map(root) {
+            Ok(m) => out.extend(m),
+            Err(e) => tracing::warn!(
+                "ConfigDumpInfo {}: {} — идентификаторы области не развернуты",
+                root.display(),
+                e
+            ),
+        }
+    }
+    out
+}
+
 fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
     // Сначала собираем все Configuration.xml в репо (multi-config layout):
     //   * <root>/Configuration.xml — классическая выгрузка одной конфигурации;
@@ -2146,13 +2169,58 @@ fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connection) -> Resu
         }
         sources.push((cfg_path.display().to_string(), total - count_before));
     }
+
+    // В Configuration.xml перечислены только подсистемы верхнего уровня.
+    // Вложенные лежат деревом `Subsystems/<Родитель>/Subsystems/<Ребёнок>.xml`
+    // и раньше в реестр не попадали: состав их разбирался, рёбра писались, а
+    // сам объект найти было нельзя (get_object_structure отвечал «не найден»).
+    let mut nested_subsystems = 0usize;
+    for cfg_path in &config_paths {
+        let root = match cfg_path.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        let sub_dir = root.join("Subsystems");
+        if !sub_dir.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(&sub_dir).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("xml") {
+                continue;
+            }
+            // Только файлы-определения подсистем (Ext/Forms и прочее — мимо).
+            if path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str())
+                != Some("Subsystems")
+            {
+                continue;
+            }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            // Верхнеуровневые уже вставлены из Configuration.xml — IGNORE вернёт 0.
+            nested_subsystems += stmt.execute(params![
+                REPO_DEFAULT,
+                &format!("Subsystem.{}", stem),
+                "Subsystem",
+                stem,
+            ])?;
+        }
+    }
+    total += nested_subsystems;
+
     drop(stmt);
     conn.execute("COMMIT", [])?;
 
     tracing::info!(
-        "metadata_objects: записано {} объектов из {} Configuration.xml",
+        "metadata_objects: записано {} объектов из {} Configuration.xml (вложенных подсистем {})",
         total,
         config_paths.len(),
+        nested_subsystems,
     );
     for (src, n) in sources {
         tracing::debug!("  {} → {} объектов", src, n);
@@ -2288,6 +2356,10 @@ fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection) -> Result<
     )?;
 
     let mut total: usize = 0;
+    // Карта «идентификатор → имя объекта» из описей выгрузки. Собирается лениво:
+    // нужна только если в составе подсистемы встретился идентификатор вместо
+    // имени, а это бывает лишь в выгрузках расширений.
+    let mut id_map: Option<std::collections::HashMap<String, String>> = None;
     for root in &roots {
         // ── Подсистемы: Subsystems/**.xml ──────────────────────────────────
         // Файл-определение подсистемы лежит прямо в папке "Subsystems"
@@ -2315,6 +2387,26 @@ fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection) -> Result<
                 match parse_subsystem_content_file(path) {
                     Ok(items) => {
                         for to_object in items {
+                            // В выгрузке расширения заимствованный объект в
+                            // составе подсистемы указан идентификатором, а не
+                            // именем. Разворачиваем его по описи выгрузки;
+                            // неразвёрнутый идентификатор — не ребро, а мусор.
+                            let to_object = if to_object.contains('.') {
+                                to_object
+                            } else {
+                                let map = id_map.get_or_insert_with(|| build_id_map(&roots));
+                                match map.get(&to_object) {
+                                    Some(name) => name.clone(),
+                                    None => {
+                                        tracing::debug!(
+                                            "subsystem_content {}: идентификатор {} не найден в описи",
+                                            from_object,
+                                            to_object
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
                             stmt.execute(params![
                                 REPO_DEFAULT,
                                 &from_object,
@@ -3380,8 +3472,19 @@ fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connection) -> Resu
 
     for sub_root in &sub_configs {
         let extension_name = compute_extension_name(repo_root, sub_root);
-        let config_versions =
-            parse_config_dump_info(sub_root).unwrap_or_default();
+        // Нечитаемая опись — не повод молчать: версии модулей останутся пустыми,
+        // и без записи в журнал причина была бы неочевидна.
+        let config_versions = match parse_config_dump_info(sub_root) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "ConfigDumpInfo {}: {} — версии модулей области не заполнены",
+                    sub_root.display(),
+                    e
+                );
+                Default::default()
+            }
+        };
 
         for entry in WalkDir::new(sub_root).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
@@ -3530,9 +3633,16 @@ fn build_module_row(
     let sub_root =
         sub_root_for_path(repo_root, bsl_path).unwrap_or_else(|| repo_root.to_path_buf());
     let extension_name = compute_extension_name(repo_root, &sub_root);
-    let config_versions = cfgver_cache
-        .entry(sub_root.clone())
-        .or_insert_with(|| parse_config_dump_info(&sub_root).unwrap_or_default());
+    let config_versions = cfgver_cache.entry(sub_root.clone()).or_insert_with(|| {
+        parse_config_dump_info(&sub_root).unwrap_or_else(|e| {
+            tracing::warn!(
+                "ConfigDumpInfo {}: {} — версия модуля не определена",
+                sub_root.display(),
+                e
+            );
+            Default::default()
+        })
+    });
     let config_version = config_versions.get(&object_id).cloned();
     let full_name = format!("{}.{}", object_name, effective_type);
     let code_path = bsl_path
@@ -5141,6 +5251,87 @@ mod tests {
         assert_eq!(row.0, "Documents.Реализация");
         assert_eq!(row.1, "ФормаДокумента");
         assert!(row.2.contains("ПриОткрытии"));
+    }
+
+    /// Вложенная подсистема должна попадать в реестр объектов (в
+    /// Configuration.xml её нет — там только верхний уровень), а цель состава,
+    /// записанная идентификатором (так выгружаются заимствованные объекты в
+    /// расширениях), — разворачиваться в имя по описи выгрузки.
+    #[test]
+    fn nested_subsystem_registered_and_identifier_target_resolved() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+
+        write(
+            &repo.join("Configuration.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Subsystem>Продажи</Subsystem>
+  <Catalog>Контрагенты</Catalog>
+</ChildObjects></Configuration></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("Catalogs").join("Контрагенты.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject><Catalog uuid="aaaaaaaa-1111-2222-3333-444444444444">
+<Properties><Name>Контрагенты</Name></Properties><ChildObjects/></Catalog></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("Subsystems").join("Продажи.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:xr="x" xmlns:xsi="y"><Subsystem><Properties>
+  <Name>Продажи</Name>
+  <Content><xr:Item xsi:type="xr:MDObjectRef">Catalog.Контрагенты</xr:Item></Content>
+</Properties><ChildObjects/></Subsystem></MetaDataObject>"#,
+        );
+        // Вложенная подсистема: в Configuration.xml не перечислена, цель состава
+        // указана идентификатором.
+        write(
+            &repo
+                .join("Subsystems")
+                .join("Продажи")
+                .join("Subsystems")
+                .join("Розница.xml"),
+            r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:xr="x" xmlns:xsi="y"><Subsystem><Properties>
+  <Name>Розница</Name>
+  <Content><xr:Item xsi:type="xr:MDObjectRef">aaaaaaaa-1111-2222-3333-444444444444</xr:Item></Content>
+</Properties><ChildObjects/></Subsystem></MetaDataObject>"#,
+        );
+        write(
+            &repo.join("ConfigDumpInfo.xml"),
+            r#"<?xml version="1.0"?>
+<ConfigDumpInfo configVersion="v0">
+  <Metadata name="Catalog.Контрагенты" id="aaaaaaaa-1111-2222-3333-444444444444" configVersion="v1"/>
+</ConfigDumpInfo>"#,
+        );
+
+        let mut storage = fresh_storage(&tmp);
+        run_index_extras(&repo, &mut storage).unwrap();
+        let conn = storage.conn();
+
+        let nested: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Subsystem.Розница'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nested, 1, "вложенная подсистема должна быть в реестре объектов");
+
+        let resolved: String = conn
+            .query_row(
+                "SELECT to_object FROM data_links WHERE link_kind='subsystem_content' \
+                 AND from_object='Subsystem.Розница'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved, "Catalog.Контрагенты",
+            "идентификатор в составе подсистемы должен разворачиваться в имя объекта"
+        );
     }
 
     /// Создать фикстуру конфигурации с источниками конфиг-уровня и ролью.

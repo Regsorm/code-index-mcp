@@ -68,6 +68,21 @@ pub fn event_to_russian(event: &str) -> &str {
         "UndoPosting" => "ОбработкаУдаленияПроведения",
         "OnSetNewNumber" => "ПриУстановкеНовогоНомера",
         "OnSetNewCode" => "ПриУстановкеНовогоКода",
+        // Получение формы и представлений — встречаются в типовых конфигурациях
+        // (в УТ это самая частая англоязычная подписка).
+        "FormGetProcessing" => "ОбработкаПолученияФормы",
+        "PresentationGetProcessing" => "ОбработкаПолученияПредставления",
+        "PresentationFieldsGetProcessing" => "ОбработкаПолученияПолейПредставления",
+        // Обмен данными между узлами планов обмена.
+        "OnSendDataToMaster" => "ПриОтправкеДанныхГлавному",
+        "OnSendDataToSlave" => "ПриОтправкеДанныхПодчиненному",
+        "OnSendNodeDataToSlave" => "ПриОтправкеДанныхУзлаПодчиненному",
+        "OnReceiveDataFromMaster" => "ПриПолученииДанныхОтГлавного",
+        "OnReceiveDataFromSlave" => "ПриПолученииДанныхОтПодчиненного",
+        // Прочие события объектов, встречающиеся в подписках.
+        "BeforeDeleteAtServer" => "ПередУдалениемНаСервере",
+        "ChoiceDataGetProcessing" => "ОбработкаПолученияДанныхВыбора",
+        "OnCopyAtServer" => "ПриКопированииНаСервере",
         other => other,
     }
 }
@@ -280,5 +295,32 @@ mod tests {
         assert_eq!(event_to_russian("ПриЗаписи"), "ПриЗаписи");
         // неизвестное — без изменений
         assert_eq!(event_to_russian("СовсемДругоеСобытие"), "СовсемДругоеСобытие");
+    }
+
+    /// События, которые раньше оставались английскими на живых конфигурациях:
+    /// в УТ это 22 подписки из 345, и поиск по русскому имени их не находил.
+    #[test]
+    fn event_to_russian_covers_form_and_exchange_events() {
+        assert_eq!(event_to_russian("FormGetProcessing"), "ОбработкаПолученияФормы");
+        assert_eq!(
+            event_to_russian("PresentationGetProcessing"),
+            "ОбработкаПолученияПредставления"
+        );
+        assert_eq!(
+            event_to_russian("PresentationFieldsGetProcessing"),
+            "ОбработкаПолученияПолейПредставления"
+        );
+        assert_eq!(
+            event_to_russian("OnSendDataToMaster"),
+            "ПриОтправкеДанныхГлавному"
+        );
+        assert_eq!(
+            event_to_russian("OnSendNodeDataToSlave"),
+            "ПриОтправкеДанныхУзлаПодчиненному"
+        );
+        assert_eq!(
+            event_to_russian("OnReceiveDataFromSlave"),
+            "ПриПолученииДанныхОтПодчиненного"
+        );
     }
 }

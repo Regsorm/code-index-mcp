@@ -932,8 +932,16 @@ impl<'a> Indexer<'a> {
             // Получаем метаданные для всех файлов
             let meta = entry.metadata().ok();
 
-            // Лимит размера — только для текстовых файлов, код индексируем всегда
-            if !matches!(category, FileCategory::Code(_)) {
+            // Лимит размера — только для текстовых файлов, код индексируем всегда.
+            // Исключение — файлы выгрузки 1С, по которым реально ищут: оглавление
+            // конфигурации, права ролей, структура формы. В крупных конфигурациях
+            // они перерастают мегабайт (в УТ Configuration.xml — 1,2 МБ, Rights.xml
+            // до 5 МБ) и молча выпадали из индекса целиком. Макеты печатных форм
+            // (Template.xml, до 78 МБ) и служебная опись выгрузки под исключение НЕ
+            // подпадают: искать по ним нечего, а места занимают больше всего.
+            if !matches!(category, FileCategory::Code(_))
+                && !file_types::is_size_exempt(path)
+            {
                 if let Some(ref m) = meta {
                     if m.len() as usize > self.config.max_file_size {
                         result.files_skipped += 1;
@@ -1376,6 +1384,42 @@ class App:
         // big.txt пропущен из-за лимита размера, big.py — нет (код не ограничен)
         assert_eq!(r.files_indexed, 2, "small.txt + big.py (код не ограничен размером)");
         assert_eq!(r.files_skipped, 1, "big.txt пропущен по размеру");
+    }
+
+    /// Файлы выгрузки 1С, по которым реально ищут (оглавление конфигурации,
+    /// права роли, состав формы), индексируются независимо от лимита: в крупных
+    /// конфигурациях они перерастают мегабайт и выпадали из индекса целиком.
+    /// Макеты печатных форм под исключение не подпадают — они бывают по 78 МБ.
+    #[test]
+    fn test_1c_dump_files_ignore_size_limit() {
+        let tmp = TempDir::new().unwrap();
+        let big = "<Metadata>".to_string() + &"x".repeat(500) + "</Metadata>\n";
+
+        fs::write(tmp.path().join("Configuration.xml"), &big).unwrap();
+        fs::write(tmp.path().join("Rights.xml"), &big).unwrap();
+        fs::write(tmp.path().join("Form.xml"), &big).unwrap();
+        // Не в исключении: макет печатной формы.
+        fs::write(tmp.path().join("Template.xml"), &big).unwrap();
+        // Служебная опись выгрузки исключена ещё раньше — как двоичная
+        // (categorize_file), поэтому в счётчик пропущенных по размеру не идёт.
+        fs::write(tmp.path().join("ConfigDumpInfo.xml"), &big).unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let config = IndexConfig {
+            max_file_size: 10, // 10 байт — все файлы заведомо крупнее
+            ..Default::default()
+        };
+        let mut indexer = Indexer::with_config(&mut storage, config);
+        let r = indexer.full_reindex(tmp.path(), false).unwrap();
+
+        assert_eq!(
+            r.files_indexed, 3,
+            "Configuration.xml, Rights.xml и Form.xml должны индексироваться вопреки лимиту"
+        );
+        assert_eq!(
+            r.files_skipped, 1,
+            "Template.xml остаётся под лимитом (опись выгрузки отсеяна как двоичная)"
+        );
     }
 
     #[test]

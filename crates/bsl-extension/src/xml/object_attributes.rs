@@ -395,6 +395,12 @@ pub fn classify_type(s: &str) -> Option<(String, bool)> {
             if kind.is_empty() || name.is_empty() {
                 return None;
             }
+            // Точка маршрута — не самостоятельный объект конфигурации: она
+            // принадлежит бизнес-процессу. Ребро ведём в сам бизнес-процесс,
+            // иначе цель `BusinessProcessRoutePoint.X` не резолвится ничем.
+            if kind == "BusinessProcessRoutePoint" {
+                return Some((format!("BusinessProcess.{}", name), false));
+            }
             Some((format!("{}.{}", kind, name), false))
         }
         // Обобщённый тип «вся категория»: `cfg:CatalogRef` без имени.
@@ -1291,6 +1297,7 @@ fn ru_ref_kind(kind: &str) -> String {
         "ChartOfCalculationTypes" => "ПланВидовРасчетаСсылка",
         "ExchangePlan" => "ПланОбменаСсылка",
         "BusinessProcess" => "БизнесПроцессСсылка",
+        "BusinessProcessRoutePoint" => "ТочкаМаршрутаБизнесПроцессаСсылка",
         "Task" => "ЗадачаСсылка",
         "Any" => "ЛюбаяСсылка",
         other => return format!("{}Ссылка", other),
@@ -1486,6 +1493,22 @@ mod tests {
         assert_eq!(
             classify_type("cfg:DefinedType.Организация"),
             Some(("*DefinedType.Организация".to_string(), true))
+        );
+    }
+
+    /// Точка маршрута принадлежит бизнес-процессу, отдельного объекта
+    /// `BusinessProcessRoutePoint.X` в конфигурации нет — ребро обязано вести
+    /// в сам бизнес-процесс, иначе цель не резолвится ничем.
+    #[test]
+    fn classify_route_point_points_to_business_process() {
+        assert_eq!(
+            classify_type("cfg:BusinessProcessRoutePointRef.СогласованиеЗакупки"),
+            Some(("BusinessProcess.СогласованиеЗакупки".to_string(), false))
+        );
+        // А человекочитаемый тип — русский, без латиницы вперемешку.
+        assert_eq!(
+            pretty_types(&["cfg:BusinessProcessRoutePointRef.СогласованиеЗакупки".to_string()]),
+            "ТочкаМаршрутаБизнесПроцессаСсылка.СогласованиеЗакупки"
         );
     }
 

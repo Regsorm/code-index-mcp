@@ -127,8 +127,11 @@ pub(crate) const HINT_GREP_BODY_EMPTY: &str = "0 совпадений в тел�
 regex с гибким пробелом, напр. Объект\\s*\\.\\s*Поле. Тексты запросов внутри строк — это тоже тело, \
 ищите по одному слову, не по всей цепочке.";
 /// grep_text вернул 0 совпадений.
-pub(crate) const HINT_GREP_TEXT_EMPTY: &str = "0 совпадений в text-файлах (xml/md/yaml/json/toml). \
-Для кода .bsl/.py/.rs и т.п. — grep_code(regex=…) или grep_body. Проверьте path_glob=/language=.";
+pub(crate) const HINT_GREP_TEXT_EMPTY: &str = "0 совпадений в text-файлах (md/yaml/json/toml и прочий текст). \
+Для кода .bsl/.py/.rs и т.п. — grep_code(regex=…) или grep_body. Проверьте path_glob=/language=. \
+▸ XML ОБЪЕКТОВ 1С (справочники, документы, регистры, роли, определяемые типы, формы) с 0.51.0 \
+разбирается как КОД — по ним ищет grep_code(regex=…). Здесь же остаются оглавление конфигурации \
+(Configuration.xml) и прочие XML без объекта метаданных.";
 /// search_text вернул 0 совпадений.
 pub(crate) const HINT_SEARCH_TEXT_EMPTY: &str = "0 совпадений в text-файлах. Это нечёткий FTS-поиск по словам. \
 Для regex по тексту — grep_text(regex=…); для кода — grep_code(regex=…)/grep_body.";

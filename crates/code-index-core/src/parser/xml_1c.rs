@@ -11,26 +11,65 @@ use super::LanguageParser;
 /// Парсер XML-файлов выгрузок конфигурации 1С
 pub struct Xml1CParser;
 
-/// Известные типы объектов метаданных 1С
-const METADATA_TYPES: &[&str] = &[
+/// Известные типы объектов метаданных 1С.
+///
+/// По этому списку XML выгрузки признаётся файлом объекта: тип распознан —
+/// файл разбирается в структуру (класс объекта, реквизиты, табличные части,
+/// номера строк) и попадает в кодовый индекс; тип неизвестен — файл остаётся
+/// обычным текстом, без структуры и координат.
+///
+/// Список ПОЛНЫЙ по типам верхнего уровня и обязан совпадать с
+/// `bsl_extension::xml::configuration::KNOWN_META_TYPES` — за этим следит тест
+/// `known_meta_types_match_core` в расширении. До 0.51.0 здесь было 18 типов
+/// из сорока пяти, и роли, определяемые типы, HTTP-сервисы, общие формы в
+/// универсальный индекс не попадали вовсе (в УТ — 2 347 файлов ролей без
+/// единого символа).
+pub const METADATA_TYPES: &[&str] = &[
+    "Subsystem",
     "Catalog",
     "Document",
+    "Enum",
+    "Constant",
     "InformationRegister",
     "AccumulationRegister",
+    "AccountingRegister",
+    "CalculationRegister",
     "DataProcessor",
     "Report",
     "CommonModule",
     "ChartOfCharacteristicTypes",
+    "ChartOfAccounts",
+    "ChartOfCalculationTypes",
     "ExchangePlan",
     "BusinessProcess",
     "Task",
-    "ChartOfAccounts",
-    "AccountingRegister",
-    "CalculationRegister",
-    "ChartOfCalculationTypes",
-    "Enum",
-    "Constant",
-    "Subsystem",
+    "DocumentJournal",
+    "FilterCriterion",
+    "EventSubscription",
+    "ScheduledJob",
+    "FunctionalOption",
+    "FunctionalOptionsParameter",
+    "DefinedType",
+    "CommonAttribute",
+    "DocumentNumerator",
+    "StyleItem",
+    "SettingsStorage",
+    "WSReference",
+    "WebService",
+    "HTTPService",
+    "Style",
+    "Language",
+    "SessionParameter",
+    "Role",
+    "CommonForm",
+    "CommonCommand",
+    "CommandGroup",
+    "CommonTemplate",
+    "CommonPicture",
+    "XDTOPackage",
+    "Sequence",
+    "Bot",
+    "ExternalDataSource",
 ];
 
 impl Xml1CParser {
@@ -442,6 +481,34 @@ mod tests {
             "Должен быть класс Контрагенты с базой Catalog, найдено: {:?}",
             result.classes
         );
+        // Полнота списка типов: роль, определяемый тип, HTTP-сервис и общая
+        // форма — такие же объекты конфигурации. До 0.51.0 их тип не значился
+        // известным, файл оставался текстом и не имел ни символов, ни координат
+        // (в УТ — 2 347 файлов ролей и 434 определяемых типа).
+        for (kind, name) in [
+            ("Role", "ЧтениеСделок"),
+            ("DefinedType", "Адресат"),
+            ("HTTPService", "ОбменДанными"),
+            ("CommonForm", "ФормаНастроек"),
+            ("StyleItem", "ЦветПросроченной"),
+        ] {
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core">
+    <{kind} uuid="u1">
+        <Properties><Name>{name}</Name></Properties>
+        <ChildObjects/>
+    </{kind}>
+</MetaDataObject>"#
+            );
+            let res = parser.parse(&xml, "x.xml").unwrap();
+            assert!(
+                res.classes.iter().any(|c| c.name == name),
+                "объект типа {} должен распознаваться, получено: {:?}",
+                kind,
+                res.classes
+            );
+        }
 
         // Реквизиты
         assert!(

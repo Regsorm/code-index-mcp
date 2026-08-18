@@ -43,11 +43,15 @@ pub fn parse_config_dump_info(cfg_root: &Path) -> Result<HashMap<String, String>
         return Ok(HashMap::new());
     }
     let content = std::fs::read_to_string(&path)?;
-    Ok(parse_config_dump_info_str(&content))
+    parse_config_dump_info_str(&content)
 }
 
 /// Тот же парсинг, но из строки (для тестов и mock-сценариев).
-pub fn parse_config_dump_info_str(xml: &str) -> HashMap<String, String> {
+///
+/// Ошибка разбора — именно ошибка, а не «пустая опись»: наполовину прочитанный
+/// файл (платформа ещё дописывает выгрузку) неотличим от честного списка, а
+/// потребитель по такому списку удаляет из индекса всё, чего в нём нет.
+pub fn parse_config_dump_info_str(xml: &str) -> Result<HashMap<String, String>> {
     let mut result: HashMap<String, String> = HashMap::new();
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -93,12 +97,18 @@ pub fn parse_config_dump_info_str(xml: &str) -> HashMap<String, String> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "ConfigDumpInfo.xml: ошибка разбора на позиции {}: {}",
+                    reader.buffer_position(),
+                    e
+                ))
+            }
             _ => {}
         }
         buf.clear();
     }
-    result
+    Ok(result)
 }
 
 /// Прочитать `ConfigDumpInfo.xml` и вернуть ВСЕ строки описи как пары
@@ -119,11 +129,16 @@ pub fn parse_config_dump_info_rows(cfg_root: &Path) -> Result<Vec<(String, Strin
         return Ok(Vec::new());
     }
     let content = std::fs::read_to_string(&path)?;
-    Ok(parse_config_dump_info_rows_str(&content))
+    parse_config_dump_info_rows_str(&content)
 }
 
 /// Тот же разбор, но из строки (для тестов и mock-сценариев).
-pub fn parse_config_dump_info_rows_str(xml: &str) -> Vec<(String, String)> {
+///
+/// Как и у карты выше: оборванный файл — ошибка, а не короткий список. По
+/// этому списку `reconcile_area` решает, какие объекты пропали из конфигурации,
+/// и удаляет их из индекса каскадом; частичная опись означала бы тихую чистку
+/// половины конфигурации.
+pub fn parse_config_dump_info_rows_str(xml: &str) -> Result<Vec<(String, String)>> {
     let mut result: Vec<(String, String)> = Vec::new();
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -159,12 +174,80 @@ pub fn parse_config_dump_info_rows_str(xml: &str) -> Vec<(String, String)> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "ConfigDumpInfo.xml: ошибка разбора на позиции {}: {}",
+                    reader.buffer_position(),
+                    e
+                ))
+            }
             _ => {}
         }
         buf.clear();
     }
-    result
+    Ok(result)
+}
+
+/// Карта «идентификатор объекта → полное имя» из описи выгрузки.
+/// Нужна там, где во внешних файлах объект указан идентификатором, а не
+/// именем (состав подсистемы в выгрузке расширения). Берутся только чистые
+/// идентификаторы — записи модулей (`uuid.Module`) пропускаются.
+pub fn parse_config_dump_info_id_map(cfg_root: &Path) -> Result<HashMap<String, String>> {
+    let path = cfg_root.join("ConfigDumpInfo.xml");
+    if !path.is_file() {
+        return Ok(HashMap::new());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    parse_config_dump_info_id_map_str(&content)
+}
+
+/// Тот же разбор, но из строки (для тестов и mock-сценариев).
+pub fn parse_config_dump_info_id_map_str(xml: &str) -> Result<HashMap<String, String>> {
+    let mut result: HashMap<String, String> = HashMap::new();
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = e.name();
+                let raw = name.as_ref();
+                let tag = std::str::from_utf8(raw).unwrap_or("");
+                let local = tag.split(':').last().unwrap_or(tag);
+                if local != "Metadata" {
+                    buf.clear();
+                    continue;
+                }
+                let mut id: Option<String> = None;
+                let mut full_name: Option<String> = None;
+                for attr in e.attributes().flatten() {
+                    match attr.key.as_ref() {
+                        b"id" => id = attr.unescape_value().ok().map(|c| c.to_string()),
+                        b"name" => full_name = attr.unescape_value().ok().map(|c| c.to_string()),
+                        _ => {}
+                    }
+                }
+                if let (Some(id), Some(full_name)) = (id, full_name) {
+                    // `uuid.Module` и прочие суффиксные записи — не объекты.
+                    if !id.contains('.') {
+                        result.insert(id, full_name);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "ConfigDumpInfo.xml: ошибка разбора на позиции {}: {}",
+                    reader.buffer_position(),
+                    e
+                ))
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -180,7 +263,7 @@ mod tests {
   <Metadata name="Catalog.X.Form.F.Module" id="bbbbbbbb-5555-6666-7777-888888888888.Module" configVersion="formver"/>
   <Metadata name="Catalog.X.ObjectModule" id="aaaaaaaa-1111-2222-3333-444444444444.ObjectModule" configVersion="catver"/>
 </ConfigDumpInfo>"#;
-        let map = parse_config_dump_info_str(xml);
+        let map = parse_config_dump_info_str(xml).unwrap();
         // Только два чистых UUID — у каталога и у формы.
         assert_eq!(map.len(), 2);
         assert_eq!(
@@ -195,13 +278,13 @@ mod tests {
 
     #[test]
     fn empty_xml_returns_empty_map() {
-        assert!(parse_config_dump_info_str("").is_empty());
+        assert!(parse_config_dump_info_str("").unwrap().is_empty());
     }
 
     #[test]
     fn no_metadata_elements_returns_empty() {
         let xml = "<ConfigDumpInfo><Other/></ConfigDumpInfo>";
-        assert!(parse_config_dump_info_str(xml).is_empty());
+        assert!(parse_config_dump_info_str(xml).unwrap().is_empty());
     }
 
     #[test]
@@ -212,7 +295,7 @@ mod tests {
             <Metadata name="Z" configVersion="cv-without-id"/>
             <Metadata name="OK" id="cccccccc-1234-5678-90ab-cdef00112233" configVersion="okver"/>
         </ConfigDumpInfo>"#;
-        let map = parse_config_dump_info_str(xml);
+        let map = parse_config_dump_info_str(xml).unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(
             map.get("cccccccc-1234-5678-90ab-cdef00112233").map(String::as_str),
@@ -224,6 +307,48 @@ mod tests {
     fn does_not_panic_on_malformed_xml() {
         let _ = parse_config_dump_info_str("<<<not really xml>");
         let _ = parse_config_dump_info_str("</wrong>");
+        let _ = parse_config_dump_info_rows_str("</wrong>");
+    }
+
+    /// Оборванная посередине опись (платформа ещё дописывает файл) — это
+    /// ошибка, а НЕ короткий список: по короткому списку потребитель удалил бы
+    /// из индекса всё, что не успело прочитаться.
+    #[test]
+    fn truncated_dump_info_is_error_not_short_list() {
+        let full = r#"<?xml version="1.0"?>
+<ConfigDumpInfo configVersion="rootver">
+  <Metadata name="Catalog.X" id="aaaaaaaa-1111-2222-3333-444444444444" configVersion="v1"/>
+  <Metadata name="Catalog.Y" id="bbbbbbbb-1111-2222-3333-444444444444" configVersion="v1"/>
+  <Metadata name="Document.Z" id="cccccccc-1111-2222-3333-444444444444" configVersion="v1"/>
+</ConfigDumpInfo>"#;
+        // Целый файл читается полностью.
+        assert_eq!(parse_config_dump_info_rows_str(full).unwrap().len(), 3);
+        assert_eq!(parse_config_dump_info_str(full).unwrap().len(), 3);
+
+        // Обрыв на середине: незакрытый корневой тег.
+        let cut = &full[..full.len() / 2];
+        assert!(
+            parse_config_dump_info_rows_str(cut).is_err(),
+            "оборванная опись обязана быть ошибкой, а не частичным списком"
+        );
+        assert!(parse_config_dump_info_str(cut).is_err());
+        assert!(parse_config_dump_info_id_map_str(cut).is_err());
+    }
+
+    #[test]
+    fn id_map_binds_identifier_to_full_name() {
+        let xml = r#"<ConfigDumpInfo>
+            <Metadata name="Catalog.Контрагенты" id="aaaaaaaa-1111-2222-3333-444444444444" configVersion="v1"/>
+            <Metadata name="Catalog.Контрагенты.Form.ФормаЭлемента" id="bbbbbbbb-1111-2222-3333-444444444444" configVersion="v1"/>
+            <Metadata name="Catalog.Контрагенты.ObjectModule" id="aaaaaaaa-1111-2222-3333-444444444444.ObjectModule" configVersion="v1"/>
+        </ConfigDumpInfo>"#;
+        let map = parse_config_dump_info_id_map_str(xml).unwrap();
+        // Суффиксные записи модулей не в счёт.
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("aaaaaaaa-1111-2222-3333-444444444444").map(String::as_str),
+            Some("Catalog.Контрагенты")
+        );
     }
 
     #[test]
@@ -237,7 +362,7 @@ mod tests {
     <Metadata name="CommonModule.M.Module" id="b.0" configVersion="modver"/>
   </ConfigVersions>
 </ConfigDumpInfo>"#;
-        let rows = parse_config_dump_info_rows_str(xml);
+        let rows = parse_config_dump_info_rows_str(xml).unwrap();
         // Объект + под-элемент (без cv) + объект-модуль + строка модуля = 4.
         assert_eq!(rows.len(), 4);
         assert!(rows.contains(&("Catalog.X".to_string(), "catver".to_string())));
@@ -247,13 +372,15 @@ mod tests {
 
     #[test]
     fn rows_empty_on_no_metadata() {
-        assert!(parse_config_dump_info_rows_str("<ConfigDumpInfo><Other/></ConfigDumpInfo>").is_empty());
+        assert!(parse_config_dump_info_rows_str("<ConfigDumpInfo><Other/></ConfigDumpInfo>")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn rows_skip_row_without_name() {
         let xml = r#"<ConfigDumpInfo><Metadata id="x" configVersion="v"/><Metadata name="OK" configVersion="okv"/></ConfigDumpInfo>"#;
-        let rows = parse_config_dump_info_rows_str(xml);
+        let rows = parse_config_dump_info_rows_str(xml).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], ("OK".to_string(), "okv".to_string()));
     }

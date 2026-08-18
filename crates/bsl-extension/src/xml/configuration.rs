@@ -43,8 +43,12 @@ pub struct ObjectRef {
 }
 
 /// Имена тегов, которые мы понимаем как тип объекта внутри `<ChildObjects>`.
-/// Совпадает с `METADATA_TYPES` в core::parser::xml_1c, но мы держим список
-/// здесь, чтобы bsl-extension не зависела от деталей core-парсера.
+/// Список держится здесь, чтобы bsl-extension не зависела от деталей
+/// core-парсера, но обязан совпадать с `METADATA_TYPES` в
+/// `code_index_core::parser::xml_1c`: по тому списку файл объекта признаётся
+/// кодовым и получает структуру. Разъезд списков означал бы, что объект
+/// числится в реестре, но не имеет ни символов, ни координат — за совпадением
+/// следит тест `known_meta_types_match_core`.
 pub(crate) const KNOWN_META_TYPES: &[&str] = &[
     "Subsystem",
     "Catalog",
@@ -73,6 +77,10 @@ pub(crate) const KNOWN_META_TYPES: &[&str] = &[
     "DefinedType",
     "CommonAttribute",
     "SettingsStorage",
+    // Нумераторы документов и элементы стиля: попадают в состав подсистем и
+    // функциональных опций, без них цели рёбер не резолвились (в УТ — 591 ребро).
+    "DocumentNumerator",
+    "StyleItem",
     "WSReference",
     "WebService",
     "HTTPService",
@@ -228,6 +236,52 @@ mod tests {
         let nonexistent = std::path::Path::new("/never/exists/here/Configuration.xml");
         let objs = parse_configuration_file(nonexistent).unwrap();
         assert!(objs.is_empty());
+    }
+
+    /// Списки типов метаданных в ядре и в расширении обязаны совпадать.
+    /// Разъезд означает тихую дыру: объект числится в реестре, но в
+    /// универсальном индексе не имеет ни символов, ни координат — ровно так
+    /// роли и определяемые типы жили до 0.51.0.
+    #[test]
+    fn known_meta_types_match_core() {
+        let mut here: Vec<&str> = KNOWN_META_TYPES.to_vec();
+        let mut core: Vec<&str> = code_index_core::parser::xml_1c::METADATA_TYPES.to_vec();
+        here.sort_unstable();
+        core.sort_unstable();
+        let only_here: Vec<&&str> = here.iter().filter(|t| !core.contains(t)).collect();
+        let only_core: Vec<&&str> = core.iter().filter(|t| !here.contains(t)).collect();
+        assert!(
+            only_here.is_empty() && only_core.is_empty(),
+            "списки типов разъехались: только здесь {:?}, только в ядре {:?}",
+            only_here,
+            only_core
+        );
+    }
+
+    /// Нумераторы документов и элементы стиля входят в состав подсистем и
+    /// функциональных опций; без них цели рёбер оставались неразрешимыми.
+    #[test]
+    fn parses_document_numerator_and_style_item() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject>
+  <Configuration>
+    <ChildObjects>
+      <DocumentNumerator>НумераторЗаказов</DocumentNumerator>
+      <StyleItem>ЦветПросроченной</StyleItem>
+      <Style>ОсновнойСтиль</Style>
+    </ChildObjects>
+  </Configuration>
+</MetaDataObject>"#;
+        let objs = parse_configuration_xml(xml).unwrap();
+        let names: Vec<String> = objs.iter().map(|o| o.full_name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "DocumentNumerator.НумераторЗаказов",
+                "StyleItem.ЦветПросроченной",
+                "Style.ОсновнойСтиль",
+            ]
+        );
     }
 
     #[test]
