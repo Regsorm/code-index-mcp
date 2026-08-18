@@ -5,11 +5,34 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.49.5] — 2026-08-18
+
+**Line anchors no longer drop matches silently: `^` and `$` in `grep_text`, `grep_code` and `grep_body` mean line boundaries, not file boundaries.**
+
+> Context. Finding M-10 of the MCP serving-layer audit. Fifth small release from that audit.
+
+### Fixed
+
+- **A pattern with `^` or `$` returned nothing even though matches existed (M-10).** The line-by-line search itself was correct — matches were dropped by the pre-filter that runs before it. For `grep_code` and `grep_text` that is the early bail-out "no match anywhere in this file — skip the per-line pass", which applied the pattern to the whole file content. For `grep_body` the same role was played by the `body REGEXP` condition in the SQL query, applied to the entire function body. In that context `^` means the start of the whole text and `$` its end, so a file or a body was filtered out before the per-line pass that would have matched it. A query for `^## ` over a document full of headings returned zero, `^fn name` over code returned zero, and the empty answer was indistinguishable from an honest "no such text". The pre-filter pattern is now compiled in multi-line mode, consistent with the search itself.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 659 passed, 0 failed (was 656; 3 added).
+- **Defect reproduction:** the old compilation was temporarily restored in `grep_text` — only its own test failed ("`^` must match the start of a line, not of the file"), while the `grep_code` and `grep_body` tests stayed green: each test is bound to its own pre-filter site.
+- **Live, local node:** four calls that returned zero before the fix — `grep_text` with `^## ` (6 headings) and with a `$`-anchored pattern (line 126), `grep_code` with `^fn is_cacheable_tool` (line 1186), `grep_body` with `^\s+let compiled = regex` (two functions).
+- **Federation smoke:** both nodes on 0.49.5; `grep_text(repo="ut", regex="^#")` over the root README found headings on lines 1, 5, 11, 23, 27 (only the first would have matched before); `grep_text(repo="zup", regex="^## ")` — five headings; `grep_code(repo="ut", regex="^Процедура ")` over a common module — lines 70, 101, 119; `bp-ss` stats over federation are normal.
+
+### Compatibility
+
+- **No reindexing required** — the fix touches the read path only, the database schema is unchanged.
+- Patterns with `^` and `$` now match STRICTLY MORE than before. Results for anchor-free patterns are unchanged.
+- Prefixing a pattern with `(?m)` remains valid — it was the workaround and keeps working.
+
 ## [0.49.4] — 2026-08-18
 
 **Path filtering no longer misses files at the repository root, and refusals and empty answers no longer stick in the serving cache for an hour. On top of that, a search whose path filter left nothing now says openly that "empty" may be an artefact of the pre-selection.**
 
-> Context. Findings M-6 … M-9 of the MCP serving-layer audit — registry in [docs/audit-2026-08.md](docs/audit-2026-08.md). Fourth small release from that audit.
+> Context. Findings M-6 … M-9 of the MCP serving-layer audit. Fourth small release from that audit.
 
 ### Fixed
 
@@ -38,7 +61,7 @@ Versioning — [SemVer](https://semver.org/).
 
 **A repeated tool call no longer comes back empty for clients that read the structured form of the response, and an answer computed before a commit no longer settles in the cache as fresh. On top of that, the serving cache now releases memory and survives an unrelated panic.**
 
-> Context. Findings M-1 … M-4 of the MCP serving-layer audit — registry in [docs/audit-2026-08.md](docs/audit-2026-08.md). Third small release from that audit.
+> Context. Findings M-1 … M-4 of the MCP serving-layer audit. Third small release from that audit.
 
 ### Fixed
 
@@ -66,7 +89,7 @@ Verification levels are listed separately — "tested" without saying at which l
 
 **A single long-past panic in an unrelated thread no longer takes the serving layer down for good, and shutting the daemon down no longer looks like a crash in the log. The lock guarding the list of idle connections was handled two different ways: returning a connection survived poisoning, while taking one called `unwrap()` and brought down the whole serving layer. Separately: closing the semaphore on shutdown is a normal event, yet both the indexing worker and the connection pool met it with a panic.**
 
-> Context. Findings G-1 and S-4 of the codebase audit — registry in [docs/audit-2026-08.md](docs/audit-2026-08.md). Second small release from that audit.
+> Context. Findings G-1 and S-4 of the codebase audit. Second small release from that audit.
 
 ### Fixed
 
@@ -88,7 +111,7 @@ Verification levels are listed separately — "tested" without saying at which l
 
 **Renaming a directory no longer desynchronises the index, and a failure inside a batch of changes is no longer reported as a successful update. A renamed folder went missing for the watcher twice over: files under the old name stayed in the index forever, and the contents of the new name were not indexed until the daemon restarted. On top of that, a write error on a single file and a failed rebuild of the add-on data (call graph, data links, object structure) were only logged — the folder still got the "ready" status, so a desynchronised snapshot looked fresh.**
 
-> Context. Findings S-1, S-2, S-3 of the codebase audit — registry in [docs/audit-2026-08.md](docs/audit-2026-08.md). From here on, fixes from that audit ship as small releases.
+> Context. Findings S-1, S-2, S-3 of the codebase audit. From here on, fixes from that audit ship as small releases.
 
 ### Fixed
 
