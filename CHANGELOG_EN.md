@@ -5,6 +5,40 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.51.0] — 2026-08-19
+
+**A truncated export manifest no longer wipes objects out of the index. Half of the 1C object kinds — roles, defined types, HTTP services, common forms — were never parsed at all; now they are. Nested subsystems made it into the object registry, and large export files made it into the index.**
+
+> Context. Findings X-1 … X-9 of the metadata XML parsing audit.
+
+### Fixed
+
+- **A truncated export manifest deleted objects from the index — silently.** `ConfigDumpInfo.xml` was parsed "until the first error": on a truncated file the part read so far was returned, with no sign of incompleteness. Area reconciliation treats anything missing from the manifest as gone and cascades the deletion — object, forms, modules, links. The platform rewrites that file on every export (over a megabyte in the UT configuration) and the watcher triggers reconciliation on its change event — so reading it mid-write was enough. On a test rig of three objects, one survived a truncated manifest, and restoring the full manifest recovered nothing: reconciliation only ever acts on deletions. Now a parse error is an error: the area is skipped whole, the reason is logged, the index is left alone.
+- **Half of the 1C object kinds were never parsed.** Recognising an XML file as an object went through a list of 18 kinds, while there are 45 top-level ones. Roles, defined types, HTTP and web services, common forms, scheduled jobs, functional options and two dozen more were not on it: their files stayed plain text — no structure, no object name, no line numbers. In the UT configuration that is 2,347 role files and 434 defined types for which `find_symbol` returned nothing. The core list is now complete, and the `known_meta_types_match_core` test fails on any divergence from the extension's list.
+- **Export files larger than a megabyte never reached the index.** The text-file size limit applied before a file could be recognised as an object, so alongside print-form templates it also cut off the configuration index (`Configuration.xml`, 1.2 MB in UT) and the rights of large roles (`Rights.xml`, up to 5 MB). Searching them silently returned nothing while the data was right there. These three kinds — configuration index, role rights and form structure — are now indexed regardless of size; print-form templates (up to 78 MB) still are not.
+- **Nested subsystems existed only as a source of links.** Only top-level subsystems — those listed in the configuration index — made it into the object registry. The nested tree was read (its content fed the link graph), but the subsystems themselves were never registered: they could not be found by name or asked for a profile, even the ones with five thousand content entries. UT has 447 unique subsystems; the registry held 60.
+- **Some subscription events stayed in English.** Event names were normalised to Russian through an 11-entry dictionary, while typical configurations also use others: form retrieval, presentation retrieval, five data-exchange events between nodes. In UT, 22 subscriptions out of 345 were stored under English names and could not be found by the Russian one. The dictionary now holds 24 entries.
+- **Extension subsystem content referenced targets by identifier.** An adopted object in an extension export is given by identifier rather than by name, and that string landed in the link graph as-is — a dangling edge. The identifier is now resolved to a name through the export manifest (the map is built lazily, only when such a target appears), and an unresolvable one is not written at all.
+- **Document numerators and style items were not listed as object kinds.** They appear in subsystem and functional-option content, so 591 links in UT pointed at objects absent from the registry.
+- **The business-process route point type produced a non-existent object.** `BusinessProcessRoutePointRef.X` yielded the target `BusinessProcessRoutePoint.X` — no such object exists in a configuration, a route point belongs to its business process. The type was also displayed with Latin and Cyrillic mixed together.
+
+### Changed
+
+- **1C object XML is now searched with `grep_code`, not `grep_text`.** A consequence of the complete kind list: object files are code files now. Tool hints and the architecture overview have been corrected — they used to send you to text search for these files. Other XML, including the configuration index, stays text.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace --all-features` — 689 passed, 0 failed (was 675). The new ones pin down: a truncated manifest is an error in all three parsing functions; the kind lists in core and extension match; role, defined type, HTTP service, common form and style item are recognised; configuration index, rights and form are indexed despite the limit while a template is not; a nested subsystem is registered and an identifier target resolves to a name; a route point leads to its business process.
+- **Test rig for the critical finding:** a separate daemon, its own three-object export, manifest truncated at 300 bytes. Before the fix — one object left in the index and a log line reading like routine "2 objects deleted"; after — all three intact and a complaint about the unreadable manifest.
+- **Live check locally** (`ut-test`, 57,072 files, forced reindex in 106 s): files parsed as 1C XML went from 15,769 to 23,479; roles gained 1,178 classes; `find_symbol("ЧтениеСделок")` returns a `Role` class at lines 1–15; the configuration index and nine large rights files are back in the index; the registry holds 447 subsystems instead of 60; identifier targets, route-point targets and English event names are all at zero.
+- **Federated check** across the node's six databases (58–95k files each, about 20 minutes total): same figures, and `find_symbol("ПолныеПрава")` returns the role class from a remote database. Indexing time stayed within the spread of previous runs (±2% either way).
+
+### Compatibility
+
+- **Reindexing required.** The fixes live in parsing and metadata collection: in already-built databases roles and other previously unseen kinds stay text, nested subsystems stay out of the registry, and English event names stay put until the database is rebuilt.
+- **Searching object XML changes tool:** `grep_text` no longer finds them — use `grep_code`. The configuration index and other XML without a metadata object are searched as before.
+- The index grows a little: files previously cut off by size return (twelve in UT), and objects of previously unrecognised kinds are added.
+
 ## [0.50.0] — 2026-08-18
 
 **Line numbers for objects from 1C XML exports are no longer byte offsets, deeply nested expressions no longer kill the indexing process, and doc comments now show up for Go and C. The AST hash computation, which nothing ever read, has been removed.**
