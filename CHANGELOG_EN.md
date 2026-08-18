@@ -5,6 +5,34 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.49.3] — 2026-08-18
+
+**A repeated tool call no longer comes back empty for clients that read the structured form of the response, and an answer computed before a commit no longer settles in the cache as fresh. On top of that, the serving cache now releases memory and survives an unrelated panic.**
+
+> Context. Findings M-1 … M-4 of the MCP serving-layer audit — registry in [docs/audit-2026-08.md](docs/audit-2026-08.md). Third small release from that audit.
+
+### Fixed
+
+- **Re-delivery filtering emptied the structured form of the response (M-1).** A tool response arrives in two shapes at once — as text and as structure (`structuredContent`) — carrying the same data. The filter processed them one after the other, but the first pass does not only drop already-delivered rows, it also remembers the new ones as delivered; by the second pass every row of the response was in memory, so it dropped all of them. A client reading the structured form lost exactly the new rows, and got a marker saying "already delivered earlier in this session" that had no basis. The second pass now makes no decision of its own: it replays the first pass's decision from the list of dropped fingerprints and never touches session memory. A response consisting only of the structured form is processed in full, as the single source.
+- **An answer computed before a commit was cached as fresh (M-2).** The guard against caching stale data looked only at the "dirty" file marks. If a call started before a batch was committed and finished after it, the mark was already cleared by then — and an answer built on old data was accepted as clean. The window equals the duration of the call, which is seconds for heavy queries. The cache now keeps an index generation per repository: any signal from the indexer moves it, it is taken before the answer starts being computed and compared when the answer is stored. A mismatch means the answer is not cached.
+- **The serving cache never released memory (M-3).** An expired entry was correctly treated as a miss but was never removed; the reverse index additionally accumulated references to keys already dropped by per-file invalidation of a different file. For a server that runs for weeks this is unbounded growth. An expired entry is now removed on the miss itself, and every 256 inserts a sweep runs: expired entries, orphaned reverse-index references, and stale "dirty" marks.
+- **A panic in an unrelated thread disabled the whole cache (M-4).** Every access to the cache maps and to the filter's session memory went through `unwrap()` on the lock: one panic and every later tool call died. The policy adopted in 0.49.2 for the connection pool is now extracted into shared lock helpers and applied in both modules — 13 sites.
+
+### Testing
+
+Verification levels are listed separately — "tested" without saying at which level says nothing.
+
+- **Unit tests:** `cargo test --workspace` — 647 passed, 0 failed (was 641; 6 added), no warnings. The lock is poisoned for real — by a thread that panics while holding it.
+- **Defect reproduction:** the old second-pass behaviour was temporarily restored and the main test failed exactly as the finding describes — the structured form arrived empty instead of carrying the row being delivered for the first time.
+- **Live on the test repository `ut-test`:** two consecutive `bsl_sql` calls in one session, the second a superset of the first. Both response shapes carried exactly one new row and the same elision marker.
+- **Live on the running server, with a control (M-2):** a change signal was injected in the middle of a call. Without interference the second identical call was a cache hit; with the signal at 100 ms into a 1.06 s call it was a miss, i.e. the answer was not cached.
+- **On an isolated test bed (M-3, M-4):** built with a 2-second entry lifetime instead of an hour and a temporary endpoint that panics while holding the cache lock. An entry past its lifetime is served as a miss and does not accumulate; after 301 inserts memory holds 199 entries instead of 301. After the panic under the lock, tool calls and `/cache-stats` keep working.
+
+### Compatibility
+
+- **No reindex required** — the database schema did not change; the fixes are in the serving layer.
+- Response shapes are unchanged. What changed is that the structured form now carries the same rows as the text form — previously it arrived empty in that case.
+
 ## [0.49.2] — 2026-08-17
 
 **A single long-past panic in an unrelated thread no longer takes the serving layer down for good, and shutting the daemon down no longer looks like a crash in the log. The lock guarding the list of idle connections was handled two different ways: returning a connection survived poisoning, while taking one called `unwrap()` and brought down the whole serving layer. Separately: closing the semaphore on shutdown is a normal event, yet both the indexing worker and the connection pool met it with a panic.**
