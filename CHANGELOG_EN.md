@@ -5,6 +5,29 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.49.7] — 2026-08-18
+
+**The two longest functions in the project are split into standalone parts: editing command startup or the watch loop no longer means holding a five-hundred-line block in your head. Behaviour and tool responses are unchanged.**
+
+> Context. Finding G-2 of the audit. Seventh small release from it.
+
+### Changed
+
+- **Command dispatch (`cli.rs::run`, 692 lines).** The work of six large commands lived inside a single seventeen-arm match, so editing any one of them meant reading the whole function. The `serve`, `index`, `stats`, `query`, `clean` and `init` arms moved into their own functions with explicit parameters; what remains in the match is the dispatch itself plus eleven short seven-line arms. `run` is now 162 lines instead of 692.
+- **File watch loop (`worker.rs::run_worker`, 552 lines).** Folder preparation, initial indexing and change handling were one block: understanding what happens to a batch of events meant reading all of it. Handling a single batch — applying events, committing the transaction, rebuilding the derived layer per-file, invalidating the serving cache and setting the resulting status — moved into `process_batch`. The wrapping that stays the same from batch to batch is collected into `BatchContext`, and the mid-loop `break` became an explicit `BatchStep::Continue` / `Stop` outcome. The loop now reads in one go: check the shutdown signal, take a batch, handle it, decide whether to continue. `run_worker` is 386 lines.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 664 passed, 0 failed. The count is deliberately unchanged: the restructuring is internal, behaviour is the same, no new branches appeared.
+- **Live check on Windows, per-file indexing on edit:** a procedure appended to a common module landed in the index in under five seconds; the log shows `batch: 1 events` and a per-file derived-layer rebuild (`index_extras_for_files`, changed=1); the server returned the function body.
+- **Live check on Windows, per-file indexing on delete:** after reverting the edit the procedure left the index in under five seconds.
+- **Live check on Windows, full indexing:** a daemon restart brought every connected repository to ready in 20 seconds with no errors, and all fifteen database counters (files, functions, calls, metadata, forms, modules, subscriptions, data links, rights, call graph, enrichment, metadata usages, per-file edges, manifest) matched the values taken before the restart.
+- **Live check on Linux (federation node):** editing a file in a large remote repository took the same path — batch handled, per-file rebuild done, the function became available through federation; reverting removed it. File watching differs between Linux and Windows, so both were exercised.
+
+### Compatibility
+
+- The restructuring is internal: the tool set, response format and database schema are unchanged. No reindexing required.
+
 ## [0.49.6] — 2026-08-18
 
 **Daemon startup after editing a few files no longer takes minutes: the derived layer is rebuilt per-file instead of wholesale. Rust modules finally land in the index, and a temporarily unavailable file is no longer dropped from it as deleted.**
