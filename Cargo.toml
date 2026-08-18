@@ -10,7 +10,7 @@ members = [
 
 # Общие метаданные пакетов воркспейса. Каждый крейт может переопределить.
 [workspace.package]
-version = "0.49.3"
+version = "0.49.4"
 edition = "2021"
 license = "MIT"
 description = "Rust-native code index MCP server with first-class 1C:Enterprise (BSL) support. Static binary, 31 tools, tree-sitter AST for 14 languages, sub-ms search."
