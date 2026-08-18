@@ -260,6 +260,11 @@ impl ServeCache {
         drop(guard);
         // Обратный индекс этого репо больше не нужен.
         lock_w(&self.reverse).retain(|(r, _), _| r != scope);
+        // «Грязные» пометки репо снимаем здесь же. Полный сброс их чистит, а
+        // сброс по одному репо — нет: пометки жили до dirty_max_age и всё это
+        // время подавляли кэширование ответов репо, хотя индекс уже пересобран
+        // (M-5). Лишние пересчёты, не порча данных.
+        lock_w(&self.dirty).retain(|(r, _), _| r != scope);
         if removed > 0 {
             self.invalidations.fetch_add(removed as u64, Ordering::Relaxed);
         }
@@ -576,6 +581,30 @@ mod tests {
         let key = ServeCache::key("ut", "t", &json!({}));
         c.insert(key.clone(), Arc::new("x".into()), "ut", &[]);
         assert_eq!(c.get(&key).as_deref().map(String::as_str), Some("x"));
+    }
+
+    /// M-5: сброс по репозиторию обязан снимать и «грязные» пометки. Иначе они
+    /// живут до dirty_max_age и всё это время подавляют кэширование ответов
+    /// репозитория, хотя индекс уже пересобран.
+    #[test]
+    fn сброс_репо_снимает_грязные_пометки() {
+        let cache = ServeCache::new(60, true);
+        cache.mark_dirty("repo1", &[("a.bsl".to_string(), 200)]);
+        cache.mark_dirty("repo2", &[("b.bsl".to_string(), 200)]);
+        assert_eq!(cache.dirty_count(), 2);
+        assert!(cache.is_path_stale("repo1", "a.bsl", 100), "пометка стоит");
+
+        cache.invalidate_scope("repo1");
+
+        assert!(
+            !cache.is_path_stale("repo1", "a.bsl", 100),
+            "после сброса репо пометка снята"
+        );
+        assert!(
+            cache.is_path_stale("repo2", "b.bsl", 100),
+            "чужой репозиторий не затронут"
+        );
+        assert_eq!(cache.dirty_count(), 1, "снята ровно одна пометка");
     }
 
     #[test]
