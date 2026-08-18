@@ -37,6 +37,11 @@ pub(crate) const GREP_CODE_DEFAULT_LIMIT: usize = 30;
 pub(crate) const CALL_GRAPH_DEFAULT_LIMIT: usize = 200;
 pub(crate) const IMPORTS_DEFAULT_LIMIT: usize = 200;
 
+/// Default-limit list_files по числу файлов, если `limit` не передан. При упоре
+/// в потолок ответ помечается `truncated` и несёт общее число файлов (M-12):
+/// раньше обрезка была молчаливой и 500 записей выглядели полным перечнем.
+pub(crate) const LIST_FILES_DEFAULT_LIMIT: usize = 500;
+
 // ── Подсказки на пустой результат ────────────────────────────────────────────
 //
 // По статистике прогона на УТ-11 (анализ сырых транскриптов): при пустом ответе
@@ -507,6 +512,52 @@ fn empty_search_extra(
     }
 }
 
+/// Добавка к НЕПУСТОМУ ответу поиска, когда сужение по пути применялось к
+/// исчерпанной предвыборке (M-11).
+///
+/// [`empty_search_extra`] помечает только пустую выдачу. Но неполнота ничем не
+/// отличается от полноты и когда что-то нашлось: в ответе может оказаться
+/// горстка записей из многих сотен, потому что путь фильтровался ПОСЛЕ выборки
+/// первых `sql_limit` штук по релевантности. Такой ответ выглядит как полный —
+/// на нём строят вывод «в этом каталоге всего N таких функций», который неверен.
+///
+/// Признак кладётся рядом с `result`, а НЕ в `_meta`: служебное поле снимается
+/// с ответа перед отдачей клиенту (`strip_meta` в `CodeIndexServer::finish`),
+/// и всё, что туда положено, до модели не доходит.
+fn prefilter_exhausted_extra(prefetched: usize, sql_limit: usize, shown: usize) -> serde_json::Value {
+    serde_json::json!({
+        "prefilter_exhausted": true,
+        "prefetched": prefetched,
+        "shown": shown,
+        "hint": format!(
+            "ВНИМАНИЕ: показано {} записей, но это НЕ весь результат. Сужение по path_glob \
+             применялось к первым {} записям, отобранным по релевантности, и предвыборка \
+             упёрлась в свой потолок — подходящие совпадения могут быть ниже в ранжировании. \
+             Поднимите limit либо возьмите grep_code/grep_text с тем же path_glob: они \
+             фильтруют путь в самом запросе, а не после выборки.",
+            shown, sql_limit
+        ),
+    })
+}
+
+/// Выбор добавки к ответу поиска с сужением по пути: пусто → подсказка M-8,
+/// непусто на исчерпанной предвыборке → признак неполноты M-11, иначе ничего.
+fn search_extra(
+    base_hint: &str,
+    has_glob: bool,
+    prefetched: usize,
+    sql_limit: usize,
+    shown: usize,
+) -> Option<serde_json::Value> {
+    if shown == 0 {
+        return Some(empty_search_extra(base_hint, has_glob, prefetched, sql_limit));
+    }
+    if has_glob && prefetched >= sql_limit {
+        return Some(prefilter_exhausted_extra(prefetched, sql_limit, shown));
+    }
+    None
+}
+
 // ── Реализации инструментов ─────────────────────────────────────────────────
 
 /// Обрезка docstring для компактных выдач (карта файла, поисковые hit'ы):
@@ -588,14 +639,14 @@ pub async fn search_function(
             let deps = collect_paths_via(&storage, &r, |fr| fr.file_id);
             // W-бенч 11.06: на BSL-репо пустой результат ведёт в search_terms.
             // M-8: плюс признак, что пусто из-за исчерпанной предвыборки.
-            let extra = r.is_empty().then(|| {
-                empty_search_extra(
-                    search_empty_hint(entry.language.as_deref()),
-                    path_glob.is_some(),
-                    prefetched,
-                    sql_limit,
-                )
-            });
+            // M-11: и то же самое, когда результат непуст, но неполон.
+            let extra = search_extra(
+                search_empty_hint(entry.language.as_deref()),
+                path_glob.is_some(),
+                prefetched,
+                sql_limit,
+                r.len(),
+            );
             // Поисковая выдача БЕЗ тел функций: только имя/путь/строки/сигнатура +
             // обрезанный docstring. Полные тела 20 результатов раздували ответ до
             // 20-45K символов (слабое место прогона УТ-11). Тело — get_function.
@@ -637,14 +688,13 @@ pub async fn search_class(
                 r.truncate(want);
             }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
-            let extra = r.is_empty().then(|| {
-                empty_search_extra(
-                    HINT_SEARCH_EMPTY,
-                    path_glob.is_some(),
-                    prefetched,
-                    sql_limit,
-                )
-            });
+            let extra = search_extra(
+                HINT_SEARCH_EMPTY,
+                path_glob.is_some(),
+                prefetched,
+                sql_limit,
+                r.len(),
+            );
             // Поисковая выдача БЕЗ тел классов: имя/путь/строки/базы + обрезанный
             // docstring. Тело — get_class/read_file.
             let hits: Vec<serde_json::Value> = r
@@ -1505,14 +1555,13 @@ pub async fn search_text(
                 .into_iter()
                 .map(|(path, snippet)| serde_json::json!({ "path": path, "snippet": snippet }))
                 .collect();
-            let extra = items.is_empty().then(|| {
-                empty_search_extra(
-                    HINT_SEARCH_TEXT_EMPTY,
-                    path_glob.is_some(),
-                    prefetched,
-                    sql_limit,
-                )
-            });
+            let extra = search_extra(
+                HINT_SEARCH_TEXT_EMPTY,
+                path_glob.is_some(),
+                prefetched,
+                sql_limit,
+                items.len(),
+            );
             wrap_with_meta_extra(&storage, &items, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"search_text: {}\"}}", e),
@@ -1548,9 +1597,19 @@ pub async fn grep_body(
         )
     } else {
         storage
-            .grep_body(pattern.as_deref(), regex.as_deref(), language.as_deref(), want)
-            .map(|r| {
-                let truncated = r.len() >= want;
+            .grep_body(
+                pattern.as_deref(),
+                regex.as_deref(),
+                language.as_deref(),
+                // M-14: берём на одну находку больше потолка. Если лишняя пришла —
+                // совпадений действительно больше и обрезка честная. Раньше признак
+                // выводился из `len >= want` и срабатывал ложно, когда находок
+                // оказалось ровно столько, сколько запросили.
+                want.saturating_add(1),
+            )
+            .map(|mut r| {
+                let truncated = r.len() > want;
+                r.truncate(want);
                 (r, truncated)
             })
     };
@@ -1599,19 +1658,46 @@ pub async fn list_files(
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    let want = limit.unwrap_or(LIST_FILES_DEFAULT_LIMIT);
     match storage.list_files_filtered(
         pattern.as_deref(),
         path_prefix.as_deref(),
         language.as_deref(),
-        limit.unwrap_or(500),
+        want,
     ) {
         Ok(r) => {
             let deps: Vec<String> = r.iter().map(|lf| lf.path.clone()).collect();
-            let hint = r.is_empty().then_some(HINT_LIST_FILES_EMPTY);
             // Компактная выдача: каждый файл — строка "path | lang | N lines | size"
             // (mtime не дублируем — он в _meta.file_mtimes).
             let listed = compact_listed_files(&r);
-            wrap_with_meta_hint(&storage, &listed, deps, hint)
+            // M-12: выборка упёрлась в свой потолок — значит список, возможно,
+            // неполон. Узнаём, сколько файлов подходит под фильтры на самом деле,
+            // и говорим об этом. Лишний проход по таблице делается ТОЛЬКО здесь:
+            // если нашлось меньше потолка, ответ заведомо полон.
+            let extra = if r.len() >= want {
+                let total = storage
+                    .count_files_filtered(
+                        pattern.as_deref(),
+                        path_prefix.as_deref(),
+                        language.as_deref(),
+                    )
+                    .unwrap_or(r.len());
+                (total > r.len()).then(|| {
+                    serde_json::json!({
+                        "truncated": true,
+                        "total": total,
+                        "shown": r.len(),
+                        "limit": want,
+                        "hint": "Показаны первые файлы по алфавиту — это НЕ весь список. \
+                                 Поднимите limit= либо сузьте pattern=/path_prefix=/language=.",
+                    })
+                })
+            } else if r.is_empty() {
+                Some(serde_json::json!({ "hint": HINT_LIST_FILES_EMPTY }))
+            } else {
+                None
+            };
+            wrap_with_meta_extra(&storage, &listed, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"list_files: {}\"}}", e),
     }
@@ -1917,6 +2003,32 @@ mod tests {
         // Без сужения по пути пометка не появляется никогда.
         let v3 = empty_search_extra("база", false, 100, 100);
         assert!(v3.get("prefilter_exhausted").is_none());
+    }
+
+    /// M-11: НЕпустая, но неполная выдача помечается так же, как пустая.
+    /// Раньше признак висел на условии «результат пуст», и урезанный ответ
+    /// выглядел как полный.
+    #[test]
+    fn search_extra_marks_incomplete_nonempty_result() {
+        // Предвыборка упёрлась в потолок, после фильтра осталось 12 из многих —
+        // признак обязан быть, несмотря на непустой результат.
+        let v = search_extra("база", true, 100, 100, 12).expect("признак неполноты");
+        assert_eq!(v["prefilter_exhausted"], serde_json::json!(true));
+        assert_eq!(v["prefetched"], serde_json::json!(100));
+        assert_eq!(v["shown"], serde_json::json!(12));
+        let hint = v["hint"].as_str().unwrap();
+        assert!(hint.contains("НЕ весь результат"), "сказано, что выдача неполна");
+
+        // Потолок не достигнут — выдача честно полная, признака нет.
+        assert!(search_extra("база", true, 7, 100, 7).is_none());
+
+        // Без сужения по пути предвыборки нет вовсе — признака нет.
+        assert!(search_extra("база", false, 100, 100, 20).is_none());
+
+        // Пустой результат по-прежнему идёт через empty_search_extra.
+        let empty = search_extra("база", true, 100, 100, 0).expect("подсказка на пусто");
+        assert_eq!(empty["prefilter_exhausted"], serde_json::json!(true));
+        assert!(empty["hint"].as_str().unwrap().starts_with("база"));
     }
 
     /// Срез плумбинга: 6 ключей исчезают на объекте, на элементах массива и

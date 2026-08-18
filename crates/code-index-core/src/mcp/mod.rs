@@ -261,6 +261,8 @@ pub struct ListFilesParams {
     /// Префикс по path (`src/auth/`). Опционально.
     pub path_prefix: Option<String>,
     pub language: Option<String>,
+    /// Максимум файлов в ответе. Default 500. При обрезке в ответе —
+    /// {truncated, total, shown, limit}.
     pub limit: Option<usize>,
 }
 
@@ -852,23 +854,50 @@ fn collect_extension_tools(
 /// `tools::mass_map`: порядок элементов = порядок имён в запросе, ошибка
 /// отдельного элемента — `{error}` на его позиции, не валит весь батч.
 fn mass_rows_to_results(rows: Vec<Result<String, String>>) -> String {
+    // Зависимости всей пачки: объединение по элементам (M-13). Раньше служебное
+    // поле просто выбрасывалось, и ответ массового режима не был привязан ни к
+    // одному файлу: точечная инвалидация кэша до него не доставала, а проверка
+    // «ответ построен на не догнавшем индексе» не выполнялась вовсе — спасал
+    // только короткий срок хранения для ответов без зависимостей.
+    let mut dependent_files: BTreeSet<String> = BTreeSet::new();
+    let mut file_mtimes = serde_json::Map::new();
     let results: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|row| match row {
             Ok(one) => {
                 let mut v = serde_json::from_str::<serde_json::Value>(&one)
                     .unwrap_or(serde_json::Value::String(one));
-                // tools::* оборачивают ответ в {_meta, result(, hint)}. В массив кладём
-                // элемент без служебного _meta (иначе N копий мусора в ответе модели).
+                // tools::* оборачивают ответ в {_meta, result(, hint)}. Из элемента
+                // служебное поле снимаем (иначе N копий мусора в ответе модели),
+                // но не теряем — переносим в общее `_meta` пачки.
                 if let Some(o) = v.as_object_mut() {
-                    o.remove("_meta");
+                    if let Some(meta) = o.remove("_meta") {
+                        if let Some(files) = meta.get("dependent_files").and_then(|d| d.as_array())
+                        {
+                            dependent_files.extend(
+                                files.iter().filter_map(|f| f.as_str().map(String::from)),
+                            );
+                        }
+                        if let Some(mt) = meta.get("file_mtimes").and_then(|m| m.as_object()) {
+                            for (path, mtime) in mt {
+                                file_mtimes.insert(path.clone(), mtime.clone());
+                            }
+                        }
+                    }
                 }
                 v
             }
             Err(e) => serde_json::json!({ "error": e }),
         })
         .collect();
-    serde_json::json!({ "results": results }).to_string()
+    serde_json::json!({
+        "results": results,
+        "_meta": {
+            "dependent_files": dependent_files.into_iter().collect::<Vec<String>>(),
+            "file_mtimes": file_mtimes,
+        },
+    })
+    .to_string()
 }
 
 // ── MCP tools ──────────────────────────────────────────────────────────────
@@ -1107,7 +1136,7 @@ impl CodeIndexServer {
         tools::stat_file(entry, p.path).await
     }
 
-    #[tool(description = "Список файлов в индексе с фильтрами. pattern — glob по пути (`**/*.py`; альтернативы `{a,b}`: `**/*.{rs,toml}`), path_prefix — префикс (`src/auth/`), language — язык. Возвращает JSON-массив строк \"<path> | <lang> | <N> lines | <size>\" (mtime — в _meta.file_mtimes).")]
+    #[tool(description = "Список файлов в индексе с фильтрами. pattern — glob по пути (`**/*.py`; альтернативы `{a,b}`: `**/*.{rs,toml}`), path_prefix — префикс (`src/auth/`), language — язык. Возвращает JSON-массив строк \"<path> | <lang> | <N> lines | <size>\" (mtime — в _meta.file_mtimes). limit — максимум файлов в ответе (default 500); если подходящих файлов больше, ответ несёт {truncated, total, shown, limit}, где total — сколько их всего.")]
     async fn list_files(&self, Parameters(p): Parameters<ListFilesParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1911,6 +1940,50 @@ mod mass_mode_tests {
         assert!(names.contains("get_class"));
         assert!(names.contains("get_object_structure"));
         assert_eq!(MASS_MODE_PARAMS.len(), 3);
+    }
+
+    /// M-13: у ответа пачки должно быть общее `_meta` — объединение зависимых
+    /// файлов и их индексных mtime по всем элементам. Без него запись кэша не
+    /// привязана ни к одному файлу и точечная инвалидация до неё не достаёт.
+    #[test]
+    fn mass_results_carry_merged_meta() {
+        let rows = vec![
+            Ok(serde_json::json!({
+                "result": [{"name": "a"}],
+                "_meta": {
+                    "dependent_files": ["src/one.rs"],
+                    "file_mtimes": {"src/one.rs": 111},
+                },
+            })
+            .to_string()),
+            Ok(serde_json::json!({
+                "result": [{"name": "b"}],
+                "_meta": {
+                    // Второй элемент из того же файла плюс ещё один — в объединении
+                    // повторов быть не должно.
+                    "dependent_files": ["src/one.rs", "src/two.rs"],
+                    "file_mtimes": {"src/one.rs": 111, "src/two.rs": 222},
+                },
+            })
+            .to_string()),
+            Err("storage pool: закрыт".to_string()),
+        ];
+        let out: serde_json::Value =
+            serde_json::from_str(&mass_rows_to_results(rows)).expect("валидный JSON");
+
+        // Порядок и состав элементов не изменились, ошибка осталась на своём месте.
+        let results = out["results"].as_array().expect("массив результатов");
+        assert_eq!(results.len(), 3);
+        assert!(results[0].get("_meta").is_none(), "у элемента служебного поля нет");
+        assert_eq!(results[2]["error"], serde_json::json!("storage pool: закрыт"));
+
+        // Зависимости слиты и дедуплицированы.
+        assert_eq!(
+            out["_meta"]["dependent_files"],
+            serde_json::json!(["src/one.rs", "src/two.rs"])
+        );
+        assert_eq!(out["_meta"]["file_mtimes"]["src/one.rs"], serde_json::json!(111));
+        assert_eq!(out["_meta"]["file_mtimes"]["src/two.rs"], serde_json::json!(222));
     }
 }
 

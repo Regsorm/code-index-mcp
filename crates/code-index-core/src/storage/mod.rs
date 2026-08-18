@@ -2008,19 +2008,15 @@ impl Storage {
         }
     }
 
-    /// list_files: список файлов с опциональными фильтрами (glob по пути,
-    /// префикс пути, язык). Возвращает `Vec<ListedFile>` с метаданными.
-    ///
-    /// `pattern` использует SQLite GLOB (`*` матчит любой символ, включая `/`,
-    /// поэтому `*.py` рекурсивно). `**` нормализуется в `*` для совместимости
-    /// с привычным glob-синтаксисом.
-    pub fn list_files_filtered(
-        &self,
+    /// Условия отбора файлов — общий код для выборки (`list_files_filtered`) и
+    /// для подсчёта общего числа (`count_files_filtered`). Вынесено, чтобы
+    /// фильтры двух запросов не разъехались: иначе счётчик в ответе начнёт
+    /// врать сильнее, чем его отсутствие (M-12).
+    fn files_filter_clause(
         pattern: Option<&str>,
         path_prefix: Option<&str>,
         language: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<ListedFile>> {
+    ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
         let mut conds: Vec<String> = Vec::new();
         let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(g) = pattern {
@@ -2049,6 +2045,45 @@ impl Storage {
         } else {
             format!("WHERE {}", conds.join(" AND "))
         };
+        (where_clause, params_dyn)
+    }
+
+    /// Сколько файлов подходит под те же фильтры, что и `list_files_filtered`,
+    /// но без ограничения по числу. Нужен, чтобы выдача могла честно сказать
+    /// «показано 500 из N», а не выглядеть полным перечнем каталога (M-12).
+    /// Вызывается только когда выборка упёрлась в свой потолок — на обычных
+    /// запросах лишнего прохода по таблице нет.
+    pub fn count_files_filtered(
+        &self,
+        pattern: Option<&str>,
+        path_prefix: Option<&str>,
+        language: Option<&str>,
+    ) -> Result<usize> {
+        let (where_clause, params_dyn) = Self::files_filter_clause(pattern, path_prefix, language);
+        let sql = format!("SELECT COUNT(*) FROM files {}", where_clause);
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let total: i64 = self
+            .conn
+            .query_row(&sql, params_refs.as_slice(), |row| row.get(0))?;
+        Ok(total.max(0) as usize)
+    }
+
+    /// list_files: список файлов с опциональными фильтрами (glob по пути,
+    /// префикс пути, язык). Возвращает `Vec<ListedFile>` с метаданными.
+    ///
+    /// `pattern` использует SQLite GLOB (`*` матчит любой символ, включая `/`,
+    /// поэтому `*.py` рекурсивно). `**` нормализуется в `*` для совместимости
+    /// с привычным glob-синтаксисом.
+    pub fn list_files_filtered(
+        &self,
+        pattern: Option<&str>,
+        path_prefix: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ListedFile>> {
+        let (where_clause, mut params_dyn) =
+            Self::files_filter_clause(pattern, path_prefix, language);
         let sql = format!(
             "SELECT path, language, lines_total, file_size, mtime
              FROM files {} ORDER BY path LIMIT ?",
@@ -3934,6 +3969,30 @@ mod tests {
         let auth = storage.list_files_filtered(Some("/src/auth/*"), None, None, 100).unwrap();
         assert_eq!(auth.len(), 1);
         assert_eq!(auth[0].path, "/src/auth/login.py");
+    }
+
+    /// M-12: подсчёт под теми же фильтрами, что и выборка. Нужен, чтобы выдача
+    /// могла сказать «показано N из M», а не выглядеть полным перечнем.
+    #[test]
+    fn test_count_files_matches_list_filters() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_file(&make_file_full("/src/auth/login.py", "python", 10)).unwrap();
+        storage.upsert_file(&make_file_full("/src/utils/helpers.py", "python", 20)).unwrap();
+        storage.upsert_file(&make_file_full("/src/utils/extra.py", "python", 20)).unwrap();
+        storage.upsert_file(&make_file_full("/docs/readme.md", "markdown", 30)).unwrap();
+
+        // Потолок выборки урезает список, счётчик — нет.
+        let shown = storage.list_files_filtered(Some("**/*.py"), None, None, 2).unwrap();
+        assert_eq!(shown.len(), 2, "выборка упёрлась в потолок");
+        assert_eq!(storage.count_files_filtered(Some("**/*.py"), None, None).unwrap(), 3);
+
+        // Те же фильтры, что у выборки: префикс пути и язык.
+        assert_eq!(storage.count_files_filtered(None, Some("/src/"), None).unwrap(), 3);
+        assert_eq!(storage.count_files_filtered(None, None, Some("markdown")).unwrap(), 1);
+
+        // Без фильтров — все файлы; ничего не подошло — ноль.
+        assert_eq!(storage.count_files_filtered(None, None, None).unwrap(), 4);
+        assert_eq!(storage.count_files_filtered(Some("**/*.rs"), None, None).unwrap(), 0);
     }
 
     #[test]
