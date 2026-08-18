@@ -1312,10 +1312,18 @@ impl CodeIndexServer {
         key: &Option<String>,
         repo: &str,
         result: &Result<CallToolResult, ErrorData>,
+        epoch_before: u64,
     ) {
         let (Some(k), Ok(res)) = (key, result) else {
             return;
         };
+        // Индекс сдвинулся, пока считался ответ: демон прислал сигнал об
+        // изменении файлов. Ответ мог быть построен на данных ДО фиксации
+        // батча, а «грязные» пометки к этому моменту уже сняты — проверка по
+        // ним такого не заметит. Такой ответ в кэш не берём.
+        if self.cache.epoch(repo) != epoch_before {
+            return;
+        }
         if res.is_error.unwrap_or(false) {
             return;
         }
@@ -1537,6 +1545,8 @@ impl ServerHandler for CodeIndexServer {
             repo_opt.as_deref().unwrap_or("")
         );
         let cache_key = self.cache_key_if_local(request.name.as_ref(), &args_val);
+        // Поколение индекса на момент НАЧАЛА вычисления ответа (см. `maybe_cache`).
+        let epoch_before = self.cache.epoch(repo_opt.as_deref().unwrap_or(""));
         if let Some(ref key) = cache_key {
             if let Some(payload) = self.cache.get(key) {
                 // Per-file свежесть: не отдавать кэш, построенный на не догнавшем
@@ -1558,7 +1568,12 @@ impl ServerHandler for CodeIndexServer {
                 context,
             );
             let r = self.tool_router.call(tcc).await;
-            self.maybe_cache(&cache_key, repo_opt.as_deref().unwrap_or(""), &r);
+            self.maybe_cache(
+                &cache_key,
+                repo_opt.as_deref().unwrap_or(""),
+                &r,
+                epoch_before,
+            );
             return self.finish(&session_id, &dedup_scope, r);
         }
         // 2. Иначе — extension-tools. Ищем по имени.
@@ -1639,7 +1654,12 @@ impl ServerHandler for CodeIndexServer {
         // Прогон через `IndexTool::execute` и обёртка результата.
         let value = ext.execute(args, ctx).await;
         let r = Ok(CallToolResult::structured(value));
-        self.maybe_cache(&cache_key, repo_opt.as_deref().unwrap_or(""), &r);
+        self.maybe_cache(
+            &cache_key,
+            repo_opt.as_deref().unwrap_or(""),
+            &r,
+            epoch_before,
+        );
         self.finish(&session_id, &dedup_scope, r)
     }
 

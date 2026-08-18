@@ -19,7 +19,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,25 @@ struct Entry {
     payload: Arc<String>,
     expires: Instant,
 }
+
+/// Захватить замок на чтение, переживая отравление.
+///
+/// Единая политика проекта, заведённая при разборе G-1 для пула соединений:
+/// отравление замка означает не порчу данных, а лишь панику где-то в стороне.
+/// Под замками здесь обычные карты, и операции над ними не оставляют их в
+/// промежуточном состоянии. Паниковать повторно — значит выводить весь слой
+/// выдачи из строя навсегда из-за одной давней аварии в чужом потоке.
+pub(crate) fn lock_r<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Захватить замок на запись, переживая отравление (см. [`lock_r`]).
+pub(crate) fn lock_w<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Раз во столько вставок запускается уборка истёкших записей.
+const SWEEP_EVERY: u64 = 256;
 
 /// In-memory кэш результатов tool-вызовов, общий на все сессии serve.
 pub struct ServeCache {
@@ -51,6 +70,19 @@ pub struct ServeCache {
     hits: AtomicU64,
     misses: AtomicU64,
     invalidations: AtomicU64,
+    /// Счётчик вставок: раз в `SWEEP_EVERY` запускается уборка истёкших
+    /// записей и подчистка обратного индекса (см. [`ServeCache::sweep`]).
+    inserts: AtomicU64,
+    /// Поколение индекса по репозиториям: растёт на КАЖДЫЙ сигнал демона
+    /// (`mark_dirty` и любая инвалидация). Ответ, посчитанный при одном
+    /// поколении и пришедший на запись при другом, в кэш не берётся — он мог
+    /// быть построен на данных до фиксации батча, а «грязные» пометки к тому
+    /// моменту уже сняты, и проверка по ним ничего не заметит.
+    epochs: RwLock<HashMap<String, u64>>,
+    /// Поколение «всех репозиториев сразу» — двигается полным сбросом кэша.
+    /// Складывается с поколением репозитория, чтобы сброс замечали и те репо,
+    /// о которых сигналов ещё не было.
+    epoch_all: AtomicU64,
 }
 
 impl ServeCache {
@@ -69,6 +101,9 @@ impl ServeCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             invalidations: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+            epochs: RwLock::new(HashMap::new()),
+            epoch_all: AtomicU64::new(0),
         }
     }
 
@@ -98,17 +133,24 @@ impl ServeCache {
         if !self.enabled {
             return None;
         }
-        let guard = self.store.read().unwrap();
-        match guard.get(key) {
-            Some(e) if e.expires > Instant::now() => {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(e.payload.clone())
+        let expired = {
+            let guard = lock_r(&self.store);
+            match guard.get(key) {
+                Some(e) if e.expires > Instant::now() => {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Some(e.payload.clone());
+                }
+                Some(_) => true,
+                None => false,
             }
-            _ => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+        };
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        if expired {
+            // Истёкшую запись убираем сразу: раньше она считалась промахом, но
+            // память занимать не переставала.
+            lock_w(&self.store).remove(key);
         }
+        None
     }
 
     /// Положить payload по ключу (с TTL от now) и зарегистрировать зависимость
@@ -122,15 +164,66 @@ impl ServeCache {
             payload,
             expires: Instant::now() + self.ttl,
         };
-        self.store.write().unwrap().insert(key.clone(), entry);
+        lock_w(&self.store).insert(key.clone(), entry);
         if !deps.is_empty() {
-            let mut rev = self.reverse.write().unwrap();
+            let mut rev = lock_w(&self.reverse);
             for d in deps {
                 rev.entry((repo.to_string(), d.clone()))
                     .or_default()
                     .insert(key.clone());
             }
         }
+        if self.inserts.fetch_add(1, Ordering::Relaxed) % SWEEP_EVERY == SWEEP_EVERY - 1 {
+            self.sweep();
+        }
+    }
+
+    /// Убрать истёкшие записи и подчистить служебные карты. Вызывается раз в
+    /// `SWEEP_EVERY` вставок. Возвращает число убранных записей кэша.
+    ///
+    /// Зачем: истёкшая запись на выдаче считалась промахом, но памяти это не
+    /// возвращало — карта росла всё время работы сервера. Обратный индекс рос
+    /// вдобавок ссылками на ключи, снесённые точечной инвалидацией по ДРУГОМУ
+    /// файлу, и зависимостями перезаписанных ключей.
+    pub fn sweep(&self) -> usize {
+        if !self.enabled {
+            return 0;
+        }
+        let now = Instant::now();
+        let removed = {
+            let mut store = lock_w(&self.store);
+            let before = store.len();
+            store.retain(|_, e| e.expires > now);
+            before - store.len()
+        };
+        {
+            // Ссылки на ключи, которых в кэше уже нет, и опустевшие записи.
+            let store = lock_r(&self.store);
+            let mut rev = lock_w(&self.reverse);
+            rev.retain(|_, keys| {
+                keys.retain(|k| store.contains_key(k));
+                !keys.is_empty()
+            });
+        }
+        {
+            // Протухшие «грязные» пометки: их снимает `is_path_stale`, но лишь
+            // когда об этом файле ещё спрашивают.
+            let mut dirty = lock_w(&self.dirty);
+            dirty.retain(|_, (_, marked)| marked.elapsed() < self.dirty_max_age);
+        }
+        removed
+    }
+
+    /// Поколение индекса репозитория (см. поле `epochs`). Складывает поколение
+    /// самого репозитория с поколением полного сброса.
+    pub fn epoch(&self, repo: &str) -> u64 {
+        let per_repo = lock_r(&self.epochs).get(repo).copied().unwrap_or(0);
+        per_repo + self.epoch_all.load(Ordering::Relaxed)
+    }
+
+    /// Отметить, что индекс репозитория сдвинулся.
+    fn bump_epoch(&self, repo: &str) {
+        *lock_w(&self.epochs).entry(repo.to_string()).or_insert(0) += 1;
     }
 
     /// Снести все ключи репо (`scope|...`). Возвращает число удалённых записей.
@@ -139,14 +232,15 @@ impl ServeCache {
         if !self.enabled {
             return 0;
         }
+        self.bump_epoch(scope);
         let prefix = format!("{scope}|");
-        let mut guard = self.store.write().unwrap();
+        let mut guard = lock_w(&self.store);
         let before = guard.len();
         guard.retain(|k, _| !k.starts_with(&prefix));
         let removed = before - guard.len();
         drop(guard);
         // Обратный индекс этого репо больше не нужен.
-        self.reverse.write().unwrap().retain(|(r, _), _| r != scope);
+        lock_w(&self.reverse).retain(|(r, _), _| r != scope);
         if removed > 0 {
             self.invalidations.fetch_add(removed as u64, Ordering::Relaxed);
         }
@@ -158,12 +252,13 @@ impl ServeCache {
         if !self.enabled {
             return 0;
         }
-        let mut guard = self.store.write().unwrap();
+        self.epoch_all.fetch_add(1, Ordering::Relaxed);
+        let mut guard = lock_w(&self.store);
         let removed = guard.len();
         guard.clear();
         drop(guard);
-        self.reverse.write().unwrap().clear();
-        self.dirty.write().unwrap().clear();
+        lock_w(&self.reverse).clear();
+        lock_w(&self.dirty).clear();
         self.invalidations.fetch_add(removed as u64, Ordering::Relaxed);
         removed
     }
@@ -174,8 +269,9 @@ impl ServeCache {
         if !self.enabled || files.is_empty() {
             return;
         }
+        self.bump_epoch(repo);
         let now = Instant::now();
-        let mut d = self.dirty.write().unwrap();
+        let mut d = lock_w(&self.dirty);
         for (path, mtime) in files {
             d.insert((repo.to_string(), path.clone()), (*mtime, now));
         }
@@ -191,7 +287,7 @@ impl ServeCache {
         }
         let key = (repo.to_string(), path.to_string());
         {
-            let guard = self.dirty.read().unwrap();
+            let guard = lock_r(&self.dirty);
             match guard.get(&key) {
                 None => return false,
                 Some((observed, marked)) if marked.elapsed() < self.dirty_max_age => {
@@ -200,7 +296,7 @@ impl ServeCache {
                 Some(_) => {} // протухло — снимем ниже
             }
         }
-        self.dirty.write().unwrap().remove(&key);
+        lock_w(&self.dirty).remove(&key);
         false
     }
 
@@ -212,9 +308,10 @@ impl ServeCache {
         if !self.enabled || paths.is_empty() {
             return 0;
         }
+        self.bump_epoch(repo);
         // 1) снять «грязные» пометки этих файлов.
         {
-            let mut d = self.dirty.write().unwrap();
+            let mut d = lock_w(&self.dirty);
             for p in paths {
                 d.remove(&(repo.to_string(), p.clone()));
             }
@@ -222,7 +319,7 @@ impl ServeCache {
         // 2) собрать зависящие от файлов ключи и почистить обратный индекс.
         let mut keys: HashSet<String> = HashSet::new();
         {
-            let mut rev = self.reverse.write().unwrap();
+            let mut rev = lock_w(&self.reverse);
             for p in paths {
                 if let Some(set) = rev.remove(&(repo.to_string(), p.clone())) {
                     keys.extend(set);
@@ -233,7 +330,7 @@ impl ServeCache {
             return 0;
         }
         // 3) снести эти ключи из store.
-        let mut store = self.store.write().unwrap();
+        let mut store = lock_w(&self.store);
         let mut removed = 0usize;
         for k in &keys {
             if store.remove(k).is_some() {
@@ -249,13 +346,13 @@ impl ServeCache {
 
     /// Число «грязных» файлов сейчас (для /cache-stats).
     pub fn dirty_count(&self) -> usize {
-        self.dirty.read().unwrap().len()
+        lock_r(&self.dirty).len()
     }
 
     /// Снимок счётчиков для /health: (entries, hits, misses, invalidations).
     pub fn stats(&self) -> (usize, u64, u64, u64) {
         (
-            self.store.read().unwrap().len(),
+            lock_r(&self.store).len(),
             self.hits.load(Ordering::Relaxed),
             self.misses.load(Ordering::Relaxed),
             self.invalidations.load(Ordering::Relaxed),
@@ -356,6 +453,79 @@ mod tests {
         assert!(c.get(&k_y).is_some());
         // Пометка X снята.
         assert!(!c.is_path_stale("ut", "src/X.bsl", 100));
+    }
+
+    /// Регресс M-3: истёкшая запись на выдаче считалась промахом, но из памяти
+    /// не уходила — карта росла всё время работы сервера.
+    #[test]
+    fn истёкшая_запись_освобождает_память() {
+        let c = ServeCache::new(0, true); // время жизни зажимается в 1 секунду
+        let key = ServeCache::key("ut", "t", &json!({"a": 1}));
+        c.insert(key.clone(), Arc::new("x".into()), "ut", &["src/X.bsl".to_string()]);
+        assert_eq!(c.stats().0, 1);
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(c.get(&key).is_none(), "истёкшая запись не должна отдаваться");
+        assert_eq!(c.stats().0, 0, "истёкшая запись должна уйти из памяти");
+    }
+
+    /// Уборка снимает и ссылки обратного индекса на снесённые ключи.
+    #[test]
+    fn уборка_чистит_обратный_индекс() {
+        let c = ServeCache::new(0, true);
+        let key = ServeCache::key("ut", "t", &json!({"a": 1}));
+        c.insert(key, Arc::new("x".into()), "ut", &["src/X.bsl".to_string()]);
+        assert_eq!(lock_r(&c.reverse).len(), 1);
+        std::thread::sleep(Duration::from_millis(1100));
+        c.sweep();
+        assert_eq!(c.stats().0, 0);
+        assert!(
+            lock_r(&c.reverse).is_empty(),
+            "ссылки на снесённые ключи должны уйти"
+        );
+    }
+
+    /// M-2: поколение индrepo двигается любым сигналом демона — по нему видно,
+    /// что индекс сместился, пока считался ответ.
+    #[test]
+    fn поколение_растёт_на_каждый_сигнал_демона() {
+        let c = ServeCache::new(60, true);
+        let e0 = c.epoch("ut");
+        c.mark_dirty("ut", &[("src/X.bsl".to_string(), 100)]);
+        let e1 = c.epoch("ut");
+        assert!(e1 > e0, "mark_dirty обязан двигать поколение");
+        c.invalidate_files("ut", &["src/X.bsl".to_string()]);
+        let e2 = c.epoch("ut");
+        assert!(e2 > e1, "точечная инвалидация обязана двигать поколение");
+        c.invalidate_scope("ut");
+        assert!(c.epoch("ut") > e2, "сброс репо обязан двигать поколение");
+        // Соседний репозиторий не задет.
+        let bp_before = c.epoch("bp");
+        assert_eq!(bp_before, 0);
+        // Полный сброс замечают и репо, о которых сигналов ещё не было.
+        c.invalidate_all();
+        assert!(c.epoch("bp") > bp_before);
+    }
+
+    /// Регресс M-4: паника стороннего потока, державшего замок, раньше делала
+    /// весь кэш неработоспособным — а с ним и каждый последующий вызов.
+    #[test]
+    fn отравленный_замок_не_роняет_кэш() {
+        let c = Arc::new(ServeCache::new(60, true));
+        let c2 = Arc::clone(&c);
+        let прежний_хук = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // не засорять вывод теста
+        let res = std::thread::spawn(move || {
+            let _guard = c2.store.write().unwrap();
+            panic!("искусственная паника ради отравления замка");
+        })
+        .join();
+        std::panic::set_hook(прежний_хук);
+        assert!(res.is_err(), "поток должен был упасть и отравить замок");
+        assert!(c.store.read().is_err(), "замок должен быть отравлен");
+
+        let key = ServeCache::key("ut", "t", &json!({}));
+        c.insert(key.clone(), Arc::new("x".into()), "ut", &[]);
+        assert_eq!(c.get(&key).as_deref().map(String::as_str), Some("x"));
     }
 
     #[test]

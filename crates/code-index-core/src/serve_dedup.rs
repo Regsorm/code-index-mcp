@@ -36,6 +36,7 @@
 //! полный сброс памяти — `POST /dedup-reset` (доступен любому клиенту: изнутри
 //! MCP сжатие контекста модели не наблюдаемо ни у одного из них).
 
+use crate::serve_cache::{lock_r, lock_w};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -84,7 +85,7 @@ impl SessionDedup {
     /// Забыть состояние сессии (на закрытии сессии). Без вызова — подчистится
     /// при рестарте serve; одна сессия ограничена `max_rows_per_session`.
     pub fn forget(&self, session_id: &str) {
-        self.sessions.write().unwrap().remove(session_id);
+        lock_w(&self.sessions).remove(session_id);
     }
 
     /// Забыть состояние ВСЕХ сессий (ручка `POST /dedup-reset`). Возвращает
@@ -95,7 +96,7 @@ impl SessionDedup {
     /// цена — разовая повторная отдача строк, корректность не страдает (тем же
     /// приёмом сбрасывается карта при переполнении).
     pub fn reset_all(&self) -> usize {
-        let mut guard = self.sessions.write().unwrap();
+        let mut guard = lock_w(&self.sessions);
         let n = guard.len();
         guard.clear();
         n
@@ -104,7 +105,7 @@ impl SessionDedup {
     /// (сессий в памяти, всего опущено строк) — для /cache-stats.
     pub fn stats(&self) -> (usize, u64) {
         (
-            self.sessions.read().unwrap().len(),
+            lock_r(&self.sessions).len(),
             self.elided_total.load(Ordering::Relaxed),
         )
     }
@@ -129,15 +130,24 @@ impl SessionDedup {
 
         // Данные tool'а лежат в MCP CallToolResult: content[*].text — это
         // вложенная JSON-строка `{result, _meta}`. Находим её, дедупим, кладём
-        // обратно. structuredContent (если есть) дублирует — обновляем и его.
+        // обратно. structuredContent (если есть) дублирует ТЕ ЖЕ данные.
         let mut elided = 0usize;
+        // Отпечатки строк, опущенных первым проходом. Второй проход обязан
+        // опустить РОВНО их: память сессии он не трогает и своего решения не
+        // принимает. Иначе он увидит в памяти строки, только что запомненные
+        // первым проходом, и опустит весь ответ до единой строки.
+        let mut elided_fps: HashSet<u64> = HashSet::new();
+        let mut text_pass_done = false;
 
         // 1) content[0].text (вложенный JSON-string)
         if let Some(text_idx) = find_text_content_index(&outer) {
             if let Some(text) = outer["content"][text_idx]["text"].as_str() {
                 if let Ok(mut inner) = serde_json::from_str::<Value>(text) {
-                    elided += self.dedup_rows_in_result(sid, scope, &mut inner);
-                    if elided > 0 {
+                    let (n, fps) = self.dedup_and_record(sid, scope, &mut inner);
+                    elided += n;
+                    elided_fps = fps;
+                    text_pass_done = true;
+                    if n > 0 {
                         if let Ok(s) = serde_json::to_string(&inner) {
                             outer["content"][text_idx]["text"] = Value::String(s);
                         }
@@ -149,11 +159,15 @@ impl SessionDedup {
         // 2) structuredContent (rmcp structured output, дублирует данные)
         if outer.get("structuredContent").is_some() {
             let mut sc = outer["structuredContent"].take();
-            let e2 = self.dedup_rows_in_result(sid, scope, &mut sc);
+            if text_pass_done {
+                // Дубль уже обработанного ответа — повторяем решение первого прохода.
+                self.apply_elision(&elided_fps, scope, &mut sc);
+            } else {
+                // Текстовой части не было: структурная форма — единственный
+                // источник, обрабатываем её полноценно.
+                elided += self.dedup_and_record(sid, scope, &mut sc).0;
+            }
             outer["structuredContent"] = sc;
-            // structuredContent дублирует content[0].text — НЕ суммируем в elided,
-            // считаем по первому источнику; но переписать обязаны для консистентности.
-            let _ = e2;
         }
 
         if elided == 0 {
@@ -166,9 +180,59 @@ impl SessionDedup {
         }
     }
 
+    /// Первый проход: опустить уже отданные строки и ЗАПОМНИТЬ новые как
+    /// отданные. Возвращает (число опущенных, отпечатки опущенных строк).
+    fn dedup_and_record(
+        &self,
+        sid: &str,
+        scope: &str,
+        obj: &mut Value,
+    ) -> (usize, HashSet<u64>) {
+        let mut elided_fps: HashSet<u64> = HashSet::new();
+        let mut guard = lock_w(&self.sessions);
+        // Защита от утечки: новая сессия при переполнении карты → полный сброс.
+        if !guard.contains_key(sid) && guard.len() >= self.max_sessions {
+            guard.clear();
+        }
+        let max_rows = self.max_rows_per_session;
+        let seen = guard.entry(sid.to_string()).or_default();
+        let elided = {
+            let fps = &mut elided_fps;
+            Self::rewrite_rows(obj, &mut |row| {
+                let fp = fingerprint(scope, row);
+                if seen.contains(&fp) {
+                    fps.insert(fp);
+                    true
+                } else {
+                    if seen.len() < max_rows {
+                        seen.insert(fp);
+                    }
+                    false
+                }
+            })
+        };
+        drop(guard);
+        (elided, elided_fps)
+    }
+
+    /// Повторный проход по ДУБЛИРУЮЩЕМУ представлению того же ответа
+    /// (`structuredContent`): опустить ровно те строки, что опущены первым
+    /// проходом. Память сессии не трогает — иначе опустил бы весь ответ, ведь
+    /// новые строки первый проход уже успел запомнить.
+    fn apply_elision(&self, elided_fps: &HashSet<u64>, scope: &str, obj: &mut Value) -> usize {
+        if elided_fps.is_empty() {
+            return 0;
+        }
+        Self::rewrite_rows(obj, &mut |row| {
+            elided_fps.contains(&fingerprint(scope, row))
+        })
+    }
+
     /// Найти `result.rows` (или `result` как массив) в объекте `{result, _meta}`,
-    /// опустить уже отданные строки, добавить маркер. Возвращает число опущенных.
-    fn dedup_rows_in_result(&self, sid: &str, scope: &str, obj: &mut Value) -> usize {
+    /// опустить строки по решению `drop_row`, проставить маркер. Возвращает
+    /// число опущенных. Память сессии сама не трогает — решение целиком за
+    /// вызывающим.
+    fn rewrite_rows(obj: &mut Value, drop_row: &mut dyn FnMut(&Value) -> bool) -> usize {
         // Форма результата решает, КУДА ляжет маркер: в таблице — внутрь
         // `result` рядом с `rows`, у голого массива — рядом с самим `result`
         // (запоминаем до мутабельного заимствования ниже).
@@ -192,27 +256,16 @@ impl SessionDedup {
                 return 0;
             }
 
-            let mut guard = self.sessions.write().unwrap();
-            // Защита от утечки: новая сессия при переполнении карты → полный сброс.
-            if !guard.contains_key(sid) && guard.len() >= self.max_sessions {
-                guard.clear();
-            }
-            let seen = guard.entry(sid.to_string()).or_default();
             let mut kept: Vec<Value> = Vec::with_capacity(rows.len());
             let mut elided = 0usize;
             for row in rows.drain(..) {
-                let fp = fingerprint(scope, &row);
-                if seen.contains(&fp) {
+                if drop_row(&row) {
                     elided += 1;
                 } else {
-                    if seen.len() < self.max_rows_per_session {
-                        seen.insert(fp);
-                    }
                     kept.push(row);
                 }
             }
             *rows = kept;
-            drop(guard);
 
             // Табличная форма: маркер внутрь `result`, рядом с `rows`.
             if elided > 0 {
@@ -443,6 +496,58 @@ mod tests {
             serde_json::from_str(outer["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(inner["hint"], json!("truncated"));
         assert_eq!(inner["rows_elided_already_delivered"], json!(1));
+    }
+
+    /// Регресс M-1: `structuredContent` дублирует те же данные, что и текстовая
+    /// часть ответа. Раньше второй проход шёл по уже пополненному множеству
+    /// отпечатков и опускал ВЕСЬ ответ — клиент, читающий структурную форму,
+    /// терял именно новые строки, да ещё с пометкой «уже отдавали ранее».
+    #[test]
+    fn структурная_форма_не_опустошается_вторым_проходом() {
+        let d = SessionDedup::new(true);
+        let mk = |rows: Value| {
+            let inner = json!({ "result": { "rows": rows } });
+            json!({
+                "content": [ { "type": "text", "text": inner.to_string() } ],
+                "structuredContent": inner
+            })
+            .to_string()
+        };
+        d.process(Some("s1"), SCOPE, &mk(json!([["A", 1], ["B", 2]])));
+        let (out, elided) =
+            d.process(Some("s1"), SCOPE, &mk(json!([["A", 1], ["B", 2], ["C", 3]])));
+        assert_eq!(elided, 2);
+
+        let outer: Value = serde_json::from_str(&out).unwrap();
+        let text: Value =
+            serde_json::from_str(outer["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text["result"]["rows"], json!([["C", 3]]));
+        assert_eq!(
+            outer["structuredContent"]["result"]["rows"],
+            json!([["C", 3]]),
+            "структурная форма обязана содержать те же строки, что и текстовая"
+        );
+        assert_eq!(
+            outer["structuredContent"]["result"]["rows_elided_already_delivered"],
+            json!(2)
+        );
+    }
+
+    /// Ответ только со структурной формой (текстовой части нет) обрабатывается
+    /// полноценно, а не как повторение несостоявшегося первого прохода.
+    #[test]
+    fn структурная_форма_без_текста_обрабатывается_самостоятельно() {
+        let d = SessionDedup::new(true);
+        let p = json!({ "structuredContent": { "result": [{"caller": "A"}] } }).to_string();
+        let (_, first) = d.process(Some("s1"), SCOPE, &p);
+        assert_eq!(first, 0, "первая доставка ничего не опускает");
+        let (out, second) = d.process(Some("s1"), SCOPE, &p);
+        assert_eq!(second, 1, "повтор обязан быть опущен");
+        let outer: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            outer["structuredContent"]["result"].as_array().unwrap().len(),
+            0
+        );
     }
 
     /// `POST /dedup-reset` → память забыта, строки приходят снова (клиент сжал
