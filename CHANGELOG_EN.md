@@ -5,6 +5,34 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.49.6] — 2026-08-18
+
+**Daemon startup after editing a few files no longer takes minutes: the derived layer is rebuilt per-file instead of wholesale. Rust modules finally land in the index, and a temporarily unavailable file is no longer dropped from it as deleted.**
+
+> Context. Findings S-5, S-6, M-5, G-5, G-6 of the audit. Sixth small release from it.
+
+### Fixed
+
+- **The derived layer was rebuilt wholesale because of a single changed file (S-6).** The skip gate at daemon startup required exactly zero changes, so any edit triggered a full rebuild of configuration metadata, forms, subscriptions and the procedure call graph. The per-file path existed, worked and was covered by tests, but only the file-watching loop could reach it — there the path list exists by construction, while the indexing result carried counters only. The result now carries the paths themselves (capped at 10 000, beyond which the lists are dropped), and startup has three branches instead of two: skip on zero changes, per-file rebuild when paths are known and the derived layer exists, full rebuild for a new database, an empty derived layer or an overflow. A failing per-file rebuild is not swallowed: a full rebuild follows, otherwise the derived layer would be left in an unknown state. Measured on 57 060 files with one changed file: **428 065 ms → 20 345 ms**, 21× faster.
+- **Rust modules did not land in the index (G-6).** Structs, enums and traits were parsed, `mod` was not — including `mod tests`, present in almost every file. As a result `get_class` could not find a module, the file map looked exhaustive without being so, and "what lives where" counts were understated. A module is now indexed on par with a type — both with a body and in the `mod foo;` form. On this repository after reindexing: 208 → 374 types, 166 of them modules.
+- **A temporarily unavailable file was taken for a deleted one (S-5).** The decision was made by an "is this a file?" check at event-handling time. If the file was invisible at that moment — antivirus scan, file locked by another process, mid-move — a modification turned into a deletion and the row left the index. No further event would come, so it would only return on a full pass. Deletion now requires an explicit "not found"; other errors are treated as a modification. In a doubtful case we keep a stale row: it goes away on the next full pass, while a lost live file would not return before it.
+- **Per-repository cache invalidation did not clear "dirty" marks (M-5).** A full flush cleared them, a per-repository one did not, so marks lived up to two minutes and suppressed caching of that repository's answers all that time. Wasted recomputation, not corruption.
+- **A failed file-metadata update was silenced (G-5).** The result was dropped via `let _ =`, although it means the file will miss the mtime fast path on the next startup and be parsed in full. The slowdown looked unexplained. Failures are now counted, the first five are logged with path and error, and a summary line states the count and the consequence.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 664 passed, 0 failed (was 659; 5 added).
+- **Live S-6 measurement:** both runs under identical daemon conditions on a 57 060-file bench with one changed file — 428 065 ms vs 20 345 ms.
+- **S-6 equivalence:** after the per-file path and after a full pass over the same file state, all twelve counters matched — `metadata_objects` 14 823, `metadata_forms` 5 284, `metadata_modules` 13 944, `event_subscriptions` 346, `data_links` 64 764, `role_rights` 49 695, `proc_call_graph` 593 515, `procedure_enrichment` 261 488, `metadata_code_usages` 280 449 (from 8 780 files), `direct_edge_files` 1 168 432, `config_manifest` 103 886.
+- **The per-file path really updates:** a function added to a module was found after startup in the core, in the enrichment layer with its terms, and in the call graph as an edge to the callee; counters moved by exactly +1 in the three code-derived tables, the other nine unchanged.
+- **Live G-6 check:** after a forced reindex `get_class` finds a module, the file map shows `mod tests` with its line range, and functions and types inside modules are still there.
+
+### Compatibility
+
+- **G-6 requires a forced reindex** of Rust repositories: swapping the binary is not enough, existing rows will not appear on their own. Nothing changes for other languages.
+- The remaining fixes require no reindexing.
+- After reindexing, output for Rust repositories contains STRICTLY MORE rows: modules were added. Existing rows are unchanged.
+
 ## [0.49.5] — 2026-08-18
 
 **Line anchors no longer drop matches silently: `^` and `$` in `grep_text`, `grep_code` and `grep_body` mean line boundaries, not file boundaries.**
