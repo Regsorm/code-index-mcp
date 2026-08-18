@@ -68,6 +68,13 @@ impl LanguageProcessor for BslLanguageProcessor {
         if repo_root.join("Configuration.xml").is_file() {
             return true;
         }
+        // Выгрузка 1C:EDT: `Configuration.xml` в ней нет вообще, вместо него
+        // `<...>/Configuration/Configuration.mdo`. Без этой ветки индексация
+        // такой выгрузки без явного `language = "bsl"` молча остаётся без
+        // schema_extensions, а весь разбор `.mdo` не запускается.
+        if crate::xml::edt_mdo::detect_edt_src(repo_root).is_some() {
+            return true;
+        }
         // Рекурсивный путь — multi-config: base/, extensions/<name>/, ...
         walkdir::WalkDir::new(repo_root)
             .max_depth(3) // root=0, depth=1=base/, depth=2=extensions/<name>/, depth=3=Configuration.xml
@@ -244,6 +251,20 @@ mod tests {
         std::fs::create_dir_all(&ext).unwrap();
         std::fs::File::create(ext.join("Configuration.xml")).unwrap();
         assert!(p.detects(tmp.path()), "base + extensions — всё ещё наш");
+    }
+
+    #[test]
+    fn detects_edt_workspace() {
+        // Выгрузка 1C:EDT: Configuration.xml нет вообще, признак формата —
+        // src/Configuration/Configuration.mdo.
+        let tmp = TempDir::new().unwrap();
+        let p = BslLanguageProcessor::new();
+        assert!(!p.detects(tmp.path()), "пустой репо — не наш");
+
+        let cfg = tmp.path().join("src").join("Configuration");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::File::create(cfg.join("Configuration.mdo")).unwrap();
+        assert!(p.detects(tmp.path()), "src/Configuration/Configuration.mdo — наш");
     }
 
     #[test]

@@ -127,6 +127,9 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
         Indexing,
         PostingProp,
         HeaderProp,
+        Owner,
+        PredefName,
+        ValueType,
     }
 
     let mut in_std = false;
@@ -136,6 +139,18 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
     let mut field: Option<FieldBuild> = None;
     let mut in_type = false;
     let mut in_synonym = false;
+    // Предопределённые элементы: `<predefined><items><name>...</name>...`.
+    // Внутри `<items>` берём только первый `<name>` (дальше идут description/code).
+    let mut in_predefined = false;
+    let mut in_predef_item = false;
+    let mut took_predef_name = false;
+    // `<type>` на уровне САМОГО объекта (не поля) — тип значения ПВХ/константы.
+    let mut in_obj_type = false;
+    // Глубина вложенности: корневой тег объекта — 1, его прямые дети — 2.
+    // Нужна, чтобы `owners`/`predefined`/`type` брались только у самого объекта:
+    // у ПВХ такие же теги есть внутри предопределённых элементов, и без границы
+    // тип значения объекта смешивается с типами каждого предопределённого вида.
+    let mut depth: usize = 0;
     let mut tt = T::None;
     let mut cur_posting_prop: Option<String> = None;
     let mut cur_header_prop: Option<String> = None;
@@ -145,6 +160,7 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
             Ok(Event::Start(e)) => {
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = local_name(&raw).to_string();
+                depth += 1;
                 if local == "standardAttributes" {
                     in_std = true;
                     buf.clear();
@@ -182,6 +198,27 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                             }
                         } else if expecting_tab_name {
                             tt = T::TabName;
+                        } else if in_predef_item && !took_predef_name {
+                            tt = T::PredefName;
+                        }
+                    }
+                    // Владельцы подчинённого справочника: `<owners>Catalog.X</owners>`.
+                    "owners" => {
+                        if field.is_none() && depth == 2 {
+                            tt = T::Owner;
+                        }
+                    }
+                    "predefined" => {
+                        if depth == 2 {
+                            in_predefined = true;
+                        }
+                    }
+                    "items" => {
+                        // Только прямые элементы блока `<predefined>` (depth 3):
+                        // вложенные `<items>` внутри них — не предопределённые.
+                        if in_predefined && depth == 3 {
+                            in_predef_item = true;
+                            took_predef_name = false;
                         }
                     }
                     "synonym" => {
@@ -192,11 +229,19 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                     "type" => {
                         if field.is_some() {
                             in_type = true;
+                        } else if depth == 2 {
+                            // `<type>` прямо под корнем — тип значения самого
+                            // объекта (ПВХ, константа, определяемый тип). Такие
+                            // же теги внутри предопределённых элементов лежат
+                            // глубже и сюда не попадают.
+                            in_obj_type = true;
                         }
                     }
                     "types" => {
                         if field.is_some() && in_type {
                             tt = T::TypeValue;
+                        } else if field.is_none() && in_obj_type {
+                            tt = T::ValueType;
                         }
                     }
                     "value" => {
@@ -293,6 +338,23 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                             }
                         }
                     }
+                    T::Owner => {
+                        if !txt.is_empty() {
+                            out.owners.push(txt);
+                        }
+                    }
+                    T::PredefName => {
+                        if !txt.is_empty() {
+                            out.predefined.push(txt);
+                            took_predef_name = true;
+                        }
+                    }
+                    T::ValueType => {
+                        if !txt.is_empty() {
+                            let cfg = edt_type_to_cfg(&txt);
+                            out.value_types.push(pretty_types(std::slice::from_ref(&cfg)));
+                        }
+                    }
                     T::HeaderProp => {
                         if let Some(p) = cur_header_prop.take() {
                             if !txt.is_empty() {
@@ -307,6 +369,7 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
             Ok(Event::End(e)) => {
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = local_name(&raw).to_string();
+                depth = depth.saturating_sub(1);
                 if local == "standardAttributes" {
                     in_std = false;
                     buf.clear();
@@ -363,7 +426,12 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                         expecting_tab_name = false;
                     }
                     "synonym" => in_synonym = false,
-                    "type" => in_type = false,
+                    "type" => {
+                        in_type = false;
+                        in_obj_type = false;
+                    }
+                    "predefined" => in_predefined = false,
+                    "items" => in_predef_item = false,
                     _ => {}
                 }
             }
@@ -984,6 +1052,63 @@ mod tests {
             s.enum_synonyms,
             vec![("Оптовая".to_string(), "Оптовая цена".to_string())]
         );
+    }
+
+    #[test]
+    fn owners_predefined_and_value_types() {
+        // Три секции, которых EDT-разбор раньше не давал вовсе: владельцы
+        // подчинённого справочника, предопределённые элементы и тип значения
+        // объекта (ПВХ/константа). Раскладка тегов — как в реальной выгрузке.
+        let mdo = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:ChartOfCharacteristicTypes xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass">
+  <name>ВидыСубконто</name>
+  <owners>Catalog.Контрагенты</owners>
+  <owners>Catalog.Организации</owners>
+  <type>
+    <types>CatalogRef.Склады</types>
+    <types>DocumentRef.АвансовыйОтчет</types>
+  </type>
+  <attributes>
+    <name>Комментарий</name>
+    <type>
+      <types>String</types>
+    </type>
+  </attributes>
+  <predefined>
+    <items id="a1">
+      <name>ОсновнойВид</name>
+      <description>Основной вид</description>
+      <code xsi:type="core:NumberValue">
+        <value>1</value>
+      </code>
+    </items>
+    <items id="a2">
+      <name>ПрочийВид</name>
+      <description>Прочий вид</description>
+      <type>
+        <types>CatalogRef.Номенклатура</types>
+      </type>
+    </items>
+  </predefined>
+</mdclass:ChartOfCharacteristicTypes>"#;
+        let s = parse_mdo_structure_xml(mdo).unwrap();
+        assert_eq!(s.owners, vec!["Catalog.Контрагенты", "Catalog.Организации"]);
+        assert_eq!(s.predefined, vec!["ОсновнойВид", "ПрочийВид"]);
+        // Только корневой тип значения объекта. Тип предопределённого элемента
+        // (CatalogRef.Номенклатура внутри <predefined>) сюда попадать не должен.
+        assert_eq!(
+            s.value_types,
+            vec!["СправочникСсылка.Склады", "ДокументСсылка.АвансовыйОтчет"]
+        );
+        // Тип значения объекта не смешивается с типом реквизита.
+        assert_eq!(s.attributes.len(), 1);
+        assert_eq!(s.attributes[0].name, "Комментарий");
+        assert_eq!(s.attributes[0].type_str, "Строка");
+        // Секции попадают в JSON структуры.
+        let js = s.to_json();
+        assert!(js.get("owners").is_some());
+        assert!(js.get("predefined").is_some());
+        assert!(js.get("value_types").is_some());
     }
 
     #[test]
