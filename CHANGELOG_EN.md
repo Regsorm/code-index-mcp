@@ -5,6 +5,29 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.49.8] — 2026-08-18
+
+**Responses no longer pass off a partial answer as a complete one: the file listing and path-scoped search now say that not everything is shown, and how much there is in total.**
+
+> Context. Findings M-11 — M-14 of the serving-layer audit. Common thread: a response looked complete when it was not, and conclusions were drawn from it.
+
+### Fixed
+
+- **The file listing was truncated silently (`list_files`).** The default is 500 files; beyond that the query simply stopped, and the answer was indistinguishable from a complete directory listing: on a 1C configuration a request for all modules returned 500 entries out of 18,298. The response now carries `truncated`, `total` (how many actually match), `shown` and `limit`. The extra count runs only when the query hit its ceiling — if there are fewer files, there is no second database round-trip. The default of 500 is now stated in the tool and parameter descriptions.
+- **Path-scoped search stayed silent about incompleteness whenever anything was found (`search_function`, `search_class`, `search_text`).** The `prefilter_exhausted` marker arrived in 0.49.4 but hung on the "result is empty" condition. Yet the path filter is applied AFTER the top records are fetched by relevance: a dozen records out of many hundreds could remain, with nothing to indicate it. The marker is now emitted for non-empty results too, along with `prefetched` and `shown`. It sits next to `result` rather than in the internal field — that field is stripped before the response reaches the client.
+- **Mass mode lost the response's link to its source files.** A batched answer (`names[]` on `get_function`/`get_class`) was assembled without the internal field entirely. As a result its cache entry never entered the reverse index — per-file eviction could not reach it, and the "response built on a lagging index" check never ran for a batch. The dependencies of all elements are now merged into one internal field on the response.
+- **The `grep_body` truncation marker fired falsely.** In the branch without a path filter and without context it was derived from "matches are not fewer than requested": a request whose ceiling equalled the number of matches was marked truncated even though there were no more. It now fetches one match beyond the ceiling and sets the marker only if that extra one arrives.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 667 passed, 0 failed (was 664; three new tests: the marker on a non-empty result, counting files under the listing filters, merging dependencies in mass mode).
+- **Live check on Windows:** a listing of all configuration modules — 500 rows with `truncated: true` and `total: 18,298`; a complete four-file listing — no extra fields. Path-scoped search — 11 records with the incompleteness marker and `prefetched: 75`; search without scoping — 16 records, no marker. Per-file cache eviction after a single and a batched call removed 2 entries instead of the previous 1. `grep_body`: with 2 matches, a ceiling of 2 yields `truncated: false`, a ceiling of 1 yields `true`.
+- **Live check on Linux (federation node):** the same listing — 500 rows out of 14,905; path-scoped search — 12 records with the marker (exactly the case that started the audit); `grep_body` on a sample with 9 matches: ceiling 9 — `truncated: false`, ceiling 8 — `true`. Federation responds normally (57,060 files in the remote repository), local repositories unaffected.
+
+### Compatibility
+
+- The new fields appear only when the response really is incomplete — complete answers keep their previous shape. The database schema and the tool set are unchanged; no reindexing is required.
+
 ## [0.49.7] — 2026-08-18
 
 **The two longest functions in the project are split into standalone parts: editing command startup or the watch loop no longer means holding a five-hundred-line block in your head. Behaviour and tool responses are unchanged.**
