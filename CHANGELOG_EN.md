@@ -5,6 +5,35 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.49.4] — 2026-08-18
+
+**Path filtering no longer misses files at the repository root, and refusals and empty answers no longer stick in the serving cache for an hour. On top of that, a search whose path filter left nothing now says openly that "empty" may be an artefact of the pre-selection.**
+
+> Context. Findings M-6 … M-9 of the MCP serving-layer audit — registry in [docs/audit-2026-08.md](docs/audit-2026-08.md). Fourth small release from that audit.
+
+### Fixed
+
+- **A path pattern with `**/` did not match files at the repository root (M-6).** Normalization collapsed `**` into `*`, but the separator after it stayed mandatory: `**/*.md` became `*/*.md`, so the path `CHANGELOG.md`, which has no separator, stopped matching. The failure was silent — an empty result is indistinguishable from an honest "no such text", and was read as absence. Every tool taking a path pattern was affected: `grep_text`, `grep_code`, `grep_body`, `list_files`, `search_*`, and the narrowing in `get_function`/`get_class`. The segment is now expanded up front into two variants — "through intermediate directories" and "without them" (`**/*.md` → `*/*.md` and `*.md`) — identically for the SQL-side filter and for the post-filter in the serving layer.
+- **Refusals and "not found" settled in the serving cache for up to an hour (M-7).** Only the protocol error flag was checked before storing, while "daemon unavailable", "indexing in progress", "path not tracked" and `{"error": …}` answers are returned as an ordinary successful string. They carry no dependent files, so per-file invalidation cannot reach them — nothing could evict them short of the hour expiring. In practice: the daemon was restarted and has been running for a while, yet the client keeps getting "daemon unavailable" for the same arguments. Such answers are no longer cached at all. Three adjacent cases are fixed along with it: answers without dependent files (including any empty search result) now live 15 seconds instead of an hour; `find_path` and `get_call_tree` are bound to the files their edges come from and are therefore evicted when code changes; `stat_file` was added to the non-cacheable list — it was meant to be one, as the code comment stated, but it was missing from the list itself.
+- **Narrowing a search by path silently lost matches (M-8).** With a path pattern set, `search_function`, `search_class` and `search_text` fetch five times more rows than requested (capped at 500) and only then filter by path. If the matching files ranked lower, the answer came back empty and was indistinguishable from an honest zero. Such answers now carry a `prefilter_exhausted` flag with the number of rows examined and a note to refine the query or use `grep_code`/`grep_text`, where the path is filtered in the query itself.
+- **A field that was built and immediately stripped (M-9).** `get_callers` and `get_callees` put `file_id` into every row, while the shared plumbing strip removed that key before delivery. The field never reached the client; the source file is already delivered as `path`.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 656 passed, 0 failed (was 647; 9 added).
+- **Defect reproduction:** the old normalization behaviour was temporarily restored and both new tests failed exactly as the finding describes ("root .md must be covered, got: `["**/*.md", "**/*.toml"]`", "file at root").
+- **Live, local node:** the three calls that returned zero before the fix — `grep_text` over the changelogs and over the root manifest, `list_files` with the `**/*.toml` pattern — returned the root files.
+- **Live, refusal with the daemon stopped (M-7):** the daemon was stopped, the call returned "daemon unavailable", and neither the entry count nor the hit count in the cache changed; after the daemon came back the same call immediately returned data rather than a stuck refusal.
+- **Live, file binding and lifetime:** after per-file invalidation on the edge source file a repeated `find_path` was a miss (the entry had been dropped); an empty search was a hit on repeat and a miss after 20 seconds.
+- **Live, `stat_file`:** after the file changed, the same call returned the fresh size and time; the cache counters did not move at all during those calls.
+- **Federated smoke:** both nodes on 0.49.4; `grep_text(repo="ut", path_glob="**/README.md")` found the root file on the remote node; queries over `zup`, `bp-ss`, `bp-tdk` and an object structure through federation behaved normally.
+
+### Compatibility
+
+- **No reindex required** — the database schema did not change; the fixes are in the serving layer.
+- Path patterns with `**/` now match STRICTLY MORE files than before: matches at the repository root were added. Results without root files are unchanged.
+- `stat_file` is no longer cached and always returns current metadata.
+
 ## [0.49.3] — 2026-08-18
 
 **A repeated tool call no longer comes back empty for clients that read the structured form of the response, and an answer computed before a commit no longer settles in the cache as fresh. On top of that, the serving cache now releases memory and survives an unrelated panic.**
