@@ -59,6 +59,26 @@ fn build_file_matcher(patterns: &[String]) -> GlobSet {
 /// переименовании файла в новое имя notify присылает на старое имя
 /// `Modify(Name(RenameMode::From))` уже после того, как путь исчез. Без этого
 /// строка старого имени осталась бы фантомом в индексе до полного reindex.
+/// Настоящее ли это удаление, если путь не виден как файл.
+///
+/// `None` — метаданные прочитались, путь на месте (обычная проверка не увидела
+/// его из-за гонки). `NotFound` — файла действительно нет. Прочие ошибки
+/// (доступ запрещён, файл занят другим процессом, том отвалился) означают, что
+/// файл, скорее всего, жив: считать их удалением — значит выбросить живую
+/// запись из индекса, а нового события не придёт, и вернётся она лишь при
+/// полном проходе (S-5). Фантомная запись, наоборот, уходит при ближайшем
+/// полном проходе, поэтому в спорном случае выбираем её.
+///
+/// Вынесено отдельной функцией ради модульного теста: реальную временную
+/// недоступность (проверка антивирусом, момент перемещения) в тесте не
+/// воспроизвести.
+fn is_real_deletion(err: Option<&std::io::Error>) -> bool {
+    match err {
+        None => false,
+        Some(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 fn classify_event(kind: &notify::EventKind, path: &Path) -> Option<FileEvent> {
     // Каталог на месте. Обычные события на папке (запись внутрь) пропускаем —
     // файлы пришлют свои события сами. НО создание и переименование каталога ОС
@@ -82,9 +102,18 @@ fn classify_event(kind: &notify::EventKind, path: &Path) -> Option<FileEvent> {
         notify::EventKind::Modify(_) if path.is_file() => {
             Some(FileEvent::Modified(path.to_path_buf()))
         }
-        // Путь исчез (rename старого имени / быстрое удаление) — это удаление.
+        // Путь не виден как файл. Удалением считаем ТОЛЬКО явное отсутствие:
+        // временная недоступность (проверка антивирусом, файл занят другим
+        // процессом, момент перемещения) тоже даёт `is_file() == false`, и
+        // трактовать её как удаление — значит выбросить живой файл из индекса,
+        // причём нового события не последует и вернётся он лишь при полном
+        // проходе (S-5).
         notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
-            Some(FileEvent::Deleted(path.to_path_buf()))
+            if is_real_deletion(std::fs::symlink_metadata(path).err().as_ref()) {
+                Some(FileEvent::Deleted(path.to_path_buf()))
+            } else {
+                Some(FileEvent::Modified(path.to_path_buf()))
+            }
         }
         notify::EventKind::Remove(_) => Some(FileEvent::Deleted(path.to_path_buf())),
         _ => None,
@@ -266,6 +295,34 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// S-5: удалением считается только явное отсутствие пути. Временная
+    /// недоступность (доступ запрещён, файл занят, том отвалился) — не повод
+    /// выбрасывать живую запись из индекса.
+    #[test]
+    fn test_is_real_deletion_only_on_not_found() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(
+            !is_real_deletion(None),
+            "путь на месте — это не удаление"
+        );
+        assert!(
+            is_real_deletion(Some(&Error::new(ErrorKind::NotFound, "нет такого файла"))),
+            "явное отсутствие — удаление"
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !is_real_deletion(Some(&Error::new(kind, "временная недоступность"))),
+                "{kind:?} не должен трактоваться как удаление"
+            );
+        }
+    }
 
     #[test]
     fn test_classify_event_rename_from_becomes_delete() {
