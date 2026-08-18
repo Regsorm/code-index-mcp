@@ -146,6 +146,9 @@ fn visit_node(
         "trait_item" => {
             visit_trait(node, ctx, current_func, depth);
         }
+        "mod_item" => {
+            visit_mod(node, ctx, current_func, depth);
+        }
         "use_declaration" => {
             visit_use(node, ctx);
         }
@@ -401,6 +404,58 @@ fn visit_trait(
                     depth + 1,
                 );
             }
+        }
+    }
+}
+
+/// Обработать mod_item → classes (bases = "mod").
+///
+/// Модуль в Rust — такая же единица организации кода, как тип: без него
+/// структура файла в выдаче неполная, `get_class` модуль не находит, а карта
+/// файла выглядит исчерпывающей, не будучи такой (G-6). Объявление без тела
+/// (`mod foo;`) тоже попадает в индекс — это факт состава, тело лежит в
+/// соседнем файле и индексируется отдельно.
+fn visit_mod(
+    node: tree_sitter::Node,
+    ctx: &mut VisitContext,
+    current_func: Option<&str>,
+    depth: usize,
+) {
+    let source = ctx.source;
+
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(n, source).to_string())
+        .unwrap_or_default();
+
+    if name.is_empty() {
+        return;
+    }
+
+    let line_start = node.start_position().row + 1;
+    let line_end = node.end_position().row + 1;
+
+    let docstring = extract_doc_comment(node, source);
+    let body = node_text(node, source).to_string();
+    let node_hash = sha256_hex(&body);
+
+    ctx.classes.push(ParsedClass {
+        name,
+        line_start,
+        line_end,
+        bases: Some("mod".to_string()),
+        docstring,
+        body,
+        node_hash,
+    });
+
+    // Содержимое модуля обходим как обычно: функции и типы внутри должны
+    // попадать в индекс так же, как на верхнем уровне файла. Объемлющего
+    // типа у них нет, поэтому impl_type сбрасывается.
+    if let Some(body_node) = node.child_by_field_name("body") {
+        let mut cursor = body_node.walk();
+        for child in body_node.children(&mut cursor) {
+            visit_node(child, ctx, None, current_func, body_node.kind(), depth + 1);
         }
     }
 }
@@ -792,6 +847,54 @@ pub trait LanguageParser: Send + Sync {
         let result = parser.parse(source, "test.rs").unwrap();
         assert!(result.classes.iter().any(|c| c.name == "FileCategory"));
         assert!(result.classes.iter().any(|c| c.name == "LanguageParser"));
+    }
+
+    /// G-6: модуль — единица организации кода наравне с типом, и он обязан
+    /// попадать в индекс. Проверяем оба вида: с телом и объявление без тела.
+    #[test]
+    fn test_parse_rust_mod() {
+        let parser = RustParser::new();
+        let source = r#"
+pub mod storage;
+
+mod helpers {
+    pub fn helper() -> u32 {
+        42
+    }
+
+    pub struct Inner {
+        pub field: u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn works() {}
+}
+"#;
+        let result = parser.parse(source, "test.rs").unwrap();
+
+        let mods: Vec<&str> = result
+            .classes
+            .iter()
+            .filter(|c| c.bases.as_deref() == Some("mod"))
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(mods.contains(&"storage"), "объявление без тела: {mods:?}");
+        assert!(mods.contains(&"helpers"), "модуль с телом: {mods:?}");
+        assert!(mods.contains(&"tests"), "модуль тестов: {mods:?}");
+
+        // Содержимое модуля по-прежнему разбирается: функция и тип внутри
+        // должны быть в индексе, иначе правка сузила бы выдачу.
+        assert!(
+            result.functions.iter().any(|f| f.name == "helper"),
+            "функция внутри модуля потерялась"
+        );
+        assert!(
+            result.classes.iter().any(|c| c.name == "Inner"),
+            "тип внутри модуля потерялся"
+        );
     }
 
     #[test]
