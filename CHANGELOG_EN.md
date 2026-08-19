@@ -5,6 +5,39 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.55.0] — 2026-08-19
+
+**A heavy response no longer breaks off silently: instead of a dropped section you get a listing with names and counts, and a ready-to-copy next call leads to the content. Large sections are now fetched page by page — enumeration values running into hundreds became reachable for the first time.**
+
+> Context. A finding from the full review: the response-size guard applied to only four tools out of eleven. An object passport for a document with 82 forms weighed 221 KB, and the client saves any response above ~25K tokens to a file, handing the model just a path and a short preview. Such a response is not «expensive» — it is silently incomplete, and the model answers from the fragment. In a multi-turn session the unit of cost is a turn, not bytes, so splitting is not free either: folding kicks in only where the full response genuinely does not fit.
+
+### Added
+
+- **Folding a section instead of dropping it.** The per-section guard used to discard a heavy section wholesale, leaving a marker and an element count: honest numbers, but you can neither answer from them nor build the next call — «82 forms» and not a single name. Now the section folds into a listing: names plus counts. A shared core helper picks the full variant while it fits the budget and the folded one when it does not.
+- **Pages measured in response bytes.** A page is filled by size, not by a fixed row count: a fixed count overflows on heavy elements and breeds extra turns on light ones. Companion fields `<key>_shown` / `_total` / `_offset` / `_has_more` come alongside. The first element is always returned even if it alone exceeds the budget — otherwise the offset would never advance and the client would loop on one call.
+- **Hints carrying a ready-to-copy call.** Instead of a template with angle brackets — a call assembled by the server with the names filled in, the number of turns stated, and not one sentence about causes: a weaker model needs the next action, not an explanation. When the full variant does not fit even the server ceiling, the hint honestly routes piece by piece.
+- **All handlers of an object's forms in one call** — the form name became optional. Previously the «fetch them per form» hint ran into an impossibility: 255 calls for an object with 255 forms.
+- **Enumeration values and other large structure sections — paged** (`offset` when a single section is requested). Before that a section of hundreds of values was dropped by the guard entirely and could not be retrieved by any means.
+- **One impact-map section in full, paged** (`section` + `offset`): structural references, code usages or role rights. The former three-section response with samples is unchanged.
+- **Per-call response budget** (`max_response_bytes`) on the object passport, form handlers and the impact map — where there was none at all.
+
+### Changed
+
+- **The object passport returns an overview, not a dump.** Forms — a listing with handler counts, modules — counts by type, data links — counts by kind without edges. Content is expanded via `expand` (`forms.handlers`, `modules.list`) or arrives on its own when the whole response fits the budget; the flags are `forms_handlers_included` and `modules_listed`. The tool description was rewritten: the promise «replaces a series of calls» made the passport the first call and justified dumping everything.
+- **`expand` raises the budget to the server ceiling** and folds first whatever was not asked for: otherwise a request for handlers also unfolded the neighbouring module list of 94 KB.
+
+### Compatibility
+
+- The passport's data-links section no longer carries an array of edges — a total and a per-kind breakdown instead. Edges come from the data-links tool, which has direction, depth and a cap for that.
+- Form handlers and the module list in the passport arrive as listings when the full response does not fit. The response itself states whether content is included, and the hint leads to it.
+- The database schema is unchanged and no reindex is needed: all edits are in the serving layer.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 723 passed, 0 failed (was 708). New ones cover: folding in three modes, pages (filling by budget, continuing from an offset, an offset past the end, an element larger than the budget, the guard disabled, companion fields), hint formatting, folding of passport forms and modules together with the next-call address, per-item handler counts, and a page-by-page walk of an impact-map section to the end of the set.
+- **Live smoke** on three local bases: a data processor with 255 forms — 242 KB of forms and 94 KB of modules → 19.1 KB; an ordinary document — 27.1 KB; all forms of an object in one call — 17.3 KB; 816 enumeration values collected in 2 turns; a full walk of 2,443 code usages — 10 turns, 0.2 s. The calls suggested by the hints worked verbatim.
+- **Federated smoke** on three remote bases of the node: the boundary object's passport 19.3 KB, all its forms 17.5 KB, the 816-value enumeration in 2 turns, an impact-map page of 269 rows out of 1,607.
+
 ## [0.54.0] — 2026-08-19
 
 **A form event handler now knows which item it belongs to, and event names became identical across both dump formats. Previously a large form returned a flat list of hundreds of «event — procedure» pairs where an input field's handler was indistinguishable from a form-level one, and the same event was named differently in the two dumps.**
