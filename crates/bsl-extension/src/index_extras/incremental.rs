@@ -335,6 +335,14 @@ pub fn run_incremental_extras(
     changed: &[std::path::PathBuf],
     deleted: &[std::path::PathBuf],
 ) -> Result<()> {
+    // Выгрузка 1C:EDT — своя раскладка и свои имена файлов. Разбор путей ниже
+    // рассчитан на формат Конфигуратора (расширение `xml`, объект прямо внутри
+    // папки типа, имена `Rights.xml` / `Form.xml` / `ConfigDumpInfo.xml`), и для
+    // EDT не срабатывала НИ ОДНА ветка: слой метаданных не обновлялся вовсе,
+    // до полной переиндексации (E-4).
+    if crate::xml::edt_mdo::detect_edt_src(repo_root).is_some() {
+        return run_incremental_extras_edt(repo_root, storage, changed, deleted);
+    }
     let mut bsl_paths: Vec<&std::path::PathBuf> = Vec::new();
     let mut dump_info_areas: Vec<std::path::PathBuf> = Vec::new();
     let mut object_xmls: Vec<&std::path::PathBuf> = Vec::new();
@@ -872,5 +880,421 @@ pub(crate) fn update_procedure_terms_for_file(
         }
     }
     conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+// ── Инкрементальное обновление для выгрузки 1C:EDT ───────────────────────────
+//
+// Роль служебной описи выгрузки здесь играет само дерево файлов: объект
+// считается удалённым, когда исчезает его `<Имя>.mdo`. Отдельного реестра
+// областей в этом формате не существует, поэтому сверять нечего и не с чем.
+
+/// Тип метаданных по имени папки выгрузки (`Catalogs` → `Catalog`).
+fn edt_meta_type_by_folder(folder: &str) -> Option<&'static str> {
+    ALL_OBJECT_FOLDERS
+        .iter()
+        .find(|(f, _)| *f == folder)
+        .map(|(_, t)| *t)
+}
+
+/// Разобрать путь описания объекта `<Папка типа>/<Имя>/<Имя>.mdo`.
+/// Возвращает `(папка типа, имя объекта)`. Описание самой конфигурации и
+/// прочие `.mdo` вне папок типов отсеиваются.
+fn edt_object_from_mdo(path: &Path) -> Option<(String, String)> {
+    let stem = path.file_stem()?.to_str()?;
+    let obj_dir = path.parent()?;
+    if obj_dir.file_name()?.to_str()? != stem {
+        return None;
+    }
+    let folder = obj_dir.parent()?.file_name()?.to_str()?;
+    edt_meta_type_by_folder(folder)?;
+    Some((folder.to_string(), stem.to_string()))
+}
+
+/// Владелец и имя формы по пути `Form.form`: форма объекта лежит в
+/// `<Папка типа>/<Объект>/Forms/<Форма>/Form.form`, общая форма — сама объект
+/// (`CommonForms/<Имя>/Form.form`).
+fn edt_form_owner(path: &Path) -> Option<(String, String)> {
+    let segs: Vec<&str> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
+    if let Some(i) = segs.iter().rposition(|s| *s == "Forms") {
+        if i < 2 {
+            return None;
+        }
+        let form_name = segs.get(i + 1)?;
+        Some((
+            format!("{}.{}", segs[i - 2], segs[i - 1]),
+            form_name.to_string(),
+        ))
+    } else {
+        let i = segs.iter().rposition(|s| *s == "CommonForms")?;
+        let name = segs.get(i + 1)?;
+        Some((format!("CommonForms.{}", name), name.to_string()))
+    }
+}
+
+/// Имя роли по пути `Roles/<Имя>/Rights.rights`.
+fn edt_role_name(path: &Path) -> Option<String> {
+    let role_dir = path.parent()?;
+    let role = role_dir.file_name()?.to_str()?;
+    if role_dir.parent()?.file_name()?.to_str()? != "Roles" {
+        return None;
+    }
+    Some(role.to_string())
+}
+
+/// Завести/обновить один объект EDT по его `.mdo`: строка перечня, структура,
+/// связи данных (объектные и конфигурационные), подписка на событие.
+fn upsert_edt_object(
+    conn: &rusqlite::Connection,
+    mdo_path: &Path,
+    obj_name: &str,
+) -> Result<()> {
+    use crate::xml::edt_mdo;
+
+    let content = match std::fs::read_to_string(mdo_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("edt upsert read {}: {}", mdo_path.display(), e);
+            return Ok(());
+        }
+    };
+    let (meta_type, synonym) = match edt_mdo::parse_mdo_header(&content) {
+        Some((mt, _name, syn)) => (mt, syn),
+        None => return Ok(()),
+    };
+    let full_name = format!("{}.{}", meta_type, obj_name);
+    let attributes_json = match edt_mdo::parse_mdo_structure_xml(&content) {
+        Ok(s) if !s.is_empty() => Some(s.to_json().to_string()),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("edt structure {}: {}", mdo_path.display(), e);
+            None
+        }
+    };
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "INSERT INTO metadata_objects \
+         (repo, full_name, meta_type, name, synonym, attributes_json) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(repo, full_name) DO UPDATE SET \
+             meta_type = excluded.meta_type, \
+             name = excluded.name, \
+             synonym = excluded.synonym, \
+             attributes_json = excluded.attributes_json",
+        params![
+            REPO_DEFAULT,
+            &full_name,
+            &meta_type,
+            obj_name,
+            synonym,
+            attributes_json
+        ],
+    )?;
+
+    // Связи данных объекта пересобираются целиком: и объектные, и
+    // конфигурационные лежат в этом же файле.
+    conn.execute(
+        "DELETE FROM data_links WHERE repo = ? AND from_object = ?",
+        params![REPO_DEFAULT, &full_name],
+    )?;
+    {
+        let mut ins_link = conn.prepare(
+            "INSERT OR IGNORE INTO data_links \
+             (repo, from_object, from_path, to_object, link_kind, is_composite, is_universal) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        match edt_mdo::parse_mdo_datalinks_xml(&content) {
+            Ok(edges) => {
+                for edge in edges {
+                    ins_link.execute(params![
+                        REPO_DEFAULT,
+                        &full_name,
+                        &edge.from_path,
+                        &edge.to_object,
+                        edge.link_kind,
+                        edge.is_composite as i64,
+                        edge.is_universal as i64,
+                    ])?;
+                }
+            }
+            Err(e) => tracing::warn!("edt data_links {}: {}", mdo_path.display(), e),
+        }
+        for (kind, to_object, from_path, is_composite, is_universal) in
+            edt_mdo::parse_mdo_config_refs(&meta_type, &content)
+        {
+            ins_link.execute(params![
+                REPO_DEFAULT,
+                &full_name,
+                &from_path,
+                &to_object,
+                kind,
+                is_composite as i64,
+                is_universal as i64,
+            ])?;
+        }
+    }
+
+    if meta_type == "EventSubscription" {
+        conn.execute(
+            "DELETE FROM event_subscriptions WHERE repo = ? AND name = ?",
+            params![REPO_DEFAULT, obj_name],
+        )?;
+        if let Some((nm, ev, module, proc_, sources)) =
+            edt_mdo::parse_mdo_event_subscription(&content)
+        {
+            let sources_json = serde_json::to_string(&sources)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO event_subscriptions \
+                 (repo, name, event, handler_module, handler_proc, sources_json) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![REPO_DEFAULT, &nm, &ev, &module, &proc_, &sources_json],
+            )?;
+        }
+    }
+    backfill_data_link_keys(conn)?;
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Убрать объект EDT, чей `.mdo` исчез: строку перечня, его связи, формы,
+/// модули и подписку.
+fn delete_edt_object(
+    conn: &rusqlite::Connection,
+    folder: &str,
+    obj_name: &str,
+) -> Result<()> {
+    let meta_type = match edt_meta_type_by_folder(folder) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let full_name = format!("{}.{}", meta_type, obj_name);
+    let owner_key = format!("{}.{}", folder, obj_name);
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_objects WHERE repo = ? AND full_name = ?",
+        params![REPO_DEFAULT, &full_name],
+    )?;
+    conn.execute(
+        "DELETE FROM data_links WHERE repo = ? AND from_object = ?",
+        params![REPO_DEFAULT, &full_name],
+    )?;
+    conn.execute(
+        "DELETE FROM metadata_forms WHERE repo = ? AND owner_full_name = ?",
+        params![REPO_DEFAULT, &owner_key],
+    )?;
+    // Модули объекта: и собственные (`Catalogs.X.ObjectModule`), и модули его
+    // форм и команд (`Catalogs.X.Form.Y.FormModule`).
+    conn.execute(
+        "DELETE FROM metadata_modules WHERE repo = ? AND (object_name = ? OR object_name LIKE ?)",
+        params![REPO_DEFAULT, &owner_key, format!("{}.%", owner_key)],
+    )?;
+    if meta_type == "EventSubscription" {
+        conn.execute(
+            "DELETE FROM event_subscriptions WHERE repo = ? AND name = ?",
+            params![REPO_DEFAULT, obj_name],
+        )?;
+    }
+    if meta_type == "Role" {
+        conn.execute(
+            "DELETE FROM role_rights WHERE repo = ? AND role_name = ?",
+            params![REPO_DEFAULT, obj_name],
+        )?;
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Обновить одну форму EDT по её `Form.form` (или убрать, если файл исчез).
+fn update_edt_form(conn: &rusqlite::Connection, form_path: &Path) -> Result<()> {
+    let (owner, form_name) = match edt_form_owner(form_path) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_forms WHERE repo = ? AND owner_full_name = ? AND form_name = ?",
+        params![REPO_DEFAULT, &owner, &form_name],
+    )?;
+    if let Ok(content) = std::fs::read_to_string(form_path) {
+        let handlers = crate::xml::edt_mdo::parse_mdo_form_handlers(&content);
+        let handlers_json = serde_json::to_string(
+            &handlers
+                .iter()
+                .map(|(ev, h)| serde_json::json!({"event": ev, "handler": h}))
+                .collect::<Vec<_>>(),
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+             VALUES (?, ?, ?, ?)",
+            params![REPO_DEFAULT, &owner, &form_name, &handlers_json],
+        )?;
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Обновить права одной роли EDT по её `Rights.rights` (или убрать, если файл
+/// исчез). Точечно: пересборка всей таблицы прав тут не нужна.
+fn update_edt_role_rights(conn: &rusqlite::Connection, rights_path: &Path) -> Result<()> {
+    let role_name = match edt_role_name(rights_path) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM role_rights WHERE repo = ? AND role_name = ?",
+        params![REPO_DEFAULT, &role_name],
+    )?;
+    if rights_path.is_file() {
+        match crate::xml::metadata_refs::parse_role_rights_file(rights_path) {
+            Ok(rights) => {
+                let mut stmt = conn.prepare(
+                    "INSERT OR IGNORE INTO role_rights (repo, role_name, object_name, right_name) \
+                     VALUES (?, ?, ?, ?)",
+                )?;
+                for r in rights {
+                    stmt.execute(params![
+                        REPO_DEFAULT,
+                        &role_name,
+                        &r.object_name,
+                        &r.right_name
+                    ])?;
+                }
+            }
+            Err(e) => tracing::warn!("edt role_rights {}: {}", rights_path.display(), e),
+        }
+    }
+    backfill_role_right_keys(conn)?;
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Инкрементальное обновление extras для батча выгрузки 1C:EDT.
+pub(crate) fn run_incremental_extras_edt(
+    repo_root: &Path,
+    storage: &mut Storage,
+    changed: &[std::path::PathBuf],
+    deleted: &[std::path::PathBuf],
+) -> Result<()> {
+    let mut bsl_changed: Vec<&std::path::PathBuf> = Vec::new();
+    let mut bsl_deleted: Vec<&std::path::PathBuf> = Vec::new();
+    let mut objects: Vec<(&std::path::PathBuf, String, String)> = Vec::new();
+    let mut removed_objects: Vec<(String, String)> = Vec::new();
+    let mut forms: Vec<&std::path::PathBuf> = Vec::new();
+    let mut roles: Vec<&std::path::PathBuf> = Vec::new();
+
+    let classify = |p: &std::path::PathBuf| -> (&'static str, Option<(String, String)>) {
+        let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("bsl") {
+            ("bsl", None)
+        } else if fname == "Form.form" {
+            ("form", None)
+        } else if fname == "Rights.rights" {
+            ("rights", None)
+        } else if ext == "mdo" {
+            match edt_object_from_mdo(p) {
+                Some(v) => ("object", Some(v)),
+                None => ("skip", None),
+            }
+        } else {
+            ("skip", None)
+        }
+    };
+
+    for p in changed {
+        match classify(p) {
+            ("bsl", _) => bsl_changed.push(p),
+            ("form", _) => forms.push(p),
+            ("rights", _) => roles.push(p),
+            ("object", Some((folder, name))) => objects.push((p, folder, name)),
+            _ => {}
+        }
+    }
+    for p in deleted {
+        match classify(p) {
+            ("bsl", _) => bsl_deleted.push(p),
+            ("form", _) => forms.push(p),
+            ("rights", _) => roles.push(p),
+            ("object", Some((folder, name))) => removed_objects.push((folder, name)),
+            _ => {}
+        }
+    }
+
+    let conn = storage.conn();
+
+    for (folder, name) in &removed_objects {
+        if let Err(e) = delete_edt_object(conn, folder, name) {
+            tracing::warn!("edt delete {}.{}: {}", folder, name, e);
+        }
+    }
+    for (path, _folder, name) in &objects {
+        if let Err(e) = upsert_edt_object(conn, path, name) {
+            tracing::warn!("edt upsert {}: {}", path.display(), e);
+        }
+    }
+    for p in &forms {
+        if let Err(e) = update_edt_form(conn, p) {
+            tracing::warn!("edt form {}: {}", p.display(), e);
+        }
+    }
+    for p in &roles {
+        if let Err(e) = update_edt_role_rights(conn, p) {
+            tracing::warn!("edt rights {}: {}", p.display(), e);
+        }
+    }
+
+    // Код-слой: те же точечные обновления, что и у формата Конфигуратора —
+    // они разбирают содержимое `.bsl`, а не раскладку выгрузки.
+    for p in &bsl_changed {
+        update_call_graph_direct_for_file(repo_root, conn, p)?;
+        update_code_usages_for_file(repo_root, conn, p)?;
+        update_procedure_terms_for_file(repo_root, conn, p)?;
+        if let Err(e) = update_metadata_module_for_file_edt(repo_root, conn, p) {
+            tracing::warn!("edt module {}: {}", p.display(), e);
+        }
+    }
+    for p in &bsl_deleted {
+        let code_path = p
+            .strip_prefix(repo_root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        conn.execute(
+            "DELETE FROM metadata_modules WHERE repo = ? AND code_path = ?",
+            params![REPO_DEFAULT, &code_path],
+        )?;
+    }
+
+    if !bsl_changed.is_empty() {
+        let _ = conn.execute("ROLLBACK", []);
+        conn.execute("BEGIN", [])?;
+        resolve_and_prune_direct_edges(conn)?;
+        conn.execute("COMMIT", [])?;
+        rebuild_call_graph_extension_override(conn)?;
+    }
+    if !forms.is_empty() {
+        rebuild_call_graph_form_event(conn)?;
+    }
+    if !objects.is_empty() || !removed_objects.is_empty() {
+        rebuild_call_graph_subscription(conn)?;
+    }
+    if !bsl_changed.is_empty() || !objects.is_empty() || !removed_objects.is_empty() {
+        if let Err(e) = maybe_analyze_graph_tables(conn) {
+            tracing::warn!("maybe_analyze_graph_tables: {}", e);
+        }
+    }
     Ok(())
 }

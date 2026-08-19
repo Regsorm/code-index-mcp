@@ -3408,3 +3408,164 @@ fn common_form_indexed_in_both_dump_formats() {
         "обработчики общей формы читаются: {handlers}"
     );
 }
+
+/// Минимальный стенд выгрузки 1C:EDT: признак формата + один справочник.
+#[cfg(test)]
+fn edt_stand(root: &Path) {
+    write(
+        &root.join("src").join("Configuration").join("Configuration.mdo"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Configuration xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cfg">
+  <name>Конфигурация</name>
+</mdclass:Configuration>"#,
+    );
+    write(
+        &root.join("src").join("Catalogs").join("Товары").join("Товары.mdo"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cat">
+  <name>Товары</name>
+  <synonym><key>ru</key><value>Товары</value></synonym>
+</mdclass:Catalog>"#,
+    );
+    write(
+        &root.join("src").join("Catalogs").join("Товары").join("ObjectModule.bsl"),
+        "Процедура ПередЗаписью(Отказ) КонецПроцедуры",
+    );
+}
+
+#[test]
+fn edt_incremental_updates_object_form_and_rights() {
+    // До правки инкрементальный путь не срабатывал для EDT ни на одной ветке:
+    // разбор путей требовал расширения `xml`, имён `Rights.xml`/`Form.xml` и
+    // объекта прямо внутри папки типа. Правка конфигурации не доезжала до
+    // индекса до полной переиндексации (E-4).
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let synonym = |st: &Storage| -> Option<String> {
+        st.conn()
+            .query_row(
+                "SELECT synonym FROM metadata_objects WHERE full_name = 'Catalog.Товары'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+    };
+    assert_eq!(synonym(&storage).as_deref(), Some("Товары"), "исходное состояние");
+
+    // ── Правка описания объекта ─────────────────────────────────────────
+    let mdo = repo.join("src").join("Catalogs").join("Товары").join("Товары.mdo");
+    write(
+        &mdo,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cat">
+  <name>Товары</name>
+  <synonym><key>ru</key><value>Номенклатура</value></synonym>
+</mdclass:Catalog>"#,
+    );
+    run_incremental_extras(&repo, &mut storage, &[mdo.clone()], &[]).unwrap();
+    assert_eq!(
+        synonym(&storage).as_deref(),
+        Some("Номенклатура"),
+        "правка описания объекта обязана доехать до индекса"
+    );
+
+    // ── Новая форма объекта ─────────────────────────────────────────────
+    let form = repo
+        .join("src")
+        .join("Catalogs")
+        .join("Товары")
+        .join("Forms")
+        .join("ФормаСписка")
+        .join("Form.form");
+    write(
+        &form,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<form:Form xmlns:form="http://g5.1c.ru/v8/dt/form">
+  <handlers><event>OnCreateAtServer</event><name>ПриСозданииНаСервере</name></handlers>
+</form:Form>"#,
+    );
+    run_incremental_extras(&repo, &mut storage, &[form.clone()], &[]).unwrap();
+    let handlers: String = storage
+        .conn()
+        .query_row(
+            "SELECT handlers_json FROM metadata_forms \
+             WHERE owner_full_name = 'Catalogs.Товары' AND form_name = 'ФормаСписка'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("новая форма обязана появиться в перечне форм");
+    assert!(handlers.contains("ПриСозданииНаСервере"));
+
+    // ── Права роли ──────────────────────────────────────────────────────
+    let rights = repo
+        .join("src")
+        .join("Roles")
+        .join("Бухгалтер")
+        .join("Rights.rights");
+    write(
+        &rights,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Rights xmlns="http://v8.1c.ru/8.2/roles" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Rights">
+    <object>
+        <name>Catalog.Товары</name>
+        <right><name>Read</name><value>true</value></right>
+    </object>
+</Rights>"#,
+    );
+    run_incremental_extras(&repo, &mut storage, &[rights.clone()], &[]).unwrap();
+    let rights_count: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM role_rights WHERE role_name = 'Бухгалтер'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rights_count, 1, "правка прав роли обязана доехать до индекса");
+}
+
+#[test]
+fn edt_incremental_removes_deleted_object() {
+    // Служебной описи выгрузки в EDT нет, поэтому удаление объекта ловится по
+    // исчезновению его описания `<Имя>.mdo` (E-4).
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let count = |st: &Storage, sql: &str| -> i64 {
+        st.conn().query_row(sql, [], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(
+        count(&storage, "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Товары'"),
+        1
+    );
+    assert_eq!(
+        count(&storage, "SELECT COUNT(*) FROM metadata_modules WHERE object_name='Catalogs.Товары'"),
+        1,
+        "модуль объекта заведён полным проходом"
+    );
+
+    let mdo = repo.join("src").join("Catalogs").join("Товары").join("Товары.mdo");
+    std::fs::remove_file(&mdo).unwrap();
+    run_incremental_extras(&repo, &mut storage, &[], &[mdo.clone()]).unwrap();
+
+    assert_eq!(
+        count(&storage, "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Товары'"),
+        0,
+        "удалённый объект обязан уйти из реестра"
+    );
+    assert_eq!(
+        count(&storage, "SELECT COUNT(*) FROM metadata_modules WHERE object_name='Catalogs.Товары'"),
+        0,
+        "модули удалённого объекта тоже убираются"
+    );
+}

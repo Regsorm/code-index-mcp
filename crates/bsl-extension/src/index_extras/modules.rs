@@ -269,7 +269,7 @@ pub(crate) fn index_metadata_modules_edt(
 
 /// Собрать строку `metadata_modules` из одного `.bsl` выгрузки EDT.
 /// Не модуль известного типа / без владельца / без идентификатора → `None`.
-fn build_module_row_edt(
+pub(crate) fn build_module_row_edt(
     repo_root: &Path,
     bsl_path: &Path,
     mdo_cache: &mut std::collections::HashMap<std::path::PathBuf, String>,
@@ -685,4 +685,19 @@ pub(crate) fn find_object_owner(bsl_path: &Path) -> Option<(std::path::PathBuf, 
     }
     let owner_full = format!("{}.{}", meta_type, owner_name);
     Some((owner_xml, owner_full))
+}
+
+/// Точечное обновление `metadata_modules` для одного изменённого `.bsl`
+/// выгрузки EDT. Кэш описаний объектов здесь не нужен: файл в батче один,
+/// объект читается один раз.
+pub(crate) fn update_metadata_module_for_file_edt(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    bsl_path: &Path,
+) -> Result<()> {
+    let mut cache = std::collections::HashMap::new();
+    match build_module_row_edt(repo_root, bsl_path, &mut cache) {
+        Some(row) => insert_module_row(conn, &row),
+        None => Ok(()),
+    }
 }
