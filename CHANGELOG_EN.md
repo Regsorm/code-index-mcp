@@ -5,6 +5,40 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.57.0] — 2026-08-19
+
+**An empty answer no longer passes for a substantive conclusion. A wrong-case Cyrillic name no longer yields a silent zero: the object name is resolved to the spelling stored in the configuration at the entry of every object-keyed tool. A walk that stopped at its limit now says «I did not finish» instead of «there is no link».**
+
+> Context. Review findings of one class: incompleteness that looks like absence. 1C object names are Cyrillic, their case is easy to get wrong, and SQLite does not fold Cyrillic — exact comparison missed silently. One and the same mistyped name on one database returned: impact map — everything (561 structural references, 2,443 code usages); data links — «nothing references this object»; register recorders — «this register has no recorders at all». Worse than a plain error: the answer reads as a conclusion about the object, and the model reasons on top of it.
+
+### Fixed
+
+- **Cyrillic case in object names.** The mechanism already existed in the project — a lowercase key column the impact map searches by. Now the object catalogue has such a key too, and the name is resolved once at the entry: from there the walk proceeds over canonical values taken from the database itself. Fixed for data links (both directions), register recorders, object structure and object profile. The «what does it reference» direction became case-insensitive as well — entry-level resolution needs no key column on the edge source.
+- **The did-you-mean list was empty exactly where it was needed.** Candidates were matched by pattern, also case-sensitive: a name differing ONLY in case produced zero suggestions, even though the object differs by one letter. Matching now goes through the key.
+- **The omitted-sections hint steered away from a shipped capability.** Its text claimed the full set of enum values is «not available as a dump» and sent the reader to search the code — untrue once per-section paging shipped. The hint now names the omitted sections and carries a ready-to-copy call for the first of them; a set of 816 values is fetched in two turns.
+- **Call-graph path search silently answered «no path» when the walk was cut short.** The breadth-first walk stops at a unique-node cap, and from outside that looked like absence of a path. The neighbouring call-tree tool solved the same problem correctly — an asymmetry inside one file.
+- **Data-links path search did not distinguish «no path» from «not enough hops».**
+- **Compressed-content search silently dropped unreadable files.** A corrupted or non-UTF-8 file was skipped with no counter, making a partial result indistinguishable from an honest «nothing found».
+- **Term search silently dropped unreadable result rows.**
+
+### Added
+
+- **Walk cut-off flags.** Call-graph path: `walk_depth_exhausted` and `walk_nodes_capped`, and the empty-result hint now differs by cause — node cap, depth limit, or an honestly exhausted reachable subgraph. Data-links path: `depth_exhausted`, `visited_nodes` and a ready call with a larger depth.
+- **Counters for what was lost.** `files_unreadable` in code and text search, `rows_unreadable` in term search — each stating outright that the result is partial. With zero skips the fields do not appear.
+- **Canonical object name in responses.** Impact map, data links and object profile return the name as stored in the configuration: the model copies it into the next call, where case does matter.
+
+### Compatibility
+
+- The extension schema gained an object-name key column and an index on it. **No reindex required:** the migration adds the column and fills the keys on the first daemon start over an existing database (verified on databases from 187 to 17,263 objects).
+- The serving layer opens databases read-only: until the daemon passes, resolution simply does not kick in and answers stay as before — nothing fails.
+- Response changes are additive; existing fields and their meaning are unchanged.
+
+### Testing
+
+- **Unit and integration tests:** `cargo test --workspace` — 743 passed, 0 failed (was 730). Thirteen new ones cover: migration with key backfill and its idempotency, name resolution (exact match, different case, missing object, nodes outside the catalogue), data links and register recorders under a different case, object structure and its suggestions, the depth-exhausted flag in both graphs, the unreadable-file counter, the ordering of omitted sections and the hint wording.
+- **Live smoke** on a typical trade configuration: 561 incoming links and 105 recorders are found with a fully lowercase name; the suggestion list offers the right object for a typo; a set of 816 enum values is fetched in two turns using calls copied from the hint verbatim.
+- **Federated smoke** on three remote databases of the node (trade, accounting, payroll): matching numbers across spellings — 1,174, 1,577 and 1,607 incoming links respectively.
+
 ## [0.56.0] — 2026-08-19
 
 **The data-links walk no longer depends on the number of paths: «what references this object» at depth 4 now answers in a fraction of a second instead of 42.9 s. A time cut-off appeared — there was none at all before, and a pooled connection stayed busy for all those seconds. Edges now arrive as a page, with per-kind link counts alongside.**
