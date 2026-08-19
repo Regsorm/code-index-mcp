@@ -71,6 +71,9 @@ const META_FORMS: &[MetaForm] = &[
     MetaForm { canonical: "Report", ru_singular: "Отчет", ru_plural: "Отчеты", en_singular: "Report", en_plural: "Reports", reftypes: &[] },
     MetaForm { canonical: "DataProcessor", ru_singular: "Обработка", ru_plural: "Обработки", en_singular: "DataProcessor", en_plural: "DataProcessors", reftypes: &[] },
     MetaForm { canonical: "Constant", ru_singular: "Константа", ru_plural: "Константы", en_singular: "Constant", en_plural: "Constants", reftypes: &[] },
+    MetaForm { canonical: "DocumentJournal", ru_singular: "ЖурналДокументов", ru_plural: "ЖурналыДокументов", en_singular: "DocumentJournal", en_plural: "DocumentJournals", reftypes: &["ЖурналДокументовМенеджер", "ЖурналДокументовСписок"] },
+    MetaForm { canonical: "Sequence", ru_singular: "Последовательность", ru_plural: "Последовательности", en_singular: "Sequence", en_plural: "Sequences", reftypes: &["ПоследовательностьМенеджер", "ПоследовательностьНаборЗаписей", "ПоследовательностьКлючЗаписи", "ПоследовательностьЗапись"] },
+    MetaForm { canonical: "FilterCriterion", ru_singular: "КритерийОтбора", ru_plural: "КритерииОтбора", en_singular: "FilterCriterion", en_plural: "FilterCriteria", reftypes: &["КритерийОтбораМенеджер", "КритерийОтбораСписок"] },
 ];
 
 /// Пары (форма-обращения-в-коде → имя-папки-метаданных) для резолва менеджер-
@@ -268,6 +271,11 @@ fn dotted_pairs(s: &str) -> Vec<(String, String)> {
                 }
                 let id2: String = chars[s2..i].iter().collect();
                 out.push((id1, id2));
+                // Перекрытие: продолжаем со ВТОРОГО идентификатора пары, а не за
+                // ней. Иначе в `Метаданные.Справочники.X` коллекция стоит вторым
+                // сегментом, первая пара отбрасывается, и `Справочники.X` уже не
+                // рассматривается (E-11). Прогресс гарантирован: s2 строго растёт.
+                i = s2;
             }
         } else {
             i += 1;
@@ -390,6 +398,27 @@ mod tests {
             .iter()
             .all(|(_, _, k)| *k != "manager"));
         assert!(kinds("// Документы.Заказ в комментарии").is_empty());
+    }
+
+    #[test]
+    fn manager_after_metadata_prefix() {
+        // `Метаданные.Справочники.X` — коллекция вторым сегментом (E-11).
+        let r = kinds("Если ПравоДоступа(\"Чтение\", Метаданные.Справочники.Организации) Тогда");
+        assert!(
+            r.contains(&("Catalog.Организации".to_string(), None, "manager")),
+            "обращение через объект Метаданные обязано попадать в индекс, получено: {r:?}"
+        );
+    }
+
+    #[test]
+    fn manager_document_journal_and_filter_criterion() {
+        // Категории, которых раньше не было в таблице форм (E-10).
+        let r = kinds("Ж = ЖурналыДокументов.ЖурналОпераций.СоставДокументов(\"X\");");
+        assert_eq!(r, vec![("DocumentJournal.ЖурналОпераций".to_string(), None, "manager")]);
+        let r = kinds("Т = КритерииОтбора.СвязанныеДокументы.Состав;");
+        assert_eq!(r, vec![("FilterCriterion.СвязанныеДокументы".to_string(), None, "manager")]);
+        let r = kinds("П = Последовательности.ПартииТоваров.СоздатьНаборЗаписей();");
+        assert_eq!(r, vec![("Sequence.ПартииТоваров".to_string(), None, "manager")]);
     }
 
     #[test]

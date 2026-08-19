@@ -485,6 +485,7 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
         TabName,
         TypeValue,
         RegisterRec,
+        OwnerRef,
     }
 
     let mut in_std = false;
@@ -523,6 +524,18 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                         }));
                     }
                     "dimensions" => field = Some(FieldBuild::new(FieldKind::Dimension)),
+                    // Ресурсы регистров тоже дают ссылочные рёбра — в формате
+                    // Конфигуратора они идут как обычные реквизиты (`attr`). Без
+                    // этой ветки в выгрузке EDT терялась основная масса ссылок
+                    // регистров сведений (E-9).
+                    "resources" => field = Some(FieldBuild::new(FieldKind::Resource)),
+                    // Владелец подчинённого справочника: `<owners>Catalog.X</owners>`,
+                    // значение уже каноническое. Берём только у самого объекта.
+                    "owners" => {
+                        if field.is_none() {
+                            tt = T::OwnerRef;
+                        }
+                    }
                     "name" => {
                         if let Some(f) = field.as_ref() {
                             if f.name.is_none() {
@@ -595,6 +608,18 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                             });
                         }
                     }
+                    // Владелец подчинённого справочника → ребро owner (E-9).
+                    T::OwnerRef => {
+                        if !txt.is_empty() {
+                            edges.push(DataLinkEdge {
+                                from_path: String::new(),
+                                to_object: txt,
+                                link_kind: "owner",
+                                is_composite: false,
+                                is_universal: false,
+                            });
+                        }
+                    }
                     T::None => {}
                 }
                 tt = T::None;
@@ -612,7 +637,7 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                     continue;
                 }
                 match local.as_str() {
-                    "attributes" | "dimensions" => {
+                    "attributes" | "dimensions" | "resources" => {
                         if let Some(fb) = field.take() {
                             if let Some(name) = fb.name.filter(|n| !n.is_empty()) {
                                 // Классифицируем каждый ссылочный тип в цель ребра.
@@ -1068,6 +1093,44 @@ mod tests {
   <enumValues uuid="e1"><name>Оптовая</name><synonym><key>ru</key><value>Оптовая цена</value></synonym></enumValues>
   <enumValues uuid="e2"><name>Розничная</name></enumValues>
 </mdclass:Enum>"#;
+
+    #[test]
+    fn resources_and_owners_give_edges() {
+        // Ресурсы регистров и владельцы подчинённых справочников в рёбра не
+        // попадали вовсе: в сборщике связей были только реквизиты, табличные
+        // части и измерения (E-9).
+        let reg = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:InformationRegister xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="r">
+  <name>СведенияОСотрудниках</name>
+  <resources uuid="r1"><name>Организация</name><type><types>CatalogRef.Организации</types></type></resources>
+  <resources uuid="r2"><name>Сумма</name><type><types>Number</types></type></resources>
+  <dimensions uuid="d1"><name>Сотрудник</name><type><types>CatalogRef.Сотрудники</types></type></dimensions>
+</mdclass:InformationRegister>"#;
+        let edges = parse_mdo_datalinks_xml(reg).unwrap();
+        assert!(
+            edges.iter().any(|e| e.link_kind == "attr"
+                && e.from_path == "Организация"
+                && e.to_object == "Catalog.Организации"),
+            "ссылочный ресурс регистра обязан давать ребро, получено: {edges:?}"
+        );
+        assert!(edges.iter().any(|e| e.link_kind == "register_dim"));
+        // Ресурс нессылочного типа ребра не даёт.
+        assert_eq!(edges.len(), 2);
+
+        let cat = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="c">
+  <name>БанковскиеСчета</name>
+  <owners>Catalog.Контрагенты</owners>
+  <owners>Catalog.Организации</owners>
+</mdclass:Catalog>"#;
+        let edges = parse_mdo_datalinks_xml(cat).unwrap();
+        let owners: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.link_kind == "owner")
+            .map(|e| e.to_object.as_str())
+            .collect();
+        assert_eq!(owners, vec!["Catalog.Контрагенты", "Catalog.Организации"]);
+    }
 
     #[test]
     fn enum_values_and_synonyms() {

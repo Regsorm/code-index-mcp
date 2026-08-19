@@ -36,6 +36,8 @@ pub const METADATA_MODULES_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_mm_module_type ON metadata_modules(repo, module_type);",
     "CREATE INDEX IF NOT EXISTS idx_mm_object_id ON metadata_modules(object_id);",
     "CREATE INDEX IF NOT EXISTS idx_mm_extension ON metadata_modules(repo, extension_name);",
+    // Под пофайловое удаление строки модуля при исчезновении .bsl (E-5).
+    "CREATE INDEX IF NOT EXISTS idx_mm_code_path ON metadata_modules(repo, code_path);",
 ];
 
 /// DDL трёх FTS-триггеров `procedure_enrichment` (INSERT/DELETE/UPDATE) —

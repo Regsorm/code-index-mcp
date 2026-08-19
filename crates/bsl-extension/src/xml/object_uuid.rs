@@ -69,6 +69,69 @@ pub fn extract_object_uuid_from_file(path: &Path) -> Result<Option<String>> {
     Ok(extract_object_uuid_from_str(&content))
 }
 
+/// Извлечь UUID команды объекта из XML владельца по её имени.
+///
+/// У команды объекта нет собственного файла — она описана внутри XML своего
+/// объекта: `<ChildObjects><Command uuid="…"><Properties><Name>Имя</Name>`.
+/// Возвращает uuid команды с указанным именем, иначе None.
+pub fn extract_command_uuid_from_str(xml: &str, command_name: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let local = |raw: &[u8]| -> Vec<u8> {
+        match raw.iter().rposition(|c| *c == b':') {
+            Some(i) => raw[i + 1..].to_vec(),
+            None => raw.to_vec(),
+        }
+    };
+
+    let mut buf = Vec::new();
+    let mut cur_uuid: Option<String> = None;
+    // Имя команды — ПЕРВЫЙ <Name> внутри <Command>; вложенные элементы команды
+    // (например, параметры) имеют свои <Name>, их не смотрим.
+    let mut expect_name = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = local(e.name().as_ref());
+                if name == b"Command" {
+                    cur_uuid = e
+                        .attributes()
+                        .flatten()
+                        .find(|a| a.key.as_ref() == b"uuid")
+                        .and_then(|a| a.unescape_value().ok().map(|c| c.to_string()));
+                    expect_name = cur_uuid.is_some();
+                } else if expect_name && name == b"Name" {
+                    // следующий текстовый узел — имя команды
+                } 
+            }
+            Ok(Event::Text(t)) if expect_name => {
+                let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                let txt = txt.trim();
+                if !txt.is_empty() {
+                    if txt == command_name {
+                        return cur_uuid;
+                    }
+                    // имя этой команды прочитано и не подошло — ждём следующую
+                    expect_name = false;
+                    cur_uuid = None;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
+/// Прочитать XML объекта с диска и извлечь uuid его команды по имени.
+pub fn extract_command_uuid_from_file(path: &Path, command_name: &str) -> Result<Option<String>> {
+    let content = std::fs::read_to_string(path)?;
+    Ok(extract_command_uuid_from_str(&content, command_name))
+}
+
 /// Извлечь UUID формы из `Form.xml` (`Forms/<FormName>/[Ext/]Form.xml`).
 /// У форм uuid — атрибут самого корневого элемента `<Form>`, а не
 /// дочернего как у обычных объектов.
