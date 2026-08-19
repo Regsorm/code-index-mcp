@@ -954,6 +954,243 @@ pub fn detect_edt_src(repo_root: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Конфигурационные рёбра из `.mdo`: состав подсистемы и плана обмена, цели
+/// определяемого типа, расположение и состав функциональной опции.
+///
+/// В формате Конфигуратора каждый вид лежит в своём файле (`Subsystems/**.xml`,
+/// `ExchangePlans/<X>/Ext/Content.xml`, `DefinedTypes/<X>.xml`,
+/// `FunctionalOptions/<X>.xml`), и их читает `index_metadata_refs`. В EDT всё
+/// это — теги внутри самого `.mdo` объекта, поэтому разбор идёт тем же проходом,
+/// что и остальная шапка: повторное чтение файла не нужно.
+///
+/// Возвращает кортежи `(link_kind, to_object, from_path, is_composite,
+/// is_universal)` — ровно те поля `data_links`, что заполняет формат
+/// Конфигуратора.
+pub fn parse_mdo_config_refs(
+    meta_type: &str,
+    content: &str,
+) -> Vec<(&'static str, String, String, bool, bool)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Want {
+        None,
+        SubsystemContent,
+        ExchangeContent,
+        DefinedType,
+        FoLocation,
+        FoContent,
+    }
+
+    // Виды, у которых конфигурационных рёбер не бывает, отсекаем сразу:
+    // проход по XML ради заведомо пустого результата не нужен.
+    if !matches!(
+        meta_type,
+        "Subsystem" | "ExchangePlan" | "DefinedType" | "FunctionalOption"
+    ) {
+        return Vec::new();
+    }
+
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut depth = 0i32;
+    let mut want = Want::None;
+    let mut in_content = false; // <content> плана обмена (обёртка над <mdObject>)
+    let mut in_type = false; // <type> определяемого типа (обёртка над <types>)
+    let mut raw_types: Vec<String> = Vec::new();
+    let mut out: Vec<(&'static str, String, String, bool, bool)> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                match (meta_type, depth, local.as_str()) {
+                    ("Subsystem", 2, "content") => want = Want::SubsystemContent,
+                    ("ExchangePlan", 2, "content") => in_content = true,
+                    ("ExchangePlan", 3, "mdObject") if in_content => want = Want::ExchangeContent,
+                    ("DefinedType", 2, "type") => in_type = true,
+                    ("DefinedType", 3, "types") if in_type => want = Want::DefinedType,
+                    ("FunctionalOption", 2, "location") => want = Want::FoLocation,
+                    ("FunctionalOption", 2, "content") => want = Want::FoContent,
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if want != Want::None {
+                    let txt = t
+                        .unescape()
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if !txt.is_empty() {
+                        match want {
+                            Want::SubsystemContent => {
+                                out.push(("subsystem_content", txt, String::new(), false, false))
+                            }
+                            Want::ExchangeContent => {
+                                out.push(("exchange_plan_content", txt, String::new(), false, false))
+                            }
+                            Want::FoContent => out.push((
+                                "functional_option_content",
+                                txt,
+                                String::new(),
+                                false,
+                                false,
+                            )),
+                            Want::FoLocation => {
+                                // Формат `<MetaType>.<Name>[.<...>]`: объект — первые
+                                // два сегмента, сырое значение уходит в `from_path`
+                                // (как в формате Конфигуратора).
+                                let mut it = txt.splitn(3, '.');
+                                if let (Some(kind), Some(name)) = (it.next(), it.next()) {
+                                    if !kind.is_empty() && !name.is_empty() {
+                                        out.push((
+                                            "functional_option_location",
+                                            format!("{}.{}", kind, name),
+                                            txt,
+                                            false,
+                                            false,
+                                        ));
+                                    }
+                                }
+                            }
+                            Want::DefinedType => raw_types.push(txt),
+                            Want::None => {}
+                        }
+                    }
+                    want = Want::None;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                match local_name(&raw) {
+                    "content" => in_content = false,
+                    "type" => in_type = false,
+                    _ => {}
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if !raw_types.is_empty() {
+        // Типы в EDT записаны без префикса `cfg:` — приводим к нотации
+        // Конфигуратора, чтобы работал общий `classify_type`.
+        let mut targets: Vec<(String, bool)> = raw_types
+            .iter()
+            .filter_map(|t| classify_type(&edt_type_to_cfg(t)))
+            .collect();
+        targets.sort();
+        targets.dedup();
+        let is_composite = targets.len() > 1;
+        for (to_object, is_universal) in targets {
+            out.push((
+                "defined_type_content",
+                to_object,
+                String::new(),
+                is_composite,
+                is_universal,
+            ));
+        }
+    }
+
+    out
+}
+
+/// Идентификатор самого объекта: атрибут `uuid` корневого тега `.mdo`.
+pub fn parse_mdo_root_uuid(content: &str) -> Option<String> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                for attr in e.attributes().filter_map(|a| a.ok()) {
+                    if local_name(&String::from_utf8_lossy(attr.key.as_ref())) == "uuid" {
+                        let v = String::from_utf8_lossy(attr.value.as_ref()).into_owned();
+                        return if v.is_empty() { None } else { Some(v) };
+                    }
+                }
+                return None;
+            }
+            Ok(Event::Eof) => return None,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// Идентификатор вложенного элемента объекта — формы или команды.
+///
+/// В EDT они описаны внутри `.mdo` владельца: `<forms uuid="…"><name>X</name>`
+/// и `<commands uuid="…"><name>X</name>`. Собственного идентификатора у файла
+/// формы (`Form.form`) нет вовсе, поэтому для перечня модулей его берут отсюда.
+pub fn parse_mdo_child_uuid(content: &str, container: &str, child_name: &str) -> Option<String> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut depth = 0i32;
+    let mut current: Option<String> = None; // uuid открытого контейнера
+    let mut want_name = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                if depth == 2 && local == container {
+                    current = e
+                        .attributes()
+                        .filter_map(|a| a.ok())
+                        .find(|a| local_name(&String::from_utf8_lossy(a.key.as_ref())) == "uuid")
+                        .map(|a| String::from_utf8_lossy(a.value.as_ref()).into_owned());
+                } else if depth == 3 && local == "name" && current.is_some() {
+                    want_name = true;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if want_name {
+                    want_name = false;
+                    let txt = t
+                        .unescape()
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if txt == child_name {
+                        if let Some(u) = current.take() {
+                            if !u.is_empty() {
+                                return Some(u);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                if depth == 2 && local_name(&raw) == container {
+                    current = None;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1241,5 +1478,95 @@ mod tests {
         assert_eq!(module, "CommonModule.УчетЗарплаты");
         assert_eq!(proc_, "ПриПроведении");
         assert_eq!(sources, vec!["DocumentObject.АвансовыйОтчет"]);
+    }
+    #[test]
+    fn config_refs_cover_four_kinds() {
+        // Состав подсистемы: прямые теги <content> с полным именем объекта.
+        let sub = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Subsystem xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="s">
+  <name>Продажи</name>
+  <content>Catalog.Контрагенты</content>
+  <content>Document.ЗаказКлиента</content>
+</mdclass:Subsystem>"#;
+        assert_eq!(
+            parse_mdo_config_refs("Subsystem", sub)
+                .iter()
+                .map(|r| (r.0, r.1.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("subsystem_content", "Catalog.Контрагенты".to_string()),
+                ("subsystem_content", "Document.ЗаказКлиента".to_string()),
+            ]
+        );
+
+        // Состав плана обмена: <content> — обёртка, имя лежит в <mdObject>.
+        let ep = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:ExchangePlan xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="e">
+  <name>Обмен</name>
+  <content>
+    <mdObject>Constant.ВестиУчет</mdObject>
+    <autoRecord>Allow</autoRecord>
+  </content>
+</mdclass:ExchangePlan>"#;
+        assert_eq!(
+            parse_mdo_config_refs("ExchangePlan", ep)
+                .iter()
+                .map(|r| (r.0, r.1.clone()))
+                .collect::<Vec<_>>(),
+            vec![("exchange_plan_content", "Constant.ВестиУчет".to_string())]
+        );
+
+        // Цели определяемого типа: ссылочные становятся рёбрами, примитивы нет.
+        let dt = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:DefinedType xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="d">
+  <name>Партнер</name>
+  <type>
+    <types>CatalogRef.Контрагенты</types>
+    <types>DocumentRef.ЗаказКлиента</types>
+    <types>String</types>
+  </type>
+</mdclass:DefinedType>"#;
+        let refs = parse_mdo_config_refs("DefinedType", dt);
+        assert_eq!(
+            refs.iter().map(|r| (r.0, r.1.clone())).collect::<Vec<_>>(),
+            vec![
+                ("defined_type_content", "Catalog.Контрагенты".to_string()),
+                ("defined_type_content", "Document.ЗаказКлиента".to_string()),
+            ],
+            "строковый тип ребром не становится"
+        );
+        assert!(
+            refs.iter().all(|r| r.3),
+            "две цели — составной тип"
+        );
+
+        // Функциональная опция: расположение (объект + сырое значение) и состав.
+        let fo = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:FunctionalOption xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="f">
+  <name>ВестиУчетПоСкладам</name>
+  <location>InformationRegister.Настройки.Resource.Значение</location>
+  <content>Document.ЗаказКлиента.Attribute.Склад</content>
+</mdclass:FunctionalOption>"#;
+        let refs = parse_mdo_config_refs("FunctionalOption", fo);
+        assert_eq!(
+            refs.iter()
+                .map(|r| (r.0, r.1.clone(), r.2.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "functional_option_location",
+                    "InformationRegister.Настройки".to_string(),
+                    "InformationRegister.Настройки.Resource.Значение".to_string()
+                ),
+                (
+                    "functional_option_content",
+                    "Document.ЗаказКлиента.Attribute.Склад".to_string(),
+                    String::new()
+                ),
+            ]
+        );
+
+        // Вид без конфигурационных рёбер — пустой результат без разбора.
+        assert!(parse_mdo_config_refs("Catalog", sub).is_empty());
     }
 }

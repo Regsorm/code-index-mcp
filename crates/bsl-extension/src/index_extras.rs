@@ -104,6 +104,16 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
         if let Err(e) = run_edt_metadata_layer(&src_root, conn) {
             tracing::warn!("edt metadata layer: {}", e);
         }
+        // Права ролей EDT лежат отдельными файлами и в общий проход по `.mdo`
+        // не попадают — своя фаза, как у формата Конфигуратора (E-1).
+        if let Err(e) = run_edt_role_rights(&src_root, conn) {
+            tracing::warn!("edt role_rights: {}", e);
+        }
+        // Перечень модулей: своя раскладка путей и свои источники
+        // идентификаторов, поэтому отдельная фаза (E-1).
+        if let Err(e) = index_metadata_modules_edt(repo_root, &src_root, conn) {
+            tracing::warn!("edt metadata_modules: {}", e);
+        }
         return Ok(());
     }
     if let Err(e) = index_metadata_objects(repo_root, conn) {
@@ -208,6 +218,7 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
 
     let mut objects = 0usize;
     let mut links = 0usize;
+    let mut cfg_links = 0usize;
     let mut forms = 0usize;
     let mut subs = 0usize;
     // Обходим ВСЕ папки типов в src/ (не только OBJECT_FOLDERS): meta_type берём
@@ -236,10 +247,29 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
             Ok(r) => r,
             Err(_) => continue,
         };
-        for entry in objs.filter_map(|e| e.ok()) {
-            let obj_dir = entry.path();
-            if !obj_dir.is_dir() {
-                continue;
+        // Очередь каталогов объектов. У всех типов, кроме подсистем, объекты
+        // лежат строго на втором уровне; вложенные подсистемы —
+        // `<Родитель>/Subsystems/<Ребёнок>/<Ребёнок>.mdo` — докладываются в
+        // очередь по ходу обхода. Раньше до них дело не доходило вовсе:
+        // из 755 подсистем живой выгрузки в реестр попадали 73 верхнеуровневые.
+        let mut obj_queue: Vec<std::path::PathBuf> = objs
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        while let Some(obj_dir) = obj_queue.pop() {
+            // Докладываем вложенные до любых `continue`: ветка дерева не должна
+            // теряться из-за того, что у самой подсистемы не прочитался `.mdo`.
+            let nested_dir = obj_dir.join("Subsystems");
+            if nested_dir.is_dir() {
+                if let Ok(nested) = std::fs::read_dir(&nested_dir) {
+                    obj_queue.extend(
+                        nested
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .filter(|p| p.is_dir()),
+                    );
+                }
             }
             let obj_name = match obj_dir.file_name().and_then(|s| s.to_str()) {
                 Some(s) => s.to_string(),
@@ -299,6 +329,24 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
                 }
             }
 
+            // Конфигурационные рёбра (состав подсистемы и плана обмена, цели
+            // определяемого типа, расположение и состав функциональной опции)
+            // лежат в этом же `.mdo` — пишем их тем же проходом (E-1).
+            for (kind, to_object, from_path, is_composite, is_universal) in
+                edt_mdo::parse_mdo_config_refs(&meta_type, &content)
+            {
+                ins_link.execute(params![
+                    REPO_DEFAULT,
+                    &full_name,
+                    &from_path,
+                    &to_object,
+                    kind,
+                    is_composite as i64,
+                    is_universal as i64,
+                ])?;
+                cfg_links += 1;
+            }
+
             match edt_mdo::parse_mdo_datalinks_xml(&content) {
                 Ok(edges) => {
                     for edge in edges {
@@ -315,6 +363,33 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
                     }
                 }
                 Err(e) => tracing::warn!("edt data_links {}: {}", mdo.display(), e),
+            }
+
+            // Общая форма — сама себе объект: `CommonForms/<Имя>/Form.form`,
+            // каталога `Forms` у неё нет (E-3).
+            if meta_type == "CommonForm" {
+                let form_file = obj_dir.join("Form.form");
+                if form_file.is_file() {
+                    match std::fs::read_to_string(&form_file) {
+                        Ok(fcontent) => {
+                            let handlers = edt_mdo::parse_mdo_form_handlers(&fcontent);
+                            let handlers_json = serde_json::to_string(
+                                &handlers
+                                    .iter()
+                                    .map(|(ev, h)| serde_json::json!({"event": ev, "handler": h}))
+                                    .collect::<Vec<_>>(),
+                            )?;
+                            ins_form.execute(params![
+                                REPO_DEFAULT,
+                                &format!("CommonForms.{}", obj_name),
+                                &obj_name,
+                                &handlers_json,
+                            ])?;
+                            forms += 1;
+                        }
+                        Err(e) => tracing::warn!("edt common form {}: {}", form_file.display(), e),
+                    }
+                }
             }
 
             // Формы объекта: <obj>/Forms/<ФормаИмя>/Form.form. owner_full_name —
@@ -372,11 +447,88 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
     conn.execute("COMMIT", [])?;
 
     tracing::info!(
-        "edt metadata: {} объектов, {} рёбер data_links, {} форм, {} подписок (src={})",
+        "edt metadata: {} объектов, {} рёбер data_links ({} конфигурационных), \
+         {} форм, {} подписок (src={})",
         objects,
         links,
+        cfg_links,
         forms,
         subs,
+        src_root.display()
+    );
+    Ok(())
+}
+
+/// Права ролей выгрузки 1C:EDT: `Roles/<Имя>/Rights.rights`.
+///
+/// Содержимое файла совпадает с `Roles/<Имя>/Ext/Rights.xml` формата
+/// Конфигуратора (то же пространство имён `v8.1c.ru/8.2/roles`, те же элементы
+/// `<object>/<right>`), поэтому разбор берётся общий. Отличаются только имя
+/// файла и глубина: имя роли — каталог-родитель, а не «через Ext».
+///
+/// Идемпотентно: DELETE всего репо + INSERT, как одноимённая фаза формата
+/// Конфигуратора. Хранятся только выданные права (`<value>true</value>`).
+fn run_edt_role_rights(src_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let roles_dir = src_root.join("Roles");
+    if !roles_dir.is_dir() {
+        return Ok(());
+    }
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute("DELETE FROM role_rights WHERE repo = ?", params![REPO_DEFAULT])?;
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO role_rights (repo, role_name, object_name, right_name) \
+         VALUES (?, ?, ?, ?)",
+    )?;
+
+    let mut total = 0usize;
+    let mut roles = 0usize;
+    let entries = match std::fs::read_dir(&roles_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("edt role_rights read_dir({}): {}", roles_dir.display(), e);
+            conn.execute("COMMIT", [])?;
+            return Ok(());
+        }
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let role_dir = entry.path();
+        if !role_dir.is_dir() {
+            continue;
+        }
+        let role_name = match role_dir.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let rights_file = role_dir.join("Rights.rights");
+        if !rights_file.is_file() {
+            continue;
+        }
+        match crate::xml::metadata_refs::parse_role_rights_file(&rights_file) {
+            Ok(rights) => {
+                roles += 1;
+                for r in rights {
+                    stmt.execute(params![
+                        REPO_DEFAULT,
+                        &role_name,
+                        &r.object_name,
+                        &r.right_name
+                    ])?;
+                    total += 1;
+                }
+            }
+            Err(e) => tracing::warn!("edt role_rights {}: {}", rights_file.display(), e),
+        }
+    }
+    drop(stmt);
+    backfill_role_right_keys(conn)?;
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!(
+        "edt role_rights: {} прав из {} ролей (src={})",
+        total,
+        roles,
         src_root.display()
     );
     Ok(())

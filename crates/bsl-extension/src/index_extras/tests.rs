@@ -3001,3 +3001,410 @@ fn backfill_keys_fill_lowercase_cyrillic() {
         .unwrap();
     assert_eq!(rk, "document.заказклиента");
 }
+
+#[test]
+fn edt_layer_indexes_nested_subsystems() {
+    // Вложенные подсистемы EDT лежат деревом
+    // `Subsystems/<Родитель>/Subsystems/<Ребёнок>/<Ребёнок>.mdo`, а обход шёл
+    // ровно на два уровня — в реестр попадали только верхнеуровневые (E-2).
+    // Вложенность есть только у подсистем: у остальных типов объекты лежат
+    // строго на втором уровне, поэтому проверяем обе раскладки сразу.
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+
+    let mdo = |name: &str, meta: &str| {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <mdclass:{meta} xmlns:mdclass=\"http://g5.1c.ru/v8/dt/metadata/mdclass\">\n\
+             <name>{name}</name>\n\
+             <synonym><key>ru</key><value>Синоним {name}</value></synonym>\n\
+             </mdclass:{meta}>"
+        )
+    };
+
+    let subs = src.join("Subsystems");
+    write(
+        &subs.join("Продажи").join("Продажи.mdo"),
+        &mdo("Продажи", "Subsystem"),
+    );
+    write(
+        &subs
+            .join("Продажи")
+            .join("Subsystems")
+            .join("Розница")
+            .join("Розница.mdo"),
+        &mdo("Розница", "Subsystem"),
+    );
+    write(
+        &subs
+            .join("Продажи")
+            .join("Subsystems")
+            .join("Розница")
+            .join("Subsystems")
+            .join("Касса")
+            .join("Касса.mdo"),
+        &mdo("Касса", "Subsystem"),
+    );
+    write(
+        &src.join("Catalogs").join("Товары").join("Товары.mdo"),
+        &mdo("Товары", "Catalog"),
+    );
+
+    let st = fresh_storage(&tmp);
+    run_edt_metadata_layer(&src, st.conn()).unwrap();
+
+    let synonym_of = |full_name: &str| -> Option<String> {
+        st.conn()
+            .query_row(
+                "SELECT synonym FROM metadata_objects WHERE full_name = ?1",
+                params![full_name],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+    };
+
+    assert_eq!(
+        synonym_of("Subsystem.Продажи").as_deref(),
+        Some("Синоним Продажи"),
+        "верхнеуровневая подсистема как и раньше в реестре"
+    );
+    assert_eq!(
+        synonym_of("Subsystem.Розница").as_deref(),
+        Some("Синоним Розница"),
+        "вложенная подсистема первого уровня обязана попасть в реестр"
+    );
+    assert_eq!(
+        synonym_of("Subsystem.Касса").as_deref(),
+        Some("Синоним Касса"),
+        "вложенная подсистема второго уровня обязана попасть в реестр"
+    );
+    assert_eq!(
+        synonym_of("Catalog.Товары").as_deref(),
+        Some("Синоним Товары"),
+        "обычный тип объектов обходом не задет"
+    );
+
+    let total: i64 = st
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM metadata_objects WHERE repo = ?",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total, 4, "три подсистемы дерева и один справочник");
+}
+
+#[test]
+fn edt_layer_indexes_role_rights() {
+    // Права роли в EDT лежат отдельным файлом `Roles/<Имя>/Rights.rights`
+    // (у Конфигуратора — `Roles/<Имя>/Ext/Rights.xml`), и фаза для EDT не
+    // выполнялась вовсе: таблица оставалась пустой при 649 ролях (E-1).
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    write(
+        &src.join("Roles").join("Бухгалтер").join("Rights.rights"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Rights xmlns="http://v8.1c.ru/8.2/roles" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Rights">
+    <object>
+        <name>Catalog.Контрагенты</name>
+        <right><name>Read</name><value>true</value></right>
+        <right><name>Update</name><value>false</value></right>
+    </object>
+    <object>
+        <name>Document.ЗаказКлиента</name>
+        <right><name>Posting</name><value>true</value></right>
+    </object>
+</Rights>"#,
+    );
+    // Каталог роли без файла прав — не должен ронять проход.
+    std::fs::create_dir_all(src.join("Roles").join("ПустаяРоль")).unwrap();
+
+    let st = fresh_storage(&tmp);
+    run_edt_role_rights(&src, st.conn()).unwrap();
+
+    let total: i64 = st
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM role_rights WHERE repo = ?",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total, 2, "берутся только выданные права, отказ не хранится");
+
+    let role: String = st
+        .conn()
+        .query_row(
+            "SELECT role_name FROM role_rights WHERE object_name='Document.ЗаказКлиента'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(role, "Бухгалтер", "имя роли — каталог-родитель файла прав");
+
+    let key: Option<String> = st
+        .conn()
+        .query_row(
+            "SELECT object_name_key FROM role_rights WHERE object_name='Catalog.Контрагенты'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        key.as_deref(),
+        Some("catalog.контрагенты"),
+        "ключ поиска достраивается так же, как в формате Конфигуратора"
+    );
+}
+
+#[test]
+fn edt_layer_indexes_modules() {
+    // В EDT у объекта нет каталога Ext, модуль формы лежит в
+    // `Forms/<Ф>/Module.bsl`, а идентификаторы форм и команд записаны внутри
+    // `.mdo` владельца. Фаза перечня модулей для EDT не выполнялась вовсе —
+    // таблица оставалась пустой при 18 267 файлах `.bsl` (E-1).
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+
+    write(
+        &src.join("Catalogs").join("Товары").join("Товары.mdo"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cat-uuid">
+  <name>Товары</name>
+  <forms uuid="form-uuid">
+    <name>ФормаСписка</name>
+  </forms>
+  <commands uuid="cmd-uuid">
+    <name>Печать</name>
+  </commands>
+</mdclass:Catalog>"#,
+    );
+    write(
+        &src.join("Catalogs").join("Товары").join("ObjectModule.bsl"),
+        "Процедура ПередЗаписью(Отказ) КонецПроцедуры",
+    );
+    write(
+        &src.join("Catalogs")
+            .join("Товары")
+            .join("Forms")
+            .join("ФормаСписка")
+            .join("Module.bsl"),
+        "&НаСервере Процедура ПриСозданииНаСервере(Отказ) КонецПроцедуры",
+    );
+    write(
+        &src.join("Catalogs")
+            .join("Товары")
+            .join("Commands")
+            .join("Печать")
+            .join("CommandModule.bsl"),
+        "Процедура ОбработкаКоманды(Параметр) КонецПроцедуры",
+    );
+    write(
+        &src.join("CommonModules").join("Общий").join("Общий.mdo"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:CommonModule xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cm-uuid">
+  <name>Общий</name>
+</mdclass:CommonModule>"#,
+    );
+    write(
+        &src.join("CommonModules").join("Общий").join("Module.bsl"),
+        "Процедура Метод() Экспорт КонецПроцедуры",
+    );
+    // Модуль самой конфигурации владельца-объекта не имеет — как и в формате
+    // Конфигуратора, в перечень он попадать не должен.
+    write(
+        &src.join("Configuration").join("Configuration.mdo"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Configuration xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cfg-uuid">
+  <name>Конфигурация</name>
+</mdclass:Configuration>"#,
+    );
+    write(
+        &src.join("Configuration").join("SessionModule.bsl"),
+        "Процедура УстановкаПараметровСеанса(ТребуемыеПараметры) КонецПроцедуры",
+    );
+
+    let st = fresh_storage(&tmp);
+    index_metadata_modules_edt(tmp.path(), &src, st.conn()).unwrap();
+
+    let mut rows: Vec<(String, String, String, Option<String>)> = st
+        .conn()
+        .prepare(
+            "SELECT full_name, module_type, object_id, config_version \
+             FROM metadata_modules WHERE repo = ? ORDER BY full_name",
+        )
+        .unwrap()
+        .query_map(params![REPO_DEFAULT], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    rows.sort();
+
+    assert_eq!(
+        rows.iter()
+            .map(|(f, t, id, _)| (f.as_str(), t.as_str(), id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Catalogs.Товары.Command.Печать.CommandModule", "CommandModule", "cmd-uuid"),
+            ("Catalogs.Товары.Form.ФормаСписка.FormModule", "FormModule", "form-uuid"),
+            ("Catalogs.Товары.ObjectModule", "ObjectModule", "cat-uuid"),
+            ("CommonModules.Общий.Module", "Module", "cm-uuid"),
+        ],
+        "форма и команда берут идентификатор из .mdo владельца, модуль конфигурации не в перечне"
+    );
+    assert!(
+        rows.iter().all(|(_, _, _, v)| v.is_none()),
+        "версии объекта в EDT нет — колонка остаётся пустой, а не выдуманной"
+    );
+
+    let code_path: String = st
+        .conn()
+        .query_row(
+            "SELECT code_path FROM metadata_modules WHERE full_name='Catalogs.Товары.ObjectModule'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        code_path, "src/Catalogs/Товары/ObjectModule.bsl",
+        "путь модуля — от корня репозитория, через прямые слеши"
+    );
+}
+
+#[test]
+fn command_named_like_its_object_finds_owner() {
+    // Подъём к владельцу шёл до папки С ИМЕНЕМ ОБЪЕКТА, поэтому у команды,
+    // названной так же, как сам объект, первой снизу оказывалась папка КОМАНДЫ:
+    // владелец искался как `Commands/<Имя>.xml` и не находился (E-12).
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+
+    // Имя команды совпадает с именем отчёта — самый частый случай.
+    let same = repo
+        .join("Reports")
+        .join("АнализПродаж")
+        .join("Commands")
+        .join("АнализПродаж")
+        .join("Ext")
+        .join("CommandModule.bsl");
+    write(&same, "Процедура ОбработкаКоманды(П, С) КонецПроцедуры");
+    // И команда с собственным именем — проверяем, что прежний случай не сломан.
+    let other = repo
+        .join("Reports")
+        .join("АнализПродаж")
+        .join("Commands")
+        .join("ПродажиПоКлиентам")
+        .join("Ext")
+        .join("CommandModule.bsl");
+    write(&other, "Процедура ОбработкаКоманды(П, С) КонецПроцедуры");
+
+    write(
+        &repo.join("Reports").join("АнализПродаж.xml"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns:xr="x" xmlns:xsi="y">
+  <Report uuid="report-uuid">
+    <Properties><Name>АнализПродаж</Name></Properties>
+    <ChildObjects>
+      <Command uuid="cmd-same">
+        <Properties><Name>АнализПродаж</Name></Properties>
+      </Command>
+      <Command uuid="cmd-other">
+        <Properties><Name>ПродажиПоКлиентам</Name></Properties>
+      </Command>
+    </ChildObjects>
+  </Report>
+</MetaDataObject>"#,
+    );
+
+    let (owner_xml, full_name, command_name) = find_object_command_owner(&same)
+        .expect("владелец команды, названной как объект, обязан находиться");
+    assert_eq!(command_name, "АнализПродаж");
+    assert_eq!(full_name, "Reports.АнализПродаж.Command.АнализПродаж");
+    assert_eq!(
+        owner_xml,
+        repo.join("Reports").join("АнализПродаж.xml"),
+        "владельцем считается XML объекта, а не несуществующий файл рядом с папкой команды"
+    );
+
+    let (_, full_other, _) = find_object_command_owner(&other).expect("прежний случай не сломан");
+    assert_eq!(full_other, "Reports.АнализПродаж.Command.ПродажиПоКлиентам");
+}
+
+#[test]
+fn common_form_indexed_in_both_dump_formats() {
+    // У общей формы нет каталога `Forms` — она сама объект: в формате
+    // Конфигуратора `CommonForms/<Имя>/Ext/Form.xml`, в EDT
+    // `CommonForms/<Имя>/Form.form`. Под разбор пути «форма внутри объекта»
+    // это не подходило, и ни одна общая форма в индекс не попадала (E-3).
+    let tmp = TempDir::new().unwrap();
+
+    // ── Формат Конфигуратора ────────────────────────────────────────────
+    let repo = tmp.path().join("repo");
+    let form_xml = repo
+        .join("CommonForms")
+        .join("ВыборПериода")
+        .join("Ext")
+        .join("Form.xml");
+    let (owner, form_name) =
+        decode_form_path(&repo, &form_xml).expect("общая форма обязана разбираться");
+    assert_eq!(owner, "CommonForms.ВыборПериода");
+    assert_eq!(form_name, "ВыборПериода");
+
+    // Обычная форма разбирается как раньше.
+    let usual = repo
+        .join("Documents")
+        .join("Реализация")
+        .join("Forms")
+        .join("ФормаДокумента")
+        .join("Ext")
+        .join("Form.xml");
+    assert_eq!(
+        decode_form_path(&repo, &usual),
+        Some((
+            "Documents.Реализация".to_string(),
+            "ФормаДокумента".to_string()
+        ))
+    );
+
+    // ── Формат EDT ──────────────────────────────────────────────────────
+    let src = tmp.path().join("src");
+    write(
+        &src.join("CommonForms").join("ВыборПериода").join("ВыборПериода.mdo"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:CommonForm xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cf-uuid">
+  <name>ВыборПериода</name>
+</mdclass:CommonForm>"#,
+    );
+    write(
+        &src.join("CommonForms").join("ВыборПериода").join("Form.form"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<form:Form xmlns:form="http://g5.1c.ru/v8/dt/form">
+  <handlers>
+    <event>OnCreateAtServer</event>
+    <name>ПриСозданииНаСервере</name>
+  </handlers>
+</form:Form>"#,
+    );
+
+    let st = fresh_storage(&tmp);
+    run_edt_metadata_layer(&src, st.conn()).unwrap();
+
+    let (form_name, handlers): (String, String) = st
+        .conn()
+        .query_row(
+            "SELECT form_name, handlers_json FROM metadata_forms \
+             WHERE owner_full_name = 'CommonForms.ВыборПериода'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("общая форма EDT обязана попасть в перечень форм");
+    assert_eq!(form_name, "ВыборПериода");
+    assert!(
+        handlers.contains("ПриСозданииНаСервере"),
+        "обработчики общей формы читаются: {handlers}"
+    );
+}

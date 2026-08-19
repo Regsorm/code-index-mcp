@@ -287,6 +287,15 @@ pub(crate) fn decode_form_path(repo_root: &Path, form_xml_path: &Path) -> Option
         })
         .collect();
 
+    // Общая форма — самостоятельный объект (`CommonForms/<Имя>/Ext/Form.xml`),
+    // каталога `Forms` у неё нет вовсе. Под общий разбор пути такой файл не
+    // подходил, и ни одна общая форма в индекс не попадала — 428 форм типовой
+    // бухгалтерии (E-3). Владелец — сама форма, ключом берём папку выгрузки
+    // `CommonForms.<Имя>`: под ней же лежит её модуль в перечне модулей.
+    if let Some(idx) = segments.iter().position(|s| *s == "CommonForms") {
+        let name = segments.get(idx + 1)?;
+        return Some((format!("CommonForms.{}", name), name.to_string()));
+    }
     // Ищем индекс "Forms" — он точно есть в правильной структуре.
     let forms_idx = segments.iter().position(|s| *s == "Forms")?;
     if forms_idx < 2 {

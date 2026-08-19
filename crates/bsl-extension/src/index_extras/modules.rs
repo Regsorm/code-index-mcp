@@ -213,6 +213,162 @@ pub(crate) fn build_module_row(
 }
 
 
+
+
+/// Заполнить `metadata_modules` для выгрузки 1C:EDT.
+///
+/// Раскладка отличается от формата Конфигуратора: каталога `Ext` нет
+/// (`<Тип>/<Объект>/ObjectModule.bsl`), модуль формы лежит в
+/// `<Тип>/<Объект>/Forms/<Форма>/Module.bsl`, описание объекта — в
+/// `<Объект>/<Объект>.mdo`, а идентификаторы форм и команд записаны
+/// вложенными тегами внутри этого же `.mdo`.
+///
+/// `config_version` для EDT остаётся пустым: служебной описи выгрузки в этом
+/// формате не существует, а выдумывать версию нельзя — её сверяет отладчик.
+/// Остальные колонки заполняются так же, как у формата Конфигуратора.
+pub(crate) fn index_metadata_modules_edt(
+    repo_root: &Path,
+    src_root: &Path,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_modules WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
+
+    // Один объект даёт до десятков модулей и форм — читаем его `.mdo` один раз.
+    let mut mdo_cache: std::collections::HashMap<std::path::PathBuf, String> =
+        std::collections::HashMap::new();
+    let mut total = 0usize;
+
+    for entry in WalkDir::new(src_root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("bsl") {
+            continue;
+        }
+        if let Some(row) = build_module_row_edt(repo_root, path, &mut mdo_cache) {
+            insert_module_row(conn, &row)?;
+            total += 1;
+        }
+    }
+    conn.execute("COMMIT", [])?;
+
+    tracing::info!(
+        "edt metadata_modules: {} модулей (src={})",
+        total,
+        src_root.display()
+    );
+    Ok(())
+}
+
+
+/// Собрать строку `metadata_modules` из одного `.bsl` выгрузки EDT.
+/// Не модуль известного типа / без владельца / без идентификатора → `None`.
+fn build_module_row_edt(
+    repo_root: &Path,
+    bsl_path: &Path,
+    mdo_cache: &mut std::collections::HashMap<std::path::PathBuf, String>,
+) -> Option<ModuleRow> {
+    let file_name = bsl_path.file_name().and_then(|n| n.to_str())?;
+    let module_type = module_type_by_filename(file_name)?;
+    let (effective_type, _) = classify_module(bsl_path, module_type);
+    let property_id = property_id_by_type(effective_type)?;
+
+    let segments: Vec<&str> = bsl_path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
+    if segments.len() < 3 {
+        return None;
+    }
+
+    // Папка объекта = каталог, в котором лежит `<Имя>.mdo`. Поднимаемся от
+    // модуля вверх, пока такой не найдётся: так одинаково разбираются и
+    // `<Объект>/ObjectModule.bsl`, и `<Объект>/Forms/<Ф>/Module.bsl`,
+    // и `<Объект>/Commands/<К>/CommandModule.bsl`.
+    let mut obj_dir = bsl_path.parent()?.to_path_buf();
+    let mdo_path = loop {
+        let name = obj_dir.file_name().and_then(|s| s.to_str())?;
+        let candidate = obj_dir.join(format!("{}.mdo", name));
+        if candidate.is_file() {
+            break candidate;
+        }
+        obj_dir = obj_dir.parent()?.to_path_buf();
+        // Модули самой конфигурации (`Configuration/SessionModule.bsl` и
+        // соседние) владельца-объекта не имеют — их пропускает и формат
+        // Конфигуратора.
+        if obj_dir.file_name().and_then(|s| s.to_str()) == Some("src") {
+            return None;
+        }
+    };
+    let owner_name = obj_dir.file_name().and_then(|s| s.to_str())?;
+    let meta_folder = obj_dir.parent()?.file_name().and_then(|s| s.to_str())?;
+    if meta_folder == "src" || owner_name == "Configuration" {
+        return None;
+    }
+
+    let content = match mdo_cache.get(&mdo_path) {
+        Some(c) => c,
+        None => {
+            let c = std::fs::read_to_string(&mdo_path).ok()?;
+            mdo_cache.entry(mdo_path.clone()).or_insert(c)
+        }
+    };
+
+    // Имя владельца и источник идентификатора зависят от вида модуля:
+    // форма и команда объекта описаны внутри `.mdo` владельца, остальные
+    // модули принадлежат самому объекту.
+    let (object_name, uuid) = if let Some(idx) = segments.iter().rposition(|s| *s == "Forms") {
+        let form_name = segments.get(idx + 1)?;
+        (
+            format!("{}.{}.Form.{}", meta_folder, owner_name, form_name),
+            crate::xml::edt_mdo::parse_mdo_child_uuid(content, "forms", form_name),
+        )
+    } else if let Some(idx) = segments.iter().rposition(|s| *s == "Commands") {
+        let command_name = segments.get(idx + 1)?;
+        (
+            format!("{}.{}.Command.{}", meta_folder, owner_name, command_name),
+            crate::xml::edt_mdo::parse_mdo_child_uuid(content, "commands", command_name),
+        )
+    } else {
+        (
+            format!("{}.{}", meta_folder, owner_name),
+            crate::xml::edt_mdo::parse_mdo_root_uuid(content),
+        )
+    };
+
+    let object_id = match uuid {
+        Some(u) if !u.is_empty() => u,
+        _ => return None,
+    };
+    let code_path = bsl_path
+        .strip_prefix(repo_root)
+        .unwrap_or(bsl_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    Some(ModuleRow {
+        full_name: format!("{}.{}", object_name, effective_type),
+        object_name,
+        effective_type,
+        object_id,
+        property_id,
+        // Описи выгрузки в EDT нет — версия объекта неизвестна.
+        config_version: None,
+        code_path,
+        extension_name: String::new(),
+    })
+}
+
+
 /// Вставка/обновление одной строки `metadata_modules`. Транзакцией управляет вызывающий.
 pub(crate) fn insert_module_row(conn: &rusqlite::Connection, row: &ModuleRow) -> Result<()> {
     conn.execute(
@@ -451,15 +607,24 @@ pub(crate) fn find_object_command_owner(bsl_path: &Path) -> Option<(std::path::P
     let owner_name = segments[idx - 1];
     let command_name = segments[idx + 1];
 
-    // Поднимаемся до папки объекта-владельца, его XML — сосед этой папки.
+    // Поднимаемся до каталога `Commands`; папка объекта — его родитель, а XML
+    // объекта — сосед этой папки. Раньше подъём шёл до папки С ИМЕНЕМ ОБЪЕКТА,
+    // и у команды, названной так же, как сам объект (обычное дело у отчётов и
+    // обработок), первой снизу встречалась папка КОМАНДЫ: владелец искался как
+    // `Commands/<Имя>.xml`, не находился, и модуль пропускался молча — 91 из
+    // 587 модулей команд типовой бухгалтерии (E-12).
     let mut dir = bsl_path.to_path_buf();
-    while let Some(parent) = dir.parent() {
-        dir = parent.to_path_buf();
-        if dir.file_name().and_then(|s| s.to_str()) == Some(owner_name) {
+    loop {
+        let parent = dir.parent()?;
+        if parent.file_name().and_then(|s| s.to_str()) == Some("Commands") {
+            dir = parent.parent()?.to_path_buf();
             break;
         }
+        dir = parent.to_path_buf();
     }
-    let owner_xml = dir.with_extension("xml");
+    let owner_xml = dir
+        .parent()?
+        .join(format!("{}.xml", owner_name));
     if !owner_xml.is_file() {
         return None;
     }
