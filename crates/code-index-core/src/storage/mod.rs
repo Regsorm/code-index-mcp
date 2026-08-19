@@ -123,6 +123,21 @@ pub struct Storage {
     conn: Connection,
 }
 
+/// Исход поиска пути в графе вызовов ([`Storage::find_call_path`]).
+///
+/// Голого `Option` мало: обход в ширину прерывается и по потолку узлов, и по
+/// заданной глубине, а наружу это выглядело одинаково — «пути нет». Признаки
+/// позволяют слою выдачи сказать «не досмотрели» вместо утверждения об
+/// отсутствии связи.
+pub struct CallPathOutcome {
+    /// Цепочка рёбер `from → to`; `None` — путь не найден.
+    pub path: Option<Vec<CallEdge>>,
+    /// Обход упёрся в потолок уникальных узлов.
+    pub nodes_capped: bool,
+    /// Были узлы, которые не разворачивали из-за заданной глубины.
+    pub depth_exhausted: bool,
+}
+
 impl Storage {
     // ── Конструкторы ────────────────────────────────────────────────────────
 
@@ -878,28 +893,40 @@ impl Storage {
     /// Общий пост-процессинг для grep_code/grep_text: стримом по строкам
     /// (path, zstd-blob) разжимает контент, ищет regex построчно, набирает
     /// context_lines, соблюдает потолки limit и max_total_bytes. Возвращает
-    /// (совпадения, truncated). Стриминговый вход — без материализации всех
-    /// blob'ов в память: ранний выход по лимитам не читает остаток.
+    /// (совпадения, truncated, число непрочитанных файлов). Стриминговый вход —
+    /// без материализации всех blob'ов в память: ранний выход по лимитам не
+    /// читает остаток.
+    ///
+    /// Непрочитанные файлы (битый blob, превышение лимита распаковки, не-UTF-8)
+    /// СЧИТАЮТСЯ: без счётчика неполный результат неотличим от честного «ничего
+    /// не найдено», и слой выдачи не может об этом предупредить.
     fn grep_zstd_stream(
         rows: impl Iterator<Item = rusqlite::Result<(String, Vec<u8>)>>,
         compiled: &regex::Regex,
         limit: usize,
         context_lines: usize,
         max_total_bytes: usize,
-    ) -> Result<(Vec<GrepTextMatch>, bool)> {
+    ) -> Result<(Vec<GrepTextMatch>, bool, usize)> {
         let mut results: Vec<GrepTextMatch> = Vec::new();
         let mut total_bytes: usize = 0;
+        let mut unreadable: usize = 0;
         for row in rows {
             // Безопасный decode zstd с лимитом размера (защита от zstd-bomb).
             // Битые blob'ы или превышение лимита пропускаем — не валим весь поиск.
             let (path, blob) = row?;
             let bytes = match Self::decode_zstd_safe(&blob) {
                 Ok(b) => b,
-                Err(_) => continue,
+                Err(_) => {
+                    unreadable += 1;
+                    continue;
+                }
             };
             let content = match String::from_utf8(bytes) {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(_) => {
+                    unreadable += 1;
+                    continue;
+                }
             };
             // H-2: файлы с окончаниями строк CRLF. Отсев ниже применяет выражение
             // к тексту ЦЕЛИКОМ, где строка кончается на `\r\n`, а построчный обход —
@@ -940,7 +967,7 @@ impl Storage {
                 total_bytes = total_bytes.saturating_add(row_bytes);
                 if total_bytes > max_total_bytes {
                     // Упёрлись в байтовый потолок ответа — результат обрезан.
-                    return Ok((results, true));
+                    return Ok((results, true, unreadable));
                 }
                 results.push(GrepTextMatch {
                     path: path.clone(),
@@ -950,11 +977,11 @@ impl Storage {
                 });
                 if results.len() >= limit {
                     // Достигнут лимит совпадений — возможно, есть ещё.
-                    return Ok((results, true));
+                    return Ok((results, true, unreadable));
                 }
             }
         }
-        Ok((results, false))
+        Ok((results, false, unreadable))
     }
 
     pub fn grep_code_filtered(
@@ -965,7 +992,7 @@ impl Storage {
         limit: usize,
         context_lines: usize,
         max_total_bytes: usize,
-    ) -> Result<(Vec<GrepTextMatch>, bool)> {
+    ) -> Result<(Vec<GrepTextMatch>, bool, usize)> {
         // Многострочный режим обязателен: то же выражение работает и как быстрый
         // отказ по файлу целиком (grep_zstd_stream), и построчно. Без него `^`/`$`
         // привязаны к границам всего файла, и отказ выбрасывает файлы, где
@@ -1564,13 +1591,15 @@ impl Storage {
         Ok(false)
     }
 
+    /// См. [`CallPathOutcome`]: кроме самого пути возвращает признаки обрыва
+    /// обхода, иначе «пути нет» неотличимо от «не досмотрели».
     pub fn find_call_path(
         &self,
         from: &str,
         to: &str,
         max_depth: i64,
         language: Option<&str>,
-    ) -> Result<Option<Vec<CallEdge>>> {
+    ) -> Result<CallPathOutcome> {
         use std::collections::{HashMap, HashSet, VecDeque};
         let depth_limit = max_depth.clamp(1, 10);
         // Путь к самому себе — пустая цепочка рёбер, но только если символ
@@ -1578,11 +1607,11 @@ impl Storage {
         // found=true для любой выдумки, то есть утверждал наличие пути между
         // символами, которых в репозитории нет.
         if from == to {
-            return if self.symbol_known(from, language)? {
-                Ok(Some(Vec::new()))
-            } else {
-                Ok(None)
-            };
+            return Ok(CallPathOutcome {
+                path: self.symbol_known(from, language)?.then(Vec::new),
+                nodes_capped: false,
+                depth_exhausted: false,
+            });
         }
         // Итеративный BFS по УНИКАЛЬНЫМ узлам графа `calls`: каждый узел
         // разворачивается ровно один раз (HashSet `visited`), поэтому циклы и
@@ -1607,8 +1636,13 @@ impl Storage {
         let mut queue: VecDeque<(String, i64)> = VecDeque::new();
         queue.push_back((from.to_string(), 0));
         let mut found = false;
+        // Признаки обрыва обхода. Без них «пути нет» неотличимо от «не
+        // досмотрели»: обход мог упереться в потолок узлов или в глубину.
+        let mut nodes_capped = false;
+        let mut depth_exhausted = false;
         'bfs: while let Some((node, d)) = queue.pop_front() {
             if d >= depth_limit {
+                depth_exhausted = true;
                 continue;
             }
             let rows: Vec<(String, i64, i64)> = if let Some(lang) = language {
@@ -1633,13 +1667,18 @@ impl Storage {
                     break 'bfs;
                 }
                 if visited.len() >= NODE_CAP {
+                    nodes_capped = true;
                     break 'bfs;
                 }
                 queue.push_back((callee, d + 1));
             }
         }
         if !found {
-            return Ok(None);
+            return Ok(CallPathOutcome {
+                path: None,
+                nodes_capped,
+                depth_exhausted,
+            });
         }
         // Реконструкция пути from→to по parent-указателям (обратный проход).
         let mut chain: Vec<CallEdge> = Vec::new();
@@ -1658,7 +1697,11 @@ impl Storage {
             cur = prev.clone();
         }
         chain.reverse();
-        Ok(Some(chain))
+        Ok(CallPathOutcome {
+            path: Some(chain),
+            nodes_capped,
+            depth_exhausted,
+        })
     }
 
     /// Дерево вызовов от корня `root` на глубину `max_depth` (recursive CTE по
@@ -2323,7 +2366,7 @@ impl Storage {
         limit: usize,
         context_lines: usize,
         max_total_bytes: usize,
-    ) -> Result<(Vec<GrepTextMatch>, bool)> {
+    ) -> Result<(Vec<GrepTextMatch>, bool, usize)> {
         // Многострочный режим — по той же причине, что в grep_code (M-10).
         let compiled = regex::RegexBuilder::new(regex_pattern)
             .multi_line(true)
@@ -3472,30 +3515,56 @@ mod tests {
         seed_calls(&storage, fid, &[("A", "B"), ("B", "C")]);
 
         // Прямое ребро A→B.
-        let direct = storage.find_call_path("A", "B", 3, None).unwrap().expect("путь A→B");
+        let direct = storage.find_call_path("A", "B", 3, None).unwrap().path.expect("путь A→B");
         assert_eq!(direct.len(), 1);
         assert_eq!(direct[0].caller, "A");
         assert_eq!(direct[0].callee, "B");
 
         // Два прыжка A→B→C.
-        let two = storage.find_call_path("A", "C", 3, None).unwrap().expect("путь A→C");
+        let two = storage.find_call_path("A", "C", 3, None).unwrap().path.expect("путь A→C");
         assert_eq!(two.len(), 2);
         assert_eq!(two[1].callee, "C");
+    }
+
+    #[test]
+    fn find_call_path_marks_depth_exhausted() {
+        // «Пути нет» и «не досмотрели» — разные ответы. Цепочка A→B→C при
+        // max_depth=1 не находится, но обход упёрся в границу глубины: без
+        // признака вызывающая сторона утверждала бы, что связи не существует.
+        let storage = Storage::open_in_memory().unwrap();
+        let fid = storage.upsert_file(&make_file("/g.py")).unwrap();
+        seed_calls(&storage, fid, &[("A", "B"), ("B", "C")]);
+
+        let shallow = storage.find_call_path("A", "C", 1, None).unwrap();
+        assert!(shallow.path.is_none());
+        assert!(shallow.depth_exhausted, "обход остановился на границе глубины");
+        assert!(!shallow.nodes_capped);
+
+        // Глубины хватило — путь найден, признака нехватки нет.
+        let deep = storage.find_call_path("A", "C", 3, None).unwrap();
+        assert!(deep.path.is_some());
+        assert!(!deep.depth_exhausted);
+
+        // Достижимый подграф исчерпан целиком: цели нет и обход не обрывался.
+        let absent = storage.find_call_path("A", "НетТакого", 5, None).unwrap();
+        assert!(absent.path.is_none());
+        assert!(!absent.depth_exhausted, "все узлы развёрнуты в пределах глубины");
+        assert!(!absent.nodes_capped);
     }
 
     #[test]
     fn find_call_path_none_and_respects_depth() {
         let storage = Storage::open_in_memory().unwrap();
         // Пустая база — пути нет.
-        assert!(storage.find_call_path("A", "B", 5, None).unwrap().is_none());
+        assert!(storage.find_call_path("A", "B", 5, None).unwrap().path.is_none());
 
         let fid = storage.upsert_file(&make_file("/g.py")).unwrap();
         seed_calls(&storage, fid, &[("A", "B"), ("B", "C"), ("C", "D")]);
 
         // A→D длиной 3: при max_depth=2 не должен найтись.
-        assert!(storage.find_call_path("A", "D", 2, None).unwrap().is_none());
+        assert!(storage.find_call_path("A", "D", 2, None).unwrap().path.is_none());
         // При max_depth=3 — путь из 3 рёбер.
-        assert_eq!(storage.find_call_path("A", "D", 3, None).unwrap().unwrap().len(), 3);
+        assert_eq!(storage.find_call_path("A", "D", 3, None).unwrap().path.unwrap().len(), 3);
     }
 
     #[test]
@@ -3505,17 +3574,17 @@ mod tests {
         seed_calls(&storage, fid, &[("A", "B")]);
 
         // Символ есть в графе — путь к самому себе пустой, но найден
-        let a = storage.find_call_path("A", "A", 5, None).unwrap();
+        let a = storage.find_call_path("A", "A", 5, None).unwrap().path;
         assert!(
             a.as_ref().is_some_and(|chain| chain.is_empty()),
             "A вызывает B, путь A→A — найден и пуст"
         );
         // Вызываемый символ тоже считается известным
-        assert!(storage.find_call_path("B", "B", 5, None).unwrap().is_some());
+        assert!(storage.find_call_path("B", "B", 5, None).unwrap().path.is_some());
 
         // Выдуманного символа в репозитории нет — пути быть не может
         assert!(
-            storage.find_call_path("НетТакого", "НетТакого", 5, None).unwrap().is_none(),
+            storage.find_call_path("НетТакого", "НетТакого", 5, None).unwrap().path.is_none(),
             "find_path не должен подтверждать путь для несуществующего символа"
         );
     }
@@ -3526,9 +3595,9 @@ mod tests {
         let py = storage.upsert_file(&make_file("/a.py")).unwrap();
         seed_calls(&storage, py, &[("A", "B")]);
 
-        assert!(storage.find_call_path("A", "A", 5, Some("python")).unwrap().is_some());
+        assert!(storage.find_call_path("A", "A", 5, Some("python")).unwrap().path.is_some());
         // Того же символа в rust-файлах нет — путь к самому себе не подтверждаем
-        assert!(storage.find_call_path("A", "A", 5, Some("rust")).unwrap().is_none());
+        assert!(storage.find_call_path("A", "A", 5, Some("rust")).unwrap().path.is_none());
     }
 
     #[test]
@@ -3540,9 +3609,9 @@ mod tests {
         seed_calls(&storage, rs, &[("X", "Y")]);
 
         // Python-ребро A→B отфильтровано при language=rust.
-        assert!(storage.find_call_path("A", "B", 3, Some("rust")).unwrap().is_none());
-        assert!(storage.find_call_path("A", "B", 3, Some("python")).unwrap().is_some());
-        assert!(storage.find_call_path("X", "Y", 3, Some("rust")).unwrap().is_some());
+        assert!(storage.find_call_path("A", "B", 3, Some("rust")).unwrap().path.is_none());
+        assert!(storage.find_call_path("A", "B", 3, Some("python")).unwrap().path.is_some());
+        assert!(storage.find_call_path("X", "Y", 3, Some("rust")).unwrap().path.is_some());
     }
 
     #[test]
@@ -4225,7 +4294,7 @@ mod tests {
             file_id: id,
             content: "host: 10.0.0.1\nport: 8080\nname: example\n".to_string(),
         }).unwrap();
-        let (m, truncated) = storage.grep_text_filtered(r"port:\s*\d+", None, None, 100, 0, 1_000_000).unwrap();
+        let (m, truncated, _) = storage.grep_text_filtered(r"port:\s*\d+", None, None, 100, 0, 1_000_000).unwrap();
         assert!(!truncated);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].path, "/cfg.yaml");
@@ -4247,17 +4316,50 @@ mod tests {
             content: "host: 10.0.0.1\nport: 8080\nname: example\n".to_string(),
         }).unwrap();
 
-        let (m, _) = storage
+        let (m, _, _) = storage
             .grep_text_filtered(r"^port:", None, None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1, "^ должен совпадать с началом строки, а не файла");
         assert_eq!(m[0].line, 2);
 
-        let (m_end, _) = storage
+        let (m_end, _, _) = storage
             .grep_text_filtered(r"8080$", None, None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m_end.len(), 1, "$ должен совпадать с концом строки, а не файла");
         assert_eq!(m_end[0].line, 2);
+    }
+
+    /// H-3: файл с нечитаемым содержимым (битый blob) пропускался молча, и
+    /// неполная выдача была неотличима от честного «ничего не найдено».
+    /// Теперь такие файлы считаются, а слой выдачи может предупредить.
+    #[test]
+    fn test_grep_code_counts_unreadable_files() {
+        let storage = Storage::open_in_memory().unwrap();
+        let good = storage.upsert_file(&make_file_full("/good.py", "python", 2)).unwrap();
+        storage.upsert_file_content(good, "def bar():\n    return 1\n", 4096).unwrap();
+        let bad = storage.upsert_file(&make_file_full("/bad.py", "python", 2)).unwrap();
+        storage.upsert_file_content(bad, "def bar():\n    return 2\n", 4096).unwrap();
+        // Портим содержимое второго файла: распаковка на нём не пройдёт.
+        storage
+            .conn()
+            .execute(
+                "UPDATE file_contents SET content_blob = X'00010203' WHERE file_id = ?1",
+                params![bad],
+            )
+            .unwrap();
+
+        let (m, truncated, unreadable) = storage
+            .grep_code_filtered(r"def bar", None, None, 100, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(m.len(), 1, "читаемый файл найден");
+        assert!(!truncated);
+        assert_eq!(unreadable, 1, "нечитаемый файл обязан быть посчитан");
+
+        // На здоровой базе счётчик остаётся нулевым — поле в ответе не появится.
+        let (_, _, none_bad) = storage
+            .grep_code_filtered(r"return 1", Some("/good.py"), None, 100, 0, 1_000_000)
+            .unwrap();
+        assert_eq!(none_bad, 0);
     }
 
     /// M-10 для grep_code: то же на содержимом code-файла.
@@ -4269,7 +4371,7 @@ mod tests {
             .upsert_file_content(id, "import os\n\ndef bar():\n    return 1\n", 4096)
             .unwrap();
 
-        let (m, _) = storage
+        let (m, _, _) = storage
             .grep_code_filtered(r"^def bar", None, None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1, "^ должен совпадать с началом строки, а не файла");
@@ -4288,14 +4390,14 @@ mod tests {
             .upsert_file_content(id, "use std::sync::Arc;\r\n\r\nfn bar() {\r\n    let x = 1;\r\n}\r\n", 4096)
             .unwrap();
 
-        let (m, _) = storage
+        let (m, _, _) = storage
             .grep_code_filtered(r"^use std::sync::Arc;$", None, None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1, "$ обязан совпадать и в файле с CRLF");
         assert_eq!(m[0].line, 1);
 
         // Якорь начала строки на CRLF тоже работает (проверяем обе стороны).
-        let (m2, _) = storage
+        let (m2, _, _) = storage
             .grep_code_filtered(r"^fn bar\(\) \{$", None, None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m2.len(), 1);
@@ -4343,7 +4445,7 @@ mod tests {
             file_id: id,
             content: "a\nb\nFOUND\nd\ne".to_string(),
         }).unwrap();
-        let (m, _truncated) = storage.grep_text_filtered(r"FOUND", None, None, 100, 1, 1_000_000).unwrap();
+        let (m, _truncated, _) = storage.grep_text_filtered(r"FOUND", None, None, 100, 1, 1_000_000).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].context.len(), 3); // строки 2, 3, 4
         assert_eq!(m[0].context[0].line, 2);
@@ -4359,7 +4461,7 @@ mod tests {
         let id2 = storage.upsert_file(&make_file_full("/b.json", "json", 1)).unwrap();
         storage.insert_text_file(&TextFileRecord { id: None, file_id: id1, content: "key: 42".into() }).unwrap();
         storage.insert_text_file(&TextFileRecord { id: None, file_id: id2, content: "{\"key\": 42}".into() }).unwrap();
-        let (m, _truncated) = storage.grep_text_filtered(r"42", Some("*.yaml"), None, 100, 0, 1_000_000).unwrap();
+        let (m, _truncated, _) = storage.grep_text_filtered(r"42", Some("*.yaml"), None, 100, 0, 1_000_000).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].path, "/a.yaml");
     }
@@ -4374,7 +4476,7 @@ mod tests {
             content: "x\nx\nx\nx\nx".to_string(),
         }).unwrap();
         // limit=2 при 5 совпадениях → результат обрезан, truncated=true
-        let (m, truncated) = storage.grep_text_filtered(r"x", None, None, 2, 0, 1_000_000).unwrap();
+        let (m, truncated, _) = storage.grep_text_filtered(r"x", None, None, 2, 0, 1_000_000).unwrap();
         assert_eq!(m.len(), 2);
         assert!(truncated);
     }
@@ -4798,7 +4900,7 @@ mod tests {
             .upsert_file_content(id2, "def bar():\n    nothing_here\n", 4096)
             .unwrap();
 
-        let (m, _truncated) = storage
+        let (m, _truncated, _) = storage
             .grep_code_filtered("specific_word", None, None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1, "только один файл должен совпасть");
@@ -4825,7 +4927,7 @@ mod tests {
             .upsert_file_content(id2, "TARGET_PATTERN in oversize", 1)
             .unwrap();
 
-        let (m, _truncated) = storage
+        let (m, _truncated, _) = storage
             .grep_code_filtered("TARGET_PATTERN", None, None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1, "oversize-файл должен быть пропущен");
@@ -4851,7 +4953,7 @@ mod tests {
             .unwrap();
 
         // Ищем только в /src/
-        let (m, _truncated) = storage
+        let (m, _truncated, _) = storage
             .grep_code_filtered("NEEDLE", Some("/src/*"), None, 100, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1, "glob должен ограничить поиск до /src/");
@@ -4870,7 +4972,7 @@ mod tests {
             .upsert_file_content(file_id, "before1\nbefore2\nMATCH\nafter1\nafter2", 4096)
             .unwrap();
 
-        let (m, _truncated) = storage
+        let (m, _truncated, _) = storage
             .grep_code_filtered("MATCH", None, None, 100, 1, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 1);
@@ -4898,7 +5000,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (m, truncated) = storage
+        let (m, truncated, _) = storage
             .grep_code_filtered("COMMON_PATTERN", None, None, 2, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 2, "limit=2 должен вернуть ровно 2 результата");

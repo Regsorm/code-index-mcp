@@ -91,12 +91,19 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
         -- расширения. Нужен для diff-удаления перечня по владельцу, когда
         -- Configuration.xml перестаёт быть триггером полного пересбора.
         sub_config TEXT NOT NULL DEFAULT '',
+        -- full_name_key = lower(full_name): регистронезависимый резолв имени на
+        -- входе объектных инструментов (SQLite lower() кириллицу не берёт —
+        -- считаем в Rust, как у to_object_key). Без него запрос с иным
+        -- регистром отвечал молчаливым нулём вместо данных объекта.
+        full_name_key TEXT NOT NULL DEFAULT '',
         UNIQUE(repo, full_name)
     );
     ",
     "CREATE INDEX IF NOT EXISTS idx_metadata_objects_repo ON metadata_objects(repo);",
     "CREATE INDEX IF NOT EXISTS idx_metadata_objects_meta_type ON metadata_objects(repo, meta_type);",
     "CREATE INDEX IF NOT EXISTS idx_metadata_objects_name ON metadata_objects(name);",
+    // idx_mo_full_key — резолв имени объекта без учёта регистра (одним seek).
+    "CREATE INDEX IF NOT EXISTS idx_mo_full_key ON metadata_objects(repo, full_name_key);",
 
     // ── config_manifest ───────────────────────────────────────────────────
     // Плоский реестр строк ConfigDumpInfo.xml всех областей выгрузки (base +
@@ -517,8 +524,63 @@ pub fn migrate_extensions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     ensure_column(conn, "role_rights", "object_name_key", "TEXT NOT NULL DEFAULT ''")?;
     // Владелец объекта (base '' / Extensions/<EF_X>) для diff-удаления перечня.
     ensure_column(conn, "metadata_objects", "sub_config", "TEXT NOT NULL DEFAULT ''")?;
+    // Ключ имени объекта для регистронезависимого резолва на входе инструментов.
+    ensure_column(conn, "metadata_objects", "full_name_key", "TEXT NOT NULL DEFAULT ''")?;
+    backfill_metadata_object_keys(conn)?;
     ensure_trigram_tokenizer(conn)?;
     Ok(())
+}
+
+/// Заполнить `metadata_objects.full_name_key = lower(full_name)` там, где он
+/// пуст. Вызывается и из миграции, и после наполнения перечня объектов при
+/// индексации. SQLite `lower()` кириллицу не сворачивает — считаем в Rust
+/// (та же нормализация, что у `to_object_key`).
+///
+/// Идемпотентно: трогает только строки с пустым ключом, поэтому повторный
+/// вызов на заполненной базе стоит один SELECT без строк. Благодаря вызову из
+/// миграции уже проиндексированные базы получают ключи при первом открытии
+/// новым бинарником — переиндексация для этого не нужна.
+pub fn backfill_metadata_object_keys(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='metadata_objects'",
+        [],
+        |r| r.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(());
+    }
+    let pending: Vec<(i64, String)> = {
+        let mut sel = conn.prepare(
+            "SELECT id, full_name FROM metadata_objects \
+             WHERE full_name_key = '' AND full_name <> ''",
+        )?;
+        let rows = sel.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    // Из миграции функция зовётся вне транзакции, и на десятках тысяч объектов
+    // автокоммит на каждой строке растянул бы старт на секунды. Из индексации —
+    // наоборот, транзакция уже открыта, и второй BEGIN был бы ошибкой.
+    let own_tx = conn.is_autocommit();
+    if own_tx {
+        conn.execute_batch("BEGIN")?;
+    }
+    let res = (|| -> rusqlite::Result<()> {
+        let mut upd =
+            conn.prepare("UPDATE metadata_objects SET full_name_key = ?2 WHERE id = ?1")?;
+        for (id, full_name) in pending {
+            upd.execute(rusqlite::params![id, full_name.to_lowercase()])?;
+        }
+        Ok(())
+    })();
+    if own_tx {
+        let _ = conn.execute_batch(if res.is_ok() { "COMMIT" } else { "ROLLBACK" });
+    }
+    res
 }
 
 /// Миграция 0.30.0: FTS-индекс термов на trigram-токенайзер. У существующей
@@ -641,6 +703,66 @@ mod tests {
 
         // Идемпотентность: повтор миграции — no-op, не падает.
         super::migrate_extensions(&conn).unwrap();
+    }
+
+    #[test]
+    fn migrate_extensions_adds_and_backfills_full_name_key() {
+        // Симуляция уже проиндексированной БД: metadata_objects без ключа имени.
+        // Миграция обязана добавить колонку И заполнить её для существующих
+        // строк — иначе резолв имени заработал бы только после переиндексации.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata_objects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo TEXT NOT NULL, full_name TEXT NOT NULL, meta_type TEXT NOT NULL,
+                name TEXT NOT NULL, synonym TEXT, attributes_json TEXT,
+                UNIQUE(repo, full_name));",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata_objects (repo, full_name, meta_type, name) \
+             VALUES ('default', 'Catalog.Организации', 'Catalog', 'Организации')",
+            [],
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "metadata_objects", "full_name_key"));
+
+        super::migrate_extensions(&conn).unwrap();
+        for ddl in SCHEMA_EXTENSIONS {
+            conn.execute_batch(ddl)
+                .expect("DDL после migrate_extensions не должен падать");
+        }
+        assert!(column_exists(&conn, "metadata_objects", "full_name_key"));
+
+        // Ключ посчитан в Rust: SQLite lower() кириллицу не сворачивает.
+        let key: String = conn
+            .query_row(
+                "SELECT full_name_key FROM metadata_objects WHERE full_name = 'Catalog.Организации'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "catalog.организации");
+
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_mo_full_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "idx_mo_full_key должен создаться после миграции");
+
+        // Идемпотентность: повтор ничего не портит.
+        super::migrate_extensions(&conn).unwrap();
+        let still: String = conn
+            .query_row(
+                "SELECT full_name_key FROM metadata_objects WHERE full_name = 'Catalog.Организации'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still, "catalog.организации");
     }
 
     #[test]

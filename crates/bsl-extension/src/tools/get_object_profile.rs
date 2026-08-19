@@ -151,6 +151,15 @@ impl IndexTool for GetObjectProfileTool {
             };
             let conn = storage.conn();
 
+            // Имя приводим к записи из конфигурации (регистр кириллицы). Разбор
+            // на тип и имя повторяем по канону: паспорт собирает формы и модули
+            // по этим кускам, и с исходным написанием секции приходили пустыми.
+            let full_name = crate::tools::canonical_object_name(conn, &full_name);
+            let (meta_type, name) = match full_name.split_once('.') {
+                Some((mt, nm)) => (mt.to_string(), nm.to_string()),
+                None => (meta_type, name),
+            };
+
             // interrupt-таймаут против runaway-запросов на больших data_links
             // (центральные регистры/объекты). Паттерн как в bsl_sql: handle живёт
             // в отдельной задаче, по истечении дёргает sqlite3_interrupt; гасим

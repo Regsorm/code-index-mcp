@@ -434,6 +434,7 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
     drop(ins_form);
     drop(ins_sub);
     backfill_data_link_keys(conn)?;
+    crate::schema::backfill_metadata_object_keys(conn)?;
     conn.execute("COMMIT", [])?;
 
     tracing::info!(

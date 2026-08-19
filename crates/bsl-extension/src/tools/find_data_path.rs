@@ -98,6 +98,12 @@ impl IndexTool for FindDataPathTool {
             };
             let conn = storage.conn();
 
+            // Оба конца приводим к записи из конфигурации: с иным регистром
+            // кириллицы обход стартовал от несуществующего узла и отвечал
+            // «пути нет» — неотличимо от честного отсутствия пути.
+            let from = crate::tools::canonical_object_name(conn, &from);
+            let to = crate::tools::canonical_object_name(conn, &to);
+
             // BFS с visited-set: каждый узел разворачивается ровно один
             // раз, поэтому обход ограничен достижимым подграфом (тысячи
             // узлов), а не числом путей (на плотном циклическом графе связей
@@ -130,9 +136,13 @@ impl IndexTool for FindDataPathTool {
             queue.push_back((from.clone(), 0));
             let mut reached = false;
             let mut db_err: Option<String> = None;
+            // Были ли узлы, которые мы отказались разворачивать из-за max_depth.
+            // Без этого признака «пути нет» неотличимо от «не хватило шагов».
+            let mut depth_exhausted = false;
 
             'bfs: while let Some((node, depth)) = queue.pop_front() {
                 if depth >= max_depth {
+                    depth_exhausted = true;
                     continue;
                 }
                 let rows = stmt.query_map(params!["default", &node], |r| {
@@ -194,9 +204,31 @@ impl IndexTool for FindDataPathTool {
                 edges.reverse();
                 json!({ "from": from, "to": to, "found": true, "path": edges })
             } else {
-                json!({
-                    "from": from, "to": to, "found": false, "path": [], "max_depth": max_depth,
-                })
+                // Обход мог упереться в max_depth — тогда «пути нет» означает лишь
+                // «не досмотрели». Даём и признак, и готовый следующий вызов:
+                // без них модель делает вывод «связи между объектами не существует».
+                let mut value = json!({
+                    "from": from, "to": to, "found": false, "path": [],
+                    "max_depth": max_depth, "depth_exhausted": depth_exhausted,
+                    "visited_nodes": visited.len(),
+                });
+                if depth_exhausted && max_depth < 8 {
+                    let call = code_index_core::mcp::cap::next_call_hint(
+                        "find_data_path",
+                        &[
+                            ("repo", json!(ctx.repo)),
+                            ("from", json!(&from)),
+                            ("to", json!(&to)),
+                            ("max_depth", json!((max_depth + 2).min(8))),
+                        ],
+                    );
+                    value["hint"] = json!(format!(
+                        "Пути в пределах {} шагов нет, но обход упёрся в эту границу — \
+                         «пути не существует» отсюда НЕ следует. Глубже — 1 вызов:\n{}",
+                        max_depth, call
+                    ));
+                }
+                value
             };
             crate::tools::wrap_with_meta("find_data_path", result_value, Vec::new())
         })

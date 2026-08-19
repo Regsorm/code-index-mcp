@@ -1024,24 +1024,45 @@ pub async fn find_path(
     let depth = max_depth.unwrap_or(5);
     let storage = acquire_storage!(entry);
     match storage.find_call_path(&from, &to, depth, language.as_deref()) {
-        Ok(opt) => {
-            let found = opt.is_some();
-            let path = opt.unwrap_or_default();
+        Ok(outcome) => {
+            let found = outcome.path.is_some();
+            let path = outcome.path.unwrap_or_default();
             // Зависимые файлы — источники рёбер найденного пути (M-7). Без них
             // ответ не попадал в обратный индекс и точечной инвалидацией не
             // вытеснялся: после правки кода обход графа отдавал старую картину.
             let deps: Vec<String> = path.iter().filter_map(|e| e.path.clone()).collect();
-            let result = serde_json::json!({
+            let mut result = serde_json::json!({
                 "from": from,
                 "to": to,
                 "found": found,
                 "path": path,
                 "max_depth": depth.clamp(1, 10),
             });
+            // Обход мог оборваться — тогда «не найден» означает лишь «не
+            // досмотрели». Признаки ставим только на пустом результате: на
+            // найденном пути они ничего не значат.
+            if !found {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("walk_depth_exhausted".to_string(),
+                               serde_json::json!(outcome.depth_exhausted));
+                    if outcome.nodes_capped {
+                        obj.insert("walk_nodes_capped".to_string(), serde_json::json!(true));
+                    }
+                }
+            }
             // На пустом результате — hint (модель часто повторяет тот же вызов).
-            let hint = (!found).then_some(
-                "Путь не найден в графе вызовов. Увеличьте max_depth, проверьте точные имена функций (get_function) или снимите language=.",
-            );
+            let hint = (!found).then(|| {
+                if outcome.nodes_capped {
+                    "Обход остановлен на потолке узлов графа — «пути нет» отсюда НЕ следует. \
+                     Сузьте поиск: задайте language= или возьмите более специфичный конец пути."
+                } else if outcome.depth_exhausted {
+                    "Пути в пределах max_depth нет, но обход упёрся в эту границу — \
+                     «пути не существует» отсюда НЕ следует. Увеличьте max_depth."
+                } else {
+                    "Путь не найден: обход исчерпал достижимый подграф целиком (не обрывался). \
+                     Проверьте точные имена функций (get_function) или снимите language=."
+                }
+            });
             wrap_with_meta_hint(&storage, &result, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"find_path: {}\"}}", e),
@@ -1757,18 +1778,19 @@ pub async fn grep_text(
         context_lines.unwrap_or(0),
         GREP_TOTAL_BYTES_CAP,
     ) {
-        Ok((matches, truncated)) => {
+        Ok((matches, truncated, unreadable)) => {
             let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
             let shown = matches.len();
             // Компактная выдача: значение files[path] — плоский массив строк
             // "N: content" (см. compact_text_matches). Путь — один раз как ключ.
             let files = compact_text_matches(&matches);
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "files": files,
                 "shown": shown,
                 "limit": want,
                 "truncated": truncated,
             });
+            annotate_unreadable(&mut payload, unreadable);
             let hint = if shown == 0 { Some(HINT_GREP_TEXT_EMPTY) } else { None };
             wrap_with_meta_hint(&storage, &payload, deps, hint)
         }
@@ -1888,23 +1910,44 @@ pub async fn grep_code(
         context_lines.unwrap_or(0),
         GREP_TOTAL_BYTES_CAP,
     ) {
-        Ok((matches, truncated)) => {
+        Ok((matches, truncated, unreadable)) => {
             let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
             let shown = matches.len();
             // Компактная выдача: значение files[path] — плоский массив строк
             // "N: content" (см. compact_text_matches). Путь — один раз как ключ.
             let files = compact_text_matches(&matches);
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "files": files,
                 "shown": shown,
                 "limit": want,
                 "truncated": truncated,
             });
+            annotate_unreadable(&mut payload, unreadable);
             let hint =
                 if shown == 0 { Some(grep_code_empty_hint(entry.language.as_deref())) } else { None };
             wrap_with_meta_hint(&storage, &payload, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"grep_code: {}\"}}", e),
+    }
+}
+
+/// Дописать в ответ поиска признак непрочитанных файлов. Молчаливый пропуск
+/// битого/не-UTF-8 содержимого делал неполную выдачу неотличимой от честного
+/// «ничего не найдено» — при нуле пропусков поле не появляется вовсе.
+fn annotate_unreadable(payload: &mut serde_json::Value, unreadable: usize) {
+    if unreadable == 0 {
+        return;
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("files_unreadable".to_string(), serde_json::json!(unreadable));
+        obj.insert(
+            "files_unreadable_hint".to_string(),
+            serde_json::json!(format!(
+                "{} файл(ов) не прочитано (повреждённое или не-UTF-8 содержимое) — \
+                 результат НЕПОЛНЫЙ. Пустой ответ здесь не означает «совпадений нет».",
+                unreadable
+            )),
+        );
     }
 }
 

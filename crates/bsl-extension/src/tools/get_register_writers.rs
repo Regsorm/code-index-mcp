@@ -95,6 +95,10 @@ impl IndexTool for GetRegisterWritersTool {
             };
             let conn = storage.conn();
 
+            // Имя приводим к записи из конфигурации: иначе иной регистр кириллицы
+            // давал `writers: []` — «у регистра нет ни одного регистратора».
+            let object = crate::tools::canonical_object_name(conn, &object);
+
             // writers — кто пишет в этот объект как в регистр (to_object = object).
             let (writers, writers_truncated) = match query_recorders(conn, &object, Side::Writers) {
                 Ok(v) => v,

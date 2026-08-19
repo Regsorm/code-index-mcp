@@ -314,15 +314,75 @@ resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only, 0, 
             // (сотни значений перечисления) опускается целиком с `_count`.
             let (result_value, omitted) =
                 code_index_core::mcp::cap::omit_oversize_sections(result_value, budget.applied);
+            // Имена опущенных секций — по маркерам `<секция>_omitted`, которые
+            // проставил omit выше. Нужны, чтобы подсказка называла КОНКРЕТНУЮ
+            // секцию и готовый вызов, а не общий совет.
+            let omitted_sections = omitted_section_names(&result_value);
             let mut out = crate::tools::wrap_with_meta_structural(result_value, Vec::new(), omitted);
-            if budget.requested.is_some() {
-                if let Some(obj) = out.as_object_mut() {
+            if let Some(obj) = out.as_object_mut() {
+                // Готовый вызов собираем только для одиночного объекта: в массовом
+                // режиме страницы по секции выключены намеренно.
+                let single = crate::tools::object_value(&args);
+                if let (Some(section), Some(name)) = (omitted_sections.first(), single) {
+                    let call = code_index_core::mcp::cap::next_call_hint(
+                        "get_object_structure",
+                        &[
+                            ("repo", json!(ctx.repo)),
+                            ("full_name", json!(name)),
+                            ("sections", json!([section])),
+                        ],
+                    );
+                    obj.insert(
+                        "response_sections_omitted_hint".to_string(),
+                        json!(format!(
+                            "Секции опущены целиком (рядом `<секция>_omitted` + `<секция>_count`): {}. \
+                             Любая из них доступна ПОЛНОСТЬЮ — запросите её отдельно, при большом \
+                             объёме придёт страницами (в ответе `<секция>_shown`/`<секция>_total` \
+                             и вызов следующей страницы). Например — 1 вызов:\n{}",
+                            omitted_sections.join(", "),
+                            call
+                        )),
+                    );
+                }
+                if budget.requested.is_some() {
                     obj.insert("response_budget_applied".to_string(), json!(budget.applied));
                 }
             }
             out
         })
     }
+}
+
+/// Имена секций, опущенных стражем размера: ключи-маркеры `<секция>_omitted`
+/// со значением `true`. Нужны, чтобы подсказка назвала конкретную секцию и
+/// собрала готовый вызов за ней; общий текст без имени модель игнорирует.
+///
+/// Обход рекурсивный: у структуры объекта секции лежат не на верхнем уровне,
+/// а внутри `attributes`, и поиск только по верхушке не находил ничего.
+/// Порядок — по убыванию `<секция>_count`: первой называем самую крупную,
+/// ради которой повторный вызов и делается.
+fn omitted_section_names(value: &Value) -> Vec<String> {
+    fn walk(v: &Value, out: &mut Vec<(String, u64)>) {
+        if let Some(obj) = v.as_object() {
+            for (k, val) in obj {
+                if val.as_bool() == Some(true) {
+                    if let Some(section) = k.strip_suffix("_omitted") {
+                        let count = obj
+                            .get(&format!("{section}_count"))
+                            .and_then(|c| c.as_u64())
+                            .unwrap_or(0);
+                        out.push((section.to_string(), count));
+                        continue;
+                    }
+                }
+                walk(val, out);
+            }
+        }
+    }
+    let mut found: Vec<(String, u64)> = Vec::new();
+    walk(value, &mut found);
+    found.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    found.into_iter().map(|(name, _)| name).collect()
 }
 
 /// Подсказка при ужатом ответе-поиске. Обязательны ОБА числа (сколько весил бы
@@ -420,7 +480,11 @@ fn resolve_one(
         },
         None => std::borrow::Cow::Borrowed(full_name),
     };
-    let full_name = normalized.as_ref();
+    // Регистр кириллицы: 'Catalog.организации' → 'Catalog.Организации'. Без
+    // резолва объект «не находился», и ответ уходил в ветку ошибки, где подбор
+    // похожих имён по образцу тоже регистрозависим — did_you_mean выходил пустым.
+    let canonical = crate::tools::canonical_object_name(conn, normalized.as_ref());
+    let full_name = canonical.as_str();
     let row = conn.query_row(
         "SELECT meta_type, name, synonym, attributes_json \
                      FROM metadata_objects WHERE repo = ? AND full_name = ?",
@@ -523,14 +587,18 @@ fn resolve_one(
                 Some((t, n)) => (Some(t.to_string()), n.to_string()),
                 None => (None, full_name.to_string()),
             };
-            let prefix: String = short.chars().take(6).collect();
-            let like_prefix = format!("{}%", prefix);
+            // Сравнение по образцу идёт по ключу `full_name_key` (нижний регистр):
+            // SQLite кириллицу не сворачивает, и на различии ТОЛЬКО в регистре
+            // прежний подбор по `name LIKE` не давал ни одной подсказки — при том
+            // что объект отличается одной буквой.
+            let prefix: String = short.chars().take(6).collect::<String>().to_lowercase();
+            let like_prefix = format!("%.{}%", prefix);
             let mut suggestions: Vec<String> = Vec::new();
             // 1) тот же meta_type + префикс имени
             if let Some(ref t) = mtype {
                 if let Ok(mut s) = conn.prepare(
                     "SELECT full_name FROM metadata_objects \
-                                 WHERE repo = 'default' AND meta_type = ?1 AND name LIKE ?2 \
+                                 WHERE repo = 'default' AND meta_type = ?1 AND full_name_key LIKE ?2 \
                                  ORDER BY name LIMIT 8",
                 ) {
                     if let Ok(rows) =
@@ -542,11 +610,11 @@ fn resolve_one(
             }
             // 2) добор по подстроке имени без учёта meta_type
             if suggestions.len() < 8 {
-                let sub: String = short.chars().take(8).collect();
+                let sub: String = short.chars().take(8).collect::<String>().to_lowercase();
                 let like_sub = format!("%{}%", sub);
                 if let Ok(mut s) = conn.prepare(
                     "SELECT full_name FROM metadata_objects \
-                                 WHERE repo = 'default' AND name LIKE ?1 \
+                                 WHERE repo = 'default' AND full_name_key LIKE ?1 \
                                  ORDER BY name LIMIT 8",
                 ) {
                     if let Ok(rows) = s.query_map(params![like_sub], |r| r.get::<_, String>(0)) {
@@ -627,6 +695,41 @@ mod tests {
         // names_only=false → структура на месте (прежнее поведение).
         let full = resolve_one(&conn, "ut", "Catalog.СоглашенияСКлиентами", None, false, 0, 0);
         assert_eq!(full["counts"]["attributes"], json!(2));
+    }
+
+    #[test]
+    fn omitted_section_names_reads_markers() {
+        // Маркеры лежат ВНУТРИ `attributes` — как в реальном ответе структуры
+        // объекта, а не на верхнем уровне. Порядок — по убыванию количества.
+        let v = json!({
+            "attributes": {
+                "enum_synonyms_omitted": true,
+                "enum_synonyms_count": 814,
+                "enum_values_omitted": true,
+                "enum_values_count": 816,
+                "tabular_sections_omitted": false,
+                "attributes": [],
+            },
+            "counts": { "enum_values": 816 },
+        });
+        assert_eq!(
+            omitted_section_names(&v),
+            vec!["enum_values".to_string(), "enum_synonyms".to_string()],
+            "первой называется самая крупная секция"
+        );
+        assert!(omitted_section_names(&json!({ "attributes": [] })).is_empty());
+    }
+
+    #[test]
+    fn omit_hint_leads_to_the_section_instead_of_denying_it() {
+        // Прежняя редакция подсказки утверждала, что полный набор значений
+        // перечисления «дампом недоступен», и отправляла искать по коду —
+        // после появления страниц по секции это стало неправдой, и выпущенная
+        // возможность оставалась невидимой для модели.
+        let hint = code_index_core::mcp::cap::OMIT_HINT;
+        assert!(!hint.contains("недоступен"), "подсказка не должна отрицать доступность: {hint}");
+        assert!(hint.contains("sections=[<секция>]"), "нужен путь к секции: {hint}");
+        assert!(hint.contains("offset="), "нужно упоминание страниц: {hint}");
     }
 
     #[test]

@@ -170,9 +170,19 @@ impl IndexTool for SearchTermsTool {
                 }))
             });
 
+            // Нечитаемые строки считаем, а не выбрасываем молча: иначе неполная
+            // выдача неотличима от честного «столько и нашлось».
+            let mut rows_unreadable: usize = 0;
             let rows: Vec<Value> = match rows_iter {
                 Ok(iter) => iter
-                    .filter_map(|r| r.ok())
+                    .filter_map(|r| match r {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::warn!("search_terms: строка результата не прочитана: {}", e);
+                            rows_unreadable += 1;
+                            None
+                        }
+                    })
                     .collect(),
                 Err(e) => {
                     // Типичная причина — невалидный FTS5 синтаксис в query.
@@ -190,6 +200,14 @@ impl IndexTool for SearchTermsTool {
             // fts_query показываем для прозрачности: агент видит, как его
             // запрос был переписан (OR-семантика), и может скорректироваться.
             let mut result = json!({ "query": query, "fts_query": fts_query, "results": rows });
+            if rows_unreadable > 0 {
+                result["rows_unreadable"] = json!(rows_unreadable);
+                result["rows_unreadable_hint"] = json!(format!(
+                    "{} строк(и) результата не прочитано — выдача НЕПОЛНАЯ. \
+                     Проверьте объект другим инструментом (grep_body/search_function).",
+                    rows_unreadable
+                ));
+            }
             if result["results"]
                 .as_array()
                 .map(|a| a.is_empty())

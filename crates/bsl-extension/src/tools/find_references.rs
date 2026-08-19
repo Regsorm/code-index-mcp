@@ -124,6 +124,11 @@ impl IndexTool for FindReferencesTool {
             };
             let conn = storage.conn();
 
+            // Данные ищутся по ключу в нижнем регистре и от написания не зависят,
+            // но в ответе показываем имя так, как оно записано в конфигурации:
+            // модель копирует его в следующий вызов, и там регистр уже важен.
+            let object = crate::tools::canonical_object_name(conn, &object);
+
             // interrupt-таймаут против runaway COUNT/GROUP BY на больших
             // data_links / metadata_code_usages (центральные объекты — десятки
             // тысяч рёбер). Тот же паттерн, что в bsl_sql: handle живёт в отдельной

@@ -209,6 +209,7 @@ pub(crate) fn upsert_metadata_object(
              sub_config = excluded.sub_config",
         params![REPO_DEFAULT, &full_name, meta_type, &stem, synonym, &owner],
     )?;
+    crate::schema::backfill_metadata_object_keys(conn)?;
     conn.execute("COMMIT", [])?;
     Ok(())
 }
@@ -1055,6 +1056,7 @@ fn upsert_edt_object(
         }
     }
     backfill_data_link_keys(conn)?;
+    crate::schema::backfill_metadata_object_keys(conn)?;
     conn.execute("COMMIT", [])?;
     Ok(())
 }

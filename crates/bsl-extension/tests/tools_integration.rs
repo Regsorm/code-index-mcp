@@ -17,8 +17,8 @@ use std::sync::Arc;
 use bsl_extension::{
     schema::SCHEMA_EXTENSIONS,
     tools::{
-        FindPathBslTool, GetEventSubscriptionsTool, GetFormHandlersTool, GetObjectStructureTool,
-        SearchTermsTool,
+        FindDataPathTool, FindPathBslTool, GetDataLinksTool, GetEventSubscriptionsTool,
+        GetFormHandlersTool, GetObjectStructureTool, GetRegisterWritersTool, SearchTermsTool,
     },
 };
 use code_index_core::extension::{IndexTool, ToolContext};
@@ -86,6 +86,189 @@ async fn get_object_structure_returns_existing() {
     assert_eq!(res["meta_type"].as_str(), Some("Catalog"));
     assert_eq!(res["name"].as_str(), Some("Контрагенты"));
     assert_eq!(res["synonym"].as_str(), Some("Контрагенты"));
+}
+
+// ── Регистр кириллицы в имени объекта (T-3) ───────────────────────────────
+//
+// Имена объектов 1С кириллические, и регистр в них легко перепутать. SQLite
+// кириллицу не сворачивает, поэтому точное сравнение промахивалось МОЛЧА:
+// связи отвечали «на объект никто не ссылается», регистраторы — «регистраторов
+// нет». Ответ выглядел содержательным выводом об объекте — это опаснее ошибки.
+
+/// Перечень объектов + связи для проверок регистра.
+async fn seed_case_fixture(storage: &Arc<StoragePool>) {
+    let s = storage.get().await.unwrap();
+    let conn = s.conn();
+    for (fqn, mt, nm) in [
+        ("Catalog.Организации", "Catalog", "Организации"),
+        ("Document.РеализацияТоваров", "Document", "РеализацияТоваров"),
+        ("AccumulationRegister.ВыручкаИСебестоимость", "AccumulationRegister", "ВыручкаИСебестоимость"),
+    ] {
+        conn.execute(
+            "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym) \
+             VALUES (?, ?, ?, ?, ?)",
+            params![REPO, fqn, mt, nm, nm],
+        )
+        .unwrap();
+    }
+    bsl_extension::schema::backfill_metadata_object_keys(conn).unwrap();
+    for (from, path, to, kind) in [
+        ("Document.РеализацияТоваров", "Организация", "Catalog.Организации", "attr"),
+        (
+            "Document.РеализацияТоваров",
+            "Движения",
+            "AccumulationRegister.ВыручкаИСебестоимость",
+            "recorder",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO data_links \
+             (repo, from_object, from_path, to_object, link_kind, to_object_key) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![REPO, from, path, to, kind, to.to_lowercase()],
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn object_structure_found_despite_name_case() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_name": "Catalog.организации"}),
+    )
+    .await;
+    assert!(
+        res["error"].is_null(),
+        "имя с иным регистром должно резолвиться, а не давать ошибку: {res}"
+    );
+    assert_eq!(res["name"].as_str(), Some("Организации"));
+}
+
+#[tokio::test]
+async fn object_structure_suggests_despite_name_case() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    // Объекта нет вовсе, но похожий отличается регистром: подбор идёт по ключу
+    // в нижнем регистре, поэтому список подсказок не должен быть пустым.
+    let res = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_name": "Catalog.организациии"}),
+    )
+    .await;
+    assert!(res["error"].is_string());
+    let dym = res["did_you_mean"].as_array().expect("did_you_mean должен быть массивом");
+    assert!(
+        dym.iter().any(|v| v.as_str() == Some("Catalog.Организации")),
+        "подсказка обязана предложить объект, отличающийся регистром: {res}"
+    );
+}
+
+#[tokio::test]
+async fn data_links_found_despite_name_case() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    let res = run_tool(
+        &GetDataLinksTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "object": "Catalog.организации", "direction": "in"}),
+    )
+    .await;
+    assert_eq!(
+        res["in_total"].as_u64(),
+        Some(1),
+        "иной регистр давал in_total: 0 — «на объект никто не ссылается»: {res}"
+    );
+    // В ответе имя показывается так, как записано в конфигурации.
+    assert_eq!(res["object"].as_str(), Some("Catalog.Организации"));
+}
+
+#[tokio::test]
+async fn data_links_out_found_despite_name_case() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    // Направление «на что ссылается» идёт по источнику ребра, у которого
+    // колонки-ключа нет вовсе — резолв имени на входе закрывает и его.
+    let res = run_tool(
+        &GetDataLinksTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "object": "document.реализациятоваров", "direction": "out"}),
+    )
+    .await;
+    assert_eq!(res["out_total"].as_u64(), Some(2), "{res}");
+}
+
+#[tokio::test]
+async fn register_writers_found_despite_name_case() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    let res = run_tool(
+        &GetRegisterWritersTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "object": "AccumulationRegister.выручкаисебестоимость"}),
+    )
+    .await;
+    let writers = res["writers"].as_array().expect("writers — массив");
+    assert_eq!(
+        writers.len(),
+        1,
+        "иной регистр давал writers: [] — «у регистра нет регистраторов»: {res}"
+    );
+    assert_eq!(writers[0].as_str(), Some("Document.РеализацияТоваров"));
+}
+
+#[tokio::test]
+async fn data_path_reports_depth_exhausted() {
+    let (_tmp, storage) = fresh_storage();
+    seed_case_fixture(&storage).await;
+    {
+        // Цепочка длиннее заданной глубины: путь есть, но за один шаг не виден.
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO data_links \
+                 (repo, from_object, from_path, to_object, link_kind, to_object_key) \
+                 VALUES (?, 'Catalog.Организации', 'Владелец', 'Catalog.НетСвязи', 'attr', ?)",
+                params![REPO, "catalog.нетсвязи"],
+            )
+            .unwrap();
+    }
+    let res = run_tool(
+        &FindDataPathTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "from": "Document.РеализацияТоваров",
+            "to": "Catalog.НетСвязи",
+            "max_depth": 1
+        }),
+    )
+    .await;
+    assert_eq!(res["found"].as_bool(), Some(false));
+    assert_eq!(
+        res["depth_exhausted"].as_bool(),
+        Some(true),
+        "«пути нет» обязано отличаться от «не хватило шагов»: {res}"
+    );
+    assert!(res["hint"].is_string(), "нужна подсказка со следующим вызовом: {res}");
+
+    // Той же глубины хватает — путь есть и признака обрыва нет.
+    let ok = run_tool(
+        &FindDataPathTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "from": "Document.РеализацияТоваров",
+            "to": "Catalog.НетСвязи",
+            "max_depth": 2
+        }),
+    )
+    .await;
+    assert_eq!(ok["found"].as_bool(), Some(true), "{ok}");
 }
 
 #[tokio::test]

@@ -201,6 +201,7 @@ pub(crate) fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connecti
     total += nested_subsystems;
 
     drop(stmt);
+    crate::schema::backfill_metadata_object_keys(conn)?;
     conn.execute("COMMIT", [])?;
 
     tracing::info!(

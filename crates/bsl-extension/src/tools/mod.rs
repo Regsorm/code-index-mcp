@@ -214,6 +214,55 @@ pub(crate) fn expand_object_criterion(
     Ok((full_names, truncated))
 }
 
+/// Привести имя объекта к тому, как оно записано в конфигурации: `Catalog.организации`
+/// → `Catalog.Организации`. Возвращает `None`, если такого объекта в перечне нет
+/// (тогда вызывающий работает с исходной строкой — так узлы, которых нет в
+/// `metadata_objects`, вроде обобщённых `*DefinedType.…`, остаются рабочими).
+///
+/// Зачем: имена объектов 1С кириллические, регистр в них легко перепутать, а
+/// SQLite кириллицу не сворачивает — точное сравнение промахивалось МОЛЧА, и
+/// связи данных отвечали «на объект никто не ссылается», регистраторы —
+/// «регистраторов нет». Пустой ответ читался как содержательный вывод.
+/// Один резолв на входе инструмента лечит это для всех запросов сразу: дальше
+/// обход идёт по каноническим значениям, взятым из самой базы.
+///
+/// Сначала точное совпадение (обычный путь, один seek по UNIQUE), затем поиск
+/// по ключу `full_name_key` (= lower(full_name), индекс `idx_mo_full_key`).
+pub(crate) fn resolve_object_name(conn: &rusqlite::Connection, input: &str) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    if input.is_empty() {
+        return None;
+    }
+    let exact: Option<String> = conn
+        .query_row(
+            "SELECT full_name FROM metadata_objects WHERE repo = 'default' AND full_name = ?1",
+            rusqlite::params![input],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if exact.is_some() {
+        return exact;
+    }
+    conn.query_row(
+        "SELECT full_name FROM metadata_objects \
+         WHERE repo = 'default' AND full_name_key = ?1 ORDER BY full_name LIMIT 1",
+        rusqlite::params![input.to_lowercase()],
+        |r| r.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// Имя объекта для запроса: канон из перечня, а если объекта там нет — как
+/// передали. Обёртка над [`resolve_object_name`] для мест, где нужна строка,
+/// а не признак «нашёлся ли объект».
+pub(crate) fn canonical_object_name(conn: &rusqlite::Connection, input: &str) -> String {
+    resolve_object_name(conn, input).unwrap_or_else(|| input.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,7 +287,42 @@ mod tests {
             )
             .unwrap();
         }
+        // Как при индексации: ключи имён догоняются после вставок.
+        crate::schema::backfill_metadata_object_keys(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn resolve_object_name_exact_and_case_insensitive() {
+        let conn = mem_db();
+        // Точное имя — возвращается как есть.
+        assert_eq!(
+            resolve_object_name(&conn, "Catalog.Контрагенты").as_deref(),
+            Some("Catalog.Контрагенты")
+        );
+        // Иной регистр кириллицы — канон из перечня. Прежде такой запрос
+        // молча не находил объект, и инструменты отвечали пустотой.
+        assert_eq!(
+            resolve_object_name(&conn, "Catalog.контрагенты").as_deref(),
+            Some("Catalog.Контрагенты")
+        );
+        assert_eq!(
+            resolve_object_name(&conn, "catalog.КОНТРАГЕНТЫ").as_deref(),
+            Some("Catalog.Контрагенты")
+        );
+    }
+
+    #[test]
+    fn resolve_object_name_unknown_stays_none() {
+        let conn = mem_db();
+        assert!(resolve_object_name(&conn, "Catalog.НетТакого").is_none());
+        assert!(resolve_object_name(&conn, "").is_none());
+        // Узлы, которых нет в перечне (обобщённые *-типы), остаются рабочими:
+        // вызывающий получает исходную строку, а не пустоту.
+        assert_eq!(
+            canonical_object_name(&conn, "*DefinedType.ЛюбаяСумма"),
+            "*DefinedType.ЛюбаяСумма"
+        );
     }
 
     #[test]
