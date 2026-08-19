@@ -20,8 +20,10 @@ impl IndexTool for GetFormHandlersTool {
     }
 
     fn description(&self) -> &str {
-        "Возвращает обработчики событий управляемой формы 1С — пары \
-         (event, handler), извлечённые из <Events> в Form.xml. \
+        "Возвращает обработчики событий управляемой формы 1С — тройки \
+         (event, handler, element), где element — элемент формы, которому \
+         принадлежит обработчик (нет поля — обработчик самой формы). \
+         Крупные формы отдают сотни записей: сузить выдачу параметром element. \
          For BSL/1C repositories only."
     }
 
@@ -40,6 +42,10 @@ impl IndexTool for GetFormHandlersTool {
                 "form_name": {
                     "type": "string",
                     "description": "Имя формы — то, что было каталогом внутри Forms/, например 'ФормаДокумента'"
+                },
+                "element": {
+                    "type": "string",
+                    "description": "Необязательный фильтр по элементу формы: имя элемента ('СуммаДокумента') — только его обработчики; пустая строка — только обработчики самой формы. Без параметра возвращаются все."
                 }
             },
             "required": ["repo", "owner_full_name", "form_name"]
@@ -126,11 +132,33 @@ impl IndexTool for GetFormHandlersTool {
                         .as_deref()
                         .and_then(|s| serde_json::from_str::<Value>(s).ok())
                         .unwrap_or_else(|| Value::Array(Vec::new()));
-                    json!({
+                    // Фильтр по владельцу: имя элемента — его обработчики,
+                    // пустая строка — обработчики самой формы (поля нет).
+                    let element_filter = args.get("element").and_then(|v| v.as_str());
+                    let total = handlers.as_array().map(|a| a.len()).unwrap_or(0);
+                    let handlers = match (element_filter, handlers) {
+                        (Some(filter), Value::Array(items)) => Value::Array(
+                            items
+                                .into_iter()
+                                .filter(|h| {
+                                    h.get("element").and_then(|v| v.as_str()).unwrap_or("")
+                                        == filter
+                                })
+                                .collect(),
+                        ),
+                        (_, other) => other,
+                    };
+                    let shown = handlers.as_array().map(|a| a.len()).unwrap_or(0);
+                    let mut out = json!({
                         "owner_full_name": matched_owner,
                         "form_name": form_name,
                         "handlers": handlers,
-                    })
+                    });
+                    if element_filter.is_some() {
+                        out["handlers_total"] = json!(total);
+                        out["handlers_shown"] = json!(shown);
+                    }
+                    out
                 }
                 None => {
                     // Умная ошибка: если владелец есть, но формы с таким именем

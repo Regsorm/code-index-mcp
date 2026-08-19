@@ -234,12 +234,7 @@ pub(crate) fn update_metadata_forms_for_file(
     if form_xml_path.is_file() {
         match parse_form_file(form_xml_path) {
             Ok(handlers) => {
-                let handlers_json = serde_json::to_string(
-                    &handlers
-                        .iter()
-                        .map(|h| serde_json::json!({"event": h.event, "handler": h.handler}))
-                        .collect::<Vec<_>>(),
-                )?;
+                let handlers_json = crate::xml::forms::handlers_to_json(&handlers)?;
                 conn.execute(
                     "INSERT OR IGNORE INTO metadata_forms \
                      (repo, owner_full_name, form_name, handlers_json) VALUES (?, ?, ?, ?)",
@@ -1128,12 +1123,7 @@ fn update_edt_form(conn: &rusqlite::Connection, form_path: &Path) -> Result<()> 
     )?;
     if let Ok(content) = std::fs::read_to_string(form_path) {
         let handlers = crate::xml::edt_mdo::parse_mdo_form_handlers(&content);
-        let handlers_json = serde_json::to_string(
-            &handlers
-                .iter()
-                .map(|(ev, h)| serde_json::json!({"event": ev, "handler": h}))
-                .collect::<Vec<_>>(),
-        )?;
+        let handlers_json = crate::xml::forms::handlers_to_json(&handlers)?;
         conn.execute(
             "INSERT OR IGNORE INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
              VALUES (?, ?, ?, ?)",

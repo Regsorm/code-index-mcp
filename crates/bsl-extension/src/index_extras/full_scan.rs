@@ -1109,10 +1109,7 @@ pub(crate) fn index_metadata_forms(repo_root: &Path, conn: &rusqlite::Connection
                 continue;
             }
         };
-        let handlers_json = serde_json::to_string(&handlers
-            .iter()
-            .map(|h| serde_json::json!({"event": h.event, "handler": h.handler}))
-            .collect::<Vec<_>>())?;
+        let handlers_json = crate::xml::forms::handlers_to_json(&handlers)?;
         stmt.execute(params![
             REPO_DEFAULT,
             &owner_full,

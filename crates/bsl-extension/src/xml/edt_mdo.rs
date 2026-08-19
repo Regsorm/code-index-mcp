@@ -27,6 +27,8 @@ use quick_xml::Reader;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use super::forms::FormHandler;
+
 use super::object_attributes::{
     classify_type, pretty_types, DataLinkEdge, ObjectStructure, StructField, StructTabular,
 };
@@ -784,25 +786,35 @@ pub fn parse_mdo_header(content: &str) -> Option<(String, String, Option<String>
 /// русскому имени через `event_to_russian` — чтобы совпадать с форматом
 /// Конфигуратора (где события формы по-русски). Привязки команд
 /// (`<action ...><handler>`) — это не event-обработчики, их не берём.
-pub fn parse_mdo_form_handlers(content: &str) -> Vec<(String, String)> {
-    use super::event_subscriptions::event_to_russian;
+pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
+    // Словарь именно событий ФОРМ — общий с форматом Конфигуратора, чтобы
+    // одна и та же форма в двух выгрузках давала одинаковые имена событий.
+    use super::forms::form_event_to_russian;
 
     let mut reader = Reader::from_str(content);
     reader.config_mut().trim_text(true);
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut out: Vec<FormHandler> = Vec::new();
     let mut buf = Vec::new();
 
     let mut in_handlers = false;
     let mut cur_event: Option<String> = None;
     let mut cur_name: Option<String> = None;
-    // 0 — нет; 1 — ждём текст <event>; 2 — ждём текст <name>.
+    // 0 — нет; 1 — ждём текст <event>; 2 — ждём текст <name> обработчика;
+    // 3 — ждём текст <name> элемента формы.
     let mut tt = 0u8;
+    // Элементы формы вложены друг в друга тегами <items>; имя элемента —
+    // прямой дочерний <name>. Владелец обработчика — ближайший открытый
+    // <items>; пусто — обработчик самой формы (его <handlers> лежат в корне).
+    let mut depth = 0usize;
+    let mut items_stack: Vec<(usize, Option<String>)> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let local = local_name(&String::from_utf8_lossy(e.name().as_ref())).to_string();
+                depth += 1;
                 match local.as_str() {
+                    "items" => items_stack.push((depth, None)),
                     "handlers" => {
                         in_handlers = true;
                         cur_event = None;
@@ -810,6 +822,16 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<(String, String)> {
                     }
                     "event" if in_handlers => tt = 1,
                     "name" if in_handlers => tt = 2,
+                    // Имя элемента формы: <name> прямо внутри своего <items>.
+                    // Вложенные <name> подсказки и контекстного меню лежат
+                    // глубже и под это условие не подходят.
+                    "name" => {
+                        if let Some((item_depth, item_name)) = items_stack.last() {
+                            if *item_depth + 1 == depth && item_name.is_none() {
+                                tt = 3;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -825,6 +847,10 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<(String, String)> {
                         cur_event = Some(txt);
                     } else if tt == 2 && !txt.is_empty() {
                         cur_name = Some(txt);
+                    } else if tt == 3 && !txt.is_empty() {
+                        if let Some((_, item_name)) = items_stack.last_mut() {
+                            *item_name = Some(txt);
+                        }
                     }
                     tt = 0;
                 }
@@ -833,10 +859,21 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<(String, String)> {
                 let local = local_name(&String::from_utf8_lossy(e.name().as_ref())).to_string();
                 if local == "handlers" {
                     if let (Some(ev), Some(nm)) = (cur_event.take(), cur_name.take()) {
-                        out.push((event_to_russian(&ev).to_string(), nm));
+                        let element = items_stack
+                            .last()
+                            .and_then(|(_, item_name)| item_name.clone());
+                        out.push(FormHandler {
+                            event: form_event_to_russian(&ev).to_string(),
+                            handler: nm,
+                            element,
+                        });
                     }
                     in_handlers = false;
                 }
+                if local == "items" {
+                    items_stack.pop();
+                }
+                depth = depth.saturating_sub(1);
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -1455,10 +1492,35 @@ mod tests {
 </form:Form>"#;
         let h = parse_mdo_form_handlers(form);
         assert_eq!(h.len(), 2);
-        assert!(h.iter().any(|(_, n)| n == "ПриСозданииНаСервере"));
-        assert!(h.iter().any(|(_, n)| n == "СписокВыбор"));
+        assert!(h.iter().any(|x| x.handler == "ПриСозданииНаСервере"));
+        assert!(h.iter().any(|x| x.handler == "СписокВыбор"));
         // Привязка команды (<action><handler>) — не event-обработчик, не берём.
-        assert!(!h.iter().any(|(_, n)| n == "НеБрать"));
+        assert!(!h.iter().any(|x| x.handler == "НеБрать"));
+        // Обработчики лежат в корне формы — владельца-элемента у них нет.
+        assert!(h.iter().all(|x| x.element.is_none()));
+    }
+
+    #[test]
+    fn form_handlers_carry_owning_element() {
+        let form = r#"<?xml version="1.0" encoding="UTF-8"?>
+<form:Form xmlns:form="http://g5.1c.ru/v8/dt/form" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <items xsi:type="form:FormGroup">
+    <name>ГруппаШапка</name>
+    <items xsi:type="form:FormField">
+      <name>Дата</name>
+      <handlers><event>OnChange</event><name>ДатаПриИзменении</name></handlers>
+      <extendedTooltip><name>ДатаПодсказка</name></extendedTooltip>
+    </items>
+  </items>
+  <handlers><event>OnOpen</event><name>ПриОткрытии</name></handlers>
+</form:Form>"#;
+        let h = parse_mdo_form_handlers(form);
+        assert_eq!(h.len(), 2);
+        let on_change = h.iter().find(|x| x.handler == "ДатаПриИзменении").unwrap();
+        // Владелец — ближайший элемент, а не группа и не имя подсказки.
+        assert_eq!(on_change.element.as_deref(), Some("Дата"));
+        let on_open = h.iter().find(|x| x.handler == "ПриОткрытии").unwrap();
+        assert_eq!(on_open.element, None);
     }
 
     #[test]

@@ -373,12 +373,7 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
                     match std::fs::read_to_string(&form_file) {
                         Ok(fcontent) => {
                             let handlers = edt_mdo::parse_mdo_form_handlers(&fcontent);
-                            let handlers_json = serde_json::to_string(
-                                &handlers
-                                    .iter()
-                                    .map(|(ev, h)| serde_json::json!({"event": ev, "handler": h}))
-                                    .collect::<Vec<_>>(),
-                            )?;
+                            let handlers_json = crate::xml::forms::handlers_to_json(&handlers)?;
                             ins_form.execute(params![
                                 REPO_DEFAULT,
                                 &format!("CommonForms.{}", obj_name),
@@ -421,12 +416,7 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
                             Err(_) => continue,
                         };
                         let handlers = edt_mdo::parse_mdo_form_handlers(&fcontent);
-                        let handlers_json = serde_json::to_string(
-                            &handlers
-                                .iter()
-                                .map(|(ev, h)| serde_json::json!({"event": ev, "handler": h}))
-                                .collect::<Vec<_>>(),
-                        )?;
+                        let handlers_json = crate::xml::forms::handlers_to_json(&handlers)?;
                         ins_form.execute(params![
                             REPO_DEFAULT,
                             &owner,
