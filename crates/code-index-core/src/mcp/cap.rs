@@ -215,7 +215,7 @@ pub fn cap_applies(tool: &str) -> bool {
 // (выкидывают тяжёлую секцию ЦЕЛИКОМ с маркером, не обрезая частично).
 //
 // Единый источник правды — этот список. Расширять сюда.
-const STRUCTURAL_TOOLS: &[&str] = &["get_object_structure"];
+const STRUCTURAL_TOOLS: &[&str] = &["get_object_structure", "get_object_profile"];
 
 /// Инструмент «структурный» (исключён из cap_response, использует
 /// posекционный `omit_oversize_sections` + structural-wrap)?
@@ -525,6 +525,117 @@ pub fn cap_response(mut value: Value, budget: usize) -> (Value, bool) {
     (value, any)
 }
 
+// ── Свёртка секции и страницы по байтам ────────────────────────────────────
+//
+// `omit_oversize_sections` умеет только выбросить секцию целиком: рядом
+// остаются `<секция>_omitted` + `<секция>_count`. Числа честные, но по ним
+// нельзя ни ответить, ни составить следующий вызов — модель видит «форм 82» и
+// не знает ни одного имени. Свёртка решает ровно это: вместо содержимого
+// отдаётся карта (имена + числа), из которой сразу виден адрес нужного куска.
+//
+// Страницы нужны там, где даже карта не помещается: связи центральных объектов
+// (до 1 600 рёбер) и значения крупных перечислений. Шаг страницы меряется
+// БАЙТАМИ, а не числом строк: фиксированное число элементов даёт либо
+// переполнение на тяжёлых элементах, либо десятки лишних ходов на лёгких.
+
+/// Выбрать развёрнутость секции по бюджету: полный вариант, если укладывается,
+/// иначе свёрнутый (карта). `budget == 0` (страж выключен) → всегда полный.
+/// Возвращает `(значение, свёрнуто_ли)`.
+///
+/// Свёрнутый вариант НЕ проверяется на размер: он может не поместиться сам
+/// (карта связей центрального объекта), и тогда вызывающий инструмент
+/// применяет к нему страницы. Молча ужимать карту нельзя — она уже минимальна.
+pub fn fold_to_budget(full: Value, folded: Value, budget: usize) -> (Value, bool) {
+    if budget == 0 || ser_len(&full) <= budget {
+        (full, false)
+    } else {
+        (folded, true)
+    }
+}
+
+/// Запас бюджета под шапку ответа, служебные поля и подсказку.
+const PAGE_OVERHEAD_BYTES: usize = 2_000;
+
+/// Страница элементов, набранная по байтовому бюджету.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Page {
+    /// Элементы страницы. Пуста, только если пуст сам набор или `offset`
+    /// уехал за его конец.
+    pub items: Vec<Value>,
+    /// Смещение начала страницы в наборе.
+    pub offset: usize,
+    /// Сколько элементов в странице.
+    pub shown: usize,
+    /// Сколько элементов в наборе всего.
+    pub total: usize,
+    /// Есть ли элементы за концом страницы.
+    pub has_more: bool,
+}
+
+impl Page {
+    /// Смещение для следующего вызова; `None` — набор кончился.
+    pub fn next_offset(&self) -> Option<usize> {
+        if self.has_more {
+            Some(self.offset + self.shown)
+        } else {
+            None
+        }
+    }
+
+    /// Дописать к объекту ответа служебные поля страницы: `<key>_shown`,
+    /// `<key>_total`, `<key>_offset`, `<key>_has_more`. Без них модель считает
+    /// страницу полным набором — это хуже, чем отказ.
+    pub fn annotate(&self, obj: &mut serde_json::Map<String, Value>, key: &str) {
+        obj.insert(format!("{}_shown", key), json!(self.shown));
+        obj.insert(format!("{}_total", key), json!(self.total));
+        obj.insert(format!("{}_offset", key), json!(self.offset));
+        obj.insert(format!("{}_has_more", key), json!(self.has_more));
+    }
+}
+
+/// Набрать страницу элементов начиная с `offset`, укладывающуюся в `budget`
+/// байт (за вычетом запаса под шапку и подсказку). `budget == 0` — страж
+/// выключен, отдаётся весь остаток набора.
+///
+/// Первый элемент берётся ВСЕГДА, даже если он один превышает бюджет: иначе
+/// страница вышла бы пустой, `offset` не сдвинулся и клиент зациклился бы на
+/// одном и том же вызове.
+pub fn page_by_bytes(items: Vec<Value>, offset: usize, budget: usize) -> Page {
+    let total = items.len();
+    let offset = offset.min(total);
+    let room = budget.saturating_sub(PAGE_OVERHEAD_BYTES);
+    let mut used = 0usize;
+    let mut page: Vec<Value> = Vec::new();
+    for item in items.into_iter().skip(offset) {
+        let size = ser_len(&item) + 1; // +1 — запятая-разделитель в массиве
+        if budget != 0 && !page.is_empty() && used + size > room {
+            break;
+        }
+        used += size;
+        page.push(item);
+    }
+    let shown = page.len();
+    Page { items: page, offset, shown, total, has_more: offset + shown < total }
+}
+
+/// Собрать готовую строку следующего вызова для подсказки:
+/// `get_data_links(repo='ut', object='Catalog.Пользователи', offset=100)`.
+///
+/// Строковые значения — в одинарных кавычках: подсказка сама живёт внутри
+/// JSON-строки, и двойные кавычки пришлось бы экранировать — модель копирует
+/// такую строку с ошибками. Шаблон с угловыми скобками не годится вовсе:
+/// подставлять имена должен сервер, а не модель.
+pub fn next_call_hint(tool: &str, args: &[(&str, Value)]) -> String {
+    let parts: Vec<String> = args
+        .iter()
+        .map(|(k, v)| match v {
+            Value::String(s) => format!("{}='{}'", k, s),
+            other => format!("{}={}", k, other),
+        })
+        .collect();
+    format!("{}({})", tool, parts.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,5 +915,114 @@ mod tests {
         assert_eq!(response_cap_hard(), DEFAULT_MAX_RESPONSE_BYTES_HARD);
         set_response_cap_hard(None);
         set_response_cap(None);
+    }
+
+    // ── fold_to_budget ──────────────────────────────────────────────────────
+
+    #[test]
+    fn fold_keeps_full_while_it_fits() {
+        let full = json!({"forms": [{"form_name": "ФормаДокумента", "handlers": ["a", "b"]}]});
+        let folded = json!({"forms": [{"form_name": "ФормаДокумента", "handlers_count": 2}]});
+        let (out, was_folded) = fold_to_budget(full.clone(), folded, 48_000);
+        assert_eq!(out, full, "укладывается в бюджет — отдаём как есть");
+        assert!(!was_folded);
+    }
+
+    #[test]
+    fn fold_switches_to_map_when_full_too_big() {
+        let heavy: Vec<Value> = (0..500).map(|i| json!({"event": format!("Событие{}", i)})).collect();
+        let full = json!({"handlers": heavy});
+        let folded = json!({"handlers_count": 500});
+        let (out, was_folded) = fold_to_budget(full, folded.clone(), 1_000);
+        assert_eq!(out, folded, "не влез — отдаём карту");
+        assert!(was_folded);
+    }
+
+    #[test]
+    fn fold_noop_when_cap_disabled() {
+        let full = json!({"a": [1, 2, 3]});
+        let (out, was_folded) = fold_to_budget(full.clone(), json!({"a_count": 3}), 0);
+        assert_eq!(out, full);
+        assert!(!was_folded);
+    }
+
+    // ── page_by_bytes ───────────────────────────────────────────────────────
+
+    /// Набор однородных элементов по ~120 байт каждый.
+    fn items(n: usize) -> Vec<Value> {
+        (0..n).map(|i| json!({"n": i, "s": "x".repeat(100)})).collect()
+    }
+
+    #[test]
+    fn page_fills_up_to_budget_and_reports_more() {
+        let page = page_by_bytes(items(100), 0, 3_000);
+        assert!(page.shown > 0 && page.shown < 100, "набрано {} из 100", page.shown);
+        assert_eq!(page.total, 100);
+        assert_eq!(page.offset, 0);
+        assert!(page.has_more);
+        assert_eq!(page.next_offset(), Some(page.shown));
+        let room = 3_000 - PAGE_OVERHEAD_BYTES;
+        assert!(ser_len(&json!(page.items)) <= room + 2, "страница не должна перебирать бюджет");
+    }
+
+    #[test]
+    fn page_continues_from_offset_to_the_end() {
+        let first = page_by_bytes(items(10), 0, 100_000);
+        assert_eq!(first.shown, 10, "всё влезает — одна страница");
+        assert!(!first.has_more);
+        assert_eq!(first.next_offset(), None);
+        // Смещение за конец набора — пустая страница, а не паника.
+        let past = page_by_bytes(items(10), 25, 100_000);
+        assert_eq!(past.shown, 0);
+        assert_eq!(past.offset, 10);
+        assert!(!past.has_more);
+    }
+
+    #[test]
+    fn page_always_yields_at_least_one_element() {
+        // Один элемент крупнее всего бюджета: отдаём его, иначе offset не
+        // сдвинется и клиент зациклится на одном вызове.
+        let big = vec![json!({"s": "y".repeat(50_000)}), json!({"s": "z"})];
+        let page = page_by_bytes(big, 0, 3_000);
+        assert_eq!(page.shown, 1);
+        assert!(page.has_more);
+        assert_eq!(page.next_offset(), Some(1));
+    }
+
+    #[test]
+    fn page_disabled_cap_returns_everything() {
+        let page = page_by_bytes(items(100), 0, 0);
+        assert_eq!(page.shown, 100);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn page_annotates_response_fields() {
+        let page = page_by_bytes(items(100), 0, 3_000);
+        let mut obj = serde_json::Map::new();
+        page.annotate(&mut obj, "in");
+        assert_eq!(obj["in_total"], json!(100));
+        assert_eq!(obj["in_offset"], json!(0));
+        assert_eq!(obj["in_shown"], json!(page.shown));
+        assert_eq!(obj["in_has_more"], json!(true));
+    }
+
+    // ── next_call_hint ──────────────────────────────────────────────────────
+
+    #[test]
+    fn next_call_hint_quotes_strings_only() {
+        let s = next_call_hint(
+            "get_data_links",
+            &[
+                ("repo", json!("ut")),
+                ("object", json!("Catalog.Пользователи")),
+                ("offset", json!(100)),
+                ("limit", json!(100)),
+            ],
+        );
+        assert_eq!(
+            s,
+            "get_data_links(repo='ut', object='Catalog.Пользователи', offset=100, limit=100)"
+        );
     }
 }

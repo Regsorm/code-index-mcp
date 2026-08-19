@@ -67,6 +67,20 @@ impl IndexTool for FindReferencesTool {
                     "type": "integer",
                     "description": "Потолок примеров (sample) на секцию (default 20, max 200). На счётчики total не влияет.",
                     "minimum": 1
+                },
+                "section": {
+                    "type": "string",
+                    "enum": ["data_refs", "code_usages", "role_rights"],
+                    "description": "Вернуть ОДНУ секцию целиком, страницами по размеру ответа, вместо трёх секций с примерами. Так забирают весь список (у центральных объектов это тысячи ссылок): рядом приходят items_shown/_total/_offset/_has_more и готовый вызов следующей страницы."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Смещение страницы внутри секции (работает вместе с section). Без параметра — с начала.",
+                    "minimum": 0
+                },
+                "max_response_bytes": {
+                    "type": "integer",
+                    "description": "Бюджет размера ЭТОГО ответа в байтах — перекрывает серверный на один вызов. Больше бюджет — больше строк в странице."
                 }
             },
             "required": ["repo", "object"]
@@ -120,6 +134,58 @@ impl IndexTool for FindReferencesTool {
                 handle.interrupt();
             });
 
+            // Режим страниц: одна секция целиком, порциями по размеру ответа.
+            // Нужен для центральных объектов, где секция — тысячи строк и
+            // примеров недостаточно, а забрать весь список было нечем.
+            if let Some(section) = args.get("section").and_then(|v| v.as_str()) {
+                let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let budget = code_index_core::mcp::cap::resolve_request_budget(
+                    args.get("max_response_bytes")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize),
+                );
+                let page = query_section_page(conn, &object_key, section, offset, budget.applied);
+                timer.abort();
+                return match page {
+                    Ok(Some((items, page))) => {
+                        let mut out = json!({
+                            "object": object,
+                            "section": section,
+                            "items": items,
+                        });
+                        if let Some(obj) = out.as_object_mut() {
+                            page.annotate(obj, "items");
+                            if let Some(next) = page.next_offset() {
+                                let call = code_index_core::mcp::cap::next_call_hint(
+                                    "find_references",
+                                    &[
+                                        ("repo", json!(ctx.repo)),
+                                        ("object", json!(&object)),
+                                        ("section", json!(section)),
+                                        ("offset", json!(next)),
+                                    ],
+                                );
+                                obj.insert(
+                                    "hint".to_string(),
+                                    json!(format!(
+                                        "Показано {} из {}. Следующая страница — 1 вызов:\n{}",
+                                        page.shown, page.total, call
+                                    )),
+                                );
+                            }
+                        }
+                        crate::tools::wrap_with_meta("find_references", out, Vec::new())
+                    }
+                    Ok(None) => crate::tools::wrap_error(json!({
+                        "error": format!("unknown section '{}'", section),
+                        "hint": "Допустимые значения: data_refs, code_usages, role_rights.",
+                    })),
+                    Err(e) => crate::tools::wrap_error(json!({
+                        "error": format!("database error (section '{}'): {}", section, e)
+                    })),
+                };
+            }
+
             let data_refs = match query_data_refs(conn, &object_key, limit) {
                 Ok(v) => v,
                 Err(e) => {
@@ -161,6 +227,83 @@ impl IndexTool for FindReferencesTool {
             )
         })
     }
+}
+
+/// Сколько строк тянуть из базы под одну страницу. Дальше `page_by_bytes`
+/// отрежет по бюджету; запас нужен, потому что вес строки заранее неизвестен
+/// (путь в коде длиннее пары имён роли и права в разы).
+const PAGE_ROWS: i64 = 2_000;
+
+/// Одна секция карты влияния целиком, страницами по размеру ответа.
+/// `None` — неизвестное имя секции. Смещение применяется в SQL, а бюджет —
+/// уже к вынутым строкам: сколько поместилось, столько и отдаём.
+fn query_section_page(
+    conn: &rusqlite::Connection,
+    object_key: &str,
+    section: &str,
+    offset: usize,
+    budget: usize,
+) -> rusqlite::Result<Option<(Value, code_index_core::mcp::cap::Page)>> {
+    let (count_sql, rows_sql) = match section {
+        "data_refs" => (
+            "SELECT COUNT(*) FROM data_links WHERE repo = ?1 AND to_object_key = ?2",
+            "SELECT from_object, from_path, link_kind FROM data_links \
+             WHERE repo = ?1 AND to_object_key = ?2 \
+             ORDER BY link_kind, from_object LIMIT ?3 OFFSET ?4",
+        ),
+        "code_usages" => (
+            "SELECT COUNT(*) FROM metadata_code_usages WHERE repo = ?1 AND object_ref_key = ?2",
+            "SELECT file_path, line, usage_kind, member_path FROM metadata_code_usages \
+             WHERE repo = ?1 AND object_ref_key = ?2 \
+             ORDER BY usage_kind, file_path, line LIMIT ?3 OFFSET ?4",
+        ),
+        "role_rights" => (
+            "SELECT COUNT(*) FROM role_rights WHERE repo = ?1 AND object_name_key = ?2",
+            "SELECT role_name, right_name FROM role_rights \
+             WHERE repo = ?1 AND object_name_key = ?2 \
+             ORDER BY role_name, right_name LIMIT ?3 OFFSET ?4",
+        ),
+        _ => return Ok(None),
+    };
+
+    let total: i64 = conn.query_row(count_sql, params!["default", object_key], |r| r.get(0))?;
+    let mut stmt = conn.prepare(rows_sql)?;
+    let rows = stmt.query_map(
+        params!["default", object_key, PAGE_ROWS, offset as i64],
+        |r| {
+            Ok(match section {
+                "data_refs" => json!({
+                    "from_object": r.get::<_, String>(0)?,
+                    "from_path": r.get::<_, String>(1)?,
+                    "link_kind": r.get::<_, String>(2)?,
+                }),
+                "code_usages" => json!({
+                    "file_path": r.get::<_, String>(0)?,
+                    "line": r.get::<_, i64>(1)?,
+                    "usage_kind": r.get::<_, String>(2)?,
+                    "member_path": r.get::<_, Option<String>>(3)?,
+                }),
+                _ => json!({
+                    "role_name": r.get::<_, String>(0)?,
+                    "right_name": r.get::<_, String>(1)?,
+                }),
+            })
+        },
+    )?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row?);
+    }
+
+    let mut page = code_index_core::mcp::cap::page_by_bytes(items, 0, budget);
+    // Смещение и итог берём из запроса, а не из вынутой порции: страница знает
+    // только про свои PAGE_ROWS строк и иначе объявила бы конец набора раньше.
+    let shown = page.shown;
+    page.offset = offset;
+    page.total = total.max(0) as usize;
+    page.has_more = offset + shown < page.total;
+    let items = std::mem::take(&mut page.items);
+    Ok(Some((Value::Array(items), page)))
 }
 
 /// Структурные ссылки на объект (реверс data_links по to_object).
@@ -328,5 +471,53 @@ mod tests {
         // Несуществующий ключ — пусто (sanity).
         let none = query_data_refs(&conn, "document.нетакого", 20).unwrap();
         assert_eq!(none["total"], json!(0));
+    }
+
+    #[test]
+    fn section_page_walks_the_whole_list() {
+        let conn = mem();
+        for i in 0..120 {
+            conn.execute(
+                "INSERT INTO data_links \
+                 (repo, from_object, from_path, to_object, link_kind, to_object_key) \
+                 VALUES ('default', ?1, 'Реквизит', 'Catalog.Организации', 'attr', 'catalog.организации')",
+                params![format!("Document.Документ{}", i)],
+            )
+            .unwrap();
+        }
+
+        // Первая страница ограничена бюджетом, но знает полный размер набора.
+        let (items, page) =
+            query_section_page(&conn, "catalog.организации", "data_refs", 0, 4_000)
+                .unwrap()
+                .expect("секция известна");
+        let shown = page.shown;
+        assert!(shown > 0 && shown < 120, "страница по бюджету: {shown}");
+        assert_eq!(page.total, 120);
+        assert_eq!(page.offset, 0);
+        assert!(page.has_more);
+        assert_eq!(page.next_offset(), Some(shown));
+        assert_eq!(items.as_array().unwrap().len(), shown);
+
+        // Продолжение со смещения доходит до конца.
+        let mut offset = shown;
+        let mut guard = 0;
+        while guard < 20 {
+            guard += 1;
+            let (_, p) =
+                query_section_page(&conn, "catalog.организации", "data_refs", offset, 4_000)
+                    .unwrap()
+                    .unwrap();
+            offset += p.shown;
+            if !p.has_more {
+                break;
+            }
+        }
+        assert_eq!(offset, 120, "обход собрал весь набор");
+
+        // Неизвестная секция — понятный отказ, а не паника.
+        assert!(query_section_page(&conn, "catalog.организации", "нет", 0, 4_000)
+            .unwrap()
+            .is_none());
     }
 }

@@ -73,6 +73,10 @@ impl IndexTool for GetObjectStructureTool {
                     "items": { "type": "string", "enum": ["attributes", "tabular_sections", "dimensions", "resources", "posting", "enum_values", "predefined", "owners", "value_types", "properties", "enum_synonyms", "commands"] },
                     "description": "Узкая выборка секций структуры (как sections у get_object_profile): вернуть ТОЛЬКО указанные ключи. Без параметра — все секции. Рычаг экономии контекста: ['posting'] (поведение проведения, ~0.2 КБ вместо полного объекта), ['attributes'] (только реквизиты шапки без табличных частей), ['tabular_sections'], ['dimensions','resources'] (для регистров)."
                 },
+                "offset": {
+                    "type": "integer",
+                    "description": "Смещение страницы внутри ОДНОЙ запрошенной секции (работает при sections=['enum_values'] и т.п.). Крупные секции — значения перечислений на сотни позиций — отдаются порциями по размеру ответа: рядом приходят <секция>_shown/_total/_offset/_has_more и готовый вызов следующей страницы. Без параметра — с начала."
+                },
                 "names_only": {
                     "type": "boolean",
                     "description": "Вернуть ТОЛЬКО паспорт каждого объекта (full_name, meta_type, name, synonym) без структуры. Самый дешёвый режим поиска: с name_like на 38 объектах ~9 КБ вместо ~63 КБ. Бери, когда нужно СНАЧАЛА понять, какие объекты подходят, а структуру запросить потом по конкретному full_name. Учти: sections=[] означает «все секции» (обратная совместимость), а не «только имена» — для имён нужен именно этот параметр."
@@ -109,6 +113,12 @@ impl IndexTool for GetObjectStructureTool {
                 .get("names_only")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // Смещение страницы — работает, когда запрошена ровно одна секция
+            // (sections=['enum_values'] и т.п.). Продолжение выдачи, а не выбор.
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
             // Бюджет размера этого ответа: клиентский max_response_bytes
             // поверх серверного, но не выше серверного потолка.
             let budget = code_index_core::mcp::cap::resolve_request_budget(
@@ -178,7 +188,10 @@ impl IndexTool for GetObjectStructureTool {
                         ctx.storage,
                         full_names,
                         move |st, fqn| {
-                            resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only)
+                            // Страницы (offset/budget) — только для одиночного объекта: в массовом
+// режиме размером управляет shrink_search_results, и постраничная выдача
+// внутри каждого элемента сделала бы ответ невнятным.
+resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only, 0, 0)
                         },
                     )
                     .await;
@@ -218,7 +231,10 @@ impl IndexTool for GetObjectStructureTool {
                 let sections_c = sections.clone();
                 let rows =
                     code_index_core::mcp::tools::mass_map(ctx.storage, items, move |st, fqn| {
-                        resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only)
+                        // Страницы (offset/budget) — только для одиночного объекта: в массовом
+// режиме размером управляет shrink_search_results, и постраничная выдача
+// внутри каждого элемента сделала бы ответ невнятным.
+resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only, 0, 0)
                     })
                     .await;
                 for (pos, row) in positions.into_iter().zip(rows) {
@@ -237,7 +253,15 @@ impl IndexTool for GetObjectStructureTool {
                         }));
                     }
                 };
-                resolve_one(storage.conn(), ctx.repo, fqn, sections.as_deref(), names_only)
+                resolve_one(
+                    storage.conn(),
+                    ctx.repo,
+                    fqn,
+                    sections.as_deref(),
+                    names_only,
+                    offset,
+                    budget.applied,
+                )
             } else {
                 json!({
                     "error": "missing parameter: передайте 'full_name' — полное имя вида '<MetaType>.<Name>' (строка)"
@@ -383,6 +407,8 @@ fn resolve_one(
     full_name: &str,
     sections: Option<&[String]>,
     names_only: bool,
+    offset: usize,
+    budget: usize,
 ) -> Value {
     // Нормализация типа метаданных: 'Документ.X' → 'Document.X' (RU/EN, регистр неважен).
     // В metadata_objects.full_name хранится canonical (англ.) тип; без этого
@@ -436,14 +462,57 @@ fn resolve_one(
                     .collect(),
                 _ => serde_json::Map::new(),
             };
-            json!({
+            // Страницы по ОДНОЙ запрошенной секции. До этого крупные секции
+            // (значения перечисления — до 87 КБ) не помещались в бюджет, и
+            // посекционный страж выбрасывал их целиком: получить значения было
+            // нельзя в принципе. Страница меряется байтами, а не числом строк.
+            let mut page_meta: Option<(String, code_index_core::mcp::cap::Page)> = None;
+            let attrs_value = match (sections, attrs_value) {
+                (Some(secs), Value::Object(mut map)) if secs.len() == 1 => {
+                    if let Some(Value::Array(items)) = map.remove(secs[0].as_str()) {
+                        let mut page = code_index_core::mcp::cap::page_by_bytes(
+                            items,
+                            offset,
+                            budget,
+                        );
+                        let items = std::mem::take(&mut page.items);
+                        map.insert(secs[0].clone(), Value::Array(items));
+                        page_meta = Some((secs[0].clone(), page));
+                    }
+                    Value::Object(map)
+                }
+                (_, v) => v,
+            };
+            let mut out = json!({
                 "full_name": full_name,
                 "meta_type": meta_type,
                 "name": name,
                 "synonym": synonym,
                 "attributes": attrs_value,
                 "counts": counts,
-            })
+            });
+            if let (Some((key, page)), Some(obj)) = (page_meta.as_ref(), out.as_object_mut()) {
+                page.annotate(obj, key);
+                if let Some(next) = page.next_offset() {
+                    let call = code_index_core::mcp::cap::next_call_hint(
+                        "get_object_structure",
+                        &[
+                            ("repo", json!(repo_label)),
+                            ("full_name", json!(full_name)),
+                            ("sections", json!([key])),
+                            ("offset", json!(next)),
+                        ],
+                    );
+                    obj.insert(
+                        "hint".to_string(),
+                        json!(format!(
+                            "Показано {} из {}. Следующая страница — 1 вызов:\n{}",
+                            page.shown, page.total, call
+                        )),
+                    );
+                }
+            }
+            out
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             // fuzzy-подсказка: объект не найден — предложим похожие по
@@ -547,7 +616,7 @@ mod tests {
         )
         .unwrap();
 
-        let v = resolve_one(&conn, "ut", "Catalog.СоглашенияСКлиентами", None, true);
+        let v = resolve_one(&conn, "ut", "Catalog.СоглашенияСКлиентами", None, true, 0, 0);
         assert_eq!(v["full_name"], json!("Catalog.СоглашенияСКлиентами"));
         assert_eq!(v["meta_type"], json!("Catalog"));
         assert_eq!(v["name"], json!("СоглашенияСКлиентами"));
@@ -556,7 +625,48 @@ mod tests {
         assert!(v.get("counts").is_none());
 
         // names_only=false → структура на месте (прежнее поведение).
-        let full = resolve_one(&conn, "ut", "Catalog.СоглашенияСКлиентами", None, false);
+        let full = resolve_one(&conn, "ut", "Catalog.СоглашенияСКлиентами", None, false, 0, 0);
         assert_eq!(full["counts"]["attributes"], json!(2));
+    }
+
+    #[test]
+    fn single_section_is_paged_by_bytes_with_next_call() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        for ddl in crate::schema::SCHEMA_EXTENSIONS {
+            conn.execute_batch(ddl).unwrap();
+        }
+        // Перечисление с сотней значений — как крупные типовые перечисления,
+        // где раньше секция выбрасывалась целиком и была недоступна.
+        let values: Vec<Value> = (0..100)
+            .map(|i| json!({ "name": format!("Значение{}", i), "synonym": format!("Подпись {}", i) }))
+            .collect();
+        let attrs = json!({ "enum_values": values, "attributes": [] }).to_string();
+        conn.execute(
+            "INSERT INTO metadata_objects (repo, full_name, meta_type, name, synonym, attributes_json) \
+             VALUES ('default','Enum.ХозяйственныеОперации','Enum','ХозяйственныеОперации',NULL,?1)",
+            params![attrs],
+        )
+        .unwrap();
+
+        let secs = vec!["enum_values".to_string()];
+        let first = resolve_one(&conn, "ut", "Enum.ХозяйственныеОперации", Some(&secs), false, 0, 3_000);
+        let shown = first["enum_values_shown"].as_u64().unwrap() as usize;
+        assert!(shown > 0 && shown < 100, "страница набирается по бюджету: {shown}");
+        assert_eq!(first["enum_values_total"], json!(100));
+        assert_eq!(first["enum_values_has_more"], json!(true));
+        assert_eq!(first["attributes"]["enum_values"].as_array().unwrap().len(), shown);
+        let hint = first["hint"].as_str().unwrap();
+        assert!(
+            hint.contains(&format!("offset={}", shown)),
+            "подсказка несёт смещение следующей страницы: {hint}"
+        );
+
+        // Продолжение со смещения доходит до конца набора.
+        let last = resolve_one(&conn, "ut", "Enum.ХозяйственныеОперации", Some(&secs), false, 90, 3_000);
+        assert_eq!(last["enum_values_offset"], json!(90));
+        assert_eq!(last["enum_values_shown"], json!(10));
+        assert_eq!(last["enum_values_has_more"], json!(false));
+        assert!(last.get("hint").is_none(), "конец набора — продолжать некуда");
     }
 }

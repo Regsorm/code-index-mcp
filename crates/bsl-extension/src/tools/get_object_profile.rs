@@ -25,11 +25,6 @@ use code_index_core::extension::{IndexTool, ToolContext};
 use rusqlite::params;
 use serde_json::{json, Value};
 
-/// Сколько исходящих рёбер связей данных отдавать максимум (защита от выгрузки
-/// тысяч строк по «центральным» объектам вроде Организации). Снижен 200→60:
-/// для обзорного паспорта 60 рёбер достаточно, `out_total` показывает полное
-/// число, за деталями — get_data_links. Экономия токенов на центральных объектах.
-const LINKS_CAP: usize = 60;
 /// Таймаут набора запросов (как в bsl_sql): sqlite3_interrupt против runaway
 /// COUNT/SELECT на больших data_links (центральные регистры/объекты).
 const QUERY_TIMEOUT_SECS: u64 = 8;
@@ -42,14 +37,20 @@ impl IndexTool for GetObjectProfileTool {
     }
 
     fn description(&self) -> &str {
-        "Полный паспорт объекта конфигурации 1С за ОДИН вызов по полному имени \
+        "Обзорный паспорт объекта конфигурации 1С за ОДИН вызов по полному имени \
          ('Document.РеализацияТоваровУслуг', 'Catalog.Контрагенты'): structure \
          (реквизиты/табличные части/измерения/ресурсы/значения перечислений), forms \
-         (формы + обработчики событий), modules (модули объекта с object_id/property_id \
-         — UUID для dbgs-breakpoints — и code_path), data_links (исходящие ссылки, \
-         движения в регистры для документов / регистраторы для регистров, число входящих \
-         ссылок). Заменяет серию get_object_structure + get_form_handlers + get_data_links \
-         одним round-trip'ом. Имя — singular meta_type ('<MetaType>.<Name>'). \
+         (перечень форм + число обработчиков у каждой), modules (счётчики модулей по \
+         типам; полный список с object_id/property_id — UUID для dbgs-breakpoints — по \
+         expand), data_links (счётчики по видам связи, регистры движений для документов / \
+         регистраторы для регистров, число входящих ссылок). \
+         Отдаёт ОБЗОР: перечни и счётчики, не содержимое. Обработчики конкретной формы \
+         — get_form_handlers(owner_full_name, form_name); связи вглубь — get_data_links. \
+         expand=['forms.handlers'] вернёт обработчики всех форм, expand=['modules.list'] — \
+         полный список модулей: на крупном объекте это сотни килобайт, берите адресно. \
+         Обе секции отдаются и без expand, если весь ответ укладывается в бюджет \
+         (признаки — forms_handlers_included, modules_listed). \
+         Имя — singular meta_type ('<MetaType>.<Name>'). \
          Параметр sections=['structure'|'forms'|'modules'|'data_links'] сужает ответ \
          (по умолчанию все секции) — удешевляет вызов, когда нужна только часть. For \
          BSL/1C repositories only."
@@ -68,6 +69,15 @@ impl IndexTool for GetObjectProfileTool {
                     "type": "array",
                     "items": { "type": "string", "enum": ["structure", "forms", "modules", "data_links"] },
                     "description": "Какие секции вернуть. По умолчанию (опущено) — все. Рычаг удешевления: ['structure'] вернёт только реквизиты/ТЧ/измерения/ресурсы без форм, модулей и связей данных."
+                },
+                "expand": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["forms.handlers", "modules.list"] },
+                    "description": "Что вернуть подробно, а не перечнем. 'forms.handlers' — обработчики всех форм объекта; 'modules.list' — полный список модулей с UUID (object_id/property_id для точек останова). На крупном объекте каждая из этих секций — сотни килобайт, поэтому берите их по одной и вместе с sections=['forms'|'modules']. Не путать с sections: sections отвечает, КАКИЕ разделы вернуть, expand — насколько подробно."
+                },
+                "max_response_bytes": {
+                    "type": "integer",
+                    "description": "Бюджет размера ЭТОГО ответа в байтах — перекрывает серверный [cap].max_response_bytes на один вызов. Применяй, когда обработчики форм пришли перечнем, а нужны полностью: повтори тот же вызов с большим значением. Запрос сверх серверного потолка зажимается до потолка; фактически применённое возвращается полем response_budget_applied."
                 }
             },
             "required": ["repo", "full_name"]
@@ -113,6 +123,23 @@ impl IndexTool for GetObjectProfileTool {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Что вернуть подробно, а не перечнем (ось развёрнутости, не выбора
+            // секций): сейчас единственное значение — обработчики всех форм.
+            let expand_of = |what: &str| {
+                args.get("expand")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().any(|x| x.as_str() == Some(what)))
+                    .unwrap_or(false)
+            };
+            let expand_handlers = expand_of("forms.handlers");
+            let expand_modules = expand_of("modules.list");
+            // Бюджет размера этого ответа: клиентский max_response_bytes поверх
+            // серверного, с зажимом по потолку.
+            let budget = code_index_core::mcp::cap::resolve_request_budget(
+                args.get("max_response_bytes")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize),
+            );
 
             let storage = match ctx.storage.get().await {
                 Ok(s) => s,
@@ -134,16 +161,169 @@ impl IndexTool for GetObjectProfileTool {
                 handle.interrupt();
             });
 
-            let result = assemble_profile(conn, &full_name, &meta_type, &name, &sections);
+            let result = assemble_profile(
+                conn,
+                &full_name,
+                &meta_type,
+                &name,
+                &sections,
+                expand_handlers,
+                expand_modules,
+                budget.applied,
+            );
             timer.abort();
 
-            match result {
-                Ok(v) => crate::tools::wrap_with_meta("get_object_profile", v, Vec::new()),
-                Err(e) => crate::tools::wrap_error(json!({
-                    "error": format!("database error: {}", e)
-                })),
+            let (value, folded) = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    return crate::tools::wrap_error(json!({
+                        "error": format!("database error: {}", e)
+                    }));
+                }
+            };
+            // Паспорт — СТРУКТУРНЫЙ ответ: слепой обрез массивов (cap_response)
+            // исказил бы структуру объекта — «1 реквизит из 200». Поэтому
+            // посекционный omit и обёртка без cap, как у get_object_structure.
+            // Бюджет тот же, под который собирался ответ: иначе страж выбросит
+            // секцию, которую по `expand` только что намеренно отдали.
+            let (value, omitted) = code_index_core::mcp::cap::omit_oversize_sections(
+                value,
+                effective_budget(budget.applied, expand_handlers, expand_modules),
+            );
+            let mut out = crate::tools::wrap_with_meta_structural(value, Vec::new(), omitted);
+            if let Some(obj) = out.as_object_mut() {
+                if let Some(info) = folded.as_ref() {
+                    obj.insert(
+                        "sections_folded_hint".to_string(),
+                        json!(info.hint(ctx.repo, &full_name)),
+                    );
+                }
+                if budget.requested.is_some() || folded.is_some() {
+                    obj.insert("response_budget_applied".to_string(), json!(budget.applied));
+                }
             }
+            out
         })
+    }
+}
+
+/// Бюджет, под который реально собирается ответ. `expand` поднимает его до
+/// потолка сервера — это и есть смысл параметра: «дай подробно, сколько вообще
+/// разрешено отдать». Выключенный страж (0) остаётся выключенным.
+fn effective_budget(budget: usize, expand_handlers: bool, expand_modules: bool) -> usize {
+    if budget == 0 || !(expand_handlers || expand_modules) {
+        budget
+    } else {
+        budget.max(code_index_core::mcp::cap::response_cap_hard())
+    }
+}
+
+/// Какие секции ушли перечнем вместо содержимого.
+struct Folded {
+    forms: Option<FoldedForms>,
+    modules: Option<FoldedModules>,
+}
+
+impl Folded {
+    /// Общая подсказка: по строке-вызову на каждую свёрнутую секцию.
+    fn hint(&self, repo: &str, full_name: &str) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(f) = self.forms.as_ref() {
+            parts.push(f.hint(repo, full_name));
+        }
+        if let Some(m) = self.modules.as_ref() {
+            parts.push(m.hint(repo, full_name));
+        }
+        parts.join("\n")
+    }
+}
+
+/// Что нужно знать подсказке, когда модули отданы счётчиками по типам.
+struct FoldedModules {
+    /// Сколько модулей у объекта вместе с модулями его форм и команд.
+    total: usize,
+    /// Сколько весил бы полный список.
+    full_bytes: usize,
+}
+
+impl FoldedModules {
+    fn hint(&self, repo: &str, full_name: &str) -> String {
+        use code_index_core::mcp::cap::next_call_hint;
+        let kb = (self.full_bytes + 512) / 1024;
+        // Список всегда достаём одним вызовом: узкая секция + запас бюджета.
+        let call = next_call_hint(
+            "get_object_profile",
+            &[
+                ("repo", json!(repo)),
+                ("full_name", json!(full_name)),
+                ("sections", json!(["modules"])),
+                ("expand", json!(["modules.list"])),
+            ],
+        );
+        format!(
+            "Модули отданы счётчиками по типам: всего {}, список не включён (целиком ≈{} КБ).\n\
+             Полный список с UUID (для точек останова) — 1 вызов:\n{}",
+            self.total, kb, call
+        )
+    }
+}
+
+/// Что нужно знать подсказке, когда обработчики форм отданы перечнем.
+struct FoldedForms {
+    /// Сколько форм у объекта.
+    forms: usize,
+    /// Сколько обработчиков во всех формах суммарно.
+    handlers: usize,
+    /// Сколько весила бы секция форм целиком.
+    full_bytes: usize,
+    /// Форма с наибольшим числом обработчиков — вероятная цель следующего вызова.
+    top_form: String,
+}
+
+impl FoldedForms {
+    /// Подсказка «что делать дальше»: только готовые вызовы и число ходов.
+    /// Причин, почему свернули, здесь нет намеренно — слабой модели нужно
+    /// следующее действие, а не объяснение.
+    fn hint(&self, repo: &str, full_name: &str) -> String {
+        use code_index_core::mcp::cap::{next_call_hint, response_cap_hard};
+        let kb = (self.full_bytes + 512) / 1024;
+        let one = next_call_hint(
+            "get_form_handlers",
+            &[
+                ("repo", json!(repo)),
+                ("owner_full_name", json!(full_name)),
+                ("form_name", json!(self.top_form)),
+            ],
+        );
+        let mut s = format!(
+            "Формы отданы перечнем: {} форм, обработчиков всего {}, содержимое не включено \
+             (целиком ≈{} КБ).\nОбработчики одной формы — 1 вызов:\n{}\n",
+            self.forms, self.handlers, kb, one
+        );
+        // Запас сверх фактического размера, округлённый до килобайта.
+        let suggested = (self.full_bytes / 1000 + 2) * 1000;
+        if suggested <= response_cap_hard() {
+            let all = next_call_hint(
+                "get_object_profile",
+                &[
+                    ("repo", json!(repo)),
+                    ("full_name", json!(full_name)),
+                    ("expand", json!(["forms.handlers"])),
+                    ("max_response_bytes", json!(suggested)),
+                ],
+            );
+            s.push_str(&format!(
+                "Обработчики всех {} форм — 1 вызов:\n{}",
+                self.forms, all
+            ));
+        } else {
+            s.push_str(&format!(
+                "Все формы разом не влезут даже в потолок сервера ({} байт) — берите по формам \
+                 через get_form_handlers.",
+                response_cap_hard()
+            ));
+        }
+        s
     }
 }
 
@@ -159,7 +339,10 @@ fn assemble_profile(
     meta_type: &str,
     name: &str,
     sections: &[String],
-) -> rusqlite::Result<Value> {
+    expand_handlers: bool,
+    expand_modules: bool,
+    budget: usize,
+) -> rusqlite::Result<(Value, Option<Folded>)> {
     let folder = crate::tools::meta_type_to_folder(meta_type);
     // Выбор секций: пустой список → все (обратная совместимость). Иначе — только
     // запрошенные (рычаг удешевления: ['structure'] вернёт лишь реквизиты/ТЧ).
@@ -225,34 +408,132 @@ fn assemble_profile(
         Value::Null
     };
 
+    // Карта модулей: счётчики по типам. Под объект попадают модули его форм и
+    // команд (у обработки с 255 формами — 267 модулей, ~100 КБ), поэтому секция
+    // тяжелеет так же, как формы. Полный список с UUID — по expand.
+    let modules_total = modules.len();
+    let mut modules_by_type = serde_json::Map::new();
+    for m in &modules {
+        let t = m["module_type"].as_str().unwrap_or("?").to_string();
+        let n = modules_by_type.get(&t).and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+        modules_by_type.insert(t, json!(n));
+    }
+    let modules_map = json!({ "by_type": Value::Object(modules_by_type.clone()) });
+
+    // Карта форм: имя + число обработчиков. Само содержимое отдаём, только если
+    // его попросили явно (expand) либо весь ответ укладывается в бюджет — по
+    // замерам на восьми конфигурациях так у подавляющего большинства объектов,
+    // и для них поведение не меняется, лишних ходов нет.
+    let handlers_count = |f: &Value| f["handlers"].as_array().map_or(0, |a| a.len());
+    let forms_count = forms.len();
+    let handlers_total: usize = forms.iter().map(handlers_count).sum();
+    let forms_map: Vec<Value> = forms
+        .iter()
+        .map(|f| json!({ "form_name": f["form_name"], "handlers_count": handlers_count(f) }))
+        .collect();
+    // Форма с наибольшим числом обработчиков — вероятная цель следующего вызова,
+    // её и подставим в подсказку.
+    let top_form = forms
+        .iter()
+        .max_by_key(|f| handlers_count(f))
+        .and_then(|f| f["form_name"].as_str())
+        .unwrap_or_default()
+        .to_string();
+
     // Сборка: заголовок всегда; секции — только запрошенные (омитим ключ, а не
     // null, чтобы агент видел, что секция не запрашивалась, и мог дозапросить).
-    let mut obj = serde_json::Map::new();
-    obj.insert("full_name".into(), json!(full_name));
-    obj.insert("found".into(), json!(found));
-    obj.insert("meta_type".into(), json!(db_meta_type));
-    obj.insert("name".into(), json!(db_name));
-    obj.insert("synonym".into(), json!(synonym));
-    if want_structure {
-        obj.insert("structure".into(), structure);
+    let build = |forms_value: Vec<Value>,
+                 handlers_included: bool,
+                 modules_value: Value,
+                 modules_listed: bool|
+     -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("full_name".into(), json!(full_name));
+        obj.insert("found".into(), json!(found));
+        obj.insert("meta_type".into(), json!(&db_meta_type));
+        obj.insert("name".into(), json!(&db_name));
+        obj.insert("synonym".into(), json!(&synonym));
+        if want_structure {
+            obj.insert("structure".into(), json!(&structure));
+        }
+        if want_forms {
+            obj.insert("forms".into(), json!(forms_value));
+            obj.insert("forms_total".into(), json!(forms_count));
+            obj.insert("forms_handlers_total".into(), json!(handlers_total));
+            obj.insert("forms_handlers_included".into(), json!(handlers_included));
+        }
+        if want_modules {
+            obj.insert("modules".into(), modules_value);
+            obj.insert("modules_total".into(), json!(modules_total));
+            obj.insert("modules_listed".into(), json!(modules_listed));
+        }
+        if want_links {
+            obj.insert("data_links".into(), json!(&data_links));
+        }
+        if !all {
+            obj.insert("sections_returned".into(), json!(sections));
+            obj.insert(
+                "sections_available".into(),
+                json!(["structure", "forms", "modules", "data_links"]),
+            );
+        }
+        Value::Object(obj)
+    };
+
+    // Деградация по шагам: сначала пробуем отдать всё, затем сворачиваем формы
+    // (обычно самая тяжёлая секция), затем — модули. Каждый следующий шаг
+    // делается, только если предыдущий не уложился в бюджет.
+    //
+    // `expand` поднимает бюджет до потолка сервера: попросили подробно — отдаём
+    // столько, сколько вообще разрешено отдать. Отменить бюджет expand не может:
+    // ответ сверх потолка клиент всё равно сбросит в файл, и модель получит
+    // обрывок вместо данных. Не влезли и в потолок — перечень плюс подсказка
+    // «берите по частям», а не молчаливая пустая секция.
+    let modules_full = json!(&modules);
+    let modules_bytes = serde_json::to_string(&modules_full).map(|s| s.len()).unwrap_or(0);
+    let full = build(forms.clone(), true, modules_full.clone(), true);
+    let forms_bytes = serde_json::to_string(&full["forms"]).map(|s| s.len()).unwrap_or(0);
+
+    // Первой сворачивается секция, которую НЕ просили подробно: иначе `expand`
+    // одной секции поднимает бюджет и заодно разворачивает соседнюю — на
+    // объекте с 255 формами это лишние 94 КБ модулей, за которыми никто не шёл.
+    let middle = if expand_handlers && !expand_modules {
+        build(forms, true, modules_map.clone(), false)
+    } else {
+        build(forms_map.clone(), false, modules_full, true)
+    };
+    let effective = effective_budget(budget, expand_handlers, expand_modules);
+    let (value, middle_used) =
+        code_index_core::mcp::cap::fold_to_budget(full, middle, effective);
+    let (value, least_used) = code_index_core::mcp::cap::fold_to_budget(
+        value,
+        build(forms_map, false, modules_map, false),
+        effective,
+    );
+    // Какая секция свернулась на каждой ступени — зависит от того же порядка.
+    let (forms_folded, modules_folded) = if expand_handlers && !expand_modules {
+        (least_used, middle_used || least_used)
+    } else {
+        (middle_used || least_used, least_used)
+    };
+    if !forms_folded && !modules_folded {
+        return Ok((value, None));
     }
-    if want_forms {
-        obj.insert("forms".into(), json!(forms));
-    }
-    if want_modules {
-        obj.insert("modules".into(), json!(modules));
-    }
-    if want_links {
-        obj.insert("data_links".into(), data_links);
-    }
-    if !all {
-        obj.insert("sections_returned".into(), json!(sections));
-        obj.insert(
-            "sections_available".into(),
-            json!(["structure", "forms", "modules", "data_links"]),
-        );
-    }
-    Ok(Value::Object(obj))
+    Ok((
+        value,
+        Some(Folded {
+            forms: forms_folded.then(|| FoldedForms {
+                forms: forms_count,
+                handlers: handlers_total,
+                full_bytes: forms_bytes,
+                top_form,
+            }),
+            modules: modules_folded.then(|| FoldedModules {
+                total: modules_total,
+                full_bytes: modules_bytes,
+            }),
+        }),
+    ))
 }
 
 /// Формы объекта: имя + распарсенный список обработчиков.
@@ -305,28 +586,26 @@ fn query_modules(conn: &rusqlite::Connection, full_name_prefix: &str) -> rusqlit
 /// Связи данных объекта: исходящие рёбра (с капом), движения в обе стороны
 /// (recorder) и число входящих ссылок.
 fn query_data_links(conn: &rusqlite::Connection, object: &str) -> rusqlite::Result<Value> {
-    // Исходящие (на что ссылается / куда пишет), кроме recorder — он отдельно.
-    let mut out_stmt = conn.prepare(
-        "SELECT link_kind, to_object, from_path FROM data_links \
+    // Исходящие связи — ТОЛЬКО счётчики по видам, без единого ребра. Объём этой
+    // секции зависит не от самого объекта, а от того, сколько связей у него во
+    // всей конфигурации (у центральных справочников — до 1 600 рёбер), поэтому
+    // паспорт не должен от неё зависеть вовсе. Сами рёбра — get_data_links,
+    // у него для этого есть глубина, направление и страницы.
+    let mut kind_stmt = conn.prepare(
+        "SELECT link_kind, COUNT(*) FROM data_links \
          WHERE repo = ?1 AND from_object = ?2 AND link_kind != 'recorder' \
-         ORDER BY link_kind, to_object LIMIT ?3",
+         GROUP BY link_kind ORDER BY link_kind",
     )?;
-    let out_rows = out_stmt.query_map(params![REPO, object, LINKS_CAP as i64], |r| {
-        Ok(json!({
-            "link_kind": r.get::<_, String>(0)?,
-            "to_object": r.get::<_, String>(1)?,
-            "from_path": r.get::<_, String>(2)?,
-        }))
+    let kind_rows = kind_stmt.query_map(params![REPO, object], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     })?;
-    let mut out_links = Vec::new();
-    for row in out_rows {
-        out_links.push(row?);
+    let mut out_by_kind = serde_json::Map::new();
+    let mut out_total: i64 = 0;
+    for row in kind_rows {
+        let (kind, count) = row?;
+        out_total += count;
+        out_by_kind.insert(kind, json!(count));
     }
-    let out_total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM data_links WHERE repo = ?1 AND from_object = ?2 AND link_kind != 'recorder'",
-        params![REPO, object],
-        |r| r.get(0),
-    )?;
 
     // Движения: документ → регистры (from_object) и кто пишет в этот регистр (to_object).
     let writes_to = collect_col(
@@ -351,9 +630,8 @@ fn query_data_links(conn: &rusqlite::Connection, object: &str) -> rusqlite::Resu
     )?;
 
     Ok(json!({
-        "out": out_links,
         "out_total": out_total,
-        "out_truncated": out_total as usize > out_links.len(),
+        "out_by_kind": Value::Object(out_by_kind),
         "writes_to_registers": writes_to,
         "written_by_documents": written_by,
         "incoming_refs_count": in_count,
@@ -442,16 +720,17 @@ mod tests {
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0]["module_type"], json!("ObjectModule"));
         assert_eq!(modules[0]["object_id"], json!("uuid-obj"));
-        // data_links
+        // data_links: рёбра в паспорт больше не идут — только счётчики по видам
         let dl = query_data_links(&conn, "Document.Реализация").unwrap();
-        assert_eq!(dl["out"].as_array().unwrap().len(), 1);
-        assert_eq!(dl["out"][0]["to_object"], json!("Catalog.Контрагенты"));
+        assert_eq!(dl["out_total"], json!(1));
+        assert_eq!(dl["out_by_kind"]["attr"], json!(1));
+        assert!(dl.get("out").is_none(), "рёбра в паспорте не отдаются");
         assert_eq!(dl["writes_to_registers"][0], json!("AccumulationRegister.Продажи"));
         assert_eq!(dl["incoming_refs_count"], json!(0));
 
         // sections=['structure'] → только structure, без forms/modules/data_links
-        let only = assemble_profile(&conn, "Document.Реализация", "Document", "Реализация",
-            &["structure".to_string()]).unwrap();
+        let (only, _) = assemble_profile(&conn, "Document.Реализация", "Document", "Реализация",
+            &["structure".to_string()], false, false, 48_000).unwrap();
         let o = only.as_object().unwrap();
         assert!(o.contains_key("structure"), "structure должна быть");
         assert!(!o.contains_key("forms"), "forms не запрашивалась → ключа нет");
@@ -460,10 +739,45 @@ mod tests {
         assert_eq!(o["sections_returned"], json!(["structure"]));
 
         // пустой список → все секции, без sections_returned (обратная совместимость)
-        let full = assemble_profile(&conn, "Document.Реализация", "Document", "Реализация", &[]).unwrap();
+        let (full, folded) = assemble_profile(&conn, "Document.Реализация", "Document",
+            "Реализация", &[], false, false, 48_000).unwrap();
         let f = full.as_object().unwrap();
         assert!(f.contains_key("structure") && f.contains_key("forms")
             && f.contains_key("modules") && f.contains_key("data_links"));
         assert!(!f.contains_key("sections_returned"));
+        // Ответ мелкий — обработчики и модули отданы полностью, свёртки нет.
+        assert!(folded.is_none());
+        assert_eq!(f["forms_handlers_included"], json!(true));
+        assert_eq!(f["forms_total"], json!(1));
+        assert_eq!(f["forms_handlers_total"], json!(1));
+        assert_eq!(f["modules_listed"], json!(true));
+        assert_eq!(f["modules_total"], json!(1));
+        assert_eq!(full["forms"][0]["handlers"][0]["event"], json!("ПриОткрытии"));
+        assert_eq!(full["modules"][0]["object_id"], json!("uuid-obj"));
+
+        // Тесный бюджет → формы и модули сворачиваются, а подсказка называет
+        // форму и несёт готовые вызовы за содержимым обеих секций.
+        let (small, folded) = assemble_profile(&conn, "Document.Реализация", "Document",
+            "Реализация", &[], false, false, 200).unwrap();
+        assert_eq!(small["forms_handlers_included"], json!(false));
+        assert_eq!(small["forms"][0]["handlers_count"], json!(1));
+        assert!(small["forms"][0].get("handlers").is_none(), "содержимое не отдаётся");
+        assert_eq!(small["modules_listed"], json!(false));
+        assert_eq!(small["modules"]["by_type"]["ObjectModule"], json!(1));
+        let info = folded.expect("свёртка должна быть отмечена");
+        assert_eq!(info.forms.as_ref().unwrap().top_form, "ФормаДокумента");
+        assert_eq!(info.modules.as_ref().unwrap().total, 1);
+        let hint = info.hint("ut", "Document.Реализация");
+        assert!(hint.contains("get_form_handlers(repo='ut', owner_full_name='Document.Реализация', form_name='ФормаДокумента')"),
+            "подсказка должна нести готовый вызов за обработчиками: {hint}");
+        assert!(hint.contains("expand=[\"modules.list\"]"),
+            "подсказка должна нести вызов за списком модулей: {hint}");
+
+        // expand → содержимое отдаётся даже при тесном бюджете (просили явно).
+        let (expanded, folded) = assemble_profile(&conn, "Document.Реализация", "Document",
+            "Реализация", &[], true, false, 200).unwrap();
+        assert!(folded.is_none());
+        assert_eq!(expanded["forms_handlers_included"], json!(true));
+        assert_eq!(expanded["forms"][0]["handlers"][0]["event"], json!("ПриОткрытии"));
     }
 }
