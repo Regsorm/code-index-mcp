@@ -5,6 +5,31 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.54.0] — 2026-08-19
+
+**A form event handler now knows which item it belongs to, and event names became identical across both dump formats. Previously a large form returned a flat list of hundreds of «event — procedure» pairs where an input field's handler was indistinguishable from a form-level one, and the same event was named differently in the two dumps.**
+
+> Context. Another finding from the same full review: for a single form the tool returned 356 records, 259 of them the same event on different fields, with no way to tell them apart. The event-name mismatch between formats surfaced alongside, while comparing two dumps of one configuration.
+
+### Fixed
+
+- **Form-item handlers were mixed with form-level ones.** Form collection picked up every event tag in the file without tracking which item contained it: the record held only the «event — procedure» pair. Whose handler it was could be guessed only from the procedure-naming convention, which is not always followed. Both parsers (Designer format and 1C:EDT) now keep an owner stack and write a third field: the item name for an item's handler, nothing for a form-level one. The nesting path is deliberately not stored — item names are unique within a form. On a typical trade configuration the owner is filled in for 51,299 records out of 76,758; form-level handlers have it empty, as they should.
+- **A form event's name depended on the dump format.** The 1C:EDT parser ran the event through a dictionary built for object event subscriptions, which overlaps with form events in only a handful of names — so a translated name stood next to an untranslated one, while the Designer format translated nothing. The same form yielded different names in the two dumps. A separate form-event dictionary, shared by both formats, now covers 91 names; unknown ones pass through unchanged, including add-in event identifiers that have no Russian name at all. The dictionary was verified against the configurations themselves: handlers are named «item name + event name», so the Russian name can be read from the tail of the procedure name; a check across four typical configurations corrected two translations and confirmed the rest. After the rebuild the set of named events matched across both formats exactly — 79 and 79.
+
+### Added
+
+- **An item filter for the form-handlers tool.** Optional `element` parameter: an item name returns only its handlers, an empty string only form-level ones. The response gains `handlers_shown` and `handlers_total`. On a large form of a typical accounting configuration — 8 records instead of 308.
+
+### Compatibility
+
+- The database schema did not change: handlers are stored as text in a single column and every reader parses it untyped, so bases can be rebuilt one by one and a mixed state is safe. The owner field and Russian event names, however, appear only after a forced reindex: the change affects parsing, and the fast modification-time path does not pick it up.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 708 passed, 0 failed (was 704). New ones cover: handler ownership in both formats (an item nested in decoration groups; a nested tooltip must not hijack ownership), the absence of the field for form-level handlers, translation of known names and pass-through of unknown ones, and three names recovered by data comparison.
+- **Live smoke** on four configurations, all force-reindexed: only add-in event identifiers remain in Latin (2 out of 47,750 records on the trade configuration), one form's output matched letter for letter across the two formats, and the item filter cuts a large form's response from 356 records to one.
+- **Federated smoke** on three node bases: ownership is filled in, events are Russian, the filter works.
+
 ## [0.53.0] — 2026-08-19
 
 **Exports from 1C:EDT are finally collected in full and updated on the fly: role rights, configuration-level links and the module registry were never built for that format, every nested subsystem was lost, and no configuration edit reached the index until a full reindex. Plus two Designer-format defects visible only when the two formats are compared: common forms reached the index in neither of them, and a command module named after its own object lost its owner.**
