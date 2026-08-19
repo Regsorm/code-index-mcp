@@ -5,6 +5,70 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.52.0] — 2026-08-19
+
+**Seven data-completeness defects found by a full review of the collection layer. The main one: for exports from 1C:EDT the call graph lost almost half of its edges — calls to common modules and managers were dropped as local object methods. Now the same configuration exported either way yields a matching graph: a 0.03% difference instead of 44%.**
+
+> Context. The review compared one configuration exported two ways — from Designer and from 1C:EDT. Three of the seven defects are precisely format mismatches visible only through such a comparison.
+
+### Fixed
+
+- **The call graph lost almost half of its edges for EDT exports.** The lookup maps used to resolve call targets were built from Designer-style paths, which always contain an `Ext` directory inside the object. EDT exports have no such directory, so both maps stayed empty. On its own that would only leave targets unresolved, but the same map also guards the balast pruning step: a single-dot call is removed when its qualifier is not a known common module. For EDT that condition never held, so every common-module call left the graph. Path patterns now accept both layouts. On a standard accounting configuration: 651,324 edges before versus 1,161,479 after, against 1,161,817 in the Designer format; the share of edges with a resolved target is 88.3% in both formats.
+- **Data links diverged between the two formats in both directions.** The EDT parser had no resources and no owners sections: register resource references were lost (6 fields instead of 15 on a sample information register) and catalogue ownership was missing entirely (0 links instead of 45). The Designer format, conversely, never parsed attributes of data processors and reports (0 links versus 962). Both gaps are closed and the formats now agree.
+- **Object command modules never reached the module registry.** The command itself was treated as the owner, so the parser looked for a `Commands/<Command>.xml` file that does not exist: a command is described inside the XML of its object. The owner is now the object, and the identifier is taken from the command itself. A standard accounting configuration yields 496 such modules and a standard trade configuration 537 — previously none. Breakpoints inside object command modules are now possible.
+- **Nested subsystems had no synonym.** Synonyms were collected exactly one level deep inside each type folder, while a nested subsystem sits two levels deeper. On a standard accounting configuration 547 of 621 subsystems had no synonym — 88%. The subsystem folder is now walked as a tree, the same way the object registry already did; no subsystem is left without a synonym.
+- **Deleting a module did not remove its registry row.** The per-file branch could only insert and update: the type came from the file name, and the owner plus identifier from the XML of the object, which stays on disk — so the row was confidently rewritten after the module had disappeared. The incremental path diverged from the full rebuild. The row is now removed unconditionally and re-created only when the file exists.
+- **Document journals, sequences and filter criteria were missing from the code-usage index.** They were absent from the table of categories addressable from code, and that same table feeds the map used to resolve manager-module calls — so such references were neither indexed nor resolvable, and were additionally removed by pruning. A standard accounting configuration has 36 document journals, 33 of them with a manager module, and 0 indexed references; now 375.
+- **References made through the metadata object were not indexed.** Identifier pairs were matched without overlap: in `Metadata.Catalogs.<Object>` the collection is the second segment, so the first pair was discarded and the second was never examined. This is the primary way typical code refers to a metadata object — access-right checks, registration in platform mechanisms, attribute lookups. A single catalogue lost 99 references across more than sixty files.
+
+### Changed
+
+- The collection layer is split into purpose-oriented modules: entry points, full metadata scan, incremental updates, call graph, module registry, shared helpers. No logic changed — the tests were left untouched and stayed green. This also removed a duplication: the full module-registry pass carried its own copy of the owner-lookup logic, so a fix applied to one branch did not affect the other.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 696 passed, 0 failed (was 689). New tests cover: the path layout without an `Ext` directory; resources and owners in data links; an object command module with the identifier of the command; a nested subsystem synonym; removal of a module row when the file is deleted; references through the metadata object; the three new collection categories.
+- **Test-catches-the-defect check:** with the fix temporarily reverted, the EDT layout test fails exactly as the defect describes — the edge disappears from the graph entirely.
+- **Live smoke** on two databases — one configuration exported by Designer and by 1C:EDT, both force-reindexed. All seven effects confirmed on real data; owner links, journal references and subsystem synonyms match across formats.
+- **Split verification:** after the move, metrics on live databases matched the previous ones exactly.
+- **Federated check:** six node databases reindexed with 0 errors; remote repositories respond and the effects hold through federation.
+
+### Compatibility
+
+- **A reindex of every 1C configuration is required.** The changes affect what is collected: without a rebuild you will not get owner and resource links, object command modules, nested subsystem synonyms or references to the three new categories, and the call graph of EDT exports will stay incomplete.
+- Indexing time is effectively unchanged: across the six node databases deviations stay within ±5% in both directions, while the untouched core fluctuates by the same amount.
+- The index grows slightly: data links for data processors and reports, register resources, command module rows and references of three categories were added.
+- For 1C:EDT exports role rights, the module registry and configuration-level links are still not collected — that is a separate open defect, outside the scope of this release.
+
+## [0.51.1] — 2026-08-19
+
+**An export from 1C:EDT is finally recognised as a 1C configuration: previously indexing such a folder silently left the database without any metadata, and the whole EDT format parser never ran. The value type of an object was read for 10 objects out of 16,106 — now for 1,306. Scheduled jobs were not parsed at all, which lost the link between a job and the procedure it calls.**
+
+> Context. First verified against a real export of a standard accounting configuration from 1C:EDT — 16,212 `.mdo` files. The format mismatch is what exposed the defects: one and the same configuration, exported two ways, was described differently.
+
+### Fixed
+
+- **An export from 1C:EDT was not recognised as a 1C configuration.** Detection relied solely on a Designer-format `Configuration.xml`, which simply does not exist in an EDT export — there it is `src/Configuration/Configuration.mdo`. As a result, command-line indexing silently created no metadata tables at all: only core tables remained, and queries against them answered "no such table". The EDT parser — a thousand lines of code — was therefore unreachable in principle, because it is invoked inside metadata collection, which never started. It only worked when the language was set explicitly in the daemon configuration, meaning EDT support rested on manual setup rather than format detection. On a real export, metadata collection took 0.7 seconds and produced nothing before the fix; after it — 15,529 objects, 22,428 data links, 7,476 forms, 447 subscriptions.
+- **The structure of EDT objects was poorer than in the Designer format.** Three sections were missing: owners of a subordinate catalogue, predefined items and the value type of an object (charts of characteristic types, constants). They are now parsed, and strictly at the object itself — by tag nesting level. Without that boundary the object value type would mix with the types of every predefined item: one chart of characteristic types produced 308 values instead of 111 — exactly the number of type tags in the whole file. Cross-checking the same configuration in both export formats: owners 43 and 43, objects with predefined items 109 and 109, predefined item counts matched the export files item by item (1,263, 169, 121).
+- **The value type of an object was read for 10 objects out of 16,106.** Object files were opened only for types with reference attributes, while a constant, a defined type, a session parameter, a common attribute and a filter criterion have none — their XML was never opened, even though the value type is recorded there. These five types are now parsed: on a standard accounting configuration the value type is present for 1,306 objects (constants 708, defined types 481, session parameters 95, charts of characteristic types 8, common attributes 7, filter criteria 6, chart of accounts 1). Both export formats give identical counts line by line.
+- **A chart of accounts held junk instead of its analytics, and a task held the types of unrelated attributes.** Any `<Type>` outside an attribute was treated as the object's own type, so seven `xs:boolean` entries from accounting flags landed in the value type of a chart of accounts, and the types of addressing attributes landed in the value type of a task. The real value type of a chart of accounts — its extra dimension types — was not read at all. The value type is now taken strictly at the object level, and extra dimension types are parsed in both formats. A task has no value type of its own, so the section is empty, as it should be.
+- **Task addressing properties were read nowhere.** The addressing register, the main addressing attribute and the session parameter holding the current performer live in the object header; they were not part of the parse. They are now in the properties section: `Addressing`, `MainAddressingAttribute`, `CurrentPerformer`.
+- **Scheduled jobs were not parsed at all.** They were absent from the list of parsed types, so the most important part was lost — `MethodName`, the name of the procedure being called: the index could not tell what runs on a schedule. That is 168 objects on a standard accounting configuration and 219 on a standard trade configuration. The procedure name is now present for all of them, along with the usage flag and restart parameters.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 689 passed, 0 failed (was 685). New tests cover: a folder with `Configuration.mdo` is recognised as a 1C configuration; three EDT structure sections are parsed while a predefined item type does not leak into the object value type; a chart of accounts gets extra dimension types rather than accounting-flag booleans; a constant value type is read; a task exposes three addressing properties and an empty value type; a scheduled job exposes the called procedure name.
+- **Live check** against an accounting configuration exported from 1C:EDT (22,775 files, forced reindex): the log now shows schema extensions being applied and the EDT metadata collection line; 41 object types; subordinate catalogue owners match the three in the export file; the value type of a chart of characteristic types holds 111 values, exactly as the root tag of the file states (a broken intermediate version produced 308 — the number of all type tags in the file; that defect was caught by the live run, not by the tests).
+- **Cross-format check** of one configuration (the same accounting configuration exported by Designer and by 1C:EDT): owners 43 and 43, predefined items 109 and 109, value types 1,306 and 1,306 matching object type by object type, scheduled jobs with a procedure name 168 of 168 in both.
+- **Federated check:** the node was brought up on this build, remote databases respond, all repositories are ready.
+
+### Compatibility
+
+- **A reindex of every 1C configuration is required.** The changes affect both export formats: without a rebuild the value type stays with the previous ten objects, scheduled jobs remain without a procedure name, and task addressing properties never appear. For EDT exports additionally: command-line indexing yields no metadata at all until the database is rebuilt with the new build.
+- The index grows: XML files of six object types that were never opened before are now read (constants, defined types, session parameters, common attributes, filter criteria, scheduled jobs). On a standard accounting configuration that is roughly 1,500 additional files, extending metadata collection by about a minute.
+- Setting the language explicitly in the daemon configuration for EDT folders is no longer required, but does no harm.
+- A minor format asymmetry: the predefined flag of a scheduled job is read only from a Designer export — in EDT the tag with that name is taken by the predefined items block of a catalogue.
+
 ## [0.51.0] — 2026-08-19
 
 **A truncated export manifest no longer wipes objects out of the index. Half of the 1C object kinds — roles, defined types, HTTP services, common forms — were never parsed at all; now they are. Nested subsystems made it into the object registry, and large export files made it into the index.**
