@@ -5,6 +5,33 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.58.0] — 2026-08-20
+
+**Settings that did not apply no longer look applied. A corrupted configuration file now stops startup instead of silently falling back to defaults; index cleanup no longer treats an unreachable file as deleted; the enrichment model signature is written only when it truly describes the whole database.**
+
+> Context. The two remaining unreviewed areas — the command line with the enrichment layer, and grammar parsing. Findings of the same class as the day before: a result that looks complete without being one. Here the silence is worse than usual — it concerns the state of the system itself, not the responses.
+
+### Fixed
+
+- **A corrupted configuration file silently fell back to defaults when a path was given explicitly.** Eight settings — the allowed-tool list, mass mode, repeat-output suppression and four response-size guard parameters — were pulled by eight separate functions, each re-reading the file and each swallowing the read error. The error surfaced only through repo-list assembly, which reads the configuration solely when no path is passed on the command line. Verified live: with a path on the command line the server came up with the full tool set instead of the single configured one, and said nothing about it. The configuration is now read once, and a parse error stops startup — same as in the no-path branch.
+- **Index cleanup treated an unreachable file as deleted.** A plain «does the path exist» check answers «no» to any error — including «access denied», «file in use», «volume gone» — and records of live files were dropped in bulk. The file watcher already guards against this with a dedicated helper; the same error classification now applies here, and unchecked files are reported explicitly, with cause and count.
+- **The enrichment model signature was written after any run.** The signature means «the whole database is enriched by this model», yet it was stamped even after a trial run over a hundred procedures and after a run where nearly every request failed. One such run was enough to erase the mismatch marker, so the next check reported «matches» over a mix of two models. The signature is now written only when the run is not capped by procedure count, had no failures, and — on a mismatch with the stored one — only with a full re-enrichment. Otherwise the log states why it was not updated.
+
+### Changed
+
+- The eight near-identical setting extractors are gone: the configuration is read once and passed on parsed. This also removes the chance of taking some settings from one version of the file and some from another (the daemon writes the detected repository language back into the same file).
+
+### Compatibility
+
+- Starting with `--path` and a knowingly invalid configuration file now fails with an error instead of continuing on defaults. This is the only externally visible change: the previous behaviour masked an operator mistake.
+- The database schema is unchanged; no reindex required.
+
+### Testing
+
+- **Unit and integration tests:** `cargo test --workspace --features enrichment` — 752 passed, 0 failed. Three new ones cover the signature-writing conditions: a capped run, a run with failures, and a mismatch without full re-enrichment (plus the update when it is used).
+- **Live check on a separate instance:** with a corrupted configuration file startup stops with a clear message; cleanup over an access-denied directory reports «0 records removed» and «1 file could not be checked», the record stays, the file on disk is intact.
+- **Serving smoke** on a typical trade configuration and **federated smoke** on three remote node databases — unchanged after the fix (same numbers: 1,174, 1,577 and 1,607 incoming links).
+
 ## [0.57.0] — 2026-08-19
 
 **An empty answer no longer passes for a substantive conclusion. A wrong-case Cyrillic name no longer yields a silent zero: the object name is resolved to the spelling stored in the configuration at the entry of every object-keyed tool. A walk that stopped at its limit now says «I did not finish» instead of «there is no link».**
