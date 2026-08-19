@@ -208,6 +208,13 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                             tt = T::Owner;
                         }
                     }
+                    // Тип значения плана счетов — виды субконто:
+                    // `<extDimensionTypes>ChartOfCharacteristicTypes.X</...>`.
+                    "extDimensionTypes" => {
+                        if field.is_none() && depth == 2 {
+                            tt = T::ValueType;
+                        }
+                    }
                     "predefined" => {
                         if depth == 2 {
                             in_predefined = true;
@@ -270,6 +277,24 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                     | "numberType" | "numberLength" | "numberPeriodicity" | "checkUnique"
                     | "autonumbering" | "hierarchical" | "codeLength" | "descriptionLength" => {
                         if field.is_none() {
+                            cur_header_prop = Some(cap_first(&local));
+                            tt = T::HeaderProp;
+                        }
+                    }
+                    // Свойства адресации задачи — только у самого объекта:
+                    // внутри реквизитов адресации есть свои теги адресации.
+                    "addressing" | "mainAddressingAttribute" | "currentPerformer" => {
+                        if field.is_none() && depth == 2 {
+                            cur_header_prop = Some(cap_first(&local));
+                            tt = T::HeaderProp;
+                        }
+                    }
+                    // Регламентное задание: вызываемая процедура и параметры
+                    // перезапуска. `predefined` сюда не входит: в EDT это имя
+                    // занято блоком предопределённых элементов справочника.
+                    "methodName" | "use" | "restartCountOnFailure"
+                    | "restartIntervalOnFailure" => {
+                        if field.is_none() && depth == 2 {
                             cur_header_prop = Some(cap_first(&local));
                             tt = T::HeaderProp;
                         }

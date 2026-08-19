@@ -968,6 +968,12 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
     let mut cur_header_prop: Option<String> = None;
     // W13: внутри корневого <Type> (тип значения характеристик ПВХ/константы).
     let mut in_root_type = false;
+    // Глубина вложенности. Корневой <Type> объекта лежит ровно на 4-м уровне:
+    // MetaDataObject(1) > <Объект>(2) > Properties(3) > Type(4). Без этой
+    // границы в тип значения утекают <Type> дочерних объектов, которые не
+    // заводятся как поля: признаки учёта плана счетов (семь xs:boolean) и
+    // реквизиты адресации задачи.
+    let mut depth: usize = 0;
     // Внутри <StandardAttributes> — стандартные атрибуты не разбираем.
     let mut in_std_attrs = false;
     // W11: внутри <Synonym> текущего поля; последний прочитанный <v8:lang>.
@@ -979,6 +985,7 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
             Ok(Event::Start(e)) => {
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = local_name(&raw);
+                depth += 1;
                 match local.as_str() {
                     "TabularSection" => {
                         expecting_tabular_name = true;
@@ -1048,15 +1055,42 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                             text_target = TextTarget::HeaderProp;
                         }
                     }
+                    // Свойства адресации задачи: регистр сведений с адресацией,
+                    // основной реквизит адресации, параметр сеанса с текущим
+                    // исполнителем. Строго 4-й уровень — внутри дочерних
+                    // <AddressingAttribute> лежат свои теги адресации.
+                    "Addressing" | "MainAddressingAttribute" | "CurrentPerformer" => {
+                        if field.is_none() && !in_std_attrs && depth == 4 {
+                            cur_header_prop = Some(local.clone());
+                            text_target = TextTarget::HeaderProp;
+                        }
+                    }
+                    // Регламентное задание: вызываемая процедура и параметры
+                    // перезапуска. MethodName даёт связь «задание → код».
+                    "MethodName" | "Use" | "Predefined" | "RestartCountOnFailure"
+                    | "RestartIntervalOnFailure" => {
+                        if field.is_none() && !in_std_attrs && depth == 4 {
+                            cur_header_prop = Some(local.clone());
+                            text_target = TextTarget::HeaderProp;
+                        }
+                    }
                     _ => {
                         if raw == "Type" {
                             if field.is_some() {
                                 in_type = true;
-                            } else if !in_std_attrs {
+                            } else if !in_std_attrs && depth == 4 {
                                 // W13: корневой <Type> — тип значения
-                                // характеристик ПВХ / тип константы.
+                                // характеристик ПВХ / константы / определяемого
+                                // типа / параметра сеанса. Строго 4-й уровень:
+                                // глубже лежат <Type> дочерних объектов
+                                // (признаки учёта, реквизиты адресации).
                                 in_root_type = true;
                             }
+                        } else if raw == "ExtDimensionTypes" && field.is_none() && depth == 4 {
+                            // Тип значения плана счетов — виды субконто:
+                            // <ExtDimensionTypes>ChartOfCharacteristicTypes.X</...>.
+                            // Тег текстовый, вложенного <v8:Type> у него нет.
+                            text_target = TextTarget::RootTypeValue;
                         } else if raw.ends_with(":Type") || raw.ends_with(":TypeSet") {
                             // <v8:TypeSet> — тип-набор (cfg:DefinedType.X), W2.
                             if field.is_some() && in_type {
@@ -1168,6 +1202,7 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
             Ok(Event::End(e)) => {
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = local_name(&raw);
+                depth = depth.saturating_sub(1);
                 match local.as_str() {
                     "Attribute" | "Dimension" | "Resource" | "EnumValue" | "Command" => {
                         if let Some(fb) = field.take() {
@@ -2095,6 +2130,128 @@ mod tests {
         let st = parse_object_structure_xml(xml).unwrap();
         assert!(st.posting.is_empty());
         assert!(!st.to_json().as_object().unwrap().contains_key("posting"));
+    }
+
+    #[test]
+    fn value_types_root_only_and_chart_of_accounts() {
+        // Тип значения берётся только у самого объекта. У плана счетов это
+        // виды субконто; <Type> признаков учёта (дочерние объекты, полями не
+        // заводятся) в тип значения попадать не должен.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <ChartOfAccounts uuid="c1">
+    <Properties>
+      <Name>Хозрасчетный</Name>
+      <ExtDimensionTypes>ChartOfCharacteristicTypes.ВидыСубконтоХозрасчетные</ExtDimensionTypes>
+      <MaxExtDimensionCount>3</MaxExtDimensionCount>
+    </Properties>
+    <ChildObjects>
+      <AccountingFlag uuid="f1">
+        <Properties>
+          <Name>Количественный</Name>
+          <Type><v8:Type>xs:boolean</v8:Type></Type>
+        </Properties>
+      </AccountingFlag>
+      <AccountingFlag uuid="f2">
+        <Properties>
+          <Name>Валютный</Name>
+          <Type><v8:Type>xs:boolean</v8:Type></Type>
+        </Properties>
+      </AccountingFlag>
+    </ChildObjects>
+  </ChartOfAccounts>
+</MetaDataObject>"#;
+        let st = parse_object_structure_xml(xml).unwrap();
+        assert_eq!(
+            st.value_types,
+            vec!["ChartOfCharacteristicTypes.ВидыСубконтоХозрасчетные"],
+            "виды субконто — да, xs:boolean признаков учёта — нет"
+        );
+    }
+
+    #[test]
+    fn task_addressing_properties() {
+        // Три свойства адресации задачи — в properties. Одноимённых тегов
+        // внутри реквизитов адресации подхватывать не должны, а типы этих
+        // реквизитов — не тип значения задачи (своего у неё нет).
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <Task uuid="t1">
+    <Properties>
+      <Name>ЗадачаИсполнителя</Name>
+      <Addressing>InformationRegister.ИсполнителиЗадач</Addressing>
+      <MainAddressingAttribute>Task.ЗадачаИсполнителя.AddressingAttribute.Исполнитель</MainAddressingAttribute>
+      <CurrentPerformer>SessionParameter.АвторизованныйПользователь</CurrentPerformer>
+    </Properties>
+    <ChildObjects>
+      <AddressingAttribute uuid="a1">
+        <Properties>
+          <Name>Исполнитель</Name>
+          <Type><v8:Type>cfg:CatalogRef.Пользователи</v8:Type></Type>
+          <AddressingDimension>InformationRegister.ИсполнителиЗадач.Dimension.Исполнитель</AddressingDimension>
+        </Properties>
+      </AddressingAttribute>
+    </ChildObjects>
+  </Task>
+</MetaDataObject>"#;
+        let st = parse_object_structure_xml(xml).unwrap();
+        let get = |k: &str| st.properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("Addressing"), Some("InformationRegister.ИсполнителиЗадач"));
+        assert_eq!(
+            get("MainAddressingAttribute"),
+            Some("Task.ЗадачаИсполнителя.AddressingAttribute.Исполнитель")
+        );
+        assert_eq!(
+            get("CurrentPerformer"),
+            Some("SessionParameter.АвторизованныйПользователь")
+        );
+        // Тип реквизита адресации не утекает в тип значения задачи.
+        assert!(st.value_types.is_empty());
+    }
+
+    #[test]
+    fn scheduled_job_header_properties() {
+        // Регламентное задание: реквизитов нет, но в шапке — вызываемая
+        // процедура и параметры перезапуска.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject>
+  <ScheduledJob uuid="s1">
+    <Properties>
+      <Name>АвтоматическоеЗакрытиеМесяца</Name>
+      <MethodName>CommonModule.ЗакрытиеМесяца.АвтоматическоеЗакрытиеМесяцаРегламентноеЗадание</MethodName>
+      <Use>false</Use>
+      <Predefined>false</Predefined>
+      <RestartCountOnFailure>3</RestartCountOnFailure>
+      <RestartIntervalOnFailure>10</RestartIntervalOnFailure>
+    </Properties>
+  </ScheduledJob>
+</MetaDataObject>"#;
+        let st = parse_object_structure_xml(xml).unwrap();
+        let get = |k: &str| st.properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(
+            get("MethodName"),
+            Some("CommonModule.ЗакрытиеМесяца.АвтоматическоеЗакрытиеМесяцаРегламентноеЗадание")
+        );
+        assert_eq!(get("Use"), Some("false"));
+        assert_eq!(get("RestartCountOnFailure"), Some("3"));
+        assert_eq!(get("RestartIntervalOnFailure"), Some("10"));
+    }
+
+    #[test]
+    fn value_types_of_constant() {
+        // У константы нет реквизитов, но есть собственный тип значения.
+        let xml = r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <Constant uuid="c1">
+    <Properties>
+      <Name>ОсновнойТипЦеныПокупки</Name>
+      <Type><v8:Type>cfg:CatalogRef.ТипыЦенНоменклатуры</v8:Type></Type>
+    </Properties>
+  </Constant>
+</MetaDataObject>"#;
+        let st = parse_object_structure_xml(xml).unwrap();
+        assert_eq!(st.value_types, vec!["СправочникСсылка.ТипыЦенНоменклатуры"]);
+        assert!(st.to_json().get("value_types").is_some());
     }
 
     #[test]

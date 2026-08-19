@@ -41,9 +41,12 @@ use crate::xml::object_attributes::{
 use crate::xml::object_uuid::{extract_form_uuid_any_from_file, extract_object_uuid_from_file};
 
 /// Папки выгрузки → singular meta_type. Объектные XML лежат прямо в этих
-/// папках (`Catalogs/<Имя>.xml`). Перечислены только типы со ссылочными
-/// реквизитами/измерениями — для остальных (CommonModule, Enum, Constant…)
-/// открывать XML смысла нет.
+/// папках (`Catalogs/<Имя>.xml`). Перечислены типы со ссылочными
+/// реквизитами/измерениями плюс те, у кого есть собственный тип значения
+/// (константа, определяемый тип, параметр сеанса, общий реквизит, критерий
+/// отбора) — у них нет реквизитов, но корневой `<Type>` есть, и без разбора
+/// секция `value_types` теряется. Для типов без структуры вовсе
+/// (CommonModule и прочие) открывать XML по-прежнему незачем.
 const OBJECT_FOLDERS: &[(&str, &str)] = &[
     ("Catalogs", "Catalog"),
     ("Documents", "Document"),
@@ -61,6 +64,16 @@ const OBJECT_FOLDERS: &[(&str, &str)] = &[
     // нужны для get_object_structure → enum_values (B2). parse_object_structure_xml
     // собирает <EnumValue>, index_object_attributes пишет в attributes_json.
     ("Enums", "Enum"),
+    // Типы без реквизитов, но с собственным типом значения (корневой <Type>).
+    // Рёбер data_links не дают: парсер связей корневой <Type> не обрабатывает.
+    ("Constants", "Constant"),
+    ("DefinedTypes", "DefinedType"),
+    ("SessionParameters", "SessionParameter"),
+    ("CommonAttributes", "CommonAttribute"),
+    ("FilterCriteria", "FilterCriterion"),
+    // Регламентные задания: реквизитов нет, но в шапке лежит имя вызываемой
+    // процедуры (MethodName) — связь «задание → код», и параметры перезапуска.
+    ("ScheduledJobs", "ScheduledJob"),
 ];
 
 /// Полный маппинг «папка (plural) → meta_type» для ВСЕХ типов верхнего уровня,
@@ -1568,7 +1581,7 @@ const PLATFORM_BALAST: &[&str] = &[
 /// Удалить direct-рёбра-балласт (см. [`PLATFORM_BALAST`]). Две защиты от потери
 /// реальных рёбер: (1) удаляются только рёбра с `callee_proc_key IS NULL` —
 /// резолвленные в реальную процедуру сохраняются; (2) имя, экспортное где-либо
-/// в конфигурации, не трогается вовсе (адаптивно к УТ/БП/ЗУП). `file_scope=
+/// в конфигурации, не трогается вовсе (адаптивно к размеру конфигурации). `file_scope=
 /// Some(rel)` ограничивает удаление рёбрами одного файла (инкремент), `None` —
 /// весь граф (полный пересбор).
 fn prune_platform_balast(conn: &rusqlite::Connection, file_scope: Option<&str>) -> Result<()> {
@@ -1979,7 +1992,7 @@ fn remerge_object(
     // metadata_modules симметрично: пересобрать модули объекта по оставшимся
     // копиям (DELETE + обход .bsl во всех roots). Без этого config_version
     // модулей формы заимствователя устаревал бы при уходе — расхождение с полным
-    // reindex, пойман федеративным smoke на УТ 11.5.
+    // reindex, пойман федеративным smoke на типовой торговой конфигурации.
     update_metadata_modules_for_object(repo_root, conn, roots, &xml_path, cfgver_cache)?;
     Ok(())
 }
@@ -3720,7 +3733,7 @@ fn update_metadata_module_for_file(
 /// `update_data_links_for_object`: при уходе заимствователя опись расширения
 /// обнуляется, но `.bsl`-модули форм физически на месте — пофайловый путь их не
 /// трогает, и `config_version` устаревал бы (расхождение с полным reindex,
-/// пойман федеративным smoke на УТ 11.5). Здесь модули приводятся к свежей описи.
+/// пойман федеративным smoke на типовой торговой конфигурации). Здесь модули приводятся к свежей описи.
 fn update_metadata_modules_for_object(
     repo_root: &Path,
     conn: &rusqlite::Connection,
@@ -6307,7 +6320,7 @@ mod tests {
         // remerge_object не трогал metadata_modules → строка модуля EF_A
         // (со своим config_version) остаётся, расходясь с полным reindex, где
         // модуль-сирота отсеивается (owner XML удалён). Фикс: remerge пере-собирает
-        // модули объекта (DELETE + обход roots). Пойман федеративным smoke на УТ 11.5.
+        // модули объекта (DELETE + обход roots). Пойман федеративным smoke на типовой торговой конфигурации.
         fn write_repo(repo: &Path) {
             write(
                 &repo.join("base").join("Configuration.xml"),
