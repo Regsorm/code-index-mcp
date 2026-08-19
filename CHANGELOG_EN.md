@@ -5,6 +5,38 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.56.0] — 2026-08-19
+
+**The data-links walk no longer depends on the number of paths: «what references this object» at depth 4 now answers in a fraction of a second instead of 42.9 s. A time cut-off appeared — there was none at all before, and a pooled connection stayed busy for all those seconds. Edges now arrive as a page, with per-kind link counts alongside.**
+
+> Context. The second half of the same review finding. The right kind of walk was sitting in the neighbouring file: path search over the same graph has long used breadth-first search with a visited set, and its comment says exactly why — on the cyclic 1C link graph there are millions of paths. Two adjacent tools walked the same data in fundamentally different ways.
+
+### Fixed
+
+- **The walk enumerated paths, not nodes.** The recursive query expanded every reachable path in full: on a central catalog the «what references it» direction took 0.0 s at depth 1, 2.6 s at depth 3 and 42.9 s at depth 4 — and the total-edge count ran the very same walk a second time. The walk was rewritten as breadth-first search with a visited set: every object is expanded exactly once, so the cost is set by the size of the reachable subgraph rather than by the number of paths through it. Measured afterwards: fractions of a second at every depth, the fourth included.
+- **There was no time cut-off.** Arbitrary SQL and the object passport have had one for a long time; data links did not, and a pooled connection was held for the entire walk. Now the walk checks the clock between steps (8 seconds) and an interrupt covers a single slow query inside a step; whatever was collected is returned with a `walk_stopped_by_time` flag instead of being lost.
+- **Terminal-node pruning was asymmetric.** Generalized references (`*CatalogRef`, `*AnyRef`, `*DefinedType.X`) were left unexpanded only in the outbound direction. In the new scheme terminal nodes are not expanded by the very structure of the walk, identically both ways.
+
+### Added
+
+- **Edge pages sized by the response budget** (`offset`): an edge-count cap alone never prevented overflow — a thousand edges is around 540 KB. Companion fields `<dir>_shown` / `_total` / `_offset` / `_has_more` and a ready-to-copy next call come along.
+- **Per-kind link counts** (`<dir>_by_kind`) in every response. The hint offers not only the next page but the cheaper route — narrow the query by link kind: attributes, register dimensions, postings, ownership.
+- **An honest partial-count flag.** At depth 1 the total edge count comes from an exact indexed count. Deeper, if the walk hit the cap or the deadline, the number is marked `<dir>_total_partial` — passing off what was collected as the whole would make the reader believe they see the entire graph.
+- **An edge cap on the walk itself** and **budget splitting** between directions for `direction=both`: otherwise the first direction consumed the whole budget and the second came back empty.
+- **A per-call response budget** (`max_response_bytes`).
+
+### Compatibility
+
+- The former `<dir>_truncated` flag is kept and means the same thing.
+- `<dir>_total` may be partial beyond depth 1 — an explicit flag sits next to it. At depth 1 the number is exact, as before.
+- The database schema is unchanged and no reindex is needed.
+
+### Testing
+
+- **Unit tests:** `cargo test --workspace` — 731 passed, 0 failed (was 723). New ones cover: a closed cycle in the graph (the walk does not loop), a terminal generalized reference, the depth limit, the reverse direction, an expired deadline, the edge cap, the exact count at depth 1 and the partial-count marking deeper.
+- **Live smoke** on a typical trade configuration: the «what references it» direction — 0.0–0.1 s at depths 1–4 versus the former 42.9 s at depth 4; 561 edges collected over 4 pages; counts across eight link kinds; both directions at once with the budget split.
+- **Federated smoke** on a remote base of the node: the most connected catalog at depth 2 — 0.0 s.
+
 ## [0.55.0] — 2026-08-19
 
 **A heavy response no longer breaks off silently: instead of a dropped section you get a listing with names and counts, and a ready-to-copy next call leads to the content. Large sections are now fetched page by page — enumeration values running into hundreds became reachable for the first time.**
