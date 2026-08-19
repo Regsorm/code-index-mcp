@@ -14,82 +14,6 @@ use crate::indexer::Indexer;
 use crate::storage::memory::StorageConfig;
 use crate::storage::Storage;
 
-/// Извлечь `daemon_cfg.tools.enabled` из конфига по пути (для моно-ветки
-/// `Commands::Serve`, где `build_repo_entries` загружает конфиг внутри себя
-/// и не возвращает его наружу). При ошибке чтения возвращает пустой Vec —
-/// сама ошибка станет видна в логах `build_repo_entries`, дублировать её
-/// здесь не нужно. Если `config` is `None` (моно с `--path` без `--config`),
-/// тоже пустой Vec — whitelist не задан, фильтр выключен.
-///
-/// Дальнейшая логика (логи, warning о опечатках, установка whitelist) живёт
-/// в [`CodeIndexServer::apply_tools_whitelist`].
-fn tools_whitelist_from_daemon_cfg(config: Option<&Path>) -> Vec<String> {
-    config
-        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
-        .map(|cfg| cfg.tools.enabled)
-        .unwrap_or_default()
-}
-
-/// Извлечь `daemon_cfg.mcp.mass_mode_tools` (моно-ветка `Commands::Serve`, где
-/// `build_repo_entries` грузит конфиг внутри и наружу не отдаёт). При ошибке
-/// чтения — пустой Vec, то есть массовый режим выключен у всех (дефолт).
-/// Дальнейшая логика — в [`CodeIndexServer::apply_mass_mode_tools`].
-fn mass_mode_tools_from_daemon_cfg(config: Option<&Path>) -> Vec<String> {
-    config
-        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
-        .map(|cfg| cfg.mcp.mass_mode_tools)
-        .unwrap_or_default()
-}
-
-/// Извлечь `daemon_cfg.mcp.dedup_enabled` (моно-ветка). При ошибке чтения —
-/// `true`, то есть дефолт секции `[mcp]`: сессионный отсев повторной выдачи
-/// включён. Дальнейшая логика — в [`CodeIndexServer::apply_dedup_enabled`].
-fn dedup_enabled_from_daemon_cfg(config: Option<&Path>) -> bool {
-    config
-        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
-        .map(|cfg| cfg.mcp.dedup_enabled)
-        .unwrap_or(true)
-}
-
-/// Извлечь `daemon_cfg.cap.max_response_bytes` (моно-ветка). `None` при ошибке
-/// чтения/отсутствии секции → страж `mcp::cap` работает на дефолтном бюджете.
-fn response_cap_from_daemon_cfg(config: Option<&Path>) -> Option<usize> {
-    config
-        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
-        .and_then(|cfg| cfg.cap.max_response_bytes)
-}
-
-/// Извлечь `daemon_cfg.cap.max_response_bytes_hard` (моно-ветка). `None` →
-/// потолок запрашиваемого бюджета на дефолте (`cap::DEFAULT_MAX_RESPONSE_BYTES_HARD`).
-fn response_cap_hard_from_daemon_cfg(config: Option<&Path>) -> Option<usize> {
-    config
-        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
-        .and_then(|cfg| cfg.cap.max_response_bytes_hard)
-}
-
-/// Извлечь `daemon_cfg.cap.max_function_body_chars` (моно-ветка). `None` →
-/// порог тела функции/класса на дефолте (`cap::DEFAULT_MAX_FUNCTION_BODY_CHARS`).
-fn function_body_cap_from_daemon_cfg(config: Option<&Path>) -> Option<usize> {
-    config
-        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
-        .and_then(|cfg| cfg.cap.max_function_body_chars)
-}
-
-/// Извлечь `daemon_cfg.cap.cap_tools` (моно-ветка). Пусто → дефолтный набор cap.
-fn cap_tools_from_daemon_cfg(config: Option<&Path>) -> Vec<String> {
-    config
-        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
-        .map(|cfg| cfg.cap.cap_tools)
-        .unwrap_or_default()
-}
-
-/// Извлечь `daemon_cfg.cap.cap_enabled` (моно-ветка). None → дефолт (cap включён).
-fn cap_enabled_from_daemon_cfg(config: Option<&Path>) -> Option<bool> {
-    config
-        .and_then(|p| crate::daemon_core::config::load_from(p).ok())
-        .and_then(|cfg| cfg.cap.cap_enabled)
-}
-
 #[derive(Parser)]
 #[command(name = "code-index", version, about = "Высокопроизводительный индексатор кода с MCP-протоколом")]
 struct Cli {
@@ -983,19 +907,37 @@ async fn cmd_serve(
         }
         None => CodeIndexServer::open_readonly_multi(entries)?,
     };
-    // Whitelist tools из daemon.toml [tools].enabled. В моно-ветке
-    // конфиг нужно отдельно загрузить — `build_repo_entries` его
-    // внутри парсит, но наружу не отдаёт. При `--path` без `--config`
-    // helper вернёт пустой список → фильтр выключен.
-    let server = server
-        .apply_tools_whitelist(&tools_whitelist_from_daemon_cfg(config.as_deref()))
-        .apply_mass_mode_tools(&mass_mode_tools_from_daemon_cfg(config.as_deref()))
-        .apply_dedup_enabled(dedup_enabled_from_daemon_cfg(config.as_deref()));
-    crate::mcp::cap::set_response_cap(response_cap_from_daemon_cfg(config.as_deref()));
-    crate::mcp::cap::set_response_cap_hard(response_cap_hard_from_daemon_cfg(config.as_deref()));
-    crate::mcp::cap::set_function_body_cap(function_body_cap_from_daemon_cfg(config.as_deref()));
-    crate::mcp::cap::set_cap_tools(Some(cap_tools_from_daemon_cfg(config.as_deref())));
-    crate::mcp::cap::set_cap_enabled(cap_enabled_from_daemon_cfg(config.as_deref()));
+    // Настройки из daemon.toml: перечень разрешённых инструментов, массовый
+    // режим, отсев повторной выдачи и четыре параметра стража размера ответа.
+    //
+    // Конфигурация читается ОДИН раз, и ошибка разбора наружу, а не в дефолт.
+    // Раньше её тянули восемь отдельных функций, каждая своим чтением файла и
+    // каждая молча подставляла свой дефолт при ошибке: с `--path` разбор
+    // конфигурации больше никто не проверял, и сервер поднимался на полных
+    // дефолтах — заданный перечень инструментов и лимиты ответа не действовали,
+    // а в журнале об этом не было ни слова (C-1). Без `--config` дефолты
+    // остаются штатным поведением.
+    let daemon_cfg = match config.as_deref() {
+        Some(p) => Some(
+            crate::daemon_core::config::load_from(p)
+                .map_err(|e| anyhow::anyhow!("чтение конфигурации {}: {}", p.display(), e))?,
+        ),
+        None => None,
+    };
+    let server = match &daemon_cfg {
+        Some(cfg) => server
+            .apply_tools_whitelist(&cfg.tools.enabled)
+            .apply_mass_mode_tools(&cfg.mcp.mass_mode_tools)
+            .apply_dedup_enabled(cfg.mcp.dedup_enabled),
+        None => server,
+    };
+    if let Some(cfg) = &daemon_cfg {
+        crate::mcp::cap::set_response_cap(cfg.cap.max_response_bytes);
+        crate::mcp::cap::set_response_cap_hard(cfg.cap.max_response_bytes_hard);
+        crate::mcp::cap::set_function_body_cap(cfg.cap.max_function_body_chars);
+        crate::mcp::cap::set_cap_tools(Some(cfg.cap.cap_tools.clone()));
+        crate::mcp::cap::set_cap_enabled(cfg.cap.cap_enabled);
+    }
     let bind_host = host.unwrap_or_else(|| "127.0.0.1".to_string());
 
     // Если запуск с --config — подписываемся на изменения daemon.toml,
@@ -1343,8 +1285,15 @@ fn cmd_clean(path: String) -> anyhow::Result<()> {
     let files = storage.get_all_files()?;
     let total = files.len();
     let mut deleted = 0usize;
+    let mut unreachable = 0usize;
 
-    // 4. Для каждого файла проверить существование на диске
+    // 4. Для каждого файла проверить существование на диске.
+    //    Удаляем ТОЛЬКО при явном «нет такого файла». Обычная проверка
+    //    существования отвечает «нет» на любую ошибку — в том числе «доступ
+    //    запрещён», «файл занят другим процессом», «том отвалился», — и тогда
+    //    очистка выбрасывает из индекса живые записи, а вернутся они лишь
+    //    полной переиндексацией. Тот же разбор ошибки, что у наблюдателя
+    //    файлов (S-5): единый ответ на один вопрос.
     for file in files {
         // Путь в индексе может быть абсолютным или относительным от корня проекта
         let on_disk = if std::path::Path::new(&file.path).is_absolute() {
@@ -1353,20 +1302,39 @@ fn cmd_clean(path: String) -> anyhow::Result<()> {
             project_root.join(&file.path)
         };
 
-        if !on_disk.exists() {
-            if let Some(id) = file.id {
-                storage.delete_file(id)?;
-                deleted += 1;
-                println!("  Удалён: {}", file.path);
-            }
+        let err = std::fs::symlink_metadata(&on_disk).err();
+        if err.is_none() {
+            continue; // файл на месте
+        }
+        if !crate::watcher::is_real_deletion(err.as_ref()) {
+            unreachable += 1;
+            tracing::warn!(
+                "clean: {} недоступен ({}) — запись оставлена в индексе",
+                file.path,
+                err.as_ref().map(|e| e.to_string()).unwrap_or_default()
+            );
+            continue;
+        }
+        if let Some(id) = file.id {
+            storage.delete_file(id)?;
+            deleted += 1;
+            println!("  Удалён: {}", file.path);
         }
     }
 
-    // 5. Итог
+    // 5. Итог. Про недоступные файлы говорим прямо: молчание здесь читалось бы
+    //    как «проверено всё», а проверить их как раз не удалось.
     println!(
         "Очистка завершена: проверено {} файлов, удалено {} записей.",
         total, deleted
     );
+    if unreachable > 0 {
+        println!(
+            "  Не удалось проверить {} файл(ов) (нет доступа, файл занят или том недоступен) — \
+             их записи оставлены. Повторите очистку, когда путь снова будет доступен.",
+            unreachable
+        );
+    }
     Ok(())
 }
 

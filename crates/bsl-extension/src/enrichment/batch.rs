@@ -74,6 +74,9 @@ pub async fn run(
     client: Arc<dyn ChatClient>,
     opts: &RunOptions,
 ) -> Result<EnrichmentStats> {
+    // Состояние подписи ДО прогона: от него зависит, можно ли записать новую
+    // (см. решение в конце функции).
+    let signature_before = super::signature::check_signature(storage.conn(), &opts.signature)?;
     let candidates = collect_candidates(storage, opts.reenrich, opts.limit)?;
     let total = candidates.len();
     if total == 0 {
@@ -143,8 +146,42 @@ pub async fn run(
         }
     }
 
-    super::signature::write_signature(storage.conn(), &opts.signature)
-        .context("не удалось обновить enrichment_signature")?;
+    // Подпись означает «вся база обогащена ЭТОЙ моделью», поэтому пишем её
+    // только когда это правда. Прежде она записывалась в конце любого прогона:
+    // достаточно было пробного обогащения сотни процедур новой моделью, чтобы
+    // признак рассинхронизации исчез, и следующая сверка сказала «совпадает»
+    // при смеси двух моделей в базе (C-3).
+    //
+    // Условия записи:
+    //   * прогон не урезан (`limit` не задан) — иначе охвачены не все;
+    //   * не было отказов — иначе часть процедур осталась без термов этой модели;
+    //   * прежняя подпись отсутствовала либо совпадала, а при расхождении —
+    //     только с полным переобогащением (`reenrich`), как и требует описание
+    //     сверки: при расхождении решает человек.
+    // Пустые ответы модели записи не мешают: это состоявшийся результат, смеси
+    // моделей он не создаёт.
+    let mismatch_without_reenrich = matches!(
+        signature_before,
+        super::signature::SignatureCheck::Mismatch { .. }
+    ) && !opts.reenrich;
+    let full_run = opts.limit.is_none() && stats.failed == 0;
+    if full_run && !mismatch_without_reenrich {
+        super::signature::write_signature(storage.conn(), &opts.signature)
+            .context("не удалось обновить enrichment_signature")?;
+    } else {
+        let reason = if mismatch_without_reenrich {
+            "в базе термы другой модели, а прогон без --reenrich"
+        } else if opts.limit.is_some() {
+            "прогон был ограничен по числу процедур"
+        } else {
+            "часть процедур завершилась отказом"
+        };
+        tracing::warn!(
+            "enrichment: подпись НЕ обновлена ({}). Она означает «вся база обогащена \
+             этой моделью» — записывать её сейчас значило бы скрыть рассинхронизацию.",
+            reason
+        );
+    }
 
     tracing::info!(
         "enrichment: готово — written={}, empty={}, failed={}",
@@ -315,6 +352,92 @@ mod tests {
 
         // Mock-клиент должен был быть вызван ровно один раз.
         assert_eq!(client.calls.lock().unwrap().len(), 1);
+    }
+
+    /// C-3: подпись означает «вся база обогащена этой моделью». Урезанный по
+    /// числу процедур прогон такого не даёт — записать подпись значило бы
+    /// скрыть рассинхронизацию от следующей сверки.
+    #[tokio::test]
+    async fn limited_run_does_not_write_signature() {
+        let tmp = TempDir::new().unwrap();
+        let mut storage = open_storage_with_bsl_function(&tmp, "A.bsl", "П", "// тело");
+
+        let client = Arc::new(MockChatClient::with_responses([Ok("термы".to_string())]));
+        let opts = RunOptions {
+            prompt_template: "sys".to_string(),
+            signature: "новая-модель".to_string(),
+            limit: Some(1), // <-- прогон урезан
+            reenrich: false,
+            batch_size: 4,
+        };
+        let stats = run(&mut storage, client, &opts).await.unwrap();
+        assert_eq!(stats.written, 1, "термы записаны как обычно");
+        assert_eq!(
+            super::super::signature::read_signature(storage.conn()).unwrap(),
+            None,
+            "подпись после урезанного прогона не пишется"
+        );
+    }
+
+    /// C-3: прогон с отказами тоже не даёт права записать подпись — часть
+    /// процедур осталась без термов этой модели.
+    #[tokio::test]
+    async fn failed_run_does_not_write_signature() {
+        let tmp = TempDir::new().unwrap();
+        let mut storage = open_storage_with_bsl_function(&tmp, "A.bsl", "П", "// тело");
+
+        let client = Arc::new(MockChatClient::with_responses([Err(anyhow::anyhow!("сеть"))]));
+        let opts = RunOptions {
+            prompt_template: "sys".to_string(),
+            signature: "новая-модель".to_string(),
+            limit: None,
+            reenrich: false,
+            batch_size: 4,
+        };
+        let stats = run(&mut storage, client, &opts).await.unwrap();
+        assert_eq!(stats.failed, 1);
+        assert_eq!(
+            super::super::signature::read_signature(storage.conn()).unwrap(),
+            None,
+            "после отказов подпись не пишется"
+        );
+    }
+
+    /// C-3: в базе термы прежней модели. Без полного переобогащения запись
+    /// новой подписи стёрла бы признак расхождения — решать должен человек.
+    #[tokio::test]
+    async fn mismatch_without_reenrich_keeps_stored_signature() {
+        let tmp = TempDir::new().unwrap();
+        let mut storage = open_storage_with_bsl_function(&tmp, "A.bsl", "П", "// тело");
+        super::super::signature::write_signature(storage.conn(), "старая-модель").unwrap();
+
+        let client = Arc::new(MockChatClient::with_responses([Ok("термы".to_string())]));
+        let opts = RunOptions {
+            prompt_template: "sys".to_string(),
+            signature: "новая-модель".to_string(),
+            limit: None,
+            reenrich: false, // <-- расхождение без переобогащения
+            batch_size: 4,
+        };
+        run(&mut storage, client, &opts).await.unwrap();
+        assert_eq!(
+            super::super::signature::read_signature(storage.conn())
+                .unwrap()
+                .as_deref(),
+            Some("старая-модель"),
+            "прежняя подпись сохраняется, расхождение остаётся видимым"
+        );
+
+        // С полным переобогащением — подпись обновляется.
+        let client = Arc::new(MockChatClient::with_responses([Ok("термы".to_string())]));
+        let opts = RunOptions { reenrich: true, ..opts };
+        run(&mut storage, client, &opts).await.unwrap();
+        assert_eq!(
+            super::super::signature::read_signature(storage.conn())
+                .unwrap()
+                .as_deref(),
+            Some("новая-модель")
+        );
     }
 
     #[tokio::test]

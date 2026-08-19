@@ -72,7 +72,11 @@ fn build_file_matcher(patterns: &[String]) -> GlobSet {
 /// Вынесено отдельной функцией ради модульного теста: реальную временную
 /// недоступность (проверка антивирусом, момент перемещения) в тесте не
 /// воспроизвести.
-fn is_real_deletion(err: Option<&std::io::Error>) -> bool {
+///
+/// Видна всему крейту: тем же вопросом задаётся ветка очистки индекса
+/// (`cli::cmd_clean`), и ответ обязан быть одинаковым — иначе одна часть
+/// программы бережёт живую запись, а другая её выбрасывает.
+pub(crate) fn is_real_deletion(err: Option<&std::io::Error>) -> bool {
     match err {
         None => false,
         Some(e) => e.kind() == std::io::ErrorKind::NotFound,
