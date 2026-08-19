@@ -33,7 +33,7 @@ Versioning — [SemVer](https://semver.org/).
 
 ### Testing
 
-- **Unit tests:** `cargo test --workspace` — 731 passed, 0 failed (was 723). New ones cover: a closed cycle in the graph (the walk does not loop), a terminal generalized reference, the depth limit, the reverse direction, an expired deadline, the edge cap, the exact count at depth 1 and the partial-count marking deeper.
+- **Unit tests:** `cargo test --workspace` — 730 passed, 0 failed (was 723). New ones cover: a closed cycle in the graph (the walk does not loop), a terminal generalized reference, the depth limit, the reverse direction, an expired deadline, the edge cap, the exact count at depth 1 and the partial-count marking deeper.
 - **Live smoke** on a typical trade configuration: the «what references it» direction — 0.0–0.1 s at depths 1–4 versus the former 42.9 s at depth 4; 561 edges collected over 4 pages; counts across eight link kinds; both directions at once with the budget split.
 - **Federated smoke** on a remote base of the node: the most connected catalog at depth 2 — 0.0 s.
 
