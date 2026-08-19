@@ -191,10 +191,10 @@ Portable layout: one folder for everything (binary + config + runtime files). Po
    max_concurrent_initial = 1     # folders processed sequentially during initial indexing
 
    [[paths]]
-   path = "C:\\RepoUT"
+   path = "C:\\Repo1C"
 
    [[paths]]
-   path = "C:\\RepoBP_1"
+   path = "C:\\Repo1C-2"
    debounce_ms = 500              # per-folder override: react faster than the default 1500 ms
    batch_ms    = 1000
    ```
@@ -335,7 +335,7 @@ Starting with v0.8.0, code-file content is stored in the `file_contents` table (
 max_code_file_size_bytes = 5242880   # 5 MB global override
 
 [[paths]]
-path = "C:/RepoUT"
+path = "C:/Repo1C"
 max_code_file_size_bytes = 10485760  # 10 MB for this repo only
 ```
 
@@ -561,7 +561,7 @@ The daemon resolves these values in this order (first match wins):
 1. **Per-folder override in `daemon.toml`:**
    ```toml
    [[paths]]
-   path = "C:/RepoBP_1"
+   path = "C:/Repo1C-2"
    debounce_ms = 500      # react in ~0.6 s instead of ~1.6 s
    batch_ms    = 1000
    ```

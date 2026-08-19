@@ -227,11 +227,11 @@ mod tests {
     #[test]
     fn daemon_alias_resolved_via_effective_alias() {
         // PathEntry без явного alias — `effective_alias` берёт последний сегмент пути.
-        let s = serve("127.0.0.1", vec![("repout", "127.0.0.1")]);
-        let d = daemon(vec![("/tmp/RepoUT", "")]);
+        let s = serve("127.0.0.1", vec![("repo1c", "127.0.0.1")]);
+        let d = daemon(vec![("/tmp/Repo1C", "")]);
         let merged = merge(&s, &d).unwrap();
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].alias, "repout");
+        assert_eq!(merged[0].alias, "repo1c");
         assert!(merged[0].is_local);
     }
 

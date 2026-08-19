@@ -193,10 +193,10 @@ cargo build --release -p bsl-indexer --features enrichment   # дополнит�
    max_concurrent_initial = 1     # папки обрабатываются последовательно при initial reindex
 
    [[paths]]
-   path = "C:\\RepoUT"
+   path = "C:\\Repo1C"
 
    [[paths]]
-   path = "C:\\RepoBP_1"
+   path = "C:\\Repo1C-2"
    debounce_ms = 500              # per-папка переопределение: быстрее чем дефолт 1500 мс
    batch_ms    = 1000
    ```
@@ -337,7 +337,7 @@ code-index serve --transport http --port 8011 --config /etc/code-index/daemon.to
 max_code_file_size_bytes = 5242880   # 5 МБ, глобальный override
 
 [[paths]]
-path = "C:/RepoUT"
+path = "C:/Repo1C"
 max_code_file_size_bytes = 10485760  # только для этого репо — 10 МБ
 ```
 
@@ -565,7 +565,7 @@ code-index get-file-summary "src/auth/login.py" --path /my/project
 1. **Переопределение per-папка в `daemon.toml`:**
    ```toml
    [[paths]]
-   path = "C:/RepoBP_1"
+   path = "C:/Repo1C-2"
    debounce_ms = 500      # реакция ~0.6 с вместо ~1.6 с
    batch_ms    = 1000
    ```

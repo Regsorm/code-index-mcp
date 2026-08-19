@@ -451,7 +451,7 @@ CREATE INDEX idx_pcg_callee ON proc_call_graph(repo, callee_proc_name);
 1. Парсер `Configuration.xml` → metadata_objects.
 2. Парсер `Forms/*.xml` → metadata_forms.
 3. Парсер `EventSubscriptions/*.xml` → event_subscriptions.
-4. Тест на `RepoUT`: проверить что количество объектов сравнимо с тем что в текущем Postgres pg_indexer.
+4. Тест на `Repo1C`: проверить что количество объектов сравнимо с тем что в текущем Postgres pg_indexer.
 
 ### Этап 4: Граф вызовов
 
@@ -583,7 +583,7 @@ INFO Состав активных языков изменился: ["bsl","pyth
 ## Связанные карточки в памяти
 
 - rag-query [259] — общий план миграции MCP-стека на VM RAG, рефакторинг bsl-agent-индексера. Включает обоснование sqlite-vec vs pgvector, hybrid embed strategy, отказ от чанков.
-- rag-query [258] — креды GitLab oshisha.tech (для git pull репо 1С на VM RAG).
+- rag-query [258] — креды GitLab внутренний GitLab (для git pull репо 1С на VM RAG).
 - rag-query [252] — bsl-platform-context удалён (не путать с bsl-extension в этом ТЗ — это разные системы).
 - claude-note-db: знания про cnotedb embed-архитектуру (sqlite-vec, multilingual-e5-large, embed_server pattern на :8079).
 

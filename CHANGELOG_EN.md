@@ -381,9 +381,9 @@ Verification levels are listed separately — "tested" without saying at which l
 ### Testing
 
 - `cargo test --workspace` — 614 passed, 0 failed, 0 warnings.
-- **Before/after data verification — the key check.** The 1C base (`RepoUT-test`, 57,060 files) was indexed by both binaries and all 20 index tables compared: **0 discrepancies**, including `metadata_code_usages` (280,449), `proc_call_graph` (593,514), `data_links` (64,764), `procedure_enrichment` (261,487). On the PHP site the symbol counters matched as well (168,024 functions, 1,458,420 calls), the zstd blob signature is intact and full-text search works.
+- **Before/after data verification — the key check.** The 1C base (`Repo1C-test`, 57,060 files) was indexed by both binaries and all 20 index tables compared: **0 discrepancies**, including `metadata_code_usages` (280,449), `proc_call_graph` (593,514), `data_links` (64,764), `procedure_enrichment` (261,487). On the PHP site the symbol counters matched as well (168,024 functions, 1,458,420 calls), the zstd blob signature is intact and full-text search works.
 - Live smoke of the BSL tools on the re-indexed base: object structure, data links (109 edges for `Document.ЗаказКлиента`), impact map (3,801 code usages for `Catalog.Номенклатура`), term search, read-only SQL.
-- Federated rollout: `bsl-indexer:0.47.0` image on the rag VM, both containers `healthy`; re-index of the `wms` base with the new binary — 20 tables compared, 0 discrepancies; smoke over federation against five VM bases (`bp-ss`, `ut`, `zup`, `bp-tdk`, `bp-sonic`).
+- Federated rollout: `bsl-indexer:0.47.0` image on the rag VM, both containers `healthy`; re-index of one base with the new binary — 20 tables compared, 0 discrepancies; smoke over federation against five node bases.
 - Local node — 51 repositories `ready`, MCP reports version 0.47.0.
 
 ### Compatibility
@@ -463,7 +463,7 @@ Verification levels are listed separately — "tested" without saying at which l
 
 - `cargo test --workspace` — 577 passed, 0 failed.
 - Local (`ut-test`, 57,060 files, `index --force` on a clean DB, 65 s): `Document.ЗаказКлиента` has exactly 7 fields with `indexing` — matches the XML (7 `Index` tags, 150 `DontIndex` not written); across the base — 891 objects with `Index`, 64 with `IndexWithAdditionalOrder`.
-- Federated rollout: reindex of all six VM bases (`ut`, `bp-ss`, `bp-tdk`, `zup`, `wms`, `bp-sonic`), `rc=0` each; the acceptance query on `ut` and `get_object_structure` over federation both return `indexing`.
+- Federated rollout: reindex of all six node bases, `rc=0` each; the acceptance query and `get_object_structure` over federation both return `indexing`.
 - The loop was verified empirically after the fix: start — 1 re-read, two real file edits — +2, two file reads — +0 (was: continuous, every 500 ms).
 
 ### Compatibility
@@ -1550,7 +1550,7 @@ The public API signature changes in `daemon_core::worker`/`runner`/`cli` are add
   max_code_file_size_bytes = 5242880   # global override (5 MB)
 
   [[paths]]
-  path = "C:/RepoUT"
+  path = "C:/Repo1C"
   max_code_file_size_bytes = 10485760  # for this repo — 10 MB
   ```
   Priority: per-path → the `[indexer]` section → the 5 MB default. The selection logic is the helper `PathEntry::effective_max_code_file_size(&IndexerSection)`.
@@ -1764,7 +1764,7 @@ A large release: a workspace refactor, the new `bsl-indexer` binary with full 1C
 
 - **Conditional registration on Claude Code 2.1.120** — `tools/list` correctly contains 18 tools (5 BSL + 13 core) when there is a BSL repo in `daemon.toml`, and 13 tools (core only) without one.
 - **`notifications/tools/list_changed` is IGNORED by Claude Code on 2.1.120** — the bug [anthropics/claude-code#13646](https://github.com/anthropics/claude-code/issues/13646) is confirmed empirically. The workaround is a manual `/mcp Reconnect`. Reconnect (issue #33779) on 2.1.120 already re-reads `tools/list` correctly.
-- **The rag VM (Linux, 8 cores, NVMe)** — RepoUT 53.6 s cold cache, 57.7 s warm, a 5 s difference = the disk is not the bottleneck. A parallel indexing of all 4 repos in 3m11s on 8 cores × ~2 rayon cores per process.
+- **The rag VM (Linux, 8 cores, NVMe)** — Repo1C 53.6 s cold cache, 57.7 s warm, a 5 s difference = the disk is not the bottleneck. A parallel indexing of all 4 repos in 3m11s on 8 cores × ~2 rayon cores per process.
 
 ### Documentation
 
@@ -1810,7 +1810,7 @@ A large release: a workspace refactor, the new `bsl-indexer` binary with full 1C
   code-index serve --transport http --port 8011
 
   # Compatible rc5 mode (mono):
-  code-index serve --transport http --port 8011 --path ut=C:/RepoUT
+  code-index serve --transport http --port 8011 --path ut=C:/Repo1C
   ```
 
 - **A pool of reusable HTTP clients** ([`src/federation/client.rs`](src/federation/client.rs)) — one `reqwest::Client` per remote IP, lazy init via `RemoteClientPool::get_or_create`. Timeout 5 s; idle pool 60 s.
@@ -1844,7 +1844,7 @@ A large release: a workspace refactor, the new `bsl-indexer` binary with full 1C
 
   ```bash
   # stdio (per-session, as before)
-  code-index serve --path ut=C:/RepoUT --path bp=C:/RepoBP
+  code-index serve --path ut=C:/Repo1C --path bp=C:/Repo1C-2
 
   # http (shared process)
   code-index serve --transport http --port 8011 --config C:/tools/code-index/daemon.toml
@@ -1914,9 +1914,9 @@ A large release: a workspace refactor, the new `bsl-indexer` binary with full 1C
 
   | Repo | `index.db` | `index.db-wal` (before the fix) |
   |------|-----------|---------------------------|
-  | RepoBP_2 | 4.7 GB | **19 GB** |
-  | RepoUT | 2.1 GB | **17 GB** |
-  | RepoZUP | 5.1 GB | 5.1 GB |
+  | Repo1C-3 | 4.7 GB | **19 GB** |
+  | Repo1C | 2.1 GB | **17 GB** |
+  | Repo1C-4 | 5.1 GB | 5.1 GB |
   | dbgs-debug | 1.4 GB | 1.4 GB |
 
   Free space on the system drive shrank by ~45 GB in a day.

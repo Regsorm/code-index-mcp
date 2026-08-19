@@ -199,12 +199,12 @@ mod normalize_tests {
     use super::normalize_path_key;
     #[test]
     fn extended_prefix_and_separators_and_case() {
-        let a = normalize_path_key(r"\\?\C:\RepoUT-test");
-        let b = normalize_path_key("C:/RepoUT-test");
-        let c = normalize_path_key(r"c:\repout-test\");
+        let a = normalize_path_key(r"\\?\C:\Repo1C-test");
+        let b = normalize_path_key("C:/Repo1C-test");
+        let c = normalize_path_key(r"c:\repo1c-test\");
         assert_eq!(a, b);
         assert_eq!(a, c);
-        assert_eq!(a, r"c:\repout-test");
+        assert_eq!(a, r"c:\repo1c-test");
     }
 }
 

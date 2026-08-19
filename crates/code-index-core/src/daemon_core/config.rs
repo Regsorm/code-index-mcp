@@ -12,10 +12,10 @@
 // max_code_file_size_bytes = 5242880   # глобальный лимит content для code (5 МБ default)
 //
 // [[paths]]
-// path = "C:\\RepoUT"
+// path = "C:\\Repo1C"
 //
 // [[paths]]
-// path = "C:\\RepoBP_1"
+// path = "C:\\Repo1C-2"
 // debounce_ms = 2000                   # опциональное переопределение per-папка
 // max_code_file_size_bytes = 10485760  # этой папке — мягче (10 МБ)
 // ```
@@ -573,7 +573,7 @@ mod tests {
             alias = "widgets"
 
             [[paths]]
-            path = "C:/RepoUT"
+            path = "C:/Repo1C"
         "#;
         let cfg = parse_str(text).unwrap();
         // Явный алиас из TOML.
@@ -581,7 +581,7 @@ mod tests {
         assert_eq!(cfg.paths[0].effective_alias(), "widgets");
         // Без явного алиаса — последний сегмент в нижнем регистре.
         assert_eq!(cfg.paths[1].alias, None);
-        assert_eq!(cfg.paths[1].effective_alias(), "repout");
+        assert_eq!(cfg.paths[1].effective_alias(), "repo1c");
     }
 
     #[test]

@@ -107,8 +107,8 @@ enum Commands {
     /// Без `=` — одиночный репо под alias `default` (старый контракт).
     ///
     /// Примеры:
-    ///   code-index serve --path C:\RepoUT                          # single, alias=default
-    ///   code-index serve --path ut=C:\RepoUT --path bp=C:\RepoBP   # multi, alias=ut/bp
+    ///   code-index serve --path C:\Repo1C                          # single, alias=default
+    ///   code-index serve --path ut=C:\Repo1C --path bp=C:\Repo1C-2   # multi, alias=ut/bp
     Serve {
         /// Корневые директории проектов. Формат: `alias=dir` или просто `dir` (alias="default").
         /// Можно указать несколько раз. Если не указан ни `--path`, ни `--config` —

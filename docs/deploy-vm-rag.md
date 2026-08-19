@@ -75,22 +75,22 @@ http_port = 0  # автовыбор; реальный порт пишется в
 log_level = "info"
 
 [[paths]]
-path = "/home/rag/data/bsl_local/RepoUT"
+path = "/home/rag/data/bsl_local/Repo1C"
 alias = "ut"
 language = "bsl"
 
 [[paths]]
-path = "/home/rag/data/bsl_local/RepoBP_1"
+path = "/home/rag/data/bsl_local/Repo1C-2"
 alias = "bp-1"
 language = "bsl"
 
 [[paths]]
-path = "/home/rag/data/bsl_local/RepoBP_2"
+path = "/home/rag/data/bsl_local/Repo1C-3"
 alias = "bp-2"
 language = "bsl"
 
 [[paths]]
-path = "/home/rag/data/bsl_local/RepoZUP"
+path = "/home/rag/data/bsl_local/Repo1C-4"
 alias = "zup"
 language = "bsl"
 
@@ -122,18 +122,18 @@ sudo chown rag:rag /etc/bsl-indexer/env
 **Не трогаем PostgreSQL pg_indexer'а.** Каждый репо индексируется отдельно, индекс пишется в `<repo>/.code-index/index.db`:
 
 ```bash
-bsl-indexer index /home/rag/data/bsl_local/RepoUT
-bsl-indexer index /home/rag/data/bsl_local/RepoBP_1
-bsl-indexer index /home/rag/data/bsl_local/RepoBP_2
-bsl-indexer index /home/rag/data/bsl_local/RepoZUP
+bsl-indexer index /home/rag/data/bsl_local/Repo1C
+bsl-indexer index /home/rag/data/bsl_local/Repo1C-2
+bsl-indexer index /home/rag/data/bsl_local/Repo1C-3
+bsl-indexer index /home/rag/data/bsl_local/Repo1C-4
 ```
 
-Ожидаемое время (с холодным кешем диска): УТ ~1 мин, БП #1 ~1.5 мин, БП #2 ~1 мин, ЗУП ~1.5-2 мин. Итого 5-7 минут на полный набор.
+Ожидаемое время (с холодным кешем диска): база #1 ~1 мин, #2 ~1.5 мин, #3 ~1 мин, #4 ~1.5-2 мин. Итого 5-7 минут на полный набор.
 
 После завершения — проверка таблиц:
 
 ```bash
-sqlite3 /home/rag/data/bsl_local/RepoUT/.code-index/index.db <<'SQL'
+sqlite3 /home/rag/data/bsl_local/Repo1C/.code-index/index.db <<'SQL'
 .headers on
 .mode column
 SELECT COUNT(*) AS files FROM files;
@@ -197,7 +197,7 @@ sudo systemctl disable --now bsl-indexer-daemon
 * **Размер индекса:** `du -sh /home/rag/data/bsl_local/*/.code-index/`. На УТ-масштаб ожидается ~3-5 ГБ суммарно.
 * **WAL-checkpoint после большой переиндексации:**
   ```bash
-  sqlite3 /home/rag/data/bsl_local/RepoUT/.code-index/index.db \
+  sqlite3 /home/rag/data/bsl_local/Repo1C/.code-index/index.db \
       "PRAGMA wal_checkpoint(TRUNCATE);"
   ```
 * **Обновление при смене кода** — пересборка из той же `code-index/` (через `git pull` ваших исходников или `tar`-копию):

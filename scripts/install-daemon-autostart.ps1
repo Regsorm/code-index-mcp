@@ -77,7 +77,7 @@ log_level = "info"
 
 # Перечислите отслеживаемые папки:
 # [[paths]]
-# path = "C:\\RepoUT"
+# path = "C:\\Repo1C"
 "@ | Out-File -FilePath $cfg -Encoding UTF8
         Write-Host "Создан шаблон конфига: $cfg"
     }

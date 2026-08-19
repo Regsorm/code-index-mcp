@@ -156,7 +156,7 @@ C:/tools/code-index/code-index.exe --help
 cat C:/tools/code-index/daemon.json
 
 # Разовая переиндексация пути:
-C:/tools/code-index/code-index.exe index C:/RepoUT
+C:/tools/code-index/code-index.exe index C:/Repo1C
 ```
 
 **Добавить новый репо:** отредактировать `C:/tools/code-index/daemon.toml` → добавить `[[paths]]` с `path` и опциональным `alias` → перезапустить daemon и serve (см. раздел «Добавление нового репо» выше).
@@ -199,7 +199,7 @@ sqlite3 C:/<repo>/.code-index/index.db "PRAGMA wal_checkpoint(TRUNCATE);"
 max_code_file_size_bytes = 5242880   # глобальный default 5 МБ
 
 [[paths]]
-path = "C:/RepoUT"
+path = "C:/Repo1C"
 max_code_file_size_bytes = 10485760  # per-repo override (10 МБ)
 ```
 Приоритет: per-path → `[indexer]` → hardcoded **5 МБ**. Файлы крупнее лимита получают `oversize=1`, `content_blob=NULL`. AST/FTS/граф вызовов работают как обычно. `read_file` отдаёт `oversize=true` + `hint`. `grep_code` пропускает.
