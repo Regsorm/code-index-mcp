@@ -56,6 +56,7 @@ A compiled Rust binary with **one-writer / many-readers** architecture:
 | Swift | tree-sitter-swift | `.swift` (v0.46.0) |
 | 1C (BSL) | tree-sitter-bsl | `.bsl`, `.os` |
 | XML (1C) | quick-xml | `.xml` (configuration metadata) |
+| 1C:EDT metadata | quick-xml | `.mdo`, `.form`, `.rights` (v0.53.0) |
 | HTML | tree-sitter-html | `.html`, `.htm` (v0.7.1, by user request — see HTML-specific mapping below) |
 
 `.h` is ambiguous between C and C++: it is parsed as C++ when the repository language is `cpp`, otherwise as C. The repository language is taken from `daemon.toml` or auto-detected by the prevailing extension.
