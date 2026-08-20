@@ -593,7 +593,7 @@ reports zero size — the file is being written all along, read its contents.
   "languages": ["python", "javascript", "typescript", "java", "rust", "go", "bsl", "php", "c", "cpp", "csharp", "ruby", "swift", "html"],
   "batch_size": 500,
   "storage_mode": "auto",
-  "memory_max_percent": 25,
+  "memory_max_percent": 50,
   "debounce_ms": 1500,
   "batch_ms": 2000
 }
@@ -601,8 +601,10 @@ reports zero size — the file is being written all along, read its contents.
 
 Key fields:
 
-- **storage_mode** — `auto` selects in-memory or disk SQLite based on available RAM; `memory` forces in-memory; `disk` forces on-disk
-- **memory_max_percent** — maximum percentage of system RAM the in-memory database may use before falling back to disk (used in `auto` mode)
+- **storage_mode** — `auto` decides by calculation (see below); `memory` forces in-memory; `disk` forces on-disk
+- **memory_max_percent** — share of FREE memory the in-memory database may use in `auto` mode (50% by default)
+
+**How `auto` works.** Before indexing, the folder is weighed: the size of the files that will be indexed is summed (metadata only, 1–3 seconds for 60,000 files). Expected memory usage is weight × 3 (multiplier from measurement: a 3.98 GB folder produced 9.8 GB of occupied memory). If that fits the allowed share of free memory at that moment, the database is built in RAM and then flushed to disk; otherwise it goes straight to disk. After working in RAM the freed memory is returned to the system, so the next folder gets it back. The decision is logged with the numbers.
 - **debounce_ms** — milliseconds to wait after a file change before triggering re-indexing (collects burst edits into one pass)
 - **batch_ms** — upper bound on how long the watcher keeps accumulating events after the first one in a batch
 - **batch_size** — number of records per SQLite transaction during indexing (higher = faster bulk inserts, higher peak memory)
