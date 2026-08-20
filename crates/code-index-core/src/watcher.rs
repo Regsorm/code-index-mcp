@@ -283,6 +283,22 @@ pub fn collect_batch(
     pending.into_values().collect()
 }
 
+/// Порция изменений, собранная наблюдателем, вместе с ответом на вопрос
+/// «это всё?».
+///
+/// Различать важно: три файла и три тысячи выглядят одинаково — просто список.
+/// Отличается то, чем закончился сбор. Дождались тишины — список полон, число
+/// файлов точное, сколько бы их ни было. Упёрлись в потолок времени — поток
+/// событий продолжается, и в очереди осталось ещё, то есть число неполное.
+/// Каким путём обрабатывать (пофайлово или полным проходом), решают уже по
+/// самому числу, но только после того, как оно стало точным.
+#[derive(Debug)]
+pub struct Batch {
+    pub events: Vec<FileEvent>,
+    /// `true` — сбор закончился тишиной, список полон.
+    pub settled: bool,
+}
+
 /// Вспомогательная функция: извлечь путь из события
 fn event_path(event: &FileEvent) -> &PathBuf {
     match event {
@@ -304,7 +320,7 @@ pub fn poll_batch(
     idle_ms: u64,
     debounce_ms: u64,
     batch_ms: u64,
-) -> Result<Option<Vec<FileEvent>>, mpsc::RecvError> {
+) -> Result<Option<Batch>, mpsc::RecvError> {
     let mut pending: HashMap<PathBuf, FileEvent> = HashMap::new();
     let debounce = Duration::from_millis(debounce_ms);
     let batch_timeout = Duration::from_millis(batch_ms);
@@ -321,9 +337,13 @@ pub fn poll_batch(
 
     let batch_start = Instant::now();
     let mut last_event = Instant::now();
+    // Дождались тишины (список полон) или упёрлись в потолок времени
+    // (поток событий продолжается, и часть изменений осталась в очереди).
+    let mut settled = true;
 
     loop {
         if batch_start.elapsed() >= batch_timeout {
+            settled = false;
             break;
         }
         let elapsed_since_last = last_event.elapsed();
@@ -342,7 +362,10 @@ pub fn poll_batch(
         }
     }
 
-    Ok(Some(pending.into_values().collect()))
+    Ok(Some(Batch {
+        events: pending.into_values().collect(),
+        settled,
+    }))
 }
 
 #[cfg(test)]

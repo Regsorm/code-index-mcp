@@ -3824,6 +3824,7 @@ mod tests {
         let config = memory::StorageConfig {
             mode: "auto".to_string(),
             memory_max_percent: 25,
+            expected_bytes: 0,
         };
 
         let storage = Storage::open_auto(&db_path, &config)
@@ -3843,6 +3844,7 @@ mod tests {
         let config = memory::StorageConfig {
             mode: "disk".to_string(),
             memory_max_percent: 25,
+            expected_bytes: 0,
         };
 
         let storage = Storage::open_auto(&db_path, &config)
@@ -3867,6 +3869,7 @@ mod tests {
         let config = memory::StorageConfig {
             mode: "memory".to_string(),
             memory_max_percent: 25,
+            expected_bytes: 0,
         };
         let storage = Storage::open_auto(&db_path, &config).unwrap();
         let found = storage.get_file_by_path("/existing.py").unwrap();
@@ -3906,6 +3909,7 @@ mod tests {
         let config = memory::StorageConfig {
             mode: "memory".to_string(),
             memory_max_percent: 25,
+            expected_bytes: 0,
         };
         let storage = Storage::open_auto(&db_path, &config).unwrap();
 

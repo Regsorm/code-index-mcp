@@ -126,12 +126,9 @@ pub(crate) fn update_call_graph_direct_for_file(
     // квадратичную деградацию на bulk-батче: каждый файл заново сканировал весь
     // proc_call_graph и пересобирал tmp-карты общих модулей.
     conn.execute("COMMIT", [])?;
-    tracing::debug!(
-        "call_graph direct per-file {}: old={} new={}",
-        rel,
-        old.len(),
-        new.len()
-    );
+    // Строки на каждый файл здесь нет намеренно: на пачке в тысячи файлов она
+    // раздувает журнал и ничего не добавляет — по ней всё равно смотрят итог
+    // по пачке, а он печатается после цикла («граф вызовов, пофайловая часть»).
     Ok(())
 }
 
@@ -366,10 +363,16 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     // ── этап 4e + 4e-D + 4e-prune: резолв callee_proc_key + отсев балласта ──
     // Общий с инкрементом хелпер: run_incremental_extras зовёт его же ОДИН раз
     // после пофайловой вставки рёбер батча → идентичность full↔incremental.
-    resolve_and_prune_direct_edges(conn)?;
+    resolve_and_prune_direct_edges(conn, EdgeScope::All)?;
 
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        (direct_count + subscription_count + form_count + override_count) as u64,
+        "ребро",
+        "ребра",
+        "рёбер",
+    ));
     tracing::info!(
         "proc_call_graph: {} direct + {} subscription + {} form_event + {} extension_override ребер",
         direct_count,
@@ -393,11 +396,99 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
 /// Трогает ТОЛЬКО рёбра с `callee_proc_key IS NULL` → идемпотентен: результат
 /// идентичен при вызове из `build_call_graph` (после полной вставки рёбер) и из
 /// `run_incremental_extras` (после пофайловой вставки рёбер батча).
-pub(crate) fn resolve_and_prune_direct_edges(conn: &rusqlite::Connection) -> Result<()> {
-    resolve_direct_callee_keys(conn)?;
-    resolve_callee_keys_by_manager(conn, None)?;
-    prune_platform_balast(conn, None)?;
-    prune_object_method_calls(conn, None)?;
+pub(crate) fn resolve_and_prune_direct_edges(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+) -> Result<()> {
+    // При полном пересборе справочник экспортных процедур собирается заново:
+    // все процедуры конфигурации тут и так читаются. При точечном обновлении
+    // он уже актуален — его ведёт пофайловый путь.
+    if scope == EdgeScope::All {
+        let t = std::time::Instant::now();
+        let n = rebuild_exported_procs(conn)?;
+        tracing::debug!(
+            "справочник экспортных процедур: {} строк за {} мс",
+            n,
+            t.elapsed().as_millis()
+        );
+    }
+    // Времена шагов — на уровне отладки: по общей строке «граф вызовов» не
+    // видно, какой именно шаг сколько занял.
+    let t = std::time::Instant::now();
+    resolve_direct_callee_keys(conn, scope)?;
+    tracing::debug!("резолв: локальные и экспортные адреса — {} мс", t.elapsed().as_millis());
+    let t = std::time::Instant::now();
+    resolve_callee_keys_by_manager(conn, scope)?;
+    tracing::debug!("резолв: адреса через менеджеры — {} мс", t.elapsed().as_millis());
+    let t = std::time::Instant::now();
+    prune_platform_balast(conn, scope)?;
+    tracing::debug!("отсев: платформенный балласт — {} мс", t.elapsed().as_millis());
+    let t = std::time::Instant::now();
+    prune_object_method_calls(conn, scope)?;
+    tracing::debug!("отсев: вызовы методов объектов — {} мс", t.elapsed().as_millis());
+    Ok(())
+}
+
+/// Область резолва: весь граф или только рёбра файлов текущего пакета.
+///
+/// Рёбра, которые не удалось адресовать однозначно, остаются с пустым адресом
+/// навсегда (неоднозначные и платформенные вызовы) — поэтому проход «по всем
+/// неадресованным рёбрам» на большой конфигурации каждый раз перебирает одно и
+/// то же. При точечном обновлении трогаем только рёбра изменённых файлов.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EdgeScope {
+    /// Весь граф репозитория (полный пересбор).
+    All,
+    /// Только файлы пакета — их пути лежат во временной таблице
+    /// `tmp_pcg_scope`, которую готовит [`create_batch_scope`].
+    Batch,
+}
+
+impl EdgeScope {
+    /// Добавка к условию `WHERE`, ограничивающая рёбра файлами пакета.
+    ///
+    /// Сравнение идёт по равенству целого ключа вызывателя, а не по отрезанию
+    /// пути из него: `substr(...)` от индексированного столбца индексом не
+    /// пользуется, и просмотр шёл бы по всему графу — ровно то, от чего мы тут
+    /// уходим (замер: 6,3 с на пакете из трёх файлов).
+    fn clause(self) -> &'static str {
+        match self {
+            EdgeScope::All => "",
+            EdgeScope::Batch => " AND caller_proc_key IN (SELECT key FROM tmp_pcg_keys)",
+        }
+    }
+}
+
+/// Сложить пути файлов пакета во временную таблицу — по ней ограничивается
+/// область резолва. Пути — в формате `files.path` (относительные, через `/`).
+pub(crate) fn create_batch_scope(conn: &rusqlite::Connection, paths: &[String]) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_scope; CREATE TEMP TABLE tmp_pcg_scope(path TEXT PRIMARY KEY);",
+    )?;
+    {
+        let mut ins = conn.prepare("INSERT OR IGNORE INTO tmp_pcg_scope(path) VALUES (?1)")?;
+        for p in paths {
+            ins.execute(params![p])?;
+        }
+    }
+    // Ключи вызывателей этих файлов. Берутся из побочной таблицы рёбер, где
+    // источник ребра записан явно, — по ней ключ находится сразу, без разбора
+    // пути из самого ключа.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_keys; CREATE TEMP TABLE tmp_pcg_keys(key TEXT PRIMARY KEY);",
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO tmp_pcg_keys(key) \
+         SELECT DISTINCT source_file || '::' || caller FROM direct_edge_files \
+         WHERE repo = ?1 AND source_file IN (SELECT path FROM tmp_pcg_scope)",
+        params![REPO_DEFAULT],
+    )?;
+    Ok(())
+}
+
+/// Убрать временные таблицы области.
+pub(crate) fn drop_batch_scope(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_scope; DROP TABLE IF EXISTS tmp_pcg_keys;")?;
     Ok(())
 }
 
@@ -421,50 +512,72 @@ pub(crate) fn resolve_and_prune_direct_edges(conn: &rusqlite::Connection) -> Res
 /// Неоднозначные (имя экспортно в ≥2 модулях), динамические (`Объект.Метод`
 /// по переменной) и платформенные (`Сообщить`, `СтрНайти` — цель вне кода
 /// конфигурации) остаются NULL.
-pub(crate) fn resolve_direct_callee_keys(conn: &rusqlite::Connection) -> Result<()> {
-    // Карта всех процедур (path, name) — для локального резолва.
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS tmp_pcg_funcs;
-         CREATE TEMP TABLE tmp_pcg_funcs AS
-           SELECT fl.path AS path, fn.name AS nm
-           FROM functions fn JOIN files fl ON fl.id = fn.file_id
-           WHERE fn.name IS NOT NULL AND fn.name != '';
-         CREATE INDEX tmp_pcg_funcs_idx ON tmp_pcg_funcs(path, nm);",
-    )?;
-    // Карта уникальных экспортных имён → путь единственного носителя.
+pub(crate) fn resolve_direct_callee_keys(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+) -> Result<()> {
+    // Карта уникальных экспортных имён → путь единственного носителя. Берётся
+    // из справочника: он и есть перечень экспортных процедур, читать заново
+    // все процедуры конфигурации с текстовым условием больше не нужно.
     conn.execute_batch(
         "DROP TABLE IF EXISTS tmp_pcg_uexp;
          CREATE TEMP TABLE tmp_pcg_uexp AS
-           SELECT nm, MIN(path) AS path FROM (
-             SELECT fn.name AS nm, fl.path AS path
-             FROM functions fn JOIN files fl ON fl.id = fn.file_id
-             WHERE fn.name IS NOT NULL AND fn.name != '' AND fn.args LIKE '%) Экспорт%'
-           ) GROUP BY nm HAVING COUNT(*) = 1;
+           SELECT name AS nm, MIN(path) AS path FROM exported_procs
+           GROUP BY name HAVING COUNT(*) = 1;
          CREATE INDEX tmp_pcg_uexp_idx ON tmp_pcg_uexp(nm);",
     )?;
 
     // (а) локальный вызов: callee объявлен в файле вызывателя.
+    //
+    // Способ проверки зависит от размера работы, и это подтверждено замером на
+    // типовой торговой конфигурации. При полном пересборе рёбер больше миллиона,
+    // и дешевле один раз сложить карту «файл + процедура» во временную таблицу
+    // (её построение окупается): 4,7 с против 20,5 с у проверки напрямую. При
+    // пакете изменений рёбер единицы, и всё наоборот: строить карту по 261 тыс.
+    // процедур ради трёх файлов — те самые секунды на ровном месте.
+    let local_exists = if scope == EdgeScope::All {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS tmp_pcg_funcs;
+             CREATE TEMP TABLE tmp_pcg_funcs AS
+               SELECT fl.path AS path, fn.name AS nm
+               FROM functions fn JOIN files fl ON fl.id = fn.file_id
+               WHERE fn.name IS NOT NULL AND fn.name != '';
+             CREATE INDEX tmp_pcg_funcs_idx ON tmp_pcg_funcs(path, nm);",
+        )?;
+        "SELECT 1 FROM tmp_pcg_funcs t \
+         WHERE t.path = substr(proc_call_graph.caller_proc_key, 1, \
+                               instr(proc_call_graph.caller_proc_key, '::') - 1) \
+           AND t.nm = proc_call_graph.callee_proc_name"
+    } else {
+        "SELECT 1 FROM functions fn JOIN files fl ON fl.id = fn.file_id \
+         WHERE fl.path = substr(proc_call_graph.caller_proc_key, 1, \
+                                instr(proc_call_graph.caller_proc_key, '::') - 1) \
+           AND fn.name = proc_call_graph.callee_proc_name"
+    };
     conn.execute(
-        "UPDATE proc_call_graph \
-         SET callee_proc_key = substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) \
-                               || '::' || callee_proc_name \
-         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
-           AND EXISTS ( \
-             SELECT 1 FROM tmp_pcg_funcs t \
-             WHERE t.path = substr(proc_call_graph.caller_proc_key, 1, \
-                                   instr(proc_call_graph.caller_proc_key, '::') - 1) \
-               AND t.nm = proc_call_graph.callee_proc_name)",
+        &format!(
+            "UPDATE proc_call_graph \
+             SET callee_proc_key = substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) \
+                                   || '::' || callee_proc_name \
+             WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+               AND EXISTS ({}){}",
+            local_exists,
+            scope.clause()
+        ),
         params![REPO_DEFAULT],
     )?;
 
     // (б) уникальный экспорт: имя callee экспортно ровно в одном месте.
     conn.execute(
-        "UPDATE proc_call_graph \
-         SET callee_proc_key = ( \
-             SELECT u.path || '::' || u.nm FROM tmp_pcg_uexp u \
-             WHERE u.nm = proc_call_graph.callee_proc_name) \
-         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
-           AND callee_proc_name IN (SELECT nm FROM tmp_pcg_uexp)",
+        &format!(
+            "UPDATE proc_call_graph \
+             SET callee_proc_key = ( \
+                 SELECT u.path || '::' || u.nm FROM tmp_pcg_uexp u \
+                 WHERE u.nm = proc_call_graph.callee_proc_name) \
+             WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+               AND callee_proc_name IN (SELECT nm FROM tmp_pcg_uexp){}",
+            scope.clause()
+        ),
         params![REPO_DEFAULT],
     )?;
 
@@ -474,7 +587,7 @@ pub(crate) fn resolve_direct_callee_keys(conn: &rusqlite::Connection) -> Result<
     // экспортных в ≥2 модулях. Только вызовы с ОДНОЙ точкой (общий модуль);
     // цепочки `Справочники.X.Метод` (менеджеры) — следующий шаг, остаются NULL.
     build_common_module_methods(conn)?;
-    resolve_callee_keys_by_qualifier(conn, None)?;
+    resolve_callee_keys_by_qualifier(conn, scope)?;
 
     conn.execute_batch(
         "DROP TABLE IF EXISTS tmp_pcg_funcs; \
@@ -490,20 +603,13 @@ pub(crate) fn resolve_direct_callee_keys(conn: &rusqlite::Connection) -> Result<
 /// `CommonModules/`). Используется Tier C резолва (`resolve_callee_keys_by_qualifier`)
 /// и в полном пересборе, и в инкременте.
 pub(crate) fn build_common_module_methods(conn: &rusqlite::Connection) -> Result<()> {
+    // Источник — справочник экспортных процедур: имя общего модуля и вид
+    // модуля в нём уже разобраны, читать пути и сигнатуры заново незачем.
     conn.execute_batch(
         "DROP TABLE IF EXISTS tmp_pcg_cmeth;\n\
          CREATE TEMP TABLE tmp_pcg_cmeth AS\n\
-           SELECT substr(s.seg, 1, instr(s.seg, '/') - 1) AS mname,\n\
-                  fn.name AS method,\n\
-                  s.path  AS path\n\
-           FROM (SELECT id, path,\n\
-                        substr(path, instr(path,'CommonModules/')+length('CommonModules/')) AS seg\n\
-                 FROM files\n\
-                 WHERE path LIKE '%CommonModules/%/Module.bsl') s\n\
-           JOIN functions fn ON fn.file_id = s.id\n\
-           WHERE instr(s.seg, '/') > 0\n\
-             AND fn.name IS NOT NULL AND fn.name != ''\n\
-             AND fn.args LIKE '%) Экспорт%';\n\
+           SELECT owner AS mname, name AS method, path AS path\n\
+           FROM exported_procs WHERE kind = 'common' AND owner IS NOT NULL;\n\
          CREATE INDEX tmp_pcg_cmeth_idx ON tmp_pcg_cmeth(mname, method);",
     )?;
     Ok(())
@@ -515,10 +621,10 @@ pub(crate) fn build_common_module_methods(conn: &rusqlite::Connection) -> Result
 /// после — как метод, и точно адресуем в файл общего модуля. Требует заранее
 /// построенной `tmp_pcg_cmeth`. Работает только для вызовов с ОДНОЙ точкой
 /// (общий модуль); цепочки `Справочники.X.Метод` пропускаются (остаются NULL).
-/// `file_scope = Some(rel)` ограничивает рёбрами одного файла (инкремент).
+/// `scope` = `Batch` ограничивает рёбрами файлов пакета (точечное обновление).
 pub(crate) fn resolve_callee_keys_by_qualifier(
     conn: &rusqlite::Connection,
-    file_scope: Option<&str>,
+    scope: EdgeScope,
 ) -> Result<()> {
     let mut sql = String::from(
         "UPDATE proc_call_graph \
@@ -534,15 +640,8 @@ pub(crate) fn resolve_callee_keys_by_qualifier(
              WHERE cm.mname = substr(proc_call_graph.callee_proc_name, 1, instr(proc_call_graph.callee_proc_name,'.')-1) \
                AND cm.method = substr(proc_call_graph.callee_proc_name, instr(proc_call_graph.callee_proc_name,'.')+1))",
     );
-    match file_scope {
-        Some(rel) => {
-            sql.push_str(" AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2");
-            conn.execute(&sql, params![REPO_DEFAULT, rel])?;
-        }
-        None => {
-            conn.execute(&sql, params![REPO_DEFAULT])?;
-        }
-    }
+    sql.push_str(scope.clause());
+    conn.execute(&sql, params![REPO_DEFAULT])?;
     Ok(())
 }
 
@@ -588,7 +687,7 @@ pub(crate) const PLATFORM_BALAST: &[&str] = &[
 /// в конфигурации, не трогается вовсе (адаптивно к размеру конфигурации). `file_scope=
 /// Some(rel)` ограничивает удаление рёбрами одного файла (инкремент), `None` —
 /// весь граф (полный пересбор).
-pub(crate) fn prune_platform_balast(conn: &rusqlite::Connection, file_scope: Option<&str>) -> Result<()> {
+pub(crate) fn prune_platform_balast(conn: &rusqlite::Connection, scope: EdgeScope) -> Result<()> {
     // Имена — статические кириллические идентификаторы без SQL-метасимволов,
     // поэтому инлайн в IN(...) безопасен (не пользовательский ввод).
     let in_list = PLATFORM_BALAST
@@ -613,19 +712,10 @@ pub(crate) fn prune_platform_balast(conn: &rusqlite::Connection, file_scope: Opt
         "DELETE FROM proc_call_graph \
          WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
            AND {meth} IN ({in_list}) \
-           AND {meth} NOT IN ( \
-             SELECT name FROM functions \
-             WHERE name IS NOT NULL AND args LIKE '%) Экспорт%')"
+           AND {meth} NOT IN (SELECT name FROM exported_procs)"
     );
-    match file_scope {
-        Some(rel) => {
-            sql.push_str(" AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2");
-            conn.execute(&sql, params![REPO_DEFAULT, rel])?;
-        }
-        None => {
-            conn.execute(&sql, params![REPO_DEFAULT])?;
-        }
-    }
+    sql.push_str(scope.clause());
+    conn.execute(&sql, params![REPO_DEFAULT])?;
     Ok(())
 }
 
@@ -662,7 +752,7 @@ pub(crate) const METADATA_COLLECTIONS: &[&str] = &[
 ///      вызовы менеджеров, резолв отложен).
 /// Удаляются только рёбра с `callee_proc_key IS NULL`. `file_scope=Some(rel)` —
 /// в области одного файла (инкремент).
-pub(crate) fn prune_object_method_calls(conn: &rusqlite::Connection, file_scope: Option<&str>) -> Result<()> {
+pub(crate) fn prune_object_method_calls(conn: &rusqlite::Connection, scope: EdgeScope) -> Result<()> {
     // tmp_pmods — имена общих модулей (сегмент пути после CommonModules/).
     conn.execute_batch(
         "DROP TABLE IF EXISTS tmp_pmods;\n\
@@ -704,19 +794,10 @@ pub(crate) fn prune_object_method_calls(conn: &rusqlite::Connection, file_scope:
            AND instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') > 0 \
            AND {first} NOT IN (SELECT q FROM tmp_pmods)"
     );
-    match file_scope {
-        Some(rel) => {
-            let f = " AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2";
-            sql1.push_str(f);
-            sql2.push_str(f);
-            conn.execute(&sql1, params![REPO_DEFAULT, rel])?;
-            conn.execute(&sql2, params![REPO_DEFAULT, rel])?;
-        }
-        None => {
-            conn.execute(&sql1, params![REPO_DEFAULT])?;
-            conn.execute(&sql2, params![REPO_DEFAULT])?;
-        }
-    }
+    sql1.push_str(scope.clause());
+    sql2.push_str(scope.clause());
+    conn.execute(&sql1, params![REPO_DEFAULT])?;
+    conn.execute(&sql2, params![REPO_DEFAULT])?;
     conn.execute_batch("DROP TABLE IF EXISTS tmp_pmods; DROP TABLE IF EXISTS tmp_pcolls;")?;
     Ok(())
 }
@@ -727,39 +808,16 @@ pub(crate) fn prune_object_method_calls(conn: &rusqlite::Connection, file_scope:
 /// `<...>/<Folder>/<Object>/[Ext/]ManagerModule.bsl` в Rust (в SQLite нет «последнего
 /// вхождения» для надёжного разбора двух хвостовых сегментов).
 pub(crate) fn build_manager_module_methods(conn: &rusqlite::Connection) -> Result<()> {
+    // Источник — справочник экспортных процедур: папка типа и имя объекта в
+    // нём уже разобраны из пути (обе раскладки — Конфигуратора и 1C:EDT).
     conn.execute_batch(
-        "DROP TABLE IF EXISTS tmp_pcg_mmeth; \
-         CREATE TEMP TABLE tmp_pcg_mmeth(folder TEXT, object TEXT, method TEXT, path TEXT);",
+        "DROP TABLE IF EXISTS tmp_pcg_mmeth;\n\
+         CREATE TEMP TABLE tmp_pcg_mmeth AS\n\
+           SELECT folder AS folder, owner AS object, name AS method, path AS path\n\
+           FROM exported_procs\n\
+           WHERE kind = 'manager' AND owner IS NOT NULL AND folder IS NOT NULL;\n\
+         CREATE INDEX tmp_pcg_mmeth_idx ON tmp_pcg_mmeth(folder, object, method);",
     )?;
-    let rows: Vec<(String, String)> = {
-        let mut st = conn.prepare(
-            "SELECT fl.path, fn.name FROM functions fn JOIN files fl ON fl.id = fn.file_id \
-             WHERE fl.path LIKE '%ManagerModule.bsl' \
-               AND fn.name IS NOT NULL AND fn.name != '' AND fn.args LIKE '%) Экспорт%'",
-        )?;
-        let v = st
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        v
-    };
-    {
-        let mut ins = conn
-            .prepare("INSERT INTO tmp_pcg_mmeth(folder, object, method, path) VALUES (?1,?2,?3,?4)")?;
-        for (path, method) in &rows {
-            // Формат Конфигуратора кладёт модуль в каталог Ext, выгрузка 1C:EDT —
-            // прямо в каталог объекта. Принимаем обе раскладки.
-            let prefix = path
-                .strip_suffix("/Ext/ManagerModule.bsl")
-                .or_else(|| path.strip_suffix("/ManagerModule.bsl"));
-            if let Some(prefix) = prefix {
-                let mut segs = prefix.rsplit('/');
-                if let (Some(object), Some(folder)) = (segs.next(), segs.next()) {
-                    ins.execute(params![folder, object, method, path])?;
-                }
-            }
-        }
-    }
-    conn.execute_batch("CREATE INDEX tmp_pcg_mmeth_idx ON tmp_pcg_mmeth(folder, object, method);")?;
     Ok(())
 }
 
@@ -785,8 +843,8 @@ pub(crate) fn build_collection_folder_map(conn: &rusqlite::Connection) -> Result
 /// Коллекцию маппим в папку метаданных, ищем экспортный метод в
 /// `<Папка>/<Объект>/[Ext/]ManagerModule.bsl`. Платформенные методы менеджера
 /// (`ПустаяСсылка`, `НайтиПоКоду`) не экспортны в модуле → остаются NULL.
-/// `file_scope=Some(rel)` — в области одного файла (инкремент).
-pub(crate) fn resolve_callee_keys_by_manager(conn: &rusqlite::Connection, file_scope: Option<&str>) -> Result<()> {
+/// `scope` = `Batch` — в области файлов пакета.
+pub(crate) fn resolve_callee_keys_by_manager(conn: &rusqlite::Connection, scope: EdgeScope) -> Result<()> {
     build_manager_module_methods(conn)?;
     build_collection_folder_map(conn)?;
     let col = "proc_call_graph.callee_proc_name";
@@ -807,15 +865,8 @@ pub(crate) fn resolve_callee_keys_by_manager(conn: &rusqlite::Connection, file_s
              SELECT 1 FROM tmp_pcg_coll cc JOIN tmp_pcg_mmeth mm ON mm.folder = cc.folder \
              WHERE {join_cond})"
     );
-    match file_scope {
-        Some(rel) => {
-            sql.push_str(" AND substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) = ?2");
-            conn.execute(&sql, params![REPO_DEFAULT, rel])?;
-        }
-        None => {
-            conn.execute(&sql, params![REPO_DEFAULT])?;
-        }
-    }
+    sql.push_str(scope.clause());
+    conn.execute(&sql, params![REPO_DEFAULT])?;
     conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_mmeth; DROP TABLE IF EXISTS tmp_pcg_coll;")?;
     Ok(())
 }

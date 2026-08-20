@@ -17,6 +17,41 @@ use crate::parser::text::TextParser;
 use crate::storage::models::*;
 use crate::storage::Storage;
 use config::IndexConfig;
+
+/// Во сколько раз работа в памяти обходится дороже веса исходников папки.
+///
+/// Замер на узле сети: папка весом 3,98 ГБ дала 9,8 ГБ занятой памяти —
+/// это 2,5. Берём 3 с запасом: лучше уйти на диск там, где памяти хватило бы
+/// впритык, чем упереться в её нехватку на чужой машине.
+pub const MEMORY_ESTIMATE_FACTOR: u64 = 3;
+
+/// Сколько весят файлы папки, которые пойдут в работу.
+///
+/// Нужно, чтобы решить, потянет ли машина работу с базой в памяти: у новой
+/// базы размер файла нулевой и о будущем объёме ничего не говорит.
+///
+/// Считается тем же обходом и с теми же исключениями каталогов, что и сама
+/// индексация, — иначе оценка разойдётся с тем, что будет прочитано. Читаются
+/// только сведения о файлах, содержимое не открывается: на 60 тысячах файлов
+/// это пара секунд при индексации в несколько минут.
+pub fn estimate_source_bytes(root: &Path, config: &IndexConfig) -> u64 {
+    let filter = config.clone();
+    WalkDir::new(root)
+        .into_iter()
+        .filter_entry(move |e| {
+            if e.file_type().is_dir() {
+                if let Some(name) = e.file_name().to_str() {
+                    return !filter.is_excluded_dir(name);
+                }
+            }
+            true
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
 use file_types::FileCategory;
 
 /// Результат одного прохода индексации
@@ -26,8 +61,14 @@ pub struct IndexResult {
     pub files_scanned: usize,
     /// Сколько файлов реально записано в БД (новые или изменённые)
     pub files_indexed: usize,
-    /// Сколько файлов пропущено (хеш не изменился)
+    /// Сколько файлов не менялось с прошлого раза (совпали время и размер
+    /// либо содержимое). Эти файлы входят в `files_scanned`.
     pub files_skipped: usize,
+    /// Сколько файлов не индексируется в принципе: двоичные и текстовые
+    /// крупнее допустимого. В `files_scanned` они не входят — их и не
+    /// просматривали дальше, поэтому смешивать эти два счётчика нельзя:
+    /// сумма выходила больше числа найденных файлов и читалась как ошибка.
+    pub files_not_indexable: usize,
     /// Сколько файлов удалено из БД (больше не существуют на диске)
     pub files_deleted: usize,
     /// Список ошибок: (путь, сообщение)
@@ -186,6 +227,7 @@ impl<'a> Indexer<'a> {
             files_scanned: 0,
             files_indexed: 0,
             files_skipped: 0,
+            files_not_indexable: 0,
             files_deleted: 0,
             errors: vec![],
             elapsed_ms: 0,
@@ -218,11 +260,46 @@ impl<'a> Indexer<'a> {
         // О начале каждого тяжёлого этапа сообщаем ДО его выполнения: если
         // этап встанет, в журнале останется имя того, на чём встали, а не
         // тишина после отчёта о предыдущем этапе.
-        tracing::info!("[{}] этап 1: обход дерева каталогов и отбор изменившихся файлов", root.display());
+        if is_fresh_db || force {
+            tracing::info!(
+                "[{}] обхожу дерево каталогов: база пустая, поэтому в работу пойдёт каждый файл",
+                root.display()
+            );
+        } else {
+            tracing::info!(
+                "[{}] обхожу дерево каталогов: у каждого файла сверяю время изменения и размер \
+                 с тем, что записано в базе (содержимое не читается)",
+                root.display()
+            );
+        }
+        crate::logging::stage_begin("обход дерева и сверка файлов");
         let candidates_start = std::time::Instant::now();
         let (candidate_files, seen_paths, metadata_updates) = self.collect_candidates(root, force, &existing_files, &mut result)?;
-        let candidates_ms = candidates_start.elapsed().as_millis();
-        tracing::info!("[этап 1] отбор кандидатов: {} мс ({} файлов)", candidates_ms, candidate_files.len());
+        let candidates_dur = candidates_start.elapsed();
+        let candidates_ms = candidates_dur.as_millis();
+        tracing::info!(
+            "обход дерева закончен за {} мс: просмотрено {} файлов, изменившихся {}",
+            candidates_ms,
+            result.files_scanned,
+            candidate_files.len()
+        );
+        crate::logging::stage_detail(format!(
+            "просмотрено {}, изменившихся {}",
+            result.files_scanned,
+            candidate_files.len()
+        ));
+        crate::logging::stage_done("обход дерева и сверка файлов", candidates_dur);
+
+        // Изменений нет — дальше все этапы отработают вхолостую и напечатают
+        // по строке нулей каждый. Читать в них нечего, поэтому выходим сразу:
+        // вызывающий напечатает единственную осмысленную строку итога.
+        if candidate_files.is_empty() && metadata_updates.is_empty() {
+            let ничего_не_исчезло = !existing_files.keys().any(|p| !seen_paths.contains(p));
+            if ничего_не_исчезло {
+                result.elapsed_ms = start.elapsed().as_millis() as u64;
+                return Ok(result);
+            }
+        }
 
         // Включаем bulk-load если количество файлов для индексации превышает порог
         let bulk_mode = candidate_files.len() > self.config.bulk_threshold;
@@ -281,7 +358,7 @@ impl<'a> Indexer<'a> {
         // ── Этап 2: параллельный парсинг (CPU-bound) ─────────────────────────
         // tree-sitter парсинг выполняется в нескольких потоках через rayon.
         // Чтение файлов уже выполнено в collect_candidates — здесь только AST.
-        tracing::info!("[этап 2] начат разбор {} файлов в несколько потоков", candidate_files.len());
+        tracing::info!("разбираю {} изменившихся файлов в несколько потоков", candidate_files.len());
         let parse_start = std::time::Instant::now();
         // Лимит для `file_contents` — копия в замыкание: сжатие идёт здесь же,
         // в rayon-потоках, а не в единственном потоке-писателе (v0.47.0).
@@ -372,8 +449,14 @@ impl<'a> Indexer<'a> {
                 }
             })
             .collect();
-        let parse_ms = parse_start.elapsed().as_millis();
-        tracing::info!("[этап 2] разбор: {} мс ({} файлов)", parse_ms, parse_results.len());
+        let parse_dur = parse_start.elapsed();
+        let parse_ms = parse_dur.as_millis();
+        tracing::info!("разбор закончен за {} мс ({} файлов)", parse_ms, parse_results.len());
+        crate::logging::stage_detail(format!(
+            "{} разобрано",
+            crate::logging::plural(parse_results.len() as u64, "файл", "файла", "файлов")
+        ));
+        crate::logging::stage_done("разбор файлов", parse_dur);
 
         // ── Этап 2b: сбор extras-сырья (bsl-indexer) ─────────────────────────
         // Пока parse_results ещё горячие в RAM — параллельно отдаём каждый
@@ -430,14 +513,14 @@ impl<'a> Indexer<'a> {
                 }
             },
         );
-        tracing::info!(
-            "[этап 2] сжатие содержимого файлов: {} мс",
-            compress_start.elapsed().as_millis()
-        );
+        let compress_dur = compress_start.elapsed();
+        let compress_ms = compress_dur.as_millis();
+        tracing::info!("содержимое файлов сжато за {} мс", compress_ms);
+        crate::logging::stage_done("сжатие содержимого", compress_dur);
 
         // ── Этап 3: последовательная запись в SQLite ──────────────────────────
         // SQLite не поддерживает параллельную запись — пишем из основного потока.
-        tracing::info!("[этап 3] начата запись в базу");
+        tracing::info!("записываю разобранное в базу");
         let write_start = std::time::Instant::now();
         let batch_size = self.config.batch_size;
         let mut batch_count = 0usize;
@@ -445,16 +528,17 @@ impl<'a> Indexer<'a> {
         // Открываем первую транзакцию перед началом цикла
         self.storage.begin_batch()?;
 
+        // Прогресс — по времени, а не по размеру транзакции: шаг в файлах на
+        // лёгких файлах сыплет строками, на тяжёлых молчит минутами, а на
+        // репозитории меньше batch_size файлов не печатает ничего.
+        let mut progress = crate::logging::Heartbeat::every_secs(5);
         for parsed in &parse_results {
-            // Прогресс-лог каждые batch_size файлов
             let total_processed = result.files_indexed + result.errors.len();
-            if total_processed > 0 && total_processed % batch_size == 0 {
+            if total_processed > 0 && progress.due() {
                 tracing::info!(
-                    "[этап 3] {}/{}: проиндексировано {}, пропущено {}",
+                    "записано в базу {} из {} изменившихся файлов",
                     total_processed,
-                    parse_results.len(),
-                    result.files_indexed,
-                    result.files_skipped
+                    parse_results.len()
                 );
             }
 
@@ -530,8 +614,14 @@ impl<'a> Indexer<'a> {
 
         // Коммитим оставшиеся записи последнего неполного батча
         self.storage.commit_batch()?;
-        let write_ms = write_start.elapsed().as_millis();
-        tracing::info!("[этап 3] запись в базу: {} мс ({} файлов)", write_ms, result.files_indexed);
+        let write_dur = write_start.elapsed();
+        let write_ms = write_dur.as_millis();
+        tracing::info!("запись в базу закончена за {} мс ({} файлов)", write_ms, result.files_indexed);
+        crate::logging::stage_detail(format!(
+            "{} записано, {} без изменений",
+            result.files_indexed, result.files_skipped
+        ));
+        crate::logging::stage_done("запись в базу", write_dur);
 
         // Сброс накопленного сборщиком extras сырья (серийно, после фазы
         // записи ядра). Для универсальной сборки collector = None.
@@ -570,10 +660,12 @@ impl<'a> Indexer<'a> {
         // Завершаем bulk-load: пересоздаём индексы, триггеры, rebuild FTS
         if bulk_mode {
             let idx_start = std::time::Instant::now();
-            tracing::info!("[этап 4] начато создание индексов и перестройка полнотекстового поиска");
+            tracing::info!("создаю индексы и перестраиваю полнотекстовый поиск");
             self.storage.finish_bulk_load()?;
-            let idx_ms = idx_start.elapsed().as_millis();
-            tracing::info!("[этап 4] индексы и полнотекстовый поиск: {} мс", idx_ms);
+            let idx_dur = idx_start.elapsed();
+            let idx_ms = idx_dur.as_millis();
+            tracing::info!("индексы и полнотекстовый поиск готовы за {} мс", idx_ms);
+            crate::logging::stage_done("индексы и полнотекстовый поиск", idx_dur);
         }
 
         // ── Этап 5: удаление устаревших записей ──────────────────────────────
@@ -590,9 +682,15 @@ impl<'a> Indexer<'a> {
             }
         }
         self.storage.commit_batch()?;
-        let cleanup_ms = cleanup_start.elapsed().as_millis();
+        let cleanup_dur = cleanup_start.elapsed();
+        let cleanup_ms = cleanup_dur.as_millis();
         if result.files_deleted > 0 {
             tracing::info!("[этап 5] удаление исчезнувших файлов: {} мс ({} файлов)", cleanup_ms, result.files_deleted);
+            crate::logging::stage_detail(format!(
+                "{} удалено",
+                crate::logging::plural(result.files_deleted as u64, "файл", "файла", "файлов")
+            ));
+            crate::logging::stage_done("удаление исчезнувших", cleanup_dur);
         }
 
         // ── Этап 6: Phase 2 backfill для file_contents ──────────────────────
@@ -642,7 +740,13 @@ impl<'a> Indexer<'a> {
                 }
             }
             self.storage.commit_batch()?;
-            let backfill_ms = backfill_start.elapsed().as_millis();
+            let backfill_dur = backfill_start.elapsed();
+            let backfill_ms = backfill_dur.as_millis();
+            crate::logging::stage_detail(format!(
+                "{} наполнено",
+                crate::logging::plural(backfilled as u64, "файл", "файла", "файлов")
+            ));
+            crate::logging::stage_done("дозаполнение содержимого", backfill_dur);
             tracing::info!(
                 "[этап 6] дозаполнение содержимого файлов: {} мс ({} наполнено из {} кандидатов, {} ошибок)",
                 backfill_ms,
@@ -653,7 +757,7 @@ impl<'a> Indexer<'a> {
         }
 
         result.elapsed_ms = start.elapsed().as_millis() as u64;
-        tracing::info!("итого по индексации: {} мс", result.elapsed_ms);
+        tracing::info!("работа с базой заняла {} мс", result.elapsed_ms);
         Ok(result)
     }
 
@@ -954,7 +1058,7 @@ impl<'a> Indexer<'a> {
             {
                 if let Some(ref m) = meta {
                     if m.len() as usize > self.config.max_file_size {
-                        result.files_skipped += 1;
+                        result.files_not_indexable += 1;
                         continue;
                     }
                 }
@@ -1035,7 +1139,7 @@ impl<'a> Indexer<'a> {
                     // Двоичные файлы (в т.ч. распознанные по контенту в file_hash)
                     // в индекс не идут — ни парсинга, ни записи.
                     if matches!(category, FileCategory::Binary) {
-                        result.files_skipped += 1;
+                        result.files_not_indexable += 1;
                         continue;
                     }
                     if !force {
@@ -1159,6 +1263,7 @@ class App:
             files_scanned: 0,
             files_indexed: 0,
             files_skipped: 0,
+            files_not_indexable: 0,
             files_deleted: 0,
             errors: vec![],
             elapsed_ms: 0,
@@ -1393,7 +1498,11 @@ class App:
 
         // big.txt пропущен из-за лимита размера, big.py — нет (код не ограничен)
         assert_eq!(r.files_indexed, 2, "small.txt + big.py (код не ограничен размером)");
-        assert_eq!(r.files_skipped, 1, "big.txt пропущен по размеру");
+        assert_eq!(
+            r.files_not_indexable, 1,
+            "big.txt не индексируется по размеру — это отдельный счётчик, не «без изменений»"
+        );
+        assert_eq!(r.files_skipped, 0, "неизменившихся файлов здесь нет");
     }
 
     /// Файлы выгрузки 1С, по которым реально ищут (оглавление конфигурации,
@@ -1427,7 +1536,7 @@ class App:
             "Configuration.xml, Rights.xml и Form.xml должны индексироваться вопреки лимиту"
         );
         assert_eq!(
-            r.files_skipped, 1,
+            r.files_not_indexable, 1,
             "Template.xml остаётся под лимитом (опись выгрузки отсеяна как двоичная)"
         );
     }

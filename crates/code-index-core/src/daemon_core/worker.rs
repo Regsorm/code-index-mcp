@@ -37,6 +37,30 @@ fn storage_mode_ru(mode: &crate::storage::memory::StorageMode) -> &'static str {
     }
 }
 
+/// Есть ли в базе хоть одна запись о файле.
+///
+/// По наличию файла судить нельзя: сервер выдачи при старте создаёт пустые
+/// базы для всех местных папок, чтобы открыть их только на чтение до первой
+/// индексации. Такая пустышка от настоящей базы по имени и размеру не
+/// отличается, и демон принимал первичную индексацию за сверку изменений —
+/// врал в журнале и открывал базу сразу на диске вместо памяти.
+fn db_has_data(db_path: &std::path::Path) -> bool {
+    if !db_path.exists() {
+        return false;
+    }
+    let Ok(storage) = Storage::open_file_readonly(db_path) else {
+        // Файл нечитаем или это ещё не база — данных в нём для нас нет.
+        return false;
+    };
+    storage
+        .conn()
+        .query_row("SELECT EXISTS(SELECT 1 FROM files)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|exists| exists != 0)
+        .unwrap_or(false)
+}
+
 /// Что делать циклу слежения после обработки пакета.
 enum BatchStep {
     /// Пакет отработан (успешно или с отмеченной ошибкой) — ждём следующий.
@@ -60,6 +84,9 @@ struct BatchContext<'a> {
     extra_text_extensions: &'a [String],
     resolved_processor: Option<&'a Arc<dyn LanguageProcessor>>,
     cache_client: Option<&'a Arc<CacheClient>>,
+    /// Настройки индексации папки — нужны, когда пачка велика и её выгоднее
+    /// обработать полным проходом, а не по одному файлу.
+    index_config: &'a IndexConfig,
 }
 
 /// Обработать один пакет событий файловой системы: пометить пути «грязными» в
@@ -93,6 +120,11 @@ fn process_batch(
     }
 
     let batch_started = std::time::Instant::now();
+    let batch_started_local = crate::logging::local_hms();
+    crate::logging::stages_reset();
+    // Сколько заняла надстройка целиком — для раскладки в итоге, как у полной
+    // индексации. Ноль означает, что её не трогали.
+    let mut extras_ms: u128 = 0;
 
     tokio_block_on(async {
         ctx.state.set_status(ctx.path, PathStatus::ReindexingBatch).await;
@@ -100,6 +132,30 @@ fn process_batch(
             .set_progress(ctx.path, Progress::new(0, batch.len()))
             .await;
     });
+
+    let batch_len = batch.len();
+    // Каким двигателем обрабатывать пачку. Пофайловый путь идёт в один поток и
+    // пишет при живых индексах — на файл он в разы дороже полного прохода,
+    // который читает и разбирает параллельно, а вставляет пакетно, сняв
+    // индексы. На правке нескольких файлов дешевле первый, на массовом
+    // обновлении — второй. Замер на типовой торговой конфигурации: пачка в
+    // 3 437 файлов пофайлово — 2 мин 50 с, полный проход по всем 57 072 —
+    // 1 мин 51 с.
+    if batch_len > ctx.index_config.bulk_batch_threshold {
+        return process_batch_full_pass(ctx, storage, batch, batch_started, batch_started_local);
+    }
+
+    // Начало обработки отмечаем прямо: сколько файлов и каким путём идём.
+    // Иначе выбор пути виден лишь по косвенным признакам, а между строкой о
+    // числе файлов и первым отчётом надстройки — полминуты тишины. Черту
+    // здесь не ставим: она уже стоит перед строкой о собранных изменениях.
+    tracing::info!(
+        "[{}] начата частичная индексация: изменившихся файлов {} — обрабатываю пофайлово \
+         (порог перехода на пакетную обработку: {} файлов)",
+        ctx.path.display(),
+        batch_len,
+        ctx.index_config.bulk_batch_threshold
+    );
 
     if let Err(e) = storage.begin_batch() {
         tracing::error!("[{}] не удалось начать транзакцию пакета: {}", ctx.path.display(), e);
@@ -118,11 +174,13 @@ fn process_batch(
         return BatchStep::Stop;
     }
 
+    let apply_started = std::time::Instant::now();
+    crate::logging::stage_begin("применение изменившихся файлов");
+    let mut progress = crate::logging::Heartbeat::every_secs(5);
     let mut done = 0usize;
     // Сколько событий батча применить не удалось. Ненулевой счётчик означает
     // неполный срез: часть файлов осталась в индексе прежней версии.
     let mut failed = 0usize;
-    let batch_len = batch.len();
     for event in batch {
         if !apply_event(
             storage,
@@ -143,8 +201,40 @@ fn process_batch(
                     .await;
             });
         }
+        // Отчёт в журнал раз в несколько секунд: без него от начала обработки
+        // до первой строки надстройки стоит тишина в десятки секунд, и по
+        // журналу не отличить работу от остановки.
+        if progress.due() {
+            tracing::info!(
+                "[{}] разобрано и записано {} из {} изменившихся файлов",
+                ctx.path.display(),
+                done,
+                batch_len
+            );
+        }
     }
 
+    // Этапы ядра пофайлово отмечает `apply_event` — те же имена, что при полной
+    // индексации. Здесь остаётся проставить, сколько файлов прошло через них.
+    let applied = crate::logging::plural(batch_len as u64, "файл", "файла", "файлов");
+    let applied = if failed > 0 {
+        format!("{}, сбоев {}", applied, failed)
+    } else {
+        applied
+    };
+    crate::logging::stage_set_detail("разбор файлов", applied.clone());
+    crate::logging::stage_set_detail("запись в базу", applied);
+    let _ = apply_started;
+
+    // Файлы применены: снять отметку об этапе и обнулить счётчик. Иначе строка
+    // состояния демона продолжает показывать «применение файлов, 2000/2000
+    // (100 %)», пока идёт надстройка, — то есть врёт о том, чем папка занята.
+    crate::logging::stage_begin("фиксация изменений");
+    tokio_block_on(async {
+        ctx.state.set_progress(ctx.path, Progress::new(0, 0)).await;
+    });
+
+    let commit_started = std::time::Instant::now();
     let commit_ok = match storage.commit_batch() {
         Ok(()) => true,
         Err(e) => {
@@ -162,6 +252,11 @@ fn process_batch(
             false
         }
     };
+
+    // Фиксация транзакции — часть записи в базу, отдельным этапом её не выносим:
+    // при полной индексации она тоже внутри «записи в базу».
+    crate::logging::stage_add("запись в базу", commit_started.elapsed());
+    crate::logging::stage_idle();
 
     // Пересобрался ли слой extras для этого батча. Провал означает, что тела
     // функций свежие, а граф вызовов и связи данных отстают — такой срез
@@ -207,15 +302,178 @@ fn process_batch(
                     extras_ok = false;
                 }
             }
+            extras_ms = t0.elapsed().as_millis();
         }
     }
+
+    finish_batch(
+        ctx,
+        storage,
+        batch,
+        BatchResult {
+            commit_ok,
+            failed,
+            batch_len,
+            extras_ok,
+            extras_ms,
+            started: batch_started,
+            started_local: batch_started_local,
+        },
+    )
+}
+
+/// Обработать большую пачку изменений полным проходом.
+///
+/// Пофайловый путь применяет события по одному, в один поток и при живых
+/// индексах — на массовом обновлении это в разы дороже полного прохода, где
+/// чтение, хеширование и разбор идут по всем ядрам, а вставка выполняется
+/// пакетно со снятыми индексами. Отбор изменившихся полный проход делает сам
+/// (по времени и размеру файла), поэтому список событий ему не нужен — он
+/// остаётся только для сброса кэша выдачи.
+///
+/// Надстройка здесь тоже пересобирается целиком: на таком объёме точечное
+/// обновление дороже (замер: 3 437 файлов точечно — 1 мин 59 с против 54 с
+/// полного пересбора по всей конфигурации).
+fn process_batch_full_pass(
+    ctx: &BatchContext<'_>,
+    storage: &mut Storage,
+    batch: &[FileEvent],
+    batch_started: std::time::Instant,
+    batch_started_local: String,
+) -> BatchStep {
+    let batch_len = batch.len();
+    tracing::info!(
+        "[{}] начата частичная индексация: изменившихся файлов {} — обрабатываю пакетно \
+         (порог перехода на пакетную обработку: {} файлов, превышен): обход всего дерева, \
+         разбор в несколько потоков, запись пачками; переписываются только изменившиеся \
+         файлы, надстройка пересобирается целиком",
+        ctx.path.display(),
+        batch_len,
+        ctx.index_config.bulk_batch_threshold
+    );
+
+    // Сборщик надстройки участвует только в полном разборе — здесь он уместен
+    // ровно так же, как при индексации на старте демона.
+    let parse_collector = ctx.resolved_processor.and_then(|proc| proc.parse_collector());
+    let core_ok = {
+        let mut indexer = Indexer::with_config(storage, ctx.index_config.clone());
+        match indexer.full_reindex_with_collector(ctx.path, false, parse_collector.as_deref()) {
+            Ok(result) => {
+                tracing::info!(
+                    "[{}] пакетная обработка закончена: просмотрено {} файлов — записано {}, \
+                     без изменений {}, не индексируется {}, удалено {}",
+                    ctx.path.display(),
+                    result.files_scanned,
+                    result.files_indexed,
+                    result.files_skipped,
+                    result.files_not_indexable,
+                    result.files_deleted
+                );
+                true
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[{}] пакетная обработка пачки изменений не удалась: {}",
+                    ctx.path.display(),
+                    e
+                );
+                false
+            }
+        }
+    };
+
+    let mut extras_ok = true;
+    let mut extras_ms: u128 = 0;
+    if core_ok {
+        if let Some(proc) = ctx.resolved_processor {
+            let t0 = std::time::Instant::now();
+            crate::logging::stage_begin("надстройка целиком");
+            match proc.index_extras(ctx.path, storage) {
+                Ok(()) => tracing::info!(
+                    "[{}] надстройка пересобрана целиком за {} мс",
+                    ctx.path.display(),
+                    t0.elapsed().as_millis()
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        "[{}] полный пересбор надстройки процессора «{}» упал: {}. \
+                         Базовая индексация при этом сохранена.",
+                        ctx.path.display(),
+                        proc.name(),
+                        e
+                    );
+                    extras_ok = false;
+                }
+            }
+            extras_ms = t0.elapsed().as_millis();
+            // Отдельным этапом надстройку в раскладку не добавляем: её слои уже
+            // перечислены выше, а общее время стоит в итоговой строке. Строка
+            // «надстройка целиком» была суммой предыдущих и читалась как
+            // двойной счёт.
+            crate::logging::stage_idle();
+        }
+    }
+
+    finish_batch(
+        ctx,
+        storage,
+        batch,
+        BatchResult {
+            commit_ok: core_ok,
+            // Полный проход не считает сбои по отдельным файлам: он либо
+            // прошёл целиком, либо вернул ошибку.
+            failed: 0,
+            batch_len,
+            extras_ok,
+            extras_ms,
+            started: batch_started,
+            started_local: batch_started_local,
+        },
+    )
+}
+
+/// Итоги обработки пачки — всё, что нужно завершающему шагу.
+struct BatchResult {
+    commit_ok: bool,
+    failed: usize,
+    batch_len: usize,
+    extras_ok: bool,
+    extras_ms: u128,
+    started: std::time::Instant,
+    started_local: String,
+}
+
+/// Завершить обработку пачки: схлопнуть журнал WAL, сбросить кэш выдачи,
+/// напечатать сводку и выставить статус папки.
+///
+/// Общий хвост для обоих путей — пофайлового и полного прохода: различаются
+/// они только тем, как применяли изменения, а заканчиваются одинаково.
+fn finish_batch(
+    ctx: &BatchContext<'_>,
+    storage: &mut Storage,
+    batch: &[FileEvent],
+    res: BatchResult,
+) -> BatchStep {
+    let BatchResult {
+        commit_ok,
+        failed,
+        batch_len,
+        extras_ok,
+        extras_ms,
+        started: batch_started,
+        started_local: batch_started_local,
+    } = res;
 
     // В disk-режиме (а worker сюда попадает всегда в disk после reopen на шаге 7)
     // flush_to_disk через Connection::backup() — бесполезное копирование БД самой
     // в себя, WAL не уменьшает. checkpoint_truncate реально схлопывает WAL.
+    let wal_started = std::time::Instant::now();
     if let Err(e) = storage.checkpoint_truncate() {
         tracing::warn!("[{}] схлопывание журнала WAL не удалось: {}", ctx.path.display(), e);
     }
+    // Схлопывание журнала WAL — то же самое, что «сброс на диск» у полной
+    // индексации: отдельным этапом не выносим, показываем в итоговой строке.
+    let flush_ms = wal_started.elapsed().as_millis();
 
     // Event-based cache invalidation (v0.9.1+): после успешного commit
     // отправляем cache-ci список затронутых относительных путей. Если
@@ -224,7 +482,7 @@ fn process_batch(
     if commit_ok {
         if let Some(cc) = ctx.cache_client {
             if !cc.is_empty() {
-                let paths_to_invalidate = collect_invalidate_paths(ctx.path, &batch);
+                let paths_to_invalidate = collect_invalidate_paths(ctx.path, batch);
                 if !paths_to_invalidate.is_empty() {
                     let cc_clone = cc.clone();
                     let repo = ctx.entry.effective_alias();
@@ -241,24 +499,53 @@ fn process_batch(
     // Провал любого из них означает неполный срез, а Ready на нём — ложное
     // «готово»: сервер выдачи начал бы отдавать устаревшее как актуальное.
     let outcome = batch_outcome(commit_ok, failed, batch_len, extras_ok);
+    // Сводка того же вида, что у первичной индексации: начало, этапы, конец.
+    // Печатается при любой настройке подробности.
+    let stages = crate::logging::stages_take();
+    let whole_ms = batch_started.elapsed().as_millis();
+    let core_ms = stages
+        .iter()
+        .filter(|s| CORE_STAGES.contains(&s.name))
+        .map(|s| s.dur.as_millis())
+        .sum::<u128>();
+    let mut parts = vec![format!("ядро {}", crate::logging::human_ms(core_ms))];
+    if extras_ms > 0 {
+        parts.push(format!("надстройка {}", crate::logging::human_ms(extras_ms)));
+    }
+    parts.push(format!("сброс на диск {}", crate::logging::human_ms(flush_ms)));
+
+    tracing::info!(
+        target: crate::logging::SUMMARY_TARGET,
+        "[{}] частичная индексация, начало {}",
+        ctx.path.display(),
+        batch_started_local
+    );
+    for line in crate::logging::stages_block(&stages) {
+        tracing::info!(target: crate::logging::SUMMARY_TARGET, "[{}] {}", ctx.path.display(), line);
+    }
     match &outcome {
         Ok(()) => tracing::info!(
-            "[{}] пакет обработан: событий {}, за {} мс, режим хранилища на диске, память демона {}",
+            target: crate::logging::SUMMARY_TARGET,
+            "[{}] конец, обработано {} за {} ({}), режим хранилища на диске, память демона {}",
             ctx.path.display(),
-            batch_len,
-            batch_started.elapsed().as_millis(),
+            crate::logging::plural(batch_len as u64, "файл", "файла", "файлов"),
+            crate::logging::human_ms(whole_ms),
+            parts.join(", "),
             crate::logging::memory_note()
         ),
         Err(msg) => tracing::warn!(
-            "[{}] пакет обработан не полностью: событий {} (сбоев {}), за {} мс — {}",
+            target: crate::logging::SUMMARY_TARGET,
+            "[{}] конец, обработано НЕ ПОЛНОСТЬЮ: {} (сбоев {}), за {} ({}) — {}",
             ctx.path.display(),
-            batch_len,
+            crate::logging::plural(batch_len as u64, "файл", "файла", "файлов"),
             failed,
-            batch_started.elapsed().as_millis(),
+            crate::logging::human_ms(whole_ms),
+            parts.join(", "),
             msg
         ),
     }
 
+    crate::logging::stage_idle();
     tokio_block_on(async {
         match outcome {
             Ok(()) => ctx.state.set_status(ctx.path, PathStatus::Ready).await,
@@ -335,13 +622,20 @@ pub fn run_worker(
     // глобальный `[indexer].max_code_file_size_bytes` → hardcoded 5 МБ.
     // Перетираем дефолт IndexConfig — переоформленные правила сильнее JSON-конфига проекта.
     index_config.max_code_file_size_bytes = entry.effective_max_code_file_size(&indexer_section);
+    // Порог выбора способа обработки пачки — тем же порядком приоритета:
+    // per-path → глобальный `[indexer]` → дефолт. Настройки демона сильнее
+    // JSON-конфига проекта: правит их тот же человек, что и остальной daemon.toml.
+    index_config.bulk_batch_threshold = entry.effective_bulk_batch_threshold(&indexer_section);
     // Язык репозитория из `[[paths]] language` — разрешает неоднозначные
     // расширения (`.h`: заголовок C или C++). Демон заполняет это поле на
     // старте автоопределением, если в конфиге его не указали.
     index_config.repo_language = entry.language.clone();
-    let storage_config = StorageConfig {
+    let mut storage_config = StorageConfig {
         mode: index_config.storage_mode.clone(),
         memory_max_percent: index_config.memory_max_percent,
+        // Заполним ниже, когда дойдём до открытия базы: оценка стоит пары
+        // секунд обхода, и платить за неё, стоя в очереди, незачем.
+        expected_bytes: 0,
     };
 
     // 3. Взять permit из семафора. Permit держится на всё время initial reindex,
@@ -374,6 +668,10 @@ pub fn run_worker(
     tokio_block_on(async {
         state.set_status(&path, PathStatus::InitialIndexing).await;
         state.set_progress(&path, Progress::new(0, 0)).await;
+        // Отметить свой поток: пока он занят долгой синхронной работой,
+        // сам он состояние не обновит, и строка состояния демона берёт
+        // текущий этап по этой отметке.
+        state.note_worker_thread(&path).await;
     });
 
     // 5. Открыть Storage.
@@ -381,10 +679,39 @@ pub fn run_worker(
     //      не пишет, нет лишнего backup memory→disk (WAL не раздувается).
     //    * Если БД новая (первый запуск на этой папке) — in-memory для
     //      скорости, потом flush на диск и reopen в disk для watcher'а.
-    let db_existed_before = db_path.exists()
-        && std::fs::metadata(&db_path).map(|m| m.len() > 0).unwrap_or(false);
+    // Проиндексирована ли папка — по наличию записей, а не по наличию файла.
+    // Пустой файл базы заранее создаёт сервер выдачи, и от порядка запуска
+    // служб зависит, успеет он это сделать до старта воркера или нет (на узле
+    // сети сервер стартует ПОСЛЕ демона, на рабочей станции — раньше).
+    // По этому признаку выбирается и режим хранилища, и слова в журнале —
+    // иначе одна и та же папка ведёт себя на двух машинах по-разному.
+    let db_has_rows = db_has_data(&db_path);
 
-    let mut storage = if db_existed_before {
+    // Паспорт папки: по присланному журналу должно быть видно, с чем работали
+    // и при каких настройках, иначе времена не с чем соотнести.
+    tracing::info!(
+        "[{}] размер базы {}, настройки: порог перехода с пофайловой обработки на пакетную — \
+         {} файлов, пауза после события {} мс, потолок сбора {} мс, транзакция записи {} файлов",
+        path.display(),
+        match std::fs::metadata(&db_path) {
+            Ok(m) => format!("{} МБ", m.len() / (1024 * 1024)),
+            Err(_) => "база ещё не создана".to_string(),
+        },
+        index_config.bulk_batch_threshold,
+        entry.debounce_ms.unwrap_or(index_config.debounce_ms),
+        entry.batch_ms.unwrap_or(index_config.batch_ms),
+        index_config.batch_size
+    );
+
+    // Работала ли база в оперативной памяти. От этого зависит, нужен ли сброс
+    // на диск после индексации, и что писать в итоге. Признак «файл базы есть»
+    // для этого не годится: пустышки создаёт сервер выдачи, и успеет он это
+    // сделать до старта воркера или нет — зависит от порядка запуска служб
+    // (на узле сети сервер стартует ПОСЛЕ демона, на рабочей станции —
+    // раньше). Режим должен быть один и тот же в обоих случаях.
+    let mut worked_in_memory = false;
+
+    let mut storage = if db_has_rows {
         tracing::info!(
             "[{}] база уже существует — режим хранилища: на диске (память демона {})",
             path.display(),
@@ -403,13 +730,27 @@ pub fn run_worker(
         // Фактический режим считаем той же функцией, что и `open_auto`, —
         // для новой базы (размер 0) он определён однозначно, расхождения с
         // тем, что реально откроется, быть не может.
+        // Взвешиваем папку: только по её весу и можно судить, потянет ли
+        // машина работу в памяти. Размер пустого файла базы об этом молчит.
+        let weigh_started = std::time::Instant::now();
+        let source_bytes = crate::indexer::estimate_source_bytes(&path, &index_config);
+        storage_config.expected_bytes =
+            source_bytes.saturating_mul(crate::indexer::MEMORY_ESTIMATE_FACTOR);
+
         let planned = crate::storage::memory::determine_storage_mode(&storage_config, &db_path);
+        worked_in_memory = matches!(planned, crate::storage::memory::StorageMode::InMemory);
         tracing::info!(
-            "[{}] новая база — режим хранилища: {} (настройка «{}», память демона {})",
+            "[{}] новая база — режим хранилища: {} (настройка «{}»; исходники {}, \
+             работа в памяти обошлась бы примерно в {}, свободно {}, разрешено занять {} % — \
+             взвешивание заняло {} мс)",
             path.display(),
             storage_mode_ru(&planned),
             storage_config.mode,
-            crate::logging::memory_note()
+            crate::logging::human_bytes(source_bytes),
+            crate::logging::human_bytes(storage_config.expected_bytes),
+            crate::logging::human_bytes(crate::storage::memory::available_ram()),
+            storage_config.memory_max_percent,
+            weigh_started.elapsed().as_millis()
         );
         match Storage::open_auto(&db_path, &storage_config) {
             Ok(s) => s,
@@ -460,7 +801,28 @@ pub fn run_worker(
         }
     }
 
-    tracing::info!("[{}] начата первичная индексация", path.display());
+    // Называем вещи своими именами: на существующей базе это НЕ первичная
+    // индексация, а сверка при старте — время и размер каждого файла
+    // сравниваются с записанным, переиндексируются только разошедшиеся.
+    crate::logging::block_separator();
+    if db_has_rows {
+        tracing::info!(
+            "[{}] начата проверка изменений при старте: сверяю время и размер файлов с базой",
+            path.display()
+        );
+    } else {
+        tracing::info!(
+            "[{}] начата первичная индексация: базы ещё нет, читаю все файлы",
+            path.display()
+        );
+    }
+    // Полное время работы с базой считаем отсюда: пользователю нужно знать,
+    // сколько папка была занята целиком, а не сколько отработало одно ядро
+    // индексатора. Накопитель этапов чистим, чтобы в раскладку не попали
+    // этапы прошлого прохода этого же потока.
+    let whole_started = std::time::Instant::now();
+    let started_at_local = crate::logging::local_hms();
+    crate::logging::stages_reset();
 
     // 6. Полная переиндексация (fast-path по mtime, если БД уже есть).
     //    Первичная индексация демона — полный путь (НЕ инкремент), поэтому
@@ -473,15 +835,19 @@ pub fn run_worker(
         let mut indexer = Indexer::with_config(&mut storage, index_config.clone());
         indexer.full_reindex_with_collector(&path, false, parse_collector.as_deref())
     };
+    let core_stages = crate::logging::stages_take();
     let reindex = match indexer_result {
         Ok(result) => {
             tracing::info!(
-                "[{}] первичная индексация закончена: {} файлов за {} мс (записано {}, пропущено {}, удалено {})",
+                "[{}] {}: просмотрено {} файлов за {} мс — записано {}, без изменений {}, \
+                 не индексируется {}, удалено {}",
                 path.display(),
+                if db_has_rows { "проверка изменений при старте закончена" } else { "первичная индексация закончена" },
                 result.files_scanned,
                 result.elapsed_ms,
                 result.files_indexed,
                 result.files_skipped,
+                result.files_not_indexable,
                 result.files_deleted
             );
             result
@@ -505,6 +871,9 @@ pub fn run_worker(
     //     Ошибка не фатальна: базовая индексация уже сохранена. Логируем и
     //     продолжаем — например, для репо без Configuration.xml (старая
     //     выгрузка обработок) парсер может ничего не найти и это нормально.
+    // Сколько заняла надстройка целиком — для раскладки в итоге. Ноль
+    // означает, что её не пересобирали (данные не менялись).
+    let mut extras_ms: u128 = 0;
     if let Some(proc) = resolved_processor.as_ref() {
         // Гейт против холостого re-enrichment на старте: если БД уже была и
         // mtime-fast-path не нашёл изменений (0 записано / 0 удалено), а extras
@@ -513,7 +882,7 @@ pub fn run_worker(
         // минуты). Любое изменение данных, новая БД или пустые extras → полный
         // проход как раньше. Инкрементальные правки покрывает watcher-цикл через
         // index_extras_for_files.
-        let skip_extras = db_existed_before
+        let skip_extras = db_has_rows
             && reindex.files_indexed == 0
             && reindex.files_deleted == 0
             && proc.extras_present(&storage);
@@ -525,7 +894,7 @@ pub fn run_worker(
         // 94 650 → 15,7 минуты), точечный отрабатывает за секунды. Полный
         // остаётся для новой БД, пустой надстройки и переполнения списка путей.
         let incremental_extras = !skip_extras
-            && db_existed_before
+            && db_has_rows
             && !reindex.paths_overflow
             && proc.extras_present(&storage);
 
@@ -542,7 +911,10 @@ pub fn run_worker(
             let deleted: Vec<PathBuf> =
                 reindex.deleted_paths.iter().map(|p| path.join(p)).collect();
             let t0 = std::time::Instant::now();
-            match proc.index_extras_for_files(&path, &mut storage, &changed, &deleted) {
+            let incremental_outcome =
+                proc.index_extras_for_files(&path, &mut storage, &changed, &deleted);
+            extras_ms = t0.elapsed().as_millis();
+            match incremental_outcome {
                 Ok(()) => {
                     need_full = false;
                     tracing::info!(
@@ -574,7 +946,9 @@ pub fn run_worker(
                  (на больших конфигурациях занимает минуты)",
                 path.display(), proc.name()
             );
-            if let Err(e) = proc.index_extras(&path, &mut storage) {
+            let full_outcome = proc.index_extras(&path, &mut storage);
+            extras_ms = t0.elapsed().as_millis();
+            if let Err(e) = full_outcome {
                 tracing::warn!(
                     "[{}] полный пересбор надстройки процессора «{}» упал: {}. \
                      Базовая индексация при этом сохранена.",
@@ -583,7 +957,7 @@ pub fn run_worker(
             } else {
                 tracing::info!(
                     "[{}] полный пересбор надстройки процессора «{}» выполнен за {} мс",
-                    path.display(), proc.name(), t0.elapsed().as_millis()
+                    path.display(), proc.name(), extras_ms
                 );
             }
         }
@@ -591,7 +965,9 @@ pub fn run_worker(
 
     // 7. Если БД была новой и открылась в памяти — flush + reopen в disk.
     //    Если уже был disk — ничего делать не нужно, изменения уже на диске.
-    if !db_existed_before {
+    let extras_stages = crate::logging::stages_take();
+    let flush_started = std::time::Instant::now();
+    if worked_in_memory {
         if let Err(e) = storage.flush_to_disk(&db_path) {
             tracing::warn!("[{}] сброс базы из памяти на диск не удался: {}", path.display(), e);
         }
@@ -606,6 +982,29 @@ pub fn run_worker(
             }
         };
         tracing::info!("[{}] база переоткрыта на диске", path.display());
+
+        // База в памяти закрыта — просим распределитель вернуть её системе.
+        // Без этого освобождённое остаётся в куче процесса, следующая папка
+        // видит память как занятую и уходит на диск, хотя машина потянула бы.
+        // Печатаем «было/стало»: решение о режиме принимается по свободной
+        // памяти, и по журналу должно быть видно, вернулась она или нет.
+        let before = crate::logging::process_memory_bytes();
+        let released = crate::storage::memory::release_free_memory();
+        let after = crate::logging::process_memory_bytes();
+        match (before, after) {
+            (Some(b), Some(a)) => tracing::info!(
+                "[{}] память после работы в памяти: было {}, стало {} (возврат системе: {})",
+                path.display(),
+                crate::logging::human_bytes(b),
+                crate::logging::human_bytes(a),
+                if released { "выполнен" } else { "система такого не умеет" }
+            ),
+            _ => tracing::info!(
+                "[{}] возврат памяти системе: {}",
+                path.display(),
+                if released { "выполнен" } else { "система такого не умеет" }
+            ),
+        }
     }
 
     // Initial reindex мог накопить много страниц в WAL (особенно для больших
@@ -614,7 +1013,7 @@ pub fn run_worker(
     match storage.checkpoint_truncate() {
         Ok((busy, log_pages, _)) if busy == 0 => {
             tracing::info!(
-                "[{}] журнал WAL схлопнут после первичной индексации: вытеснено страниц {}",
+                "[{}] журнал WAL схлопнут: вытеснено страниц {}",
                 path.display(), log_pages
             );
         }
@@ -632,18 +1031,56 @@ pub fn run_worker(
         }
     }
 
-    // Итог по папке одной строкой — то, что первым делом ищут в присланном
-    // журнале: сколько заняло, в каком виде работала база, сколько памяти
-    // держит демон после прохода.
+    // Итог по папке — то, что первым делом ищут в присланном журнале.
+    // Первым числом идёт ПОЛНОЕ время работы с базой: ядро индексатора,
+    // надстройка процессора и сброс на диск вместе. Прежде здесь стояло время
+    // одного ядра, и на больших конфигурациях оно занижало правду в разы —
+    // надстройка растёт быстрее ядра.
+    let flush_ms = flush_started.elapsed().as_millis();
+    let whole_ms = whole_started.elapsed().as_millis();
+    let others_ms = whole_ms.saturating_sub(
+        reindex.elapsed_ms as u128 + extras_ms + flush_ms,
+    );
+    let mut parts = vec![
+        format!("ядро {}", crate::logging::human_ms(reindex.elapsed_ms as u128)),
+    ];
+    if extras_ms > 0 {
+        parts.push(format!("надстройка {}", crate::logging::human_ms(extras_ms)));
+    }
+    parts.push(format!("сброс на диск {}", crate::logging::human_ms(flush_ms)));
+    // «Прочее» — освобождение памяти под разобранные файлы и переходы между
+    // шагами. Показываем, только когда оно заметно, иначе слагаемые не сходятся
+    // с полным временем и в это упирается первый же читатель журнала.
+    if others_ms >= 1000 {
+        parts.push(format!("прочее {}", crate::logging::human_ms(others_ms)));
+    }
+
+    // Короткая сводка: что за папка, когда начали, что делали по этапам, когда
+    // закончили. Печатается при любой настройке подробности — метка «итог»
+    // пропускается фильтром всегда.
+    let mut stages = core_stages;
+    stages.extend(extras_stages);
     tracing::info!(
-        "[{}] итог первичной индексации: {} файлов, {} мс, режим хранилища {}, память демона {}",
+        target: crate::logging::SUMMARY_TARGET,
+        "[{}] {}, начало {}",
+        path.display(),
+        if db_has_rows { "проверка изменений при старте" } else { "первичная индексация" },
+        started_at_local
+    );
+    for line in crate::logging::stages_block(&stages) {
+        tracing::info!(target: crate::logging::SUMMARY_TARGET, "[{}] {}", path.display(), line);
+    }
+    tracing::info!(
+        target: crate::logging::SUMMARY_TARGET,
+        "[{}] конец, обработано {} файлов за {} ({}), режим хранилища {}, память демона {}",
         path.display(),
         reindex.files_scanned,
-        reindex.elapsed_ms,
-        if db_existed_before {
-            "на диске"
-        } else {
+        crate::logging::human_ms(whole_ms),
+        parts.join(", "),
+        if worked_in_memory {
             "в оперативной памяти со сбросом на диск"
+        } else {
+            "на диске"
         },
         crate::logging::memory_note()
     );
@@ -652,6 +1089,7 @@ pub fn run_worker(
     drop(_permit);
 
     // 10. Перевести в Ready и запустить watcher
+    crate::logging::stage_idle();
     tokio_block_on(async {
         state.set_status(&path, PathStatus::Ready).await;
     });
@@ -705,6 +1143,7 @@ pub fn run_worker(
         extra_text_extensions: &extra_text_extensions,
         resolved_processor: resolved_processor.as_ref(),
         cache_client: cache_client.as_ref(),
+        index_config: &index_config,
     };
 
     loop {
@@ -712,14 +1151,38 @@ pub fn run_worker(
             break;
         }
 
-        let batch = match poll_batch(&rx, IDLE_POLL_MS, debounce_ms, batch_ms) {
+        let collected = match poll_batch(&rx, IDLE_POLL_MS, debounce_ms, batch_ms) {
             Ok(Some(b)) => {
-                tracing::info!("[{}] пакет изменений: событий {}", path.display(), b.len());
+                // Число изменившихся файлов точное только когда сбор закончился
+                // тишиной. Упёрлись в потолок — поток ещё идёт, и в очереди
+                // осталось; говорим об этом прямо, иначе число в журнале
+                // прочтут как итог.
+                // Черта — здесь: сбор изменений уже начало новой работы, и
+                // отделять надо от предыдущей операции, а не от собственной
+                // первой строки.
+                crate::logging::block_separator();
+                if b.settled {
+                    tracing::info!(
+                        "[{}] наблюдатель собрал изменения: {} (поток событий утих, \
+                         это все изменения)",
+                        path.display(),
+                        crate::logging::plural(b.events.len() as u64, "файл", "файла", "файлов")
+                    );
+                } else {
+                    tracing::info!(
+                        "[{}] наблюдатель собрал изменения: {} — поток событий не утих за {} мс, \
+                         остальные попадут в следующую пачку",
+                        path.display(),
+                        crate::logging::plural(b.events.len() as u64, "файл", "файла", "файлов"),
+                        batch_ms
+                    );
+                }
                 b
             }
             Ok(None) => continue, // idle timeout — проверим shutdown на следующей итерации
             Err(_) => break,      // канал закрыт — watcher дропнут
         };
+        let batch = collected.events;
         if batch.is_empty() {
             continue;
         }
@@ -859,6 +1322,33 @@ mod tests {
         let err = batch_outcome(false, 3, 3, false).unwrap_err();
         assert!(err.contains("фиксация"), "текст: {err}");
     }
+
+    /// Пустая база, созданная сервером выдачи заранее, не должна считаться
+    /// уже проиндексированной: иначе первичная индексация выдаётся в журнале
+    /// за сверку изменений, а хранилище открывается на диске вместо памяти.
+    #[test]
+    fn пустая_база_от_сервера_выдачи_данными_не_считается() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("index.db");
+
+        assert!(!db_has_data(&db), "файла ещё нет — данных нет");
+
+        // Ровно то, что делает сервер выдачи: создать файл со схемой и закрыть.
+        drop(Storage::open_file(&db).unwrap());
+        assert!(db.exists(), "файл базы создан");
+        assert!(!db_has_data(&db), "схема без записей — это не проиндексированная папка");
+
+        let storage = Storage::open_file(&db).unwrap();
+        storage
+            .conn()
+            .execute(
+                "INSERT INTO files (path, content_hash, language) VALUES ('a.rs', 'h', 'rust')",
+                [],
+            )
+            .unwrap();
+        drop(storage);
+        assert!(db_has_data(&db), "появилась запись о файле — база рабочая");
+    }
 }
 
 fn shutdown_received(rx: &mut tokio::sync::broadcast::Receiver<()>) -> bool {
@@ -955,6 +1445,20 @@ fn tokio_block_on_value<T, F: std::future::Future<Output = T>>(fut: F) -> T {
     }
 }
 
+/// Имена этапов ядра индексатора. Нужны, чтобы в итоге по пакету изменений
+/// отделить время ядра от времени надстройки: этапы копятся вперемешку, а
+/// разложить их надо так же, как при полной индексации.
+const CORE_STAGES: [&str; 7] = [
+    "разбор файлов",
+    "запись в базу",
+    "удаление исчезнувших",
+    "сжатие содержимого",
+    // Эти три даёт полный проход — им обрабатывается большая пачка изменений.
+    "обход дерева и отбор файлов",
+    "индексы и полнотекстовый поиск",
+    "дозаполнение содержимого",
+];
+
 /// Обработать одно событие файловой системы: пересчитать хеш, записать/удалить в БД.
 ///
 /// Возвращает `false`, если применить событие не удалось: файл не прочитан по
@@ -1040,7 +1544,11 @@ fn apply_event(
                         .unwrap_or("")
                         .to_lowercase();
                     if let Some(parser) = registry.get_parser(&ext) {
-                        match parser.parse_guarded(&content, &rel_path) {
+                        let parse_started = std::time::Instant::now();
+                        let parsed = parser.parse_guarded(&content, &rel_path);
+                        crate::logging::stage_add("разбор файлов", parse_started.elapsed());
+                        let write_started = std::time::Instant::now();
+                        match parsed {
                             Ok(pr) => {
                                 let indexer = Indexer::with_config(
                                     storage,
@@ -1080,9 +1588,11 @@ fn apply_event(
                                 ok = false;
                             }
                         }
+                        crate::logging::stage_add("запись в базу", write_started.elapsed());
                     }
                 }
                 FileCategory::Text => {
+                    let text_started = std::time::Instant::now();
                     // Попробуем XML 1С — если есть BSL-блоки, пишем как код.
                     let ext = abs
                         .extension()
@@ -1142,12 +1652,14 @@ fn apply_event(
                             ok = false;
                         }
                     }
+                    crate::logging::stage_add("запись в базу", text_started.elapsed());
                 }
                 FileCategory::Binary => {}
             }
             ok
         }
         FileEvent::Deleted(abs) => {
+            let delete_started = std::time::Instant::now();
             let rel_path = abs
                 .strip_prefix(root)
                 .unwrap_or(abs)
@@ -1182,6 +1694,7 @@ fn apply_event(
                     }
                 }
             }
+            crate::logging::stage_add("удаление исчезнувших", delete_started.elapsed());
             ok
         }
     }

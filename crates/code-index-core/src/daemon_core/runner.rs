@@ -152,10 +152,11 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     // и перезапускает их (см. supervise_workers).
     let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(5));
 
-    // Пульс: раз в минуту строка о состоянии всех папок. Нужен, чтобы по
-    // присланному журналу было видно и что демон жив, и какая папка стоит
-    // без движения — «встало на первичной индексации» иначе выглядит как
-    // просто оборвавшийся журнал.
+    // Пульс: раз в минуту строка о состоянии папок, но ТОЛЬКО пока есть
+    // незавершённая работа. Нужен, чтобы по присланному журналу было видно,
+    // какая папка стоит без движения — «встало на первичной индексации»
+    // иначе выглядит как просто оборвавшийся журнал. Когда все папки готовы,
+    // сообщать нечего: одинаковая строка каждую минуту только забивает файл.
     // Первый тик — через интервал, а не сразу: на старте все папки ещё «не
     // начаты», и мгновенный пульс дал бы полсотни бессодержательных строк.
     let pulse_period = std::time::Duration::from_secs(PULSE_INTERVAL_SEC);
@@ -196,10 +197,13 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
                 ).await;
             }
             _ = pulse.tick() => {
-                let uptime = started_at.elapsed().as_secs();
-                let memory = crate::logging::memory_note();
-                for line in format_pulse(uptime, &memory, &daemon_state.pulse_snapshot().await) {
-                    tracing::info!("{}", line);
+                let snapshot = daemon_state.pulse_snapshot().await;
+                if pulse_needed(&snapshot) {
+                    let uptime = started_at.elapsed().as_secs();
+                    let memory = crate::logging::memory_note();
+                    for line in format_pulse(uptime, &memory, &snapshot) {
+                        tracing::info!("{}", line);
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -237,33 +241,35 @@ const PULSE_INTERVAL_SEC: u64 = 60;
 /// очередь на первичную индексацию иначе даёт стену строк каждую минуту.
 const PULSE_MAX_PATH_LINES: usize = 10;
 
-/// Человекочитаемая длительность. Журнал читает человек, а не машина:
-/// «3 ч 12 мин» разбирается с одного взгляда, 11532 секунды — нет.
-fn human_duration(sec: u64) -> String {
-    if sec < 60 {
-        format!("{} с", sec)
-    } else if sec < 3600 {
-        format!("{} мин {} с", sec / 60, sec % 60)
-    } else {
-        format!("{} ч {} мин", sec / 3600, (sec % 3600) / 60)
-    }
-}
+use crate::logging::human_duration;
 
 /// Название статуса по-русски — журнал читает человек, которому машинные
 /// `reindexing_batch` ничего не говорят.
 fn status_ru(status: PathStatus) -> &'static str {
     match status {
         PathStatus::NotStarted => "не начата",
-        PathStatus::InitialIndexing => "первичная индексация",
+        // Не «первичная»: демон приходит сюда и на существующей базе, где
+        // переписываются только изменившиеся файлы. Обещание «первичная»
+        // сбивало с толку — на деле это индексация папки при старте демона.
+        PathStatus::InitialIndexing => "индексация при старте",
         PathStatus::Ready => "готова",
         PathStatus::ReindexingBatch => "обработка пакета изменений",
         PathStatus::Error => "ошибка",
     }
 }
 
-/// Собрать строки пульса: сводка по всем папкам плюс отдельная строка на
-/// каждую, которая сейчас не готова. Готовые папки поимённо не перечисляем —
-/// на полусотне репозиториев это была бы стена текста каждую минуту.
+/// Нужна ли строка состояния прямо сейчас. Пока все папки готовы, состояние
+/// демона не меняется, и минутная строка о простое только забивает журнал:
+/// интересны индексация, пакеты изменений и ошибки — то есть незавершённая
+/// работа. Вынесено чистой функцией ради модульного теста.
+fn pulse_needed(snapshot: &[PathPulse]) -> bool {
+    snapshot.iter().any(|p| p.status != PathStatus::Ready)
+}
+
+/// Собрать строки состояния демона: сводка по всем папкам плюс отдельная
+/// строка на каждую, которая сейчас не готова. Готовые папки поимённо не
+/// перечисляем — на полусотне репозиториев это была бы стена текста каждую
+/// минуту.
 ///
 /// Вынесено чистой функцией ради модульного теста — тем же приёмом, что
 /// `allow_respawn` и `batch_outcome`.
@@ -282,7 +288,10 @@ fn format_pulse(uptime_sec: u64, memory: &str, snapshot: &[PathPulse]) -> Vec<St
     }
 
     let mut lines = vec![format!(
-        "[пульс] работает {}, память демона {}, папок {}: готовы {}, индексируются {}, ошибок {}, не начаты {}",
+        // «Запущен столько-то назад» — про возраст процесса. Прежнее «работает
+        // 4 мин» рядом с «в работе 1» читалось как время текущей работы, хотя
+        // это время жизни демона: он мог уже отработать несколько операций.
+        "[состояние демона] запущен {} назад, память демона {}, папок {}: готовы {}, в работе {}, ошибок {}, не начаты {}",
         human_duration(uptime_sec),
         memory,
         snapshot.len(),
@@ -298,27 +307,40 @@ fn format_pulse(uptime_sec: u64, memory: &str, snapshot: &[PathPulse]) -> Vec<St
         .collect();
 
     for p in pending.iter().take(PULSE_MAX_PATH_LINES) {
-        let progress = match &p.progress {
-            Some(pr) if pr.files_total > 0 => format!(
-                "{}/{} файлов ({:.1}%)",
-                pr.files_done,
-                pr.files_total,
-                pr.percent.unwrap_or(0.0)
-            ),
-            _ => "прогресс не сообщался".to_string(),
+        // Что папка делает прямо сейчас — главное, ради чего строку читают.
+        // Этап знает только рабочий поток; если он между этапами, остаётся
+        // общий статус и время без движения.
+        // Когда известен текущий этап, названием статуса его не предваряем:
+        // статус описывает всю операцию грубо («индексация при старте») и на
+        // первичной индексации звучит неточно, а этап отвечает на вопрос
+        // «чем занято прямо сейчас» — ради него строку и читают.
+        let mut parts = match &p.stage {
+            Some((stage, sec)) => vec![format!("этап «{}» идёт {}", stage, human_duration(*sec))],
+            None => vec![status_ru(p.status).to_string()],
         };
+        if let Some(pr) = &p.progress {
+            // Ноль обработанных показывать незачем: полный проход счётчик
+            // файлов не ведёт вовсе, и «0/3000 (0.0%)» читается как «встало».
+            if pr.files_total > 0 && pr.files_done > 0 {
+                parts.push(format!(
+                    "{}/{} файлов ({:.1}%)",
+                    pr.files_done,
+                    pr.files_total,
+                    pr.percent.unwrap_or(0.0)
+                ));
+            }
+        }
+        parts.push(format!("в этом состоянии {}", human_duration(p.still_sec)));
         lines.push(format!(
-            "[пульс] {} — {}, {}, без изменений {}",
+            "[состояние демона] {} — {}",
             p.path.display(),
-            status_ru(p.status),
-            progress,
-            human_duration(p.still_sec)
+            parts.join(", ")
         ));
     }
 
     if pending.len() > PULSE_MAX_PATH_LINES {
         lines.push(format!(
-            "[пульс] …и ещё {} папок не готовы (перечислены первые {})",
+            "[состояние демона] …и ещё {} папок не готовы (перечислены первые {})",
             pending.len() - PULSE_MAX_PATH_LINES,
             PULSE_MAX_PATH_LINES
         ));
@@ -687,7 +709,47 @@ mod migrate_tests {
     }
 
     #[test]
-    fn пульс_даёт_сводку_и_строку_на_каждую_неготовую_папку() {
+    fn состояние_молчит_когда_все_папки_готовы() {
+        let ready = |name: &str| PathPulse {
+            path: PathBuf::from(name),
+            status: PathStatus::Ready,
+            progress: None,
+            still_sec: 3600,
+            stage: None,
+        };
+
+        // Всё готово — работы нет, писать нечего.
+        assert!(!pulse_needed(&[ready("/repo/a"), ready("/repo/b")]));
+        // Нет ни одной папки — тоже молчим.
+        assert!(!pulse_needed(&[]));
+
+        // Достаточно одной незавершённой папки, чтобы строка снова заработала.
+        for status in [
+            PathStatus::NotStarted,
+            PathStatus::InitialIndexing,
+            PathStatus::ReindexingBatch,
+            PathStatus::Error,
+        ] {
+            let snapshot = vec![
+                ready("/repo/a"),
+                PathPulse {
+                    path: PathBuf::from("/repo/busy"),
+                    status,
+                    progress: None,
+                    still_sec: 5,
+                    stage: None,
+                },
+            ];
+            assert!(
+                pulse_needed(&snapshot),
+                "статус {:?} должен давать строку состояния",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn состояние_даёт_сводку_и_строку_на_каждую_неготовую_папку() {
         use super::super::ipc::Progress;
 
         let snapshot = vec![
@@ -696,12 +758,14 @@ mod migrate_tests {
                 status: PathStatus::Ready,
                 progress: None,
                 still_sec: 5,
+                stage: None,
             },
             PathPulse {
                 path: PathBuf::from("/repo/slow"),
                 status: PathStatus::InitialIndexing,
                 progress: Some(Progress::new(1200, 90_000)),
                 still_sec: 3700,
+                stage: Some(("граф вызовов".to_string(), 95)),
             },
         ];
 
@@ -710,21 +774,28 @@ mod migrate_tests {
         assert!(lines[0].contains("папок 2"));
         assert!(lines[0].contains("память демона 812 МБ"));
         assert!(lines[0].contains("готовы 1"));
-        assert!(lines[0].contains("индексируются 1"));
+        assert!(lines[0].contains("в работе 1"));
         // Готовая папка поимённо не перечисляется.
         assert!(!lines.iter().any(|l| l.contains("/repo/ready")));
         // У застрявшей видно и прогресс, и как давно нет движения.
         assert!(lines[1].contains("1200/90000 файлов"));
-        assert!(lines[1].contains("первичная индексация"));
+        // Пока известен этап, названием статуса строку не начинаем.
+        assert!(!lines[1].contains("индексация при старте"), "{}", lines[1]);
+        // Главное в строке — чем папка занята прямо сейчас.
         assert!(
-            lines[1].contains("без изменений 1 ч 1 мин"),
+            lines[1].contains("этап «граф вызовов» идёт 1 мин 35 с"),
+            "текущий этап и сколько он идёт: {}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("в этом состоянии 1 ч 1 мин"),
             "время без движения должно быть человекочитаемым: {}",
             lines[1]
         );
     }
 
     #[test]
-    fn пульс_не_перечисляет_больше_десяти_папок() {
+    fn состояние_не_перечисляет_больше_десяти_папок() {
         // 25 неготовых папок: десять поимённо плюс строка про остаток —
         // иначе каждую минуту в журнал уходила бы стена строк.
         let snapshot: Vec<PathPulse> = (0..25)
@@ -733,6 +804,7 @@ mod migrate_tests {
                 status: PathStatus::NotStarted,
                 progress: None,
                 still_sec: 10,
+                stage: None,
             })
             .collect();
 
@@ -741,12 +813,6 @@ mod migrate_tests {
         assert!(lines.last().unwrap().contains("и ещё 15 папок"), "{}", lines.last().unwrap());
     }
 
-    #[test]
-    fn длительность_переводится_в_человеческий_вид() {
-        assert_eq!(human_duration(42), "42 с");
-        assert_eq!(human_duration(125), "2 мин 5 с");
-        assert_eq!(human_duration(7300), "2 ч 1 мин");
-    }
 
     fn make_repo_with_marker(tmp: &TempDir, name: &str, marker: &str) -> std::path::PathBuf {
         let dir = tmp.path().join(name);

@@ -35,10 +35,14 @@ pub struct PathRuntime {
     pub error: Option<String>,
     /// Когда папка последний раз приходила в `Ready`.
     pub last_ready_at: Option<String>,
-    /// Момент последнего изменения статуса или прогресса. По нему пульс в
-    /// журнале считает, сколько папка стоит без движения — главный признак
-    /// «встало» при разборе обращения.
+    /// Момент последнего изменения статуса или прогресса. По нему строка
+    /// состояния демона считает, сколько папка стоит без движения — главный
+    /// признак «встало» при разборе обращения.
     pub changed_at: Instant,
+    /// Поток, который ведёт эту папку. По нему берётся текущий этап работы:
+    /// сам поток занят долгой синхронной работой и состояние обновлять не
+    /// может, поэтому этап читается из общего реестра `logging`.
+    pub worker_thread: Option<std::thread::ThreadId>,
 }
 
 impl Default for PathRuntime {
@@ -49,11 +53,12 @@ impl Default for PathRuntime {
             error: None,
             last_ready_at: None,
             changed_at: Instant::now(),
+            worker_thread: None,
         }
     }
 }
 
-/// Срез одной папки для строки пульса в журнале.
+/// Срез одной папки для строки состояния демона в журнале.
 #[derive(Debug, Clone)]
 pub struct PathPulse {
     pub path: PathBuf,
@@ -61,6 +66,9 @@ pub struct PathPulse {
     pub progress: Option<Progress>,
     /// Секунд без изменения статуса и прогресса.
     pub still_sec: u64,
+    /// Чем папка занята прямо сейчас и сколько секунд: («граф вызовов», 40).
+    /// `None` — между этапами или когда работа закончена.
+    pub stage: Option<(String, u64)>,
 }
 
 impl DaemonState {
@@ -109,6 +117,15 @@ impl DaemonState {
         }
 
         (added, removed, unchanged)
+    }
+
+    /// Запомнить поток, который ведёт эту папку. Вызывается самим рабочим
+    /// потоком в начале работы: по этой отметке строка состояния демона
+    /// узнаёт, каким этапом папка занята прямо сейчас.
+    pub async fn note_worker_thread(&self, path: &PathBuf) {
+        let mut guard = self.inner.write().await;
+        let entry = guard.paths.entry(path.clone()).or_default();
+        entry.worker_thread = Some(std::thread::current().id());
     }
 
     /// Выставить статус папки. Используется фоновыми задачами демона.
@@ -179,6 +196,7 @@ impl DaemonState {
                 status: rt.status,
                 progress: rt.progress.clone(),
                 still_sec: now.duration_since(rt.changed_at).as_secs(),
+                stage: rt.worker_thread.and_then(crate::logging::stage_running),
             })
             .collect();
         out.sort_by(|a, b| a.path.cmp(&b.path));

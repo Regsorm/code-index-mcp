@@ -432,6 +432,10 @@ pub fn run_incremental_extras(
     // приезжает своим ходом через пофайловые ветки ниже (upsert_metadata_object
     // / update_*_for_*). reconcile_area ведёт собственные транзакции, поэтому
     // безопасен до пофайловых веток; home объекта читается ДО их правок.
+    // Этапы называются так же, как при полной переиндексации: тот же слой —
+    // то же имя, только объём работы другой. Время копится по имени, потому что
+    // здесь слои обновляются пофайлово, а не одним проходом.
+    let started = std::time::Instant::now();
     for area_root in &dump_info_areas {
         match reconcile_area(repo_root, conn, &roots, area_root) {
             Ok(s) => tracing::info!(
@@ -442,24 +446,60 @@ pub fn run_incremental_extras(
             Err(e) => tracing::warn!("reconcile_area {}: {}", area_root.display(), e),
         }
     }
+    if !dump_info_areas.is_empty() {
+        code_index_core::logging::stage_add("опись состава", started.elapsed());
+        code_index_core::logging::stage_set_detail(
+            "опись состава",
+            code_index_core::logging::plural(
+                dump_info_areas.len() as u64,
+                "область",
+                "области",
+                "областей",
+            ),
+        );
+    }
     // Точечный upsert перечня/синонима/владельца по каждому изменённому объекту.
     // Идёт ПОСЛЕ config_changed-блока: если тот сделал полный reinsert (sub_config
     // там всегда '' — Configuration.xml не знает ObjectBelonging), upsert поверх
     // выставит корректного владельца Native-объектам.
     for p in &all_object_xmls {
+        let t = std::time::Instant::now();
         if let Err(e) = upsert_metadata_object(repo_root, conn, &roots, p) {
             tracing::warn!("upsert_metadata_object {}: {}", p.display(), e);
         }
+        code_index_core::logging::stage_add("объекты", t.elapsed());
     }
     for p in &object_xmls {
+        let t = std::time::Instant::now();
         update_data_links_for_object(conn, &roots, p)?;
+        code_index_core::logging::stage_add("связи данных", t.elapsed());
+        let t = std::time::Instant::now();
         update_object_attributes_for_object(conn, &roots, p)?;
+        code_index_core::logging::stage_add("структура объектов", t.elapsed());
     }
     for p in &form_xmls {
+        let t = std::time::Instant::now();
         update_metadata_forms_for_file(repo_root, conn, p)?;
+        code_index_core::logging::stage_add("формы", t.elapsed());
     }
     for p in &sub_xmls {
+        let t = std::time::Instant::now();
         update_event_subscription_for_file(conn, p)?;
+        code_index_core::logging::stage_add("подписки", t.elapsed());
+    }
+    for (имя, сколько) in [
+        ("объекты", all_object_xmls.len()),
+        ("связи данных", object_xmls.len()),
+        ("структура объектов", object_xmls.len()),
+        ("формы", form_xmls.len()),
+        ("подписки", sub_xmls.len()),
+    ] {
+        if сколько > 0 {
+            code_index_core::logging::stage_set_detail(
+                имя,
+                code_index_core::logging::plural(сколько as u64, "файл", "файла", "файлов"),
+            );
+        }
     }
     // .bsl — точечный per-file апдейт слоя direct (O(рёбер файла)) + обратного
     // индекса использований объектов МД в коде (metadata_code_usages).
@@ -469,27 +509,94 @@ pub fn run_incremental_extras(
         std::path::PathBuf,
         std::collections::HashMap<String, String>,
     > = std::collections::HashMap::new();
+    let mut per_file_graph = std::time::Duration::ZERO;
+    // На большой пачке пофайловый обход идёт минутами, и без отметок журнал
+    // молчит от начала до конца — по нему не отличить медленную работу от
+    // зависшей. Отчёт по времени, а не по числу файлов: на лёгких файлах шаг
+    // в штуках сыплет строками, на тяжёлых молчит.
+    let mut progress = code_index_core::logging::Heartbeat::every_secs(5);
+    let mut files_done = 0usize;
+    // Отметка для строки состояния демона. Ставится один раз на весь цикл, а не
+    // по слоям: слои чередуются на каждом файле, и отметка менялась бы тысячи
+    // раз в секунду, ничего не сообщая.
+    code_index_core::logging::stage_begin("точечное обновление надстройки");
     for p in &bsl_paths {
+        files_done += 1;
+        if progress.due() {
+            tracing::info!(
+                "точечное обновление надстройки: обработано {} из {} файлов",
+                files_done,
+                bsl_paths.len()
+            );
+        }
+        let t = std::time::Instant::now();
         update_call_graph_direct_for_file(repo_root, conn, p)?;
+        per_file_graph += t.elapsed();
+        code_index_core::logging::stage_add("граф вызовов", t.elapsed());
+        let t = std::time::Instant::now();
         update_code_usages_for_file(repo_root, conn, p)?;
+        code_index_core::logging::stage_add("использования в коде", t.elapsed());
+        let t = std::time::Instant::now();
         update_procedure_terms_for_file(repo_root, conn, p)?;
+        code_index_core::logging::stage_add("термины процедур", t.elapsed());
+        // Справочник экспортных процедур ведётся вместе с модулем: по нему
+        // резолв узнаёт, куда ведут вызовы, не перебирая всю конфигурацию.
+        let t = std::time::Instant::now();
+        let rel = rel_path(repo_root, p);
+        if let Err(e) = update_exported_procs_for_file(conn, &rel) {
+            tracing::warn!("update_exported_procs_for_file {}: {}", rel, e);
+        }
+        code_index_core::logging::stage_add("справочник экспортных", t.elapsed());
         // Точечное ведение metadata_modules (dbgs): завести/обновить строку
         // модуля этого .bsl. Superset при живом config_changed-триггере.
+        let t = std::time::Instant::now();
         if let Err(e) = update_metadata_module_for_file(repo_root, conn, p, &mut cfgver_cache) {
             tracing::warn!("update_metadata_module_for_file {}: {}", p.display(), e);
         }
+        code_index_core::logging::stage_add("модули", t.elapsed());
     }
+    if !bsl_paths.is_empty() {
+        let сколько =
+            code_index_core::logging::plural(bsl_paths.len() as u64, "файл", "файла", "файлов");
+        for имя in ["граф вызовов", "использования в коде", "термины процедур", "модули"] {
+            code_index_core::logging::stage_set_detail(имя, сколько.clone());
+        }
+        tracing::debug!(
+            "граф вызовов, пофайловая часть: {} мс на {} файлов",
+            per_file_graph.as_millis(),
+            bsl_paths.len()
+        );
+    }
+    // Пофайловый обход закончен — дальше общий на всю пачку резолв адресов.
+    code_index_core::logging::stage_begin("резолв адресов вызовов");
     // Этап 4e ОДИН раз на батч: резолв callee_proc_key новых direct-рёбер +
     // отсев балласта (тот же хелпер, что в полном пересборе). Пофайловый цикл
     // выше кладёт лишь сырые рёбра с NULL-адресом (дёшево, по индексам); тяжёлый
     // глобальный резолв (build_common_module_methods + resolve_* + prune_*) идёт
     // здесь единожды — вместо N-кратного повтора на каждый файл (была
     // квадратичная деградация на bulk-батче в тысячи файлов).
+    let t = std::time::Instant::now();
     if !bsl_paths.is_empty() {
+        // База, проиндексированная прежней версией, справочника не имеет —
+        // тогда собираем его один раз, иначе адреса вызовов не проставятся.
+        if exported_procs_empty(conn) {
+            tracing::info!("справочник экспортных процедур пуст — собираю целиком");
+            let _ = conn.execute("ROLLBACK", []);
+            conn.execute("BEGIN", [])?;
+            rebuild_exported_procs(conn)?;
+            conn.execute("COMMIT", [])?;
+        }
+        // Область — только файлы пакета: рёбра, которые не удалось адресовать
+        // однозначно, остаются с пустым адресом навсегда, и проход «по всем
+        // неадресованным» каждый раз перебирал бы весь граф заново.
+        let scope_paths: Vec<String> =
+            bsl_paths.iter().map(|p| rel_path(repo_root, p)).collect();
+        create_batch_scope(conn, &scope_paths)?;
         let _ = conn.execute("ROLLBACK", []);
         conn.execute("BEGIN", [])?;
-        resolve_and_prune_direct_edges(conn)?;
+        resolve_and_prune_direct_edges(conn, EdgeScope::Batch)?;
         conn.execute("COMMIT", [])?;
+        drop_batch_scope(conn)?;
     }
     // Слой extension_override зависит от functions.override_* (обновляется
     // core-индексатором при правке .bsl) — полный пересбор дёшев (один SELECT).
@@ -502,22 +609,29 @@ pub fn run_incremental_extras(
     if !sub_xmls.is_empty() {
         rebuild_call_graph_subscription(conn)?;
     }
+    code_index_core::logging::stage_add("граф вызовов", t.elapsed());
     // Конфиг-уровневые источники: полный пересбор затронутой таблицы. Каждая
     // функция сносит только свои строки (data_links config link_kind / всю
     // role_rights), не трогая объектные рёбра графа данных.
     if refs_dirty {
+        let t = std::time::Instant::now();
         index_metadata_refs(repo_root, conn)?;
+        code_index_core::logging::stage_add("связи конфигурации", t.elapsed());
     }
     if roles_dirty {
+        let t = std::time::Instant::now();
         index_role_rights(repo_root, conn)?;
+        code_index_core::logging::stage_add("права ролей", t.elapsed());
     }
     // Освежить статистику планировщика, если графовые таблицы (data_links /
     // proc_call_graph) разъехались со статистикой в ≥1.5× (например, bulk-залив
     // расширений). Только когда рёбра реально могли измениться в этом батче.
     if !dump_info_areas.is_empty() || !bsl_paths.is_empty() || !object_xmls.is_empty() || refs_dirty {
+        let t = std::time::Instant::now();
         if let Err(e) = maybe_analyze_graph_tables(conn) {
             tracing::warn!("maybe_analyze_graph_tables: {}", e);
         }
+        code_index_core::logging::stage_add("статистика", t.elapsed());
     }
     Ok(())
 }
@@ -1273,7 +1387,7 @@ pub(crate) fn run_incremental_extras_edt(
     if !bsl_changed.is_empty() {
         let _ = conn.execute("ROLLBACK", []);
         conn.execute("BEGIN", [])?;
-        resolve_and_prune_direct_edges(conn)?;
+        resolve_and_prune_direct_edges(conn, EdgeScope::Batch)?;
         conn.execute("COMMIT", [])?;
         rebuild_call_graph_extension_override(conn)?;
     }

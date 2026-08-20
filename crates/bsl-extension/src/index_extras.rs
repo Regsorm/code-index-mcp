@@ -24,15 +24,36 @@ use rusqlite::params;
 
 mod call_graph;
 mod common;
+mod exported;
 mod full_scan;
 mod incremental;
 mod modules;
 
 pub(crate) use call_graph::*;
 pub(crate) use common::*;
+pub(crate) use exported::*;
 pub(crate) use full_scan::*;
 pub(crate) use incremental::*;
 pub(crate) use modules::*;
+
+/// Выполнить одну фазу надстройки, отметив её длительность для итоговой
+/// строки по папке. Ошибка фазы не фатальна: базовая индексация уже сохранена,
+/// поэтому журналируем предупреждение и идём дальше — как было и до отметок.
+///
+/// `name` — короткое имя для раскладки в итоге, `label` — прежняя метка
+/// предупреждения (по ней ищут в журнале, менять нельзя).
+fn phase(name: &'static str, label: &str, f: impl FnOnce() -> Result<()>) {
+    let started = std::time::Instant::now();
+    // Отметка «занят этим» — по ней строка состояния демона отвечает, чем
+    // папка занята сейчас: слои надстройки идут минутами, и без отметки
+    // журнал молчит от начала слоя до его конца.
+    code_index_core::logging::stage_begin(name);
+    let outcome = f();
+    code_index_core::logging::stage_done(name, started.elapsed());
+    if let Err(e) = outcome {
+        tracing::warn!("{}: {}", label, e);
+    }
+}
 
 /// Запустить полный проход по репо и заполнить специфичные таблицы.
 /// Реализация публичная, чтобы её можно было звать из тестов.
@@ -53,8 +74,10 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // bsl-indexer), повторный disk-rebuild пропускаем — данные идентичны.
     if crate::parse_collector::collector_did(conn, crate::parse_collector::MARK_CODE_USAGES) {
         tracing::info!("metadata_code_usages: наполнено parse-collector'ом, disk-rebuild пропущен");
-    } else if let Err(e) = index_metadata_code_usages(repo_root, conn) {
-        tracing::warn!("metadata_code_usages: {}", e);
+    } else {
+        phase("использования в коде", "metadata_code_usages", || {
+            index_metadata_code_usages(repo_root, conn)
+        });
     }
     // Механические термы процедур (имя + объект + синоним + комментарий) —
     // после синонимов (использует metadata_objects.synonym, заполнен в слое).
@@ -62,17 +85,17 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // bsl-indexer) — строим из него, без повторного чтения .bsl с диска;
     // иначе полный disk-rebuild (инкремент / публичный путь).
     if crate::parse_collector::collector_did(conn, crate::parse_collector::MARK_PROC_TERMS) {
-        if let Err(e) = build_procedure_terms_from_staging(conn) {
-            tracing::warn!("procedure_terms (staging): {}", e);
-        }
-    } else if let Err(e) = index_procedure_terms(repo_root, conn) {
-        tracing::warn!("procedure_terms: {}", e);
+        phase("термины процедур", "procedure_terms (staging)", || {
+            build_procedure_terms_from_staging(conn)
+        });
+    } else {
+        phase("термины процедур", "procedure_terms", || {
+            index_procedure_terms(repo_root, conn)
+        });
     }
     // Граф вызовов строится ПОСЛЕ заполнения metadata_forms и event_subscriptions
     // (они в XML-слое выше) — он опирается на их содержимое.
-    if let Err(e) = build_call_graph(conn) {
-        tracing::warn!("proc_call_graph: {}", e);
-    }
+    phase("граф вызовов", "proc_call_graph", || build_call_graph(conn));
     // ANALYZE: без статистики SQLite в рекурсивном шаге find_path_bsl/
     // find_data_path использует лишь префикс индекса (repo=) и сканирует
     // все рёбра repo на каждой итерации (depth=3 ~240с на КА1.1). После
@@ -81,9 +104,9 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // INDEXED BY это НЕ чинит — решает только статистика. Графы строятся
     // заново при каждом reindex (DELETE+INSERT), поэтому ANALYZE здесь, в
     // конце прохода, освежает статистику синхронно с ними (~0.6с на 2.4ГБ).
-    if let Err(e) = conn.execute_batch("ANALYZE;") {
-        tracing::warn!("ANALYZE: {}", e);
-    }
+    phase("статистика", "ANALYZE", || {
+        conn.execute_batch("ANALYZE;").map_err(Into::into)
+    });
     Ok(())
 }
 
@@ -101,72 +124,72 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
     // Формат 1C:EDT (`.mdo`) — отдельный путь разбора. Заполняет ТЕ ЖЕ таблицы
     // (metadata_objects / data_links), поэтому downstream-инструменты не меняются.
     if let Some(src_root) = crate::xml::edt_mdo::detect_edt_src(repo_root) {
-        if let Err(e) = run_edt_metadata_layer(&src_root, conn) {
-            tracing::warn!("edt metadata layer: {}", e);
-        }
+        phase("объекты (EDT)", "edt metadata layer", || {
+            run_edt_metadata_layer(&src_root, conn)
+        });
         // Права ролей EDT лежат отдельными файлами и в общий проход по `.mdo`
         // не попадают — своя фаза, как у формата Конфигуратора (E-1).
-        if let Err(e) = run_edt_role_rights(&src_root, conn) {
-            tracing::warn!("edt role_rights: {}", e);
-        }
+        phase("права ролей (EDT)", "edt role_rights", || {
+            run_edt_role_rights(&src_root, conn)
+        });
         // Перечень модулей: своя раскладка путей и свои источники
         // идентификаторов, поэтому отдельная фаза (E-1).
-        if let Err(e) = index_metadata_modules_edt(repo_root, &src_root, conn) {
-            tracing::warn!("edt metadata_modules: {}", e);
-        }
+        phase("модули (EDT)", "edt metadata_modules", || {
+            index_metadata_modules_edt(repo_root, &src_root, conn)
+        });
         return Ok(());
     }
-    if let Err(e) = index_metadata_objects(repo_root, conn) {
-        tracing::warn!("metadata_objects: {}", e);
-    }
+    phase("объекты", "metadata_objects", || {
+        index_metadata_objects(repo_root, conn)
+    });
     // Граф связей данных: ссылочные реквизиты/измерения → рёбра data_links.
     // Открывает XML отдельных объектов (которые остальные проходы не читают).
-    if let Err(e) = index_data_links(repo_root, conn) {
-        tracing::warn!("data_links: {}", e);
-    }
+    phase("связи данных", "data_links", || {
+        index_data_links(repo_root, conn)
+    });
     // Рёбра data_links КОНФИГУРАЦИОННОГО уровня (подсистемы, планы обмена,
     // определяемые типы, расположение ФО). Строго ПОСЛЕ index_data_links —
     // та wipe-ит все рёбра repo и пишет объектные; эта добавляет свои link_kind.
-    if let Err(e) = index_metadata_refs(repo_root, conn) {
-        tracing::warn!("data_links(config-level): {}", e);
-    }
+    phase("связи конфигурации", "data_links(config-level)", || {
+        index_metadata_refs(repo_root, conn)
+    });
     // Права ролей → отдельная таблица role_rights.
-    if let Err(e) = index_role_rights(repo_root, conn) {
-        tracing::warn!("role_rights: {}", e);
-    }
+    phase("права ролей", "role_rights", || {
+        index_role_rights(repo_root, conn)
+    });
     // Полная структура объектов (реквизиты+типы, ТЧ, измерения, ресурсы)
     // → metadata_objects.attributes_json. Зависит от строк, созданных
     // index_metadata_objects (выше), — делает UPDATE по full_name.
-    if let Err(e) = index_object_attributes(repo_root, conn) {
-        tracing::warn!("object_attributes: {}", e);
-    }
+    phase("структура объектов", "object_attributes", || {
+        index_object_attributes(repo_root, conn)
+    });
     // Синонимы (русские представления) ВСЕХ объектов — отдельный лёгкий проход
     // по корневым XML всех папок типов. Покрывает и объекты без структуры
     // реквизитов (CommonModule/Constant/CommonPicture/FunctionalOption/…),
     // которых нет в OBJECT_FOLDERS. UPDATE по full_name; зависит от строк,
     // созданных index_metadata_objects.
-    if let Err(e) = index_object_synonyms(repo_root, conn) {
-        tracing::warn!("object_synonyms: {}", e);
-    }
-    if let Err(e) = index_metadata_forms(repo_root, conn) {
-        tracing::warn!("metadata_forms: {}", e);
-    }
-    if let Err(e) = index_event_subscriptions(repo_root, conn) {
-        tracing::warn!("event_subscriptions: {}", e);
-    }
+    phase("синонимы", "object_synonyms", || {
+        index_object_synonyms(repo_root, conn)
+    });
+    phase("формы", "metadata_forms", || {
+        index_metadata_forms(repo_root, conn)
+    });
+    phase("подписки", "event_subscriptions", || {
+        index_event_subscriptions(repo_root, conn)
+    });
     // metadata_modules зависят от UUID объектов (читают XML-файлы напрямую)
     // и от ConfigDumpInfo.xml каждой sub-config. Не зависят от других
     // *_index_extras-функций; порядок не критичен. После `DumpConfigToFiles`
     // платформа 1С перезаписывает всю выгрузку, поэтому полный пересбор оправдан.
-    if let Err(e) = index_metadata_modules(repo_root, conn) {
-        tracing::warn!("metadata_modules: {}", e);
-    }
+    phase("модули", "metadata_modules", || {
+        index_metadata_modules(repo_root, conn)
+    });
     // Реестр строк ConfigDumpInfo.xml всех областей (base + расширения) —
     // плоский снимок состава для diff-сверки Фазы 2. Только текст описей,
     // объектные XML не читает. Идемпотентно (DELETE repo + reinsert).
-    if let Err(e) = index_config_manifest(repo_root, conn) {
-        tracing::warn!("config_manifest: {}", e);
-    }
+    phase("опись состава", "config_manifest", || {
+        index_config_manifest(repo_root, conn)
+    });
     Ok(())
 }
 

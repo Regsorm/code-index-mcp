@@ -152,6 +152,7 @@ mod tests {
                     alias: if alias.is_empty() { None } else { Some(alias.to_string()) },
                     language: None,
                     max_code_file_size_bytes: None,
+                    bulk_batch_threshold: None,
                 })
                 .collect(),
             enrichment: None,

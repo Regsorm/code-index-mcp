@@ -10,6 +10,7 @@
 //
 // [indexer]
 // max_code_file_size_bytes = 5242880   # глобальный лимит content для code (5 МБ default)
+// bulk_batch_threshold = 8000          # с этого числа изменившихся файлов — пакетная обработка
 //
 // [[paths]]
 // path = "C:\\Repo1C"
@@ -18,6 +19,7 @@
 // path = "C:\\Repo1C-2"
 // debounce_ms = 2000                   # опциональное переопределение per-папка
 // max_code_file_size_bytes = 10485760  # этой папке — мягче (10 МБ)
+// bulk_batch_threshold = 3000          # этой папке — раньше переходить на пакетную
 // ```
 
 use std::path::{Path, PathBuf};
@@ -85,6 +87,12 @@ pub struct DaemonFileConfig {
 /// продолжают индексироваться по AST/FTS. Подробности — в `IndexerSection`.
 pub const DEFAULT_MAX_CODE_FILE_SIZE_BYTES: usize = 5 * 1024 * 1024; // 5 МБ
 
+/// Дефолтное число изменившихся файлов, с которого пачка обрабатывается не
+/// пофайлово, а пакетно (обход всего дерева, разбор в несколько потоков,
+/// запись со снятыми индексами). Замер на типовой торговой конфигурации:
+/// равновесие около семи тысяч файлов, поэтому дефолт взят с запасом.
+pub const DEFAULT_BULK_BATCH_THRESHOLD: usize = 8000;
+
 /// Секция `[indexer]` из конфига демона (Phase 2, v0.8.0).
 ///
 /// Сейчас содержит только лимит на размер code-файла, content которого
@@ -104,6 +112,11 @@ pub struct IndexerSection {
     /// `None` → используется hardcoded дефолт 5 МБ.
     #[serde(default)]
     pub max_code_file_size_bytes: Option<usize>,
+
+    /// Глобальный порог перехода с пофайловой обработки пачки на пакетную.
+    /// `None` → используется hardcoded дефолт 8000 файлов.
+    #[serde(default)]
+    pub bulk_batch_threshold: Option<usize>,
 }
 
 /// Запись в секции `[[cache_targets]]`. Описывает один cache-ci endpoint,
@@ -479,6 +492,12 @@ pub struct PathEntry {
     /// `[indexer].max_code_file_size_bytes` либо hardcoded дефолт 5 МБ.
     #[serde(default)]
     pub max_code_file_size_bytes: Option<usize>,
+
+    /// Per-path override порога перехода на пакетную обработку пачки.
+    /// `None` → использовать глобальный `[indexer].bulk_batch_threshold`
+    /// либо hardcoded дефолт 8000 файлов.
+    #[serde(default)]
+    pub bulk_batch_threshold: Option<usize>,
 }
 
 impl PathEntry {
@@ -502,6 +521,14 @@ impl PathEntry {
         self.max_code_file_size_bytes
             .or(indexer.max_code_file_size_bytes)
             .unwrap_or(DEFAULT_MAX_CODE_FILE_SIZE_BYTES)
+    }
+
+    /// Эффективный порог перехода на пакетную обработку пачки.
+    /// Приоритет: per-path → глобальный `[indexer]` → hardcoded дефолт 8000.
+    pub fn effective_bulk_batch_threshold(&self, indexer: &IndexerSection) -> usize {
+        self.bulk_batch_threshold
+            .or(indexer.bulk_batch_threshold)
+            .unwrap_or(DEFAULT_BULK_BATCH_THRESHOLD)
     }
 }
 
@@ -593,6 +620,7 @@ mod tests {
             alias: None,
             language: None,
             max_code_file_size_bytes: None,
+            bulk_batch_threshold: None,
         };
         assert_eq!(entry.effective_alias(), "some_folder_name");
     }
@@ -686,9 +714,11 @@ mod tests {
             alias: None,
             language: None,
             max_code_file_size_bytes: Some(1024),
+            bulk_batch_threshold: None,
         };
         let indexer_with_global = IndexerSection {
             max_code_file_size_bytes: Some(2048),
+            bulk_batch_threshold: None,
         };
         assert_eq!(
             entry_with_override.effective_max_code_file_size(&indexer_with_global),
@@ -704,6 +734,7 @@ mod tests {
             alias: None,
             language: None,
             max_code_file_size_bytes: None,
+            bulk_batch_threshold: None,
         };
         assert_eq!(
             entry_no_override.effective_max_code_file_size(&indexer_with_global),
@@ -719,6 +750,41 @@ mod tests {
             "без override должен браться hardcoded дефолт"
         );
         assert_eq!(DEFAULT_MAX_CODE_FILE_SIZE_BYTES, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn порог_пакетной_обработки_читается_из_конфига_демона() {
+        let text = r#"
+            [indexer]
+            bulk_batch_threshold = 5000
+
+            [[paths]]
+            path = "/tmp/a"
+
+            [[paths]]
+            path = "/tmp/b"
+            bulk_batch_threshold = 3000
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(cfg.indexer.bulk_batch_threshold, Some(5000));
+
+        // Папке без своей настройки достаётся глобальная.
+        assert_eq!(
+            cfg.paths[0].effective_bulk_batch_threshold(&cfg.indexer),
+            5000
+        );
+        // Своя настройка папки сильнее глобальной.
+        assert_eq!(
+            cfg.paths[1].effective_bulk_batch_threshold(&cfg.indexer),
+            3000
+        );
+        // Не задано нигде — дефолт.
+        let empty = IndexerSection::default();
+        assert_eq!(
+            cfg.paths[0].effective_bulk_batch_threshold(&empty),
+            DEFAULT_BULK_BATCH_THRESHOLD
+        );
+        assert_eq!(DEFAULT_BULK_BATCH_THRESHOLD, 8000);
     }
 
     #[test]

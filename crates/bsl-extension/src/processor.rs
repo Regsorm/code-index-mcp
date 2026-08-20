@@ -173,6 +173,7 @@ impl LanguageProcessor for BslLanguageProcessor {
         crate::index_extras::run_incremental_extras(repo_root, storage, changed, deleted)
     }
 
+
     /// Extras считаются наполненными, когда непусты ОБЕ ключевые таблицы,
     /// которые гарантированно есть у нормального BSL-репо: `metadata_objects`
     /// (из Configuration.xml) и механические термы в `procedure_enrichment`

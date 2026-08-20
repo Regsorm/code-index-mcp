@@ -1079,10 +1079,14 @@ fn cmd_index(
         }
     }
 
-    // 4. Открыть Storage с автоопределением режима
+    // 4. Открыть Storage с автоопределением режима. Папку взвешиваем тем же
+    //    способом, что и демон: у новой базы размер файла нулевой, и без
+    //    оценки по исходникам решение о памяти принимать не на чем.
     let storage_config = StorageConfig {
         mode: config.storage_mode.clone(),
         memory_max_percent: config.memory_max_percent,
+        expected_bytes: crate::indexer::estimate_source_bytes(&abs_path, &config)
+            .saturating_mul(crate::indexer::MEMORY_ESTIMATE_FACTOR),
     };
     let mut storage = Storage::open_auto(&db_path, &storage_config)?;
 
@@ -1207,7 +1211,8 @@ fn cmd_index(
     );
     println!("  Найдено файлов:        {}", result.files_scanned);
     println!("  Проиндексировано:      {}", result.files_indexed);
-    println!("  Пропущено (без изм.):  {}", result.files_skipped);
+    println!("  Без изменений:         {}", result.files_skipped);
+    println!("  Не индексируется:      {}", result.files_not_indexable);
     println!("  Удалено из индекса:    {}", result.files_deleted);
 
     if !result.errors.is_empty() {
@@ -1511,6 +1516,9 @@ async fn handle_daemon(
                 std::process::id(),
                 level
             );
+            // Паспорт машины — первым делом. Присланный журнал без него
+            // нечитаем: времена есть, а соотнести их не с чем.
+            tracing::info!("машина: {}", crate::logging::machine_note());
             match log_path {
                 Some(p) => tracing::info!("журнал демона: {}", p.display()),
                 None => tracing::warn!(

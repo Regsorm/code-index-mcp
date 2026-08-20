@@ -65,6 +65,10 @@ pub(crate) fn index_config_manifest(repo_root: &Path, conn: &rusqlite::Connectio
     drop(stmt);
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(format!(
+        "{} описи",
+        code_index_core::logging::plural(total as u64, "строка", "строки", "строк")
+    ));
     tracing::info!(
         "config_manifest: записано {} строк описи из {} областей",
         total,
@@ -204,6 +208,12 @@ pub(crate) fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connecti
     crate::schema::backfill_metadata_object_keys(conn)?;
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        total as u64,
+        "объект",
+        "объекта",
+        "объектов",
+    ));
     tracing::info!(
         "metadata_objects: записано {} объектов из {} Configuration.xml (вложенных подсистем {})",
         total,
@@ -306,6 +316,12 @@ pub(crate) fn index_data_links(repo_root: &Path, conn: &rusqlite::Connection) ->
     backfill_data_link_keys(conn)?;
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        total as u64,
+        "ребро",
+        "ребра",
+        "рёбер",
+    ));
     tracing::info!(
         "data_links: {} рёбер из {} объектов ({} sub-config)",
         total,
@@ -556,6 +572,12 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
     backfill_data_link_keys(conn)?;
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        total as u64,
+        "ребро",
+        "ребра",
+        "рёбер",
+    ));
     tracing::info!(
         "data_links(config-level): {} рёбер ({} sub-config)",
         total,
@@ -624,6 +646,12 @@ pub(crate) fn index_role_rights(repo_root: &Path, conn: &rusqlite::Connection) -
     backfill_role_right_keys(conn)?;
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        total as u64,
+        "право",
+        "права",
+        "прав",
+    ));
     tracing::info!(
         "role_rights: {} прав из {} ролей ({} sub-config)",
         total,
@@ -693,6 +721,12 @@ pub(crate) fn index_metadata_code_usages(repo_root: &Path, conn: &rusqlite::Conn
     drop(stmt);
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        total as u64,
+        "обращение",
+        "обращения",
+        "обращений",
+    ));
     tracing::info!(
         "metadata_code_usages: {} обращений из {} .bsl",
         total,
@@ -785,6 +819,12 @@ pub(crate) fn index_object_attributes(repo_root: &Path, conn: &rusqlite::Connect
     drop(stmt);
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        filled as u64,
+        "объект",
+        "объекта",
+        "объектов",
+    ));
     tracing::info!(
         "object_attributes: заполнено attributes_json у {} объектов ({} sub-config, base-first merge)",
         filled,
@@ -885,6 +925,12 @@ pub(crate) fn index_object_synonyms(repo_root: &Path, conn: &rusqlite::Connectio
     drop(stmt);
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        filled as u64,
+        "объект",
+        "объекта",
+        "объектов",
+    ));
     tracing::info!("object_synonyms: заполнен synonym у {} объектов", filled);
     Ok(())
 }
@@ -977,6 +1023,12 @@ pub(crate) fn index_procedure_terms(repo_root: &Path, conn: &rusqlite::Connectio
     drop(ins);
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        filled as u64,
+        "процедура",
+        "процедуры",
+        "процедур",
+    ));
     tracing::info!("procedure_terms: механически обогащено {} процедур", filled);
     Ok(())
 }
@@ -1052,6 +1104,12 @@ pub(crate) fn build_procedure_terms_from_staging(conn: &rusqlite::Connection) ->
         conn.execute_batch("INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment) VALUES('rebuild');")?;
         conn.execute_batch("DROP TABLE IF EXISTS _proc_terms_staging;")?;
 
+        code_index_core::logging::stage_detail(code_index_core::logging::plural(
+            filled as u64,
+            "процедура",
+            "процедуры",
+            "процедур",
+        ));
         tracing::info!("procedure_terms (staging): механически обогащено {} процедур", filled);
         Ok(())
     };
@@ -1122,6 +1180,12 @@ pub(crate) fn index_metadata_forms(repo_root: &Path, conn: &rusqlite::Connection
     drop(stmt);
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        count as u64,
+        "форма",
+        "формы",
+        "форм",
+    ));
     tracing::info!("metadata_forms: проиндексировано {} форм", count);
     Ok(())
 }
@@ -1185,6 +1249,12 @@ pub(crate) fn index_event_subscriptions(repo_root: &Path, conn: &rusqlite::Conne
     drop(stmt);
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        count as u64,
+        "подписка",
+        "подписки",
+        "подписок",
+    ));
     tracing::info!("event_subscriptions: проиндексировано {} подписок", count);
     Ok(())
 }

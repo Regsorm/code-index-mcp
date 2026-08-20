@@ -102,6 +102,12 @@ pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connecti
     }
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        total as u64,
+        "модуль",
+        "модуля",
+        "модулей",
+    ));
     tracing::info!(
         "metadata_modules: записано {} модулей из {} sub-configs (пропущено файлов: {})",
         total,
@@ -258,6 +264,12 @@ pub(crate) fn index_metadata_modules_edt(
     }
     conn.execute("COMMIT", [])?;
 
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        total as u64,
+        "модуль",
+        "модуля",
+        "модулей",
+    ));
     tracing::info!(
         "edt metadata_modules: {} модулей (src={})",
         total,
