@@ -27,6 +27,10 @@ pub struct WatcherConfig {
     pub exclude_dirs: Vec<String>,
     /// Glob-паттерны имён файлов для исключения (например "*.tmp.*", "*.bak")
     pub exclude_file_patterns: Vec<String>,
+    /// Преобладающий язык репозитория — нужен категоризации (`.h` в C++-проекте).
+    pub repo_language: Option<String>,
+    /// Дополнительные текстовые расширения из настроек проекта.
+    pub extra_text_extensions: Vec<String>,
 }
 
 impl Default for WatcherConfig {
@@ -36,6 +40,8 @@ impl Default for WatcherConfig {
             batch_ms: 2000,
             exclude_dirs: vec![],
             exclude_file_patterns: vec![],
+            repo_language: None,
+            extra_text_extensions: vec![],
         }
     }
 }
@@ -124,6 +130,43 @@ fn classify_event(kind: &notify::EventKind, path: &Path) -> Option<FileEvent> {
     }
 }
 
+/// Может ли событие по этому пути вообще что-то изменить в индексе.
+///
+/// Наблюдатель раньше отсеивал только исключённые каталоги и образцы имён, а
+/// категорию файла не смотрел. В итоге рабочие файлы соседних процессов —
+/// журнал приложения, база очереди и её служебный журнал — будили демон
+/// каждые пару секунд: он открывал транзакцию, обновлял надстройку, схлопывал
+/// журнал WAL и писал три строки в свой журнал. Работы ноль: такие файлы в
+/// индекс не попадают. Замер на рабочей установке: 3 051 пакет из 3 093 —
+/// пустые, 77 % строк журнала — их след, и полезное вытеснялось ротацией.
+///
+/// Пропускаем дальше:
+/// * каталоги — по ним раскрывается содержимое созданной или переименованной
+///   папки;
+/// * пути без расширения — это может быть удалённый каталог, отличить его от
+///   файла после удаления уже нельзя;
+/// * файлы, которые категоризация считает кодом или текстом.
+///
+/// Отсеиваем только то, что заведомо не индексируется: файл с расширением,
+/// признанный двоичным (с учётом языка репозитория и дополнительных текстовых
+/// расширений из настроек).
+pub fn event_can_change_index(
+    path: &Path,
+    repo_language: Option<&str>,
+    extra_text: &[String],
+) -> bool {
+    if path.is_dir() {
+        return true;
+    }
+    if path.extension().is_none() {
+        return true;
+    }
+    !matches!(
+        crate::indexer::file_types::categorize_file_in_repo(path, repo_language, extra_text),
+        crate::indexer::file_types::FileCategory::Binary
+    )
+}
+
 /// Создать watcher и вернуть receiver для событий файловой системы.
 ///
 /// Watcher работает в фоновом потоке notify. Возвращает кортеж
@@ -136,6 +179,8 @@ pub fn create_watcher(
     let exclude_dirs = config.exclude_dirs.clone();
     let file_matcher = build_file_matcher(&config.exclude_file_patterns);
     let root_path = root.to_path_buf();
+    let repo_language = config.repo_language.clone();
+    let extra_text = config.extra_text_extensions.clone();
 
     let mut watcher =
         notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
@@ -160,6 +205,12 @@ pub fn create_watcher(
                         if file_matcher.is_match(fname) {
                             continue;
                         }
+                    }
+
+                    // Файл заведомо не попадёт в индекс — будить обработку
+                    // пакета незачем.
+                    if !event_can_change_index(path, repo_language.as_deref(), &extra_text) {
+                        continue;
                     }
 
                     let file_event = match classify_event(&event.kind, path) {
@@ -292,6 +343,71 @@ pub fn poll_batch(
     }
 
     Ok(Some(pending.into_values().collect()))
+}
+
+#[cfg(test)]
+mod otsev_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Рабочие файлы соседних процессов (журнал приложения, база очереди и её
+    /// служебный журнал) в индекс не попадают — и будить обработку пакета
+    /// не должны. Это они давали 98 % пустых пакетов и три четверти строк
+    /// журнала на рабочей установке.
+    #[test]
+    fn двоичные_файлы_не_будят_обработку() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["poller.log", "queue.db", "queue.db-journal", "photo.png"] {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            assert!(
+                !event_can_change_index(&p, None, &[]),
+                "{} не индексируется — событие по нему обязано отсеиваться",
+                name
+            );
+        }
+    }
+
+    /// Всё, что действительно попадает в индекс, обязано проходить дальше.
+    #[test]
+    fn код_и_текст_проходят_дальше() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["Module.bsl", "main.rs", "readme.md", "Configuration.xml"] {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            assert!(
+                event_can_change_index(&p, None, &[]),
+                "{} индексируется — событие по нему нельзя терять",
+                name
+            );
+        }
+    }
+
+    /// Каталог и путь без расширения проходят всегда: по каталогу
+    /// раскрывается содержимое, а удалённый каталог от файла уже не отличить.
+    #[test]
+    fn каталоги_и_пути_без_расширения_проходят() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("Ext");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(event_can_change_index(&dir, None, &[]));
+
+        // Путь уже удалён — на диске его нет, расширения нет.
+        let ghost = tmp.path().join("УдалённыйКаталог");
+        assert!(event_can_change_index(&ghost, None, &[]));
+    }
+
+    /// Расширение из настроек проекта делает файл текстовым — значит событие
+    /// по нему отсеивать нельзя.
+    #[test]
+    fn дополнительные_расширения_снимают_отсев() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("service.log");
+        std::fs::write(&p, b"x").unwrap();
+
+        assert!(!event_can_change_index(&p, None, &[]));
+        assert!(event_can_change_index(&p, None, &["log".to_string()]));
+    }
 }
 
 #[cfg(test)]

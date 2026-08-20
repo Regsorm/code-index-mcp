@@ -664,6 +664,8 @@ pub fn run_worker(
         batch_ms,
         exclude_dirs: index_config.exclude_dirs.clone(),
         exclude_file_patterns: index_config.exclude_file_patterns.clone(),
+        repo_language: index_config.repo_language.clone(),
+        extra_text_extensions: index_config.extra_text_extensions.clone(),
     };
     let (watcher, rx) = match create_watcher(&path, &watcher_config) {
         Ok(pair) => pair,
