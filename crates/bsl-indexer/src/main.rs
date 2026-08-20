@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
     // делегат не делает — это наша забота тут.
     if let Some(sub) = argv.get(1) {
         if BSL_SUBCOMMANDS.contains(&sub.as_str()) {
-            init_tracing();
+            code_index_core::logging::init_stderr();
             // Передаём всё, что после `enrich`, в обработчик подкоманды.
             let rest: Vec<String> = argv[2..].to_vec();
             return match sub.as_str() {
@@ -64,16 +64,3 @@ async fn main() -> anyhow::Result<()> {
     cli::run(build_registry()).await
 }
 
-/// Инициализация tracing_subscriber. core::cli делает то же самое идемпотентно
-/// при своём вызове, но при перехвате `enrich` мы туда не заходим — поэтому
-/// инициализируем явно. `try_init` тихо возвращает Err, если глобальный
-/// dispatcher уже установлен (например, в тестах) — это нормально.
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
-}

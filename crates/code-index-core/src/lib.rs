@@ -2,6 +2,7 @@
 // Каждый модуль будет реализован в соответствующем шаге плана
 
 pub mod cli;            // CLI-обёртка (вызывается из bin'ов code-index и bsl-indexer)
+pub mod logging;        // Журнал долгоживущих процессов: stderr + файл с ротацией
 pub mod storage;        // SQLite-хранилище индекса
 pub mod parser;         // tree-sitter парсеры
 pub mod indexer;        // Обход и индексация файлов

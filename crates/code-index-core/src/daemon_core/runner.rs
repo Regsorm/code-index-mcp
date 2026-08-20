@@ -19,12 +19,12 @@ use tokio::sync::{broadcast, Semaphore};
 use super::cache_client::CacheClient;
 use super::commands::{self, DaemonCommand};
 use super::config::{self, IndexerSection, PathEntry};
-use super::ipc::{ReloadResponse, RuntimeInfo, StopResponse};
+use super::ipc::{PathStatus, ReloadResponse, RuntimeInfo, StopResponse};
 use super::language_detect;
 use super::lock;
 use super::paths;
 use super::server::{build_router, AppState};
-use super::state::DaemonState;
+use super::state::{DaemonState, PathPulse};
 use super::worker;
 use crate::extension::ProcessorRegistry;
 
@@ -43,8 +43,8 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
 
     let mut cfg = config::load_or_default()?;
     let cfg_path = paths::config_path()?;
-    eprintln!(
-        "[daemon] Конфиг: {} (папок: {})",
+    tracing::info!(
+        "конфиг: {} (папок: {})",
         cfg_path.display(),
         cfg.paths.len()
     );
@@ -70,7 +70,7 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     let actual_addr = listener.local_addr()?;
 
     write_runtime_info(&actual_addr, pid, &version)?;
-    eprintln!("[daemon] HTTP health-IPC: http://{}", actual_addr);
+    tracing::info!("HTTP health-IPC: http://{}", actual_addr);
 
     let app_state = AppState {
         state: daemon_state.clone(),
@@ -82,7 +82,7 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
 
     let server_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router).await {
-            eprintln!("[daemon] HTTP-сервер упал: {}", e);
+            tracing::error!("HTTP-сервер упал: {}", e);
         }
     });
 
@@ -123,8 +123,8 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
         None
     } else {
         let cc = Arc::new(CacheClient::new(cache_target_urls));
-        eprintln!(
-            "[daemon] cache invalidation: {} target(s) настроено",
+        tracing::info!(
+            "сброс кэша выдачи: настроено адресов — {}",
             cc.target_count()
         );
         Some(cc)
@@ -151,6 +151,15 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     // Сторож worker'ов тикает раз в 5 секунд — ищет аварийно завершившиеся потоки
     // и перезапускает их (см. supervise_workers).
     let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(5));
+
+    // Пульс: раз в минуту строка о состоянии всех папок. Нужен, чтобы по
+    // присланному журналу было видно и что демон жив, и какая папка стоит
+    // без движения — «встало на первичной индексации» иначе выглядит как
+    // просто оборвавшийся журнал.
+    // Первый тик — через интервал, а не сразу: на старте все папки ещё «не
+    // начаты», и мгновенный пульс дал бы полсотни бессодержательных строк.
+    let pulse_period = std::time::Duration::from_secs(PULSE_INTERVAL_SEC);
+    let mut pulse = tokio::time::interval_at(tokio::time::Instant::now() + pulse_period, pulse_period);
 
     // Основной цикл: команды + Ctrl-C + сторож
     loop {
@@ -186,19 +195,26 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
                     &cache_client,
                 ).await;
             }
+            _ = pulse.tick() => {
+                let uptime = started_at.elapsed().as_secs();
+                let memory = crate::logging::memory_note();
+                for line in format_pulse(uptime, &memory, &daemon_state.pulse_snapshot().await) {
+                    tracing::info!("{}", line);
+                }
+            }
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("[daemon] Ctrl-C — завершение");
+                tracing::info!("Ctrl-C — завершение");
                 break;
             }
         }
     }
 
-    eprintln!("[daemon] остановка worker'ов...");
+    tracing::info!("остановка worker'ов...");
     let _ = shutdown_tx.send(());
     for (path, handle) in workers {
         if let Err(e) = handle.await {
-            eprintln!(
-                "[daemon] worker {} не завершился корректно: {}",
+            tracing::warn!(
+                "worker {} не завершился корректно: {}",
                 path.display(),
                 e
             );
@@ -207,11 +223,108 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     server_handle.abort();
 
     remove_runtime_info();
-    eprintln!(
-        "[daemon] завершено, uptime {}с",
-        started_at.elapsed().as_secs()
+    tracing::info!(
+        "демон остановлен, время работы {}",
+        human_duration(started_at.elapsed().as_secs())
     );
     Ok(())
+}
+
+/// Как часто демон пишет в журнал строку пульса.
+const PULSE_INTERVAL_SEC: u64 = 60;
+
+/// Сколько неготовых папок перечислять поимённо. На полусотне репозиториев
+/// очередь на первичную индексацию иначе даёт стену строк каждую минуту.
+const PULSE_MAX_PATH_LINES: usize = 10;
+
+/// Человекочитаемая длительность. Журнал читает человек, а не машина:
+/// «3 ч 12 мин» разбирается с одного взгляда, 11532 секунды — нет.
+fn human_duration(sec: u64) -> String {
+    if sec < 60 {
+        format!("{} с", sec)
+    } else if sec < 3600 {
+        format!("{} мин {} с", sec / 60, sec % 60)
+    } else {
+        format!("{} ч {} мин", sec / 3600, (sec % 3600) / 60)
+    }
+}
+
+/// Название статуса по-русски — журнал читает человек, которому машинные
+/// `reindexing_batch` ничего не говорят.
+fn status_ru(status: PathStatus) -> &'static str {
+    match status {
+        PathStatus::NotStarted => "не начата",
+        PathStatus::InitialIndexing => "первичная индексация",
+        PathStatus::Ready => "готова",
+        PathStatus::ReindexingBatch => "обработка пакета изменений",
+        PathStatus::Error => "ошибка",
+    }
+}
+
+/// Собрать строки пульса: сводка по всем папкам плюс отдельная строка на
+/// каждую, которая сейчас не готова. Готовые папки поимённо не перечисляем —
+/// на полусотне репозиториев это была бы стена текста каждую минуту.
+///
+/// Вынесено чистой функцией ради модульного теста — тем же приёмом, что
+/// `allow_respawn` и `batch_outcome`.
+fn format_pulse(uptime_sec: u64, memory: &str, snapshot: &[PathPulse]) -> Vec<String> {
+    let mut ready = 0usize;
+    let mut indexing = 0usize;
+    let mut errors = 0usize;
+    let mut not_started = 0usize;
+    for p in snapshot {
+        match p.status {
+            PathStatus::Ready => ready += 1,
+            PathStatus::InitialIndexing | PathStatus::ReindexingBatch => indexing += 1,
+            PathStatus::Error => errors += 1,
+            PathStatus::NotStarted => not_started += 1,
+        }
+    }
+
+    let mut lines = vec![format!(
+        "[пульс] работает {}, память демона {}, папок {}: готовы {}, индексируются {}, ошибок {}, не начаты {}",
+        human_duration(uptime_sec),
+        memory,
+        snapshot.len(),
+        ready,
+        indexing,
+        errors,
+        not_started
+    )];
+
+    let pending: Vec<&PathPulse> = snapshot
+        .iter()
+        .filter(|p| p.status != PathStatus::Ready)
+        .collect();
+
+    for p in pending.iter().take(PULSE_MAX_PATH_LINES) {
+        let progress = match &p.progress {
+            Some(pr) if pr.files_total > 0 => format!(
+                "{}/{} файлов ({:.1}%)",
+                pr.files_done,
+                pr.files_total,
+                pr.percent.unwrap_or(0.0)
+            ),
+            _ => "прогресс не сообщался".to_string(),
+        };
+        lines.push(format!(
+            "[пульс] {} — {}, {}, без изменений {}",
+            p.path.display(),
+            status_ru(p.status),
+            progress,
+            human_duration(p.still_sec)
+        ));
+    }
+
+    if pending.len() > PULSE_MAX_PATH_LINES {
+        lines.push(format!(
+            "[пульс] …и ещё {} папок не готовы (перечислены первые {})",
+            pending.len() - PULSE_MAX_PATH_LINES,
+            PULSE_MAX_PATH_LINES
+        ));
+    }
+
+    lines
 }
 
 fn spawn_worker(
@@ -290,12 +403,12 @@ async fn supervise_workers(
     for path in finished {
         if let Some(handle) = workers.remove(&path) {
             match handle.await {
-                Ok(()) => eprintln!(
-                    "[daemon] worker {} завершился сам (не shutdown) — перезапуск",
+                Ok(()) => tracing::warn!(
+                    "worker {} завершился сам (не по команде остановки) — перезапуск",
                     path.display()
                 ),
                 Err(e) => {
-                    eprintln!("[daemon] worker {} упал ({}) — перезапуск", path.display(), e)
+                    tracing::error!("worker {} упал ({}) — перезапуск", path.display(), e)
                 }
             }
         }
@@ -303,8 +416,8 @@ async fn supervise_workers(
         let entry = match worker_entries.get(&path) {
             Some(e) => e.clone(),
             None => {
-                eprintln!(
-                    "[daemon] worker {} завершился, но PathEntry не найден — перезапуск невозможен",
+                tracing::error!(
+                    "worker {} завершился, но его настройки не найдены — перезапуск невозможен",
                     path.display()
                 );
                 state
@@ -324,8 +437,8 @@ async fn supervise_workers(
             RESPAWN_WINDOW,
             MAX_RESPAWNS,
         ) {
-            eprintln!(
-                "[daemon] worker {} аварийно завершался > {} раз за {}с — прекращаю перезапуски, статус Error",
+            tracing::error!(
+                "worker {} аварийно завершался > {} раз за {} с — перезапуски прекращены, статус «ошибка»",
                 path.display(),
                 MAX_RESPAWNS,
                 RESPAWN_WINDOW.as_secs()
@@ -571,6 +684,68 @@ mod migrate_tests {
         // По прошествии окна счётчик сбрасывается — снова разрешено.
         let later = t0 + std::time::Duration::from_secs(61);
         assert!(allow_respawn(&mut tracker, &path, later, window, 5));
+    }
+
+    #[test]
+    fn пульс_даёт_сводку_и_строку_на_каждую_неготовую_папку() {
+        use super::super::ipc::Progress;
+
+        let snapshot = vec![
+            PathPulse {
+                path: PathBuf::from("/repo/ready"),
+                status: PathStatus::Ready,
+                progress: None,
+                still_sec: 5,
+            },
+            PathPulse {
+                path: PathBuf::from("/repo/slow"),
+                status: PathStatus::InitialIndexing,
+                progress: Some(Progress::new(1200, 90_000)),
+                still_sec: 3700,
+            },
+        ];
+
+        let lines = format_pulse(7300, "812 МБ", &snapshot);
+        assert_eq!(lines.len(), 2, "сводка + одна неготовая папка: {:?}", lines);
+        assert!(lines[0].contains("папок 2"));
+        assert!(lines[0].contains("память демона 812 МБ"));
+        assert!(lines[0].contains("готовы 1"));
+        assert!(lines[0].contains("индексируются 1"));
+        // Готовая папка поимённо не перечисляется.
+        assert!(!lines.iter().any(|l| l.contains("/repo/ready")));
+        // У застрявшей видно и прогресс, и как давно нет движения.
+        assert!(lines[1].contains("1200/90000 файлов"));
+        assert!(lines[1].contains("первичная индексация"));
+        assert!(
+            lines[1].contains("без изменений 1 ч 1 мин"),
+            "время без движения должно быть человекочитаемым: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn пульс_не_перечисляет_больше_десяти_папок() {
+        // 25 неготовых папок: десять поимённо плюс строка про остаток —
+        // иначе каждую минуту в журнал уходила бы стена строк.
+        let snapshot: Vec<PathPulse> = (0..25)
+            .map(|i| PathPulse {
+                path: PathBuf::from(format!("/repo/{:02}", i)),
+                status: PathStatus::NotStarted,
+                progress: None,
+                still_sec: 10,
+            })
+            .collect();
+
+        let lines = format_pulse(60, "100 МБ", &snapshot);
+        assert_eq!(lines.len(), 1 + 10 + 1, "сводка + 10 папок + остаток: {:?}", lines.len());
+        assert!(lines.last().unwrap().contains("и ещё 15 папок"), "{}", lines.last().unwrap());
+    }
+
+    #[test]
+    fn длительность_переводится_в_человеческий_вид() {
+        assert_eq!(human_duration(42), "42 с");
+        assert_eq!(human_duration(125), "2 мин 5 с");
+        assert_eq!(human_duration(7300), "2 ч 1 мин");
     }
 
     fn make_repo_with_marker(tmp: &TempDir, name: &str, marker: &str) -> std::path::PathBuf {

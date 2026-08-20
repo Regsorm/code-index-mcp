@@ -219,8 +219,6 @@ dependencies = [
  "rmcp",
  "serde_json",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

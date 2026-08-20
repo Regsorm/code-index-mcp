@@ -576,18 +576,31 @@ async fn dedup_reset_route(
 /// выполнение соответствующей подкоманды. Не возвращает Ok пока
 /// демон/сервер живут — это long-running процесс.
 pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
-    // Инициализация логирования. tracing_subscriber idempotent при
-    // повторных вызовах — если bin уже что-то настроил, второй вызов
-    // вернёт ошибку, которую мы игнорируем (для тестов это норма).
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
-
     let cli = Cli::parse();
+
+    // Инициализация журнала. Долгоживущие процессы пишут ещё и в файл — их
+    // вывод некому смотреть в момент сбоя, а пользователю нужно что-то
+    // приложить к обращению. Короткие команды работают на глазах у человека,
+    // им хватает stderr.
+    //
+    // `daemon run` здесь намеренно пропущен: на Windows процесс сначала
+    // перезапускает себя отвязанным от консоли, и открывать файл журнала
+    // должен именно отвязанный клон (см. handle_daemon).
+    match &cli.command {
+        Commands::Daemon { action: DaemonAction::Run } => {}
+        Commands::Serve { .. } => {
+            match crate::daemon_core::paths::serve_log_file() {
+                Ok(p) => {
+                    crate::logging::init_with_file(&p, crate::logging::DEFAULT_LEVEL);
+                }
+                // Без CODE_INDEX_HOME писать журнал некуда — это не повод
+                // не запускать сервер выдачи.
+                Err(_) => crate::logging::init_stderr(),
+            }
+        }
+        _ => crate::logging::init_stderr(),
+    }
+
     // На текущем этапе registry приходит только в Serve через
     // `with_repos_and_registry` или `from_federated`. Остальные команды
     // (Index/Stats/...) её не используют. Чтобы не плодить копии,
@@ -1409,14 +1422,39 @@ async fn handle_daemon(
     action: DaemonAction,
     processor_registry: Option<Arc<ProcessorRegistry>>,
 ) -> anyhow::Result<()> {
-    use crate::daemon_core::{client, runner};
+    use crate::daemon_core::{client, paths, runner};
 
     match action {
         DaemonAction::Run => {
             if detach_from_console_if_needed()? {
                 return Ok(());
             }
-            tracing::info!("Запуск фонового демона code-index");
+            // Журнал открывает уже отвязанный от консоли процесс — у него
+            // stderr некуда девать, и файл остаётся единственным следом.
+            // Уровень: RUST_LOG сильнее `[daemon] log_level` из daemon.toml.
+            let level = crate::daemon_core::config::load_or_default()
+                .map(|c| c.daemon.log_level)
+                .unwrap_or_else(|_| crate::logging::DEFAULT_LEVEL.to_string());
+            let log_path = match paths::log_file() {
+                Ok(p) => crate::logging::init_with_file(&p, &level),
+                Err(_) => {
+                    crate::logging::init_stderr();
+                    None
+                }
+            };
+            tracing::info!(
+                "Запуск фонового демона code-index {} (PID {}), уровень журнала «{}»",
+                env!("CARGO_PKG_VERSION"),
+                std::process::id(),
+                level
+            );
+            match log_path {
+                Some(p) => tracing::info!("журнал демона: {}", p.display()),
+                None => tracing::warn!(
+                    "файл журнала не ведётся — вывод только в stderr; \
+                     проверьте переменную окружения CODE_INDEX_HOME"
+                ),
+            }
             runner::run(processor_registry).await?;
         }
         DaemonAction::Status { json } => match client::health().await {

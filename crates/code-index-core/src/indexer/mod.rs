@@ -215,10 +215,14 @@ impl<'a> Indexer<'a> {
         let collector = if force || is_fresh_db { collector } else { None };
 
         // ── Этап 1: сбор кандидатов (параллельный read+hash) ─────────────────
+        // О начале каждого тяжёлого этапа сообщаем ДО его выполнения: если
+        // этап встанет, в журнале останется имя того, на чём встали, а не
+        // тишина после отчёта о предыдущем этапе.
+        tracing::info!("[{}] этап 1: обход дерева каталогов и отбор изменившихся файлов", root.display());
         let candidates_start = std::time::Instant::now();
         let (candidate_files, seen_paths, metadata_updates) = self.collect_candidates(root, force, &existing_files, &mut result)?;
         let candidates_ms = candidates_start.elapsed().as_millis();
-        eprintln!("[timing] Сбор кандидатов: {} мс ({} файлов)", candidates_ms, candidate_files.len());
+        tracing::info!("[этап 1] отбор кандидатов: {} мс ({} файлов)", candidates_ms, candidate_files.len());
 
         // Включаем bulk-load если количество файлов для индексации превышает порог
         let bulk_mode = candidate_files.len() > self.config.bulk_threshold;
@@ -232,8 +236,8 @@ impl<'a> Indexer<'a> {
         if bulk_mode && is_fresh_db {
             // Первичная индексация: таблицы уже созданы через initialize(),
             // дропаем индексы которые были созданы вместе со схемой
-            eprintln!(
-                "[bulk] Первичная индексация {} файлов (порог {}): удаляем индексы",
+            tracing::info!(
+                "[пакетный режим] первичная индексация {} файлов (порог {}): индексы временно снимаются",
                 candidate_files.len(),
                 self.config.bulk_threshold
             );
@@ -247,8 +251,8 @@ impl<'a> Indexer<'a> {
             //      DELETE вырождается в полный скан таблиц на каждый файл —
             //      квадратичная деградация);
             //   3) дропнуть B-tree индексы перед массовой вставкой.
-            eprintln!(
-                "[bulk] Обновление {} файлов (порог {}): пакетное удаление старых строк + удаление индексов",
+            tracing::info!(
+                "[пакетный режим] обновление {} файлов (порог {}): пакетное удаление прежних строк и снятие индексов",
                 candidate_files.len(),
                 self.config.bulk_threshold
             );
@@ -259,8 +263,8 @@ impl<'a> Indexer<'a> {
                 .iter()
                 .filter_map(|c| existing_files.get(c.0.as_str()).map(|e| e.0))
                 .collect();
-            eprintln!(
-                "[bulk] Пакетное удаление старых строк: {} из {} кандидатов уже были в БД",
+            tracing::info!(
+                "[пакетный режим] пакетное удаление прежних строк: {} из {} кандидатов уже были в базе",
                 victim_ids.len(),
                 candidate_files.len()
             );
@@ -277,6 +281,7 @@ impl<'a> Indexer<'a> {
         // ── Этап 2: параллельный парсинг (CPU-bound) ─────────────────────────
         // tree-sitter парсинг выполняется в нескольких потоках через rayon.
         // Чтение файлов уже выполнено в collect_candidates — здесь только AST.
+        tracing::info!("[этап 2] начат разбор {} файлов в несколько потоков", candidate_files.len());
         let parse_start = std::time::Instant::now();
         // Лимит для `file_contents` — копия в замыкание: сжатие идёт здесь же,
         // в rayon-потоках, а не в единственном потоке-писателе (v0.47.0).
@@ -368,7 +373,7 @@ impl<'a> Indexer<'a> {
             })
             .collect();
         let parse_ms = parse_start.elapsed().as_millis();
-        eprintln!("[timing] Парсинг (rayon): {} мс ({} файлов)", parse_ms, parse_results.len());
+        tracing::info!("[этап 2] разбор: {} мс ({} файлов)", parse_ms, parse_results.len());
 
         // ── Этап 2b: сбор extras-сырья (bsl-indexer) ─────────────────────────
         // Пока parse_results ещё горячие в RAM — параллельно отдаём каждый
@@ -425,13 +430,14 @@ impl<'a> Indexer<'a> {
                 }
             },
         );
-        eprintln!(
-            "[timing] Сжатие content (rayon): {} мс",
+        tracing::info!(
+            "[этап 2] сжатие содержимого файлов: {} мс",
             compress_start.elapsed().as_millis()
         );
 
         // ── Этап 3: последовательная запись в SQLite ──────────────────────────
         // SQLite не поддерживает параллельную запись — пишем из основного потока.
+        tracing::info!("[этап 3] начата запись в базу");
         let write_start = std::time::Instant::now();
         let batch_size = self.config.batch_size;
         let mut batch_count = 0usize;
@@ -443,8 +449,8 @@ impl<'a> Indexer<'a> {
             // Прогресс-лог каждые batch_size файлов
             let total_processed = result.files_indexed + result.errors.len();
             if total_processed > 0 && total_processed % batch_size == 0 {
-                eprintln!(
-                    "[{}/{}] Проиндексировано {}, пропущено {}...",
+                tracing::info!(
+                    "[этап 3] {}/{}: проиндексировано {}, пропущено {}",
                     total_processed,
                     parse_results.len(),
                     result.files_indexed,
@@ -525,7 +531,7 @@ impl<'a> Indexer<'a> {
         // Коммитим оставшиеся записи последнего неполного батча
         self.storage.commit_batch()?;
         let write_ms = write_start.elapsed().as_millis();
-        eprintln!("[timing] Запись в БД: {} мс ({} файлов)", write_ms, result.files_indexed);
+        tracing::info!("[этап 3] запись в базу: {} мс ({} файлов)", write_ms, result.files_indexed);
 
         // Сброс накопленного сборщиком extras сырья (серийно, после фазы
         // записи ядра). Для универсальной сборки collector = None.
@@ -545,14 +551,14 @@ impl<'a> Indexer<'a> {
                 if let Err(e) = self.storage.update_file_metadata(path, *mtime, *file_size) {
                     meta_errors += 1;
                     if meta_errors <= 5 {
-                        eprintln!("[indexer] update_file_metadata {}: {}", path, e);
+                        tracing::debug!("не обновлены сведения о файле {}: {}", path, e);
                     }
                 }
             }
             self.storage.commit_batch()?;
             if meta_errors > 0 {
-                eprintln!(
-                    "[indexer] метаданные не обновлены у {} файлов из {} — на следующем старте \
+                tracing::warn!(
+                    "сведения о файлах не обновлены у {} из {} — на следующем старте \
                      они пойдут полным разбором вместо быстрого пути",
                     meta_errors,
                     metadata_updates.len()
@@ -564,10 +570,10 @@ impl<'a> Indexer<'a> {
         // Завершаем bulk-load: пересоздаём индексы, триггеры, rebuild FTS
         if bulk_mode {
             let idx_start = std::time::Instant::now();
-            eprintln!("[bulk] Создание B-tree индексов и перестройка FTS...");
+            tracing::info!("[этап 4] начато создание индексов и перестройка полнотекстового поиска");
             self.storage.finish_bulk_load()?;
             let idx_ms = idx_start.elapsed().as_millis();
-            eprintln!("[timing] Индексы + FTS rebuild: {} мс", idx_ms);
+            tracing::info!("[этап 4] индексы и полнотекстовый поиск: {} мс", idx_ms);
         }
 
         // ── Этап 5: удаление устаревших записей ──────────────────────────────
@@ -586,7 +592,7 @@ impl<'a> Indexer<'a> {
         self.storage.commit_batch()?;
         let cleanup_ms = cleanup_start.elapsed().as_millis();
         if result.files_deleted > 0 {
-            eprintln!("[timing] Удаление устаревших: {} мс ({} файлов)", cleanup_ms, result.files_deleted);
+            tracing::info!("[этап 5] удаление исчезнувших файлов: {} мс ({} файлов)", cleanup_ms, result.files_deleted);
         }
 
         // ── Этап 6: Phase 2 backfill для file_contents ──────────────────────
@@ -618,7 +624,7 @@ impl<'a> Indexer<'a> {
                         ) {
                             Ok(_) => backfilled += 1,
                             Err(e) => {
-                                eprintln!("[backfill] upsert_file_content {}: {}", path, e);
+                                tracing::debug!("[этап 6] не записано содержимое {}: {}", path, e);
                                 backfill_errors += 1;
                             }
                         }
@@ -637,8 +643,8 @@ impl<'a> Indexer<'a> {
             }
             self.storage.commit_batch()?;
             let backfill_ms = backfill_start.elapsed().as_millis();
-            eprintln!(
-                "[timing] file_contents backfill: {} мс ({} наполнено из {} кандидатов, {} ошибок)",
+            tracing::info!(
+                "[этап 6] дозаполнение содержимого файлов: {} мс ({} наполнено из {} кандидатов, {} ошибок)",
                 backfill_ms,
                 backfilled,
                 backfill_candidates.len(),
@@ -647,7 +653,7 @@ impl<'a> Indexer<'a> {
         }
 
         result.elapsed_ms = start.elapsed().as_millis() as u64;
-        eprintln!("[timing] Итого: {} мс", result.elapsed_ms);
+        tracing::info!("итого по индексации: {} мс", result.elapsed_ms);
         Ok(result)
     }
 

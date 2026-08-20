@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
 
@@ -35,6 +35,10 @@ pub struct PathRuntime {
     pub error: Option<String>,
     /// Когда папка последний раз приходила в `Ready`.
     pub last_ready_at: Option<String>,
+    /// Момент последнего изменения статуса или прогресса. По нему пульс в
+    /// журнале считает, сколько папка стоит без движения — главный признак
+    /// «встало» при разборе обращения.
+    pub changed_at: Instant,
 }
 
 impl Default for PathRuntime {
@@ -44,8 +48,19 @@ impl Default for PathRuntime {
             progress: None,
             error: None,
             last_ready_at: None,
+            changed_at: Instant::now(),
         }
     }
+}
+
+/// Срез одной папки для строки пульса в журнале.
+#[derive(Debug, Clone)]
+pub struct PathPulse {
+    pub path: PathBuf,
+    pub status: PathStatus,
+    pub progress: Option<Progress>,
+    /// Секунд без изменения статуса и прогресса.
+    pub still_sec: u64,
 }
 
 impl DaemonState {
@@ -102,6 +117,7 @@ impl DaemonState {
         let entry = guard.paths.entry(path.clone()).or_default();
         entry.status = status;
         entry.error = None;
+        entry.changed_at = Instant::now();
         if status == PathStatus::Ready {
             entry.progress = None;
             entry.last_ready_at = Some(chrono::Utc::now().to_rfc3339());
@@ -118,6 +134,7 @@ impl DaemonState {
                 PathStatus::InitialIndexing | PathStatus::ReindexingBatch
             ) {
                 entry.progress = Some(progress);
+                entry.changed_at = Instant::now();
             }
         }
     }
@@ -129,6 +146,7 @@ impl DaemonState {
         entry.status = PathStatus::Error;
         entry.progress = None;
         entry.error = Some(message.into());
+        entry.changed_at = Instant::now();
     }
 
     /// Получить текущий runtime одной папки.
@@ -145,6 +163,26 @@ impl DaemonState {
     /// Время старта демона в RFC 3339.
     pub async fn started_at_rfc3339(&self) -> String {
         self.inner.read().await.started_at_rfc3339.clone()
+    }
+
+    /// Срез всех папок для пульса в журнале: статус, прогресс и сколько
+    /// секунд не было движения. Порядок — по пути, чтобы строки в журнале
+    /// от снимка к снимку шли одинаково и разница читалась глазами.
+    pub async fn pulse_snapshot(&self) -> Vec<PathPulse> {
+        let guard = self.inner.read().await;
+        let now = Instant::now();
+        let mut out: Vec<PathPulse> = guard
+            .paths
+            .iter()
+            .map(|(path, rt)| PathPulse {
+                path: path.clone(),
+                status: rt.status,
+                progress: rt.progress.clone(),
+                still_sec: now.duration_since(rt.changed_at).as_secs(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
     }
 
     /// Сформировать срез состояния для ответа GET /health.

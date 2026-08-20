@@ -6,7 +6,8 @@
 //   daemon.toml  — конфиг, редактирует пользователь
 //   daemon.pid   — runtime, пишет демон при старте
 //   daemon.json  — runtime, порт HTTP-IPC (читают MCP и CLI)
-//   daemon.log   — лог демона
+//   daemon.log   — журнал демона (ротация: daemon.log.1 … .3)
+//   serve.log    — журнал сервера выдачи (ротация: serve.log.1 … .3)
 //
 // Способы задать переменную:
 //   * Windows:  setx CODE_INDEX_HOME "C:\tools\code-index"
@@ -60,6 +61,12 @@ pub fn runtime_info_file() -> Result<PathBuf> {
 /// Лог-файл демона.
 pub fn log_file() -> Result<PathBuf> {
     Ok(state_dir()?.join("daemon.log"))
+}
+
+/// Лог-файл сервера выдачи (`serve`). Отдельный от демона: это другой процесс,
+/// и общий файл давал бы вперемешку две несвязанные ленты событий.
+pub fn serve_log_file() -> Result<PathBuf> {
+    Ok(state_dir()?.join("serve.log"))
 }
 
 /// Убедиться, что каталог `CODE_INDEX_HOME` существует.

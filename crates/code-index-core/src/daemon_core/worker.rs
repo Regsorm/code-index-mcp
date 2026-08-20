@@ -27,6 +27,16 @@ use super::config::{IndexerSection, PathEntry};
 use super::ipc::{PathStatus, Progress};
 use super::state::DaemonState;
 
+/// Название режима хранилища для журнала. Пользователю, приславшему журнал,
+/// важно видеть, работала база в памяти или на диске: от этого зависят и
+/// расход памяти, и поведение при обрыве.
+fn storage_mode_ru(mode: &crate::storage::memory::StorageMode) -> &'static str {
+    match mode {
+        crate::storage::memory::StorageMode::InMemory => "в оперативной памяти",
+        crate::storage::memory::StorageMode::Disk => "на диске",
+    }
+}
+
 /// Что делать циклу слежения после обработки пакета.
 enum BatchStep {
     /// Пакет отработан (успешно или с отмеченной ошибкой) — ждём следующий.
@@ -80,6 +90,8 @@ fn process_batch(
         }
     }
 
+    let batch_started = std::time::Instant::now();
+
     tokio_block_on(async {
         ctx.state.set_status(ctx.path, PathStatus::ReindexingBatch).await;
         ctx.state
@@ -88,7 +100,7 @@ fn process_batch(
     });
 
     if let Err(e) = storage.begin_batch() {
-        eprintln!("[worker:{}] begin_batch: {}", ctx.path.display(), e);
+        tracing::error!("[{}] не удалось начать транзакцию пакета: {}", ctx.path.display(), e);
         // Транзакцию начать не удалось — данные батча НЕ применены. Не выдаём
         // Ready (был бы ложный «готово» на старом срезе). Помечаем Error и
         // выходим из воркера: сторож в runner перезапустит его со свежим
@@ -133,13 +145,13 @@ fn process_batch(
     let commit_ok = match storage.commit_batch() {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("[worker:{}] commit_batch: {}", ctx.path.display(), e);
+            tracing::error!("[{}] не удалось зафиксировать пакет: {}", ctx.path.display(), e);
             // Фиксация не удалась — данных батча в базе НЕТ. Откатываем, чтобы
             // соединение не осталось с открытой транзакцией (SQLITE_BUSY на
             // COMMIT её не снимает) и следующий begin_batch не упал.
             if let Err(re) = storage.rollback_batch() {
-                eprintln!(
-                    "[worker:{}] rollback после провала commit: {}",
+                tracing::error!(
+                    "[{}] откат после несостоявшейся фиксации не удался: {}",
                     ctx.path.display(),
                     re
                 );
@@ -178,14 +190,14 @@ fn process_batch(
                 &changed_paths,
                 &deleted_paths,
             ) {
-                Ok(()) => eprintln!(
-                    "[worker:{}] index_extras_for_files (инкремент): {} мс (changed={}, deleted={})",
+                Ok(()) => tracing::info!(
+                    "[{}] надстройка обновлена точечно за {} мс (изменено {}, удалено {})",
                     ctx.path.display(), t0.elapsed().as_millis(),
                     changed_paths.len(), deleted_paths.len()
                 ),
                 Err(e) => {
-                    eprintln!(
-                        "[worker:{}] index_extras_for_files процессора '{}' упал: {}. \
+                    tracing::warn!(
+                        "[{}] точечное обновление надстройки процессора «{}» упало: {}. \
                          Базовая индексация при этом сохранена.",
                         ctx.path.display(), proc.name(), e
                     );
@@ -199,7 +211,7 @@ fn process_batch(
     // flush_to_disk через Connection::backup() — бесполезное копирование БД самой
     // в себя, WAL не уменьшает. checkpoint_truncate реально схлопывает WAL.
     if let Err(e) = storage.checkpoint_truncate() {
-        eprintln!("[worker:{}] checkpoint_truncate: {}", ctx.path.display(), e);
+        tracing::warn!("[{}] схлопывание журнала WAL не удалось: {}", ctx.path.display(), e);
     }
 
     // Event-based cache invalidation (v0.9.1+): после успешного commit
@@ -225,8 +237,27 @@ fn process_batch(
     // применение каждого события, фиксация транзакции и пересборка extras.
     // Провал любого из них означает неполный срез, а Ready на нём — ложное
     // «готово»: сервер выдачи начал бы отдавать устаревшее как актуальное.
+    let outcome = batch_outcome(commit_ok, failed, batch_len, extras_ok);
+    match &outcome {
+        Ok(()) => tracing::info!(
+            "[{}] пакет обработан: событий {}, за {} мс, режим хранилища на диске, память демона {}",
+            ctx.path.display(),
+            batch_len,
+            batch_started.elapsed().as_millis(),
+            crate::logging::memory_note()
+        ),
+        Err(msg) => tracing::warn!(
+            "[{}] пакет обработан не полностью: событий {} (сбоев {}), за {} мс — {}",
+            ctx.path.display(),
+            batch_len,
+            failed,
+            batch_started.elapsed().as_millis(),
+            msg
+        ),
+    }
+
     tokio_block_on(async {
-        match batch_outcome(commit_ok, failed, batch_len, extras_ok) {
+        match outcome {
             Ok(()) => ctx.state.set_status(ctx.path, PathStatus::Ready).await,
             Err(msg) => ctx.state.set_error(ctx.path, msg).await,
         }
@@ -314,7 +345,11 @@ pub fn run_worker(
     // включая открытие in-memory Storage — чтобы в памяти одновременно жил
     // максимум ОДИН in-memory storage (ограничено max_concurrent_initial).
     if let Some(sem) = initial_limiter.as_ref() {
-        eprintln!("[worker:{}] ждём слота initial reindex (доступно {})", path.display(), sem.available_permits());
+        tracing::info!(
+            "[{}] ожидание очереди на первичную индексацию (свободных мест {})",
+            path.display(),
+            sem.available_permits()
+        );
     }
     let _permit = match tokio_block_on_value(acquire_initial_slot(initial_limiter)) {
         Ok(permit) => permit,
@@ -322,8 +357,8 @@ pub fn run_worker(
             // Семафор закрывают при остановке демона. Это штатное завершение:
             // выходим тихо. Паника здесь давала бы лишний перезапуск воркера
             // сторожем и мусорную запись в журнале, маскирующую настоящие аварии.
-            eprintln!(
-                "[worker:{}] слот initial reindex недоступен — демон останавливается, воркер завершается",
+            tracing::info!(
+                "[{}] очередь на первичную индексацию закрыта — демон останавливается, worker завершается",
                 path.display()
             );
             return;
@@ -347,7 +382,11 @@ pub fn run_worker(
         && std::fs::metadata(&db_path).map(|m| m.len() > 0).unwrap_or(false);
 
     let mut storage = if db_existed_before {
-        eprintln!("[worker:{}] БД уже существует — открываем сразу в disk", path.display());
+        tracing::info!(
+            "[{}] база уже существует — режим хранилища: на диске (память демона {})",
+            path.display(),
+            crate::logging::memory_note()
+        );
         match Storage::open_file(&db_path) {
             Ok(s) => s,
             Err(e) => {
@@ -358,7 +397,17 @@ pub fn run_worker(
             }
         }
     } else {
-        eprintln!("[worker:{}] новая БД — открываем в {}", path.display(), storage_config.mode);
+        // Фактический режим считаем той же функцией, что и `open_auto`, —
+        // для новой базы (размер 0) он определён однозначно, расхождения с
+        // тем, что реально откроется, быть не может.
+        let planned = crate::storage::memory::determine_storage_mode(&storage_config, &db_path);
+        tracing::info!(
+            "[{}] новая база — режим хранилища: {} (настройка «{}», память демона {})",
+            path.display(),
+            storage_mode_ru(&planned),
+            storage_config.mode,
+            crate::logging::memory_note()
+        );
         match Storage::open_auto(&db_path, &storage_config) {
             Ok(s) => s,
             Err(e) => {
@@ -386,29 +435,29 @@ pub fn run_worker(
         //       apply_schema_extensions: иначе CREATE INDEX по новой колонке
         //       рвёт DDL-батч на БД, созданной старым бинарником.
         if let Err(e) = proc.migrate_schema(storage.conn()) {
-            eprintln!(
-                "[worker:{}] migrate_schema ('{}') упал: {}",
+            tracing::warn!(
+                "[{}] миграция схемы процессора «{}» упала: {}",
                 path.display(), proc.name(), e
             );
         }
         let exts = proc.schema_extensions();
         if !exts.is_empty() {
             if let Err(e) = storage.apply_schema_extensions(exts) {
-                eprintln!(
-                    "[worker:{}] apply_schema_extensions ('{}') упал: {}. \
-                     Базовая индексация продолжится, но extension-tools могут не работать.",
+                tracing::warn!(
+                    "[{}] расширение схемы процессора «{}» упало: {}. \
+                     Базовая индексация продолжится, но инструменты надстройки могут не работать.",
                     path.display(), proc.name(), e
                 );
             } else {
-                eprintln!(
-                    "[worker:{}] schema_extensions процессора '{}' применены ({} DDL)",
+                tracing::info!(
+                    "[{}] схема процессора «{}» применена ({} команд)",
                     path.display(), proc.name(), exts.len()
                 );
             }
         }
     }
 
-    eprintln!("[worker:{}] initial reindex", path.display());
+    tracing::info!("[{}] начата первичная индексация", path.display());
 
     // 6. Полная переиндексация (fast-path по mtime, если БД уже есть).
     //    Первичная индексация демона — полный путь (НЕ инкремент), поэтому
@@ -423,8 +472,8 @@ pub fn run_worker(
     };
     let reindex = match indexer_result {
         Ok(result) => {
-            eprintln!(
-                "[worker:{}] initial reindex: {} файлов за {} мс (записано {}, пропущено {}, удалено {})",
+            tracing::info!(
+                "[{}] первичная индексация закончена: {} файлов за {} мс (записано {}, пропущено {}, удалено {})",
                 path.display(),
                 result.files_scanned,
                 result.elapsed_ms,
@@ -479,9 +528,9 @@ pub fn run_worker(
 
         let mut need_full = !skip_extras;
         if skip_extras {
-            eprintln!(
-                "[worker:{}] index_extras пропущен: данные не менялись (mtime fast-path), \
-                 extras процессора '{}' уже на месте",
+            tracing::info!(
+                "[{}] надстройка не пересобирается: данные не менялись (быстрая проверка по времени файлов), \
+                 надстройка процессора «{}» уже на месте",
                 path.display(), proc.name()
             );
         } else if incremental_extras {
@@ -493,9 +542,9 @@ pub fn run_worker(
             match proc.index_extras_for_files(&path, &mut storage, &changed, &deleted) {
                 Ok(()) => {
                     need_full = false;
-                    eprintln!(
-                        "[worker:{}] index_extras (точечно на старте) процессора '{}': {} мс \
-                         (changed={}, deleted={})",
+                    tracing::info!(
+                        "[{}] надстройка процессора «{}» обновлена точечно на старте за {} мс \
+                         (изменено {}, удалено {})",
                         path.display(), proc.name(), t0.elapsed().as_millis(),
                         changed.len(), deleted.len()
                     );
@@ -503,8 +552,8 @@ pub fn run_worker(
                 Err(e) => {
                     // Точечный путь оставляет надстройку в неизвестном состоянии,
                     // поэтому падение лечится полным пересбором, а не пропуском.
-                    eprintln!(
-                        "[worker:{}] index_extras (точечно на старте) процессора '{}' упал: {}. \
+                    tracing::warn!(
+                        "[{}] точечное обновление надстройки процессора «{}» на старте упало: {}. \
                          Переходим на полный пересбор.",
                         path.display(), proc.name(), e
                     );
@@ -514,15 +563,23 @@ pub fn run_worker(
 
         if need_full {
             let t0 = std::time::Instant::now();
+            // Сообщаем о НАЧАЛЕ: на больших конфигурациях полный пересбор идёт
+            // минутами, и если он встанет — в журнале должна остаться запись
+            // о том, на чём именно встали, а не тишина после прошлой строки.
+            tracing::info!(
+                "[{}] начат полный пересбор надстройки процессора «{}» \
+                 (на больших конфигурациях занимает минуты)",
+                path.display(), proc.name()
+            );
             if let Err(e) = proc.index_extras(&path, &mut storage) {
-                eprintln!(
-                    "[worker:{}] index_extras процессора '{}' упал: {}. \
+                tracing::warn!(
+                    "[{}] полный пересбор надстройки процессора «{}» упал: {}. \
                      Базовая индексация при этом сохранена.",
                     path.display(), proc.name(), e
                 );
             } else {
-                eprintln!(
-                    "[worker:{}] index_extras (полный) процессора '{}' выполнен за {} мс",
+                tracing::info!(
+                    "[{}] полный пересбор надстройки процессора «{}» выполнен за {} мс",
                     path.display(), proc.name(), t0.elapsed().as_millis()
                 );
             }
@@ -533,7 +590,7 @@ pub fn run_worker(
     //    Если уже был disk — ничего делать не нужно, изменения уже на диске.
     if !db_existed_before {
         if let Err(e) = storage.flush_to_disk(&db_path) {
-            eprintln!("[worker:{}] предупреждение: flush_to_disk: {}", path.display(), e);
+            tracing::warn!("[{}] сброс базы из памяти на диск не удался: {}", path.display(), e);
         }
         drop(storage);
         storage = match Storage::open_file(&db_path) {
@@ -545,7 +602,7 @@ pub fn run_worker(
                 return;
             }
         };
-        eprintln!("[worker:{}] переоткрыт в disk-режиме", path.display());
+        tracing::info!("[{}] база переоткрыта на диске", path.display());
     }
 
     // Initial reindex мог накопить много страниц в WAL (особенно для больших
@@ -553,21 +610,40 @@ pub fn run_worker(
     // физическое уменьшение файла — нужен явный TRUNCATE.
     match storage.checkpoint_truncate() {
         Ok((busy, log_pages, _)) if busy == 0 => {
-            eprintln!(
-                "[worker:{}] post-initial WAL checkpoint: {} страниц вытеснено",
+            tracing::info!(
+                "[{}] журнал WAL схлопнут после первичной индексации: вытеснено страниц {}",
                 path.display(), log_pages
             );
         }
         Ok((busy, _, _)) => {
-            eprintln!(
-                "[worker:{}] post-initial WAL checkpoint: busy={} (частичный)",
+            tracing::info!(
+                "[{}] журнал WAL схлопнут частично (занято читателями: {})",
                 path.display(), busy
             );
         }
         Err(e) => {
-            eprintln!("[worker:{}] post-initial checkpoint_truncate: {}", path.display(), e);
+            tracing::warn!(
+                "[{}] схлопывание журнала WAL после первичной индексации не удалось: {}",
+                path.display(), e
+            );
         }
     }
+
+    // Итог по папке одной строкой — то, что первым делом ищут в присланном
+    // журнале: сколько заняло, в каком виде работала база, сколько памяти
+    // держит демон после прохода.
+    tracing::info!(
+        "[{}] итог первичной индексации: {} файлов, {} мс, режим хранилища {}, память демона {}",
+        path.display(),
+        reindex.files_scanned,
+        reindex.elapsed_ms,
+        if db_existed_before {
+            "на диске"
+        } else {
+            "в оперативной памяти со сбросом на диск"
+        },
+        crate::logging::memory_note()
+    );
 
     // 9. Отпустить permit — следующий worker может начинать initial reindex.
     drop(_permit);
@@ -598,8 +674,10 @@ pub fn run_worker(
     // Держим watcher на стеке — при drop watcher остановится.
     let _watcher = watcher;
 
-    eprintln!("[worker:{}] watcher активен (debounce={}ms, batch={}ms)",
-        path.display(), debounce_ms, batch_ms);
+    tracing::info!(
+        "[{}] слежение за файлами включено (пауза после события {} мс, окно пакета {} мс)",
+        path.display(), debounce_ms, batch_ms
+    );
 
     let registry = ParserRegistry::from_languages(&index_config.languages);
     // Эффективный лимит для file_contents — пробросим в apply_event,
@@ -629,7 +707,7 @@ pub fn run_worker(
 
         let batch = match poll_batch(&rx, IDLE_POLL_MS, debounce_ms, batch_ms) {
             Ok(Some(b)) => {
-                eprintln!("[worker:{}] batch: {} events", path.display(), b.len());
+                tracing::info!("[{}] пакет изменений: событий {}", path.display(), b.len());
                 b
             }
             Ok(None) => continue, // idle timeout — проверим shutdown на следующей итерации
@@ -645,9 +723,9 @@ pub fn run_worker(
         }
     }
 
-    eprintln!("[worker:{}] shutdown, финальный checkpoint", path.display());
+    tracing::info!("[{}] остановка worker'а, завершающее схлопывание журнала WAL", path.display());
     if let Err(e) = storage.checkpoint_truncate() {
-        eprintln!("[worker:{}] финальный checkpoint_truncate: {}", path.display(), e);
+        tracing::warn!("[{}] завершающее схлопывание журнала WAL не удалось: {}", path.display(), e);
     }
 }
 
@@ -914,7 +992,10 @@ fn apply_event(
                             return true;
                         }
                     }
-                    eprintln!("[worker:{}] file_hash {}: {}", root.display(), abs.display(), e);
+                    // Пофайловые сбои — на уровне отладки: на сломанной выгрузке
+                    // их тысячи, и в обычном журнале они топят всё остальное.
+                    // Сводку по пакету даёт `batch_outcome`.
+                    tracing::debug!("[{}] не прочитан {}: {}", root.display(), abs.display(), e);
                     return false;
                 }
             };
@@ -979,13 +1060,13 @@ fn apply_event(
                                     text_for_fts,
                                     crate::indexer::ContentInput::Raw(content.as_str()),
                                 ) {
-                                    eprintln!("[worker:{}] write_code {}: {}",
+                                    tracing::debug!("[{}] запись кода {}: {}",
                                         root.display(), rel_path, e);
                                     ok = false;
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[worker:{}] parse {}: {}",
+                                tracing::debug!("[{}] разбор {}: {}",
                                     root.display(), rel_path, e);
                                 ok = false;
                             }
@@ -1047,7 +1128,7 @@ fn apply_event(
                             mtime,
                             file_size,
                         ) {
-                            eprintln!("[worker:{}] write_text {}: {}",
+                            tracing::debug!("[{}] запись текста {}: {}",
                                 root.display(), rel_path, e);
                             ok = false;
                         }
@@ -1069,7 +1150,7 @@ fn apply_event(
                     // Провал удаления оставляет файл фантомом в выдаче —
                     // это расхождение индекса с диском, а не мелочь для тишины.
                     if let Err(e) = storage.delete_file(id) {
-                        eprintln!("[worker:{}] delete_file {}: {}",
+                        tracing::debug!("[{}] удаление из индекса {}: {}",
                             root.display(), rel_path, e);
                         ok = false;
                     }
@@ -1081,12 +1162,12 @@ fn apply_event(
                 // фантомами в выдаче до полной переиндексации.
                 match storage.delete_files_under_prefix(&rel_path) {
                     Ok(0) => {}
-                    Ok(n) => eprintln!(
-                        "[worker:{}] каталог {} исчез — удалено файлов из индекса: {}",
+                    Ok(n) => tracing::info!(
+                        "[{}] каталог {} исчез — удалено файлов из индекса: {}",
                         root.display(), rel_path, n
                     ),
                     Err(e) => {
-                        eprintln!("[worker:{}] delete_files_under_prefix {}: {}",
+                        tracing::warn!("[{}] удаление файлов исчезнувшего каталога {}: {}",
                             root.display(), rel_path, e);
                         ok = false;
                     }
@@ -1123,7 +1204,7 @@ fn apply_dir_scan(
             if e.kind() == std::io::ErrorKind::NotFound {
                 return true;
             }
-            eprintln!("[worker:{}] read_dir {}: {}", root.display(), dir.display(), e);
+            tracing::debug!("[{}] обход каталога {}: {}", root.display(), dir.display(), e);
             return false;
         }
     };
