@@ -5,6 +5,79 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.60.0] — 2026-08-20
+
+**Indexing now decides for itself whether to build the database in RAM or on disk — from the folder's weight and the machine's free memory, not from an accidental signal. After working in RAM, the memory is returned to the system. The bulk-processing threshold moved into the daemon settings. The log no longer passes off a first-time index as a change check.**
+
+> Context. The storage mode was chosen by comparing the database FILE SIZE against a share of free memory. For a new database that size is zero, and zero is below any threshold — so for an empty folder the decision was predetermined and checked nothing. Chance then took over: at startup the serving process creates empty database files for every local folder, and if it got there before the daemon, the folder counted as "already existing" and went to disk. Whether it got there first depended on service startup order: on a workstation the server starts earlier, on a network node later. The same folder behaved differently on two machines, and the log said nothing about it.
+
+### Added
+
+- **Folder weighing before the mode is chosen.** Before opening the database the daemon walks the folder and sums the weight of the files that will be indexed, using the same directory exclusions as indexing itself. Only file metadata is read, contents are not opened: 1–3 seconds for 60,000 files against an index run of several minutes.
+- **Memory returned to the system after working in RAM.** Having closed the in-memory database and reopened it on disk, the daemon asks the allocator to hand the freed memory back, and logs "before / after". Measured on a network node, six folders in a row: 21.4 GB → 491 MB, 10.1 GB → 932 MB, 8.7 GB → 1.1 GB, 22.5 GB → 1.5 GB. Without this the freed memory stayed in the process heap, the next folder saw it as occupied and went to disk although the machine could have handled it. On systems without such a facility (Windows, macOS) the log says so explicitly instead of silently doing nothing.
+- **Bulk-processing threshold in the daemon settings.** `bulk_batch_threshold` globally under `[indexer]` and per folder — with the same priority order as the file size limit: per-folder → global → default 8000. Previously the threshold could only be set in the project settings file inside the indexed folder, which in practice exists nowhere.
+
+### Fixed
+
+- **A first-time index was presented as a change check.** The "database already exists" signal was taken from the presence of a file, and an empty file is created in advance by the serving process. The log read: "database already exists", "startup change check begun: comparing file times and sizes against the database" — followed immediately by "database is empty, so every file will be processed", "57072 changed out of 57072". Now there is a single signal — whether the database holds any records — and the storage mode follows the same one. The same folder behaves identically regardless of which service started first.
+- **Mode choice no longer depends on service startup order.** Previously a new folder almost always went to disk on a workstation (the serving process managed to create the placeholder) and to RAM on a network node (it did not). That divergence is gone.
+
+### Changed
+
+- **Share of free memory allowed for the database raised from 25% to 50%.** At the old quarter, a folder of 4 GB of sources went to RAM only with at least 48 GB free — that is, practically never. This is a share of FREE memory at the moment the folder starts, not of the machine's total.
+
+### How the mode is chosen — the full calculation
+
+1. Sum the weight of the folder's files that will be indexed.
+2. Expected memory usage = **weight × 3**. The multiplier comes from measurement: a folder of 3.98 GB produced 9.8 GB of occupied memory (2.5); three leaves headroom.
+3. Read the machine's FREE memory **at that moment**; `memory_max_percent` of it may be used (50% by default).
+4. If it fits, the database is built in RAM and then flushed to disk. If not, straight to disk.
+
+Free memory is re-read for every folder, which makes the rule guard itself: if the previous folder did not return its memory, the next one sees less free and goes to disk. Folders are indexed one at a time, so the calculation only considers the current one.
+
+The decision is logged with the numbers:
+
+```
+new database — storage mode: in RAM (setting "auto"; sources 6.7 GB, working in RAM would
+cost about 20.1 GB, 54.8 GB free, allowed to use 50% — weighing took 1531 ms)
+```
+
+Manual control remains: `storage_mode` in the settings file inside the folder — `"memory"` (always RAM, no calculation), `"disk"` (always disk), `"auto"` (the calculation above, the default). `memory_max_percent` lives there too, if half of free memory is not the right share.
+
+### The daemon log — what to enable before sending it in
+
+Both long-running processes keep a log; the files live in the state directory (`CODE_INDEX_HOME`), not next to the executable:
+
+| File | Written by |
+|------|------------|
+| `daemon.log` | the indexing daemon |
+| `serve.log` | the serving process |
+
+Rotation by size: 10 MB per file, three previous copies kept alongside.
+
+Verbosity — `[daemon] log_level` in `daemon.toml`; the `RUST_LOG` environment variable overrides it, raising verbosity for one run without editing settings.
+
+| Level | What it gives |
+|-------|---------------|
+| `warn` | warnings and errors only |
+| `info` (default) | machine and folder profile, start and end of every stage with counts, per-stage breakdown, storage mode decision, memory return, daemon state once a minute |
+| `debug` | additionally: module name on each line, call-graph resolution step by step, unresolved references in subsystem contents, per-file details |
+| `trace` | all of the above plus third-party library internals |
+
+For diagnosing a stalled or slow index, `info` is enough: it shows both where it stopped and how long there has been no movement. `debug` is for when `info` does not reveal the cause — for example, why an expected edge is missing from the call graph.
+
+### Compatibility
+
+- The database schema did not change. However, **a from-scratch reindex is recommended**: remove the `.code-index` directory in the folder and restart the daemon. Reason — databases built by earlier releases may have gone through the path with a wrongly chosen storage mode and an incomplete flush to disk; a full rebuild guarantees a consistent state and also produces a fresh log with numbers for every folder. Measured on a network node: six folders, 374,000 files — 20 minutes.
+- The new `[indexer] bulk_batch_threshold` setting is optional; without it the previous default of 8000 applies.
+- The default for `memory_max_percent` changed: 25% → 50%. Anyone who set it explicitly in the project settings file is unaffected.
+
+### Testing
+
+- **Unit and integration tests:** `cargo test --workspace` — 770 passed, 0 failed. New ones cover: an empty database file from the serving process does not count as an indexed folder; the mode follows the estimate rather than the file size; an explicit memory setting overrides the calculation; the bulk threshold is read from daemon settings with the correct priority.
+- **Workstation, a typical trade configuration (57,072 files):** folder weight 3.7 GB, expected 11.0 GB, 38.7 GB free → RAM; 2 min 41 s against 3 min 20–46 s on disk. Memory return: "the system cannot do this" (Windows), exactly as stated.
+- **Network node, six folders (374,000 files), 62 GB of RAM:** all six decisions made by calculation, all six databases built in RAM, memory returned after each (2.0 GB left over across all six). Free memory held at 53–55 GB throughout, no restarts, the process was not killed for memory. The same trade folder: 2 min 38 s in RAM against 3 min 28 s on disk.
+
 ## [0.59.0] — 2026-08-20
 
 **Stalled indexing now leaves a trace you can send in. The daemon and the serving process keep a rotating log file; every heavy stage announces its start rather than only its result; once a minute a heartbeat records time without movement, memory usage and storage mode.**
