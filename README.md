@@ -526,6 +526,59 @@ If the daemon is offline:
 { "status": "daemon_offline", "message": "Демон code-index не доступен. Запустите 'code-index daemon run' или Scheduled Task." }
 ```
 
+### Logs: what to attach when indexing appears stuck
+
+The daemon and the serving process keep logs in `CODE_INDEX_HOME`:
+
+| File | Written by | Contents |
+|------|-----------|----------|
+| `daemon.log` | indexing daemon | scan and parse stages, per-folder summaries, change batches, heartbeat |
+| `serve.log` | serving process | startup, port, config reload, request errors |
+
+Rotation by size: `daemon.log.1`, `.2`, `.3` (10 MB per file).
+
+**Verbosity.** `[daemon] log_level` in `daemon.toml` (`error`, `warn`, `info` by
+default, `debug`, `trace`). `RUST_LOG` overrides the config — handy for a one-off
+deep dive without editing files. `debug` adds per-file messages (unreadable,
+unparsable, not written); `info` deliberately omits them, since a broken export
+would drown everything else.
+
+**A full pass looks like this:**
+
+```
+[…/repo] new database — storage mode: in memory (setting "auto", daemon memory 11 MB)
+[…/repo] initial indexing started
+[stage 1] candidate selection: 49 ms (543 files)
+[stage 2] parsing 543 files started, multi-threaded
+[stage 3] database write: 86 ms (543 files)
+[…/repo] initial indexing summary: 543 files, 232 ms,
+         storage mode in memory with flush to disk, daemon memory 22 MB
+```
+
+**A change batch looks like this:**
+
+```
+[…/repo] change batch: 3 events
+[…/repo] extras updated incrementally in 26 ms (changed 3, deleted 0)
+[…/repo] batch done: 3 events, 44 ms, storage mode on disk, daemon memory 23 MB
+```
+
+**Heartbeat** is written once a minute and answers "alive or stuck":
+
+```
+[heartbeat] uptime 1 min 0 s, daemon memory 778 MB, folders 50: ready 50, indexing 0, errors 0, not started 0
+[heartbeat] …/repo — initial indexing, 1200/90000 files (1.3%), unchanged for 1 h 1 min
+```
+
+Ready folders are not listed by name; at most ten unready ones are listed plus a
+count of the rest. A growing "unchanged for" while the stage line stays the same
+is the signature of a hang — on exactly the stage named above it.
+
+**What to attach to a bug report:** `daemon.log` (plus rotated `daemon.log.1…3`
+if relevant), the output of `code-index daemon status --json`, and your
+`daemon.toml`. Note: while the daemon holds the file open, Windows Explorer
+reports zero size — the file is being written all along, read its contents.
+
 ## Configuration
 
 `.code-index/config.json` is created automatically on first run. Full reference:
