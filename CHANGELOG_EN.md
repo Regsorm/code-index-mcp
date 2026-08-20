@@ -5,6 +5,46 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.59.0] — 2026-08-20
+
+**Stalled indexing now leaves a trace you can send in. The daemon and the serving process keep a rotating log file; every heavy stage announces its start rather than only its result; once a minute a heartbeat records time without movement, memory usage and storage mode.**
+
+> Context. There was nothing to say about a stalled index: all output went to the error stream, and on Windows the daemon detaches from the console — so the output vanished entirely. The log file path existed in the code but nobody opened it; the verbosity setting was parsed from the configuration file and applied nowhere. Live diagnostics did exist (folder status, progress, error), but they answer "what now", not "what happened five minutes ago", and cannot be sent as a single file.
+
+### Added
+
+- **A log file for both long-running processes.** The daemon writes `daemon.log`, the serving process writes `serve.log` in the state directory; output also goes to the error stream (collected by the container engine in a container). Rotation by size: 10 MB per file, three previous ones kept. The file is opened by the already-detached process — otherwise the writes belonged to the parent, which exits immediately. If the directory is read-only (that is how the serving process is mounted on the node), a warning is emitted and work continues through the error stream; startup is not aborted.
+- **A start marker for every heavy stage.** Tree scan, parsing, database write, index creation, removal of vanished files, content backfill, full extras rebuild — previously each reported only on completion. If a stage stalled, the log fell silent after the previous stage's report; now the name of the stage you stalled on stays in the file.
+- **A heartbeat once a minute.** A summary line (uptime, process memory, folder counts by state) plus one line per unready folder: state, progress, seconds without movement. A growing "unchanged for" next to an unchanging stage is the signature of a hang. Ready folders are not listed by name; at most ten unready ones plus a count of the rest — on fifty repositories anything else was a wall of text every minute.
+- **Process memory and storage mode in the log.** In the initial indexing summary, in every change-batch summary and in every heartbeat. The mode is named plainly: "in memory", "on disk" or "in memory with flush to disk" — both memory usage and crash behaviour follow from it.
+
+### Fixed
+
+- **The verbosity setting did nothing.** `[daemon] log_level` was parsed from the configuration file, documented in its comments — and applied nowhere. It now applies; `RUST_LOG` still overrides it, which keeps one-off deep dives easy. Third-party libraries are held at warning level: otherwise `debug` drowns in their own stream of messages.
+- **The one-off index command did not truncate the WAL.** The daemon does this after every initial pass; the command did not — a multi-gigabyte journal could be left next to a database that looked nearly empty. Reported from an external stand: a 168 KB database with a 2.9 GB journal, indistinguishable from a failed run even though the data was intact, and every subsequent reader pays for replaying the journal. Truncation now runs over a separate connection to the file (the working database may live in memory, and its journal has nothing to do with the file), and the outcome is logged.
+- **Language tools were missing when the language was not set explicitly.** The `language` field of a path entry is filled in by the daemon at startup; anyone running only the serving process never got it — and the eleven 1C tools were silently absent from the list whatever the configuration said. The language is now detected the same way the daemon does it, by markers in the repository root.
+- **A race while collecting active languages.** The initial collection ran as a background task alongside client service: a client that asked for the tool list in its very first request got the list without the language tools. Measured on the stand: 20 tools with no pause, 31 with a three-second pause. The collection moved to a synchronous step before the transport starts; the configuration watcher remains for later edits.
+- **The extra text extensions setting was never read.** `extra_text_extensions` is declared in project settings and offered by the `init` hint — people set it and believed they had widened the index, while no indexing stage looked at it. An extension from the setting now makes a file textual when it would otherwise be skipped as binary. It cannot override a language: a mistakenly listed `py` must not drop code parsing from the index.
+
+### Changed
+
+- All output from the daemon, per-folder workers and the indexer moved from direct printing to the error stream onto log levels — every line now carries a timestamp and a level. Per-file failures (unreadable, unparsable, not written) moved to `debug`: a broken export produces thousands of them, and at the normal level they drowned everything else. The per-batch summary line covers them collectively.
+
+### Compatibility
+
+- No schema change, no reindex needed.
+- No new settings. New files appear in the state directory: `daemon.log`, `serve.log` and their rotated copies, 10 MB each at most.
+
+### Testing
+
+- **Unit and integration tests:** `cargo test --workspace` — 754 passed, 0 failed. New ones cover rotation (file shifting, removal of extra files, continued writing, appending to an existing file), filter directive assembly, process memory measurement, heartbeat formatting (summary, ten-folder cap, human-readable durations), extra text extensions (case, leading dot, inability to override a language) and language detection without an explicit setting.
+- **Full indexing on a separate stand** (copy of a small configuration, 543 files, empty database): the log shows "in memory" mode, all six stages with timings, a full extras rebuild in 359 ms, and a summary with 22 MB of memory.
+- **Partial reindex on the same stand:** editing three files — a three-event batch, incremental extras update in 26 ms, batch summary in 44 ms, "on disk" mode, 23 MB.
+- **Verbosity:** with `log_level = "error"` the log is empty; with `RUST_LOG=info` over the same configuration file, 23 lines. The setting genuinely applies and the environment variable overrides it.
+- **Working installation:** both logs are written, 429 KB from the daemon in a minute; across fifty folders the storage mode and the growth of process memory during the pass are visible.
+- **Federation node:** the daemon writes its log; the serving process has the directory mounted read-only — the fallback path worked (warning plus error-stream output), container healthy. Remote repositories answer through federation as before.
+- **The three reported fixes, verified live:** the one-off index command logs "WAL truncated in 11 ms" and leaves only the database file behind; a stdio client gets 31 of 31 tools with no pause and no explicit language (previously 20); files with extensions from `extra_text_extensions` land in the text index together with their content.
+
 ## [0.58.0] — 2026-08-20
 
 **Settings that did not apply no longer look applied. A corrupted configuration file now stops startup instead of silently falling back to defaults; index cleanup no longer treats an unreachable file as deleted; the enrichment model signature is written only when it truly describes the whole database.**
