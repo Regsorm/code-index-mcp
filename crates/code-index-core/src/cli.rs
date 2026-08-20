@@ -863,6 +863,21 @@ async fn cmd_serve(
         let federate_router = federation::server::federate_router(server.clone());
         let allowed = std::sync::Arc::new(federation::whitelist::build(&serve_cfg));
 
+        // Языки из daemon.toml применяем ДО старта транспорта: клиент,
+        // спросивший перечень инструментов первым же запросом, обязан
+        // увидеть инструменты языка, а не гоняться с фоновой задачей.
+        if let Some(cfg_path) = config.as_deref() {
+            if let Err(e) =
+                crate::mcp::config_watch::apply_languages_from_config(&server, cfg_path).await
+            {
+                tracing::warn!(
+                    "не удалось собрать активные языки из {}: {}",
+                    cfg_path.display(),
+                    e
+                );
+            }
+        }
+
         // File-watch на daemon.toml — реактивно подменяем
         // active_languages при правке (этап 1.7). config может быть
         // не задан — тогда watcher не запускаем (active set
@@ -958,6 +973,22 @@ async fn cmd_serve(
     // при правке оператором (этап 1.7). Без --config нет файла,
     // за которым наблюдать — режим --path даёт фиксированный набор
     // репо, в нём перезагрузка не нужна.
+    //
+    // Сбор языков — синхронно до старта транспорта (см. федеративную ветку):
+    // иначе первый же запрос перечня инструментов мог обогнать фоновую задачу
+    // и получить набор без инструментов языка.
+    if let Some(cfg_path) = config.as_deref() {
+        if let Err(e) =
+            crate::mcp::config_watch::apply_languages_from_config(&server, cfg_path).await
+        {
+            tracing::warn!(
+                "не удалось собрать активные языки из {}: {}",
+                cfg_path.display(),
+                e
+            );
+        }
+    }
+
     let _config_watch = if let Some(cfg_path) = config.as_deref() {
         Some(crate::mcp::config_watch::spawn_watch(
             server.clone(),
@@ -1129,6 +1160,38 @@ fn cmd_index(
     let flush_start = std::time::Instant::now();
     storage.flush_to_disk(&db_path)?;
     let flush_ms = flush_start.elapsed().as_millis();
+
+    // 7a. Схлопнуть журнал WAL целевого файла. Демон это делает после каждой
+    // первичной индексации, а разовая команда — не делала: рядом с базой мог
+    // остаться журнал в гигабайты, а сама база выглядеть почти пустой. Данные
+    // при этом целы, но со стороны это неотличимо от провалившейся индексации,
+    // и любой следующий читатель платит за проигрывание журнала.
+    // Соединение открываем отдельное: `storage` мог работать в памяти, и его
+    // журнал к файлу отношения не имеет.
+    let wal_start = std::time::Instant::now();
+    match Storage::open_file(&db_path).and_then(|s| s.checkpoint_truncate()) {
+        Ok((busy, log_pages, _)) if busy == 0 => {
+            tracing::info!(
+                "журнал WAL схлопнут за {} мс (вытеснено страниц {})",
+                wal_start.elapsed().as_millis(),
+                log_pages
+            );
+        }
+        Ok((busy, _, _)) => {
+            tracing::warn!(
+                "журнал WAL схлопнут частично (занято читателями: {}) — \
+                 рядом с базой останется файл index.db-wal",
+                busy
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "не удалось схлопнуть журнал WAL: {} — рядом с базой останется \
+                 файл index.db-wal, данные при этом целы",
+                e
+            );
+        }
+    }
 
     // 8. Вывести результат.
     // `result.elapsed_ms` — только ядро (обход, парсинг, запись символов).

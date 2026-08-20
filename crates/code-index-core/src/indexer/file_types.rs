@@ -114,17 +114,28 @@ pub const EXCLUDE_DIRS: &[&str] = &[
     ".tox", "dist", "build", "venv", "env", ".env",
 ];
 
-/// Категория файла с учётом языка репозитория.
+/// Категория файла с учётом языка репозитория и дополнительных текстовых
+/// расширений из настроек проекта (`extra_text_extensions`).
 ///
-/// Нужно ровно для одного расширения — `.h`. Оно принадлежит сразу двум
-/// языкам: в C-проекте это заголовок C, в C++-проекте — заголовок C++
-/// (`.hpp` завели не все, крупные проекты вроде rocksdb пишут просто `.h`).
+/// Язык репозитория нужен ровно для одного расширения — `.h`. Оно принадлежит
+/// сразу двум языкам: в C-проекте это заголовок C, в C++-проекте — заголовок
+/// C++ (`.hpp` завели не все, крупные проекты вроде rocksdb пишут просто `.h`).
 /// По имени файла отличить нельзя, поэтому спрашиваем язык репозитория.
 ///
-/// Все остальные расширения определяются как раньше — язык репозитория
-/// на них не влияет.
-pub fn categorize_file_in_repo(path: &Path, repo_language: Option<&str>) -> FileCategory {
+/// `extra_text` расширяет только границу «двоичный → текстовый»: расширение
+/// из настроек делает файл текстовым, если иначе он был бы пропущен как
+/// двоичный. Перебить язык оно не может — иначе указанный по ошибке `py`
+/// выбросил бы разбор кода из индекса.
+pub fn categorize_file_in_repo(
+    path: &Path,
+    repo_language: Option<&str>,
+    extra_text: &[String],
+) -> FileCategory {
     let category = categorize_file(path);
+    let category = match category {
+        FileCategory::Binary if matches_extra_text(path, extra_text) => FileCategory::Text,
+        other => other,
+    };
     if repo_language != Some("cpp") {
         return category;
     }
@@ -139,6 +150,22 @@ pub fn categorize_file_in_repo(path: &Path, repo_language: Option<&str>) -> File
         }
         other => other,
     }
+}
+
+/// Совпадает ли расширение файла с одним из дополнительных текстовых,
+/// заданных в настройках проекта. Регистр не важен, ведущая точка
+/// допускается: люди пишут и `log`, и `.log`.
+fn matches_extra_text(path: &Path, extra_text: &[String]) -> bool {
+    if extra_text.is_empty() {
+        return false;
+    }
+    let ext = match path.extension().and_then(|s| s.to_str()) {
+        Some(e) => e.to_lowercase(),
+        None => return false,
+    };
+    extra_text
+        .iter()
+        .any(|e| e.trim().trim_start_matches('.').eq_ignore_ascii_case(&ext))
 }
 
 /// Определить категорию файла по расширению пути
@@ -248,24 +275,73 @@ mod tests {
     fn h_header_follows_repo_language() {
         let h = Path::new("db/db_impl.h");
         assert_eq!(
-            categorize_file_in_repo(h, Some("cpp")),
+            categorize_file_in_repo(h, Some("cpp"), &[]),
             FileCategory::Code("cpp".to_string()),
             "в C++-проекте .h — заголовок C++"
         );
         assert_eq!(
-            categorize_file_in_repo(h, Some("c")),
+            categorize_file_in_repo(h, Some("c"), &[]),
             FileCategory::Code("c".to_string()),
             "в C-проекте .h — заголовок C"
         );
         assert_eq!(
-            categorize_file_in_repo(h, None),
+            categorize_file_in_repo(h, None, &[]),
             FileCategory::Code("c".to_string()),
             "язык репо неизвестен — как раньше, по таблице расширений"
         );
         assert_eq!(
-            categorize_file_in_repo(Path::new("SRC/SERVER.H"), Some("cpp")),
+            categorize_file_in_repo(Path::new("SRC/SERVER.H"), Some("cpp"), &[]),
             FileCategory::Code("cpp".to_string()),
             "регистр расширения значения не имеет"
+        );
+    }
+
+    /// `extra_text_extensions` из настроек проекта — настройка была объявлена
+    /// и предлагалась в подсказке `init`, но не читалась ни одним этапом
+    /// индексации: люди задавали её и считали, что расширили индекс.
+    #[test]
+    fn дополнительные_текстовые_расширения_из_настроек_применяются() {
+        let extra = vec!["log".to_string(), ".conf".to_string(), "TPL".to_string()];
+
+        // Иначе файл был бы пропущен как двоичный.
+        assert_eq!(
+            categorize_file_in_repo(Path::new("app.log"), None, &extra),
+            FileCategory::Text
+        );
+        // Ведущая точка в настройке допускается.
+        assert_eq!(
+            categorize_file_in_repo(Path::new("nginx.conf"), None, &extra),
+            FileCategory::Text
+        );
+        // Регистр не важен ни в настройке, ни в имени файла.
+        assert_eq!(
+            categorize_file_in_repo(Path::new("Page.tpl"), None, &extra),
+            FileCategory::Text
+        );
+        // Не перечисленное остаётся двоичным.
+        assert_eq!(
+            categorize_file_in_repo(Path::new("image.png"), None, &extra),
+            FileCategory::Binary
+        );
+        // Пустой список ничего не меняет.
+        assert_eq!(
+            categorize_file_in_repo(Path::new("app.log"), None, &[]),
+            FileCategory::Binary
+        );
+    }
+
+    /// Ошибочно указанное расширение кода не должно выбрасывать разбор:
+    /// `py` в списке текстовых не делает питон текстом.
+    #[test]
+    fn дополнительные_расширения_не_перебивают_код_и_текст() {
+        let extra = vec!["py".to_string(), "md".to_string()];
+        assert_eq!(
+            categorize_file_in_repo(Path::new("script.py"), None, &extra),
+            FileCategory::Code("python".to_string())
+        );
+        assert_eq!(
+            categorize_file_in_repo(Path::new("readme.md"), None, &extra),
+            FileCategory::Text
         );
     }
 
@@ -283,7 +359,7 @@ mod tests {
             ("mod.rs", "rust"),
         ] {
             assert_eq!(
-                categorize_file_in_repo(Path::new(path), Some("cpp")),
+                categorize_file_in_repo(Path::new(path), Some("cpp"), &[]),
                 FileCategory::Code(lang.to_string()),
                 "{} не должен зависеть от языка репозитория",
                 path
@@ -291,11 +367,11 @@ mod tests {
         }
         // Текстовые и двоичные тоже не затрагиваются
         assert_eq!(
-            categorize_file_in_repo(Path::new("readme.md"), Some("cpp")),
+            categorize_file_in_repo(Path::new("readme.md"), Some("cpp"), &[]),
             FileCategory::Text
         );
         assert_eq!(
-            categorize_file_in_repo(Path::new("image.png"), Some("cpp")),
+            categorize_file_in_repo(Path::new("image.png"), Some("cpp"), &[]),
             FileCategory::Binary
         );
     }

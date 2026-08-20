@@ -70,22 +70,11 @@ async fn run_watch(server: CodeIndexServer, daemon_toml_path: PathBuf) -> Result
         daemon_toml_path.display()
     );
 
-    // Первичная «затравка» сразу после старта — без неё клиент,
-    // подключившийся ДО первого изменения daemon.toml, видел бы
-    // только core-tools (extension_tools пуст у server-конструкторов
-    // в `cli::run`, потому что RepoEntry.language=None при загрузке
-    // из --config). Делаем синхронный rebuild на старте, чтобы
-    // tools/list на первом же запросе содержал bsl-tools, если
-    // в TOML есть `language = "bsl"`.
-    if daemon_toml_path.exists() {
-        if let Err(e) = reload_from_disk(&server, &daemon_toml_path).await {
-            tracing::warn!(
-                "config_watch: первичная инициализация active_languages из {} упала: {}",
-                daemon_toml_path.display(),
-                e
-            );
-        }
-    }
+    // Первичный сбор языков здесь НЕ делается: он выполняется вызывающей
+    // стороной синхронно, до запуска транспорта (`apply_languages_from_config`).
+    // Пока он жил тут, получалась гонка — задача наблюдателя и обслуживание
+    // клиента стартовали одновременно, и клиент, спросивший перечень
+    // инструментов первым, получал набор без инструментов языка.
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -175,6 +164,18 @@ fn build_debouncer(
     Ok(debouncer)
 }
 
+/// Собрать активные языки из конфигурации и применить их к серверу.
+///
+/// Вызывается дважды: один раз синхронно при старте сервера (до того как
+/// клиент сможет спросить перечень инструментов) и затем на каждое изменение
+/// файла настроек. Идемпотентна.
+pub async fn apply_languages_from_config(
+    server: &CodeIndexServer,
+    daemon_toml_path: &Path,
+) -> Result<()> {
+    reload_from_disk(server, daemon_toml_path).await
+}
+
 /// Перечитать конфиг и пересобрать active_languages. Дальше — в сервер.
 async fn reload_from_disk(server: &CodeIndexServer, daemon_toml_path: &Path) -> Result<()> {
     if !daemon_toml_path.exists() {
@@ -189,13 +190,32 @@ async fn reload_from_disk(server: &CodeIndexServer, daemon_toml_path: &Path) -> 
     }
     let cfg = config::load_from(daemon_toml_path)?;
 
-    // Собираем множество активных языков. Записи без `language` —
-    // пропускаются (на этапе 1.8 auto-detect заполнит их и сделает
-    // отдельный `daemon reload` / следующее событие watcher'а).
+    // Собираем множество активных языков. У записи без `language` язык
+    // определяем сами — тем же способом, каким его заполняет демон при
+    // старте. Раньше такие записи просто пропускались, и получалось так:
+    // конфигурация 1С подключена, а одиннадцать инструментов 1С в перечне
+    // отсутствуют, потому что демон на этом файле ещё не отработал и поле
+    // не дописал. Со стороны это выглядит как «инструментов нет вовсе».
     let mut active = BTreeSet::new();
     for entry in &cfg.paths {
-        if let Some(lang) = &entry.language {
-            active.insert(lang.clone());
+        match &entry.language {
+            Some(lang) => {
+                active.insert(lang.clone());
+            }
+            None => {
+                let root = entry
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| entry.path.clone());
+                if let Some(lang) = crate::daemon_core::language_detect::detect_language(&root) {
+                    tracing::info!(
+                        "config_watch: язык для {} не задан, определён автоматически: {}",
+                        entry.path.display(),
+                        lang
+                    );
+                    active.insert(lang.to_string());
+                }
+            }
         }
     }
 
@@ -260,6 +280,50 @@ mod tests {
             is_local: false,
             language: None,
         }
+    }
+
+    /// Запись без `language` раньше просто пропускалась при сборе активных
+    /// языков: пока демон не отработал на этом файле и не дописал поле,
+    /// инструменты языка не появлялись в перечне вовсе. Теперь язык
+    /// определяется тем же автоопределением, что и у демона.
+    #[tokio::test]
+    async fn язык_без_явной_настройки_определяется_автоматически() {
+        let tmp = TempDir::new().unwrap();
+
+        // «Репозиторий» с признаком языка в корне.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::File::create(repo.join("Configuration.xml")).unwrap();
+
+        // Конфигурация без `language` — как её пишет человек руками.
+        let cfg_path = tmp.path().join("daemon.toml");
+        let mut f = std::fs::File::create(&cfg_path).unwrap();
+        write!(
+            f,
+            "[[paths]]\npath = '{}'\n",
+            repo.canonicalize().unwrap().display()
+        )
+        .unwrap();
+        drop(f);
+
+        let mut repos = BTreeMap::new();
+        repos.insert("stand".to_string(), dummy_repo());
+        let mut registry = ProcessorRegistry::new();
+        registry.register(StdArc::new(FakeBslProcessor));
+        let server = CodeIndexServer::with_repos_and_registry(repos, registry);
+
+        reload_from_disk(&server, &cfg_path).await.unwrap();
+
+        assert!(
+            server.active_language_names().contains(&"bsl".to_string()),
+            "язык должен определиться по признаку в корне: {:?}",
+            server.active_language_names()
+        );
+        assert_eq!(
+            server.extension_tools_count(),
+            1,
+            "инструменты языка должны появиться и без явной настройки"
+        );
     }
 
     /// Событие «файл открыли/закрыли на чтение» не должно считаться

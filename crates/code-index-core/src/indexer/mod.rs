@@ -929,7 +929,11 @@ impl<'a> Indexer<'a> {
             }
 
             let category =
-                file_types::categorize_file_in_repo(path, self.config.repo_language.as_deref());
+                file_types::categorize_file_in_repo(
+                    path,
+                    self.config.repo_language.as_deref(),
+                    &self.config.extra_text_extensions,
+                );
 
             if matches!(category, FileCategory::Binary) {
                 continue;

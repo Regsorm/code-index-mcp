@@ -56,6 +56,8 @@ struct BatchContext<'a> {
     registry: &'a ParserRegistry,
     max_code_file_size: usize,
     repo_language: Option<&'a str>,
+    /// Дополнительные текстовые расширения из настроек проекта.
+    extra_text_extensions: &'a [String],
     resolved_processor: Option<&'a Arc<dyn LanguageProcessor>>,
     cache_client: Option<&'a Arc<CacheClient>>,
 }
@@ -129,6 +131,7 @@ fn process_batch(
             ctx.registry,
             ctx.max_code_file_size,
             ctx.repo_language,
+            ctx.extra_text_extensions,
         ) {
             failed += 1;
         }
@@ -684,6 +687,7 @@ pub fn run_worker(
     // чтобы Indexer::with_config не пересоздавался на каждое событие.
     let max_code_file_size = index_config.max_code_file_size_bytes;
     let repo_language = index_config.repo_language.clone();
+    let extra_text_extensions = index_config.extra_text_extensions.clone();
 
     // Основной цикл обработки батчей. Idle-таймаут 500 мс даёт шанс проверить
     // shutdown-сигнал даже если файлов давно не меняли.
@@ -696,6 +700,7 @@ pub fn run_worker(
         registry: &registry,
         max_code_file_size,
         repo_language: repo_language.as_deref(),
+        extra_text_extensions: &extra_text_extensions,
         resolved_processor: resolved_processor.as_ref(),
         cache_client: cache_client.as_ref(),
     };
@@ -965,6 +970,7 @@ fn apply_event(
     registry: &ParserRegistry,
     max_code_file_size: usize,
     repo_language: Option<&str>,
+    extra_text_extensions: &[String],
 ) -> bool {
     match event {
         FileEvent::Modified(abs) | FileEvent::Created(abs) => {
@@ -979,6 +985,7 @@ fn apply_event(
                     registry,
                     max_code_file_size,
                     repo_language,
+                    extra_text_extensions,
                 );
             }
             let (content, hash, is_binary) = match hasher::file_hash(abs) {
@@ -1018,7 +1025,7 @@ fn apply_event(
             let category = if is_binary {
                 FileCategory::Binary
             } else {
-                categorize_file_in_repo(abs, repo_language)
+                categorize_file_in_repo(abs, repo_language, extra_text_extensions)
             };
             // Исход применения события. Ошибка записи не должна молча
             // превращаться в «готово» на уровне батча — см. run_worker.
@@ -1195,6 +1202,7 @@ fn apply_dir_scan(
     registry: &ParserRegistry,
     max_code_file_size: usize,
     repo_language: Option<&str>,
+    extra_text_extensions: &[String],
 ) -> bool {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -1221,7 +1229,15 @@ fn apply_dir_scan(
             if excluded {
                 continue;
             }
-            if !apply_dir_scan(storage, root, &path, registry, max_code_file_size, repo_language) {
+            if !apply_dir_scan(
+                storage,
+                root,
+                &path,
+                registry,
+                max_code_file_size,
+                repo_language,
+                extra_text_extensions,
+            ) {
                 ok = false;
             }
         } else if path.is_file()
@@ -1232,6 +1248,7 @@ fn apply_dir_scan(
                 registry,
                 max_code_file_size,
                 repo_language,
+                extra_text_extensions,
             )
         {
             ok = false;
