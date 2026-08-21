@@ -594,6 +594,7 @@ reports zero size — the file is being written all along, read its contents.
   "batch_size": 500,
   "storage_mode": "auto",
   "memory_max_percent": 50,
+  "memory_estimate_factor": 3.0,
   "debounce_ms": 1500,
   "batch_ms": 2000
 }
@@ -603,8 +604,38 @@ Key fields:
 
 - **storage_mode** — `auto` decides by calculation (see below); `memory` forces in-memory; `disk` forces on-disk
 - **memory_max_percent** — share of FREE memory the in-memory database may use in `auto` mode (50% by default)
+- **memory_estimate_factor** — how many times working in RAM costs more than the source files weigh (3.0 by default)
 
-**How `auto` works.** Before indexing, the folder is weighed: the size of the files that will be indexed is summed (metadata only, 1–3 seconds for 60,000 files). Expected memory usage is weight × 3 (multiplier from measurement: a 3.98 GB folder produced 9.8 GB of occupied memory). If that fits the allowed share of free memory at that moment, the database is built in RAM and then flushed to disk; otherwise it goes straight to disk. After working in RAM the freed memory is returned to the system, so the next folder gets it back. The decision is logged with the numbers.
+**How `auto` works.** Before indexing, the folder is weighed: the size of the files that will be indexed is summed (metadata only, 1–3 seconds for 60,000 files). Then the calculation:
+
+```text
+expected usage = source weight × memory_estimate_factor
+allowed usage  = free memory × memory_max_percent / 100
+
+expected usage ≤ allowed usage → the database is built in RAM, then flushed to disk
+otherwise                      → the database goes straight to disk
+```
+
+Free memory is re-read for every folder, not once at startup. After working in RAM the freed memory is returned to the system, so the next folder gets it back. Both sides of the calculation, the multiplier and the decision are logged.
+
+**When to change `memory_estimate_factor`.** The default 3.0 is the middle of the observed spread, not headroom on top of it. Measurements across folders range from about 2 to over 4:
+
+| Source weight | Memory used | Actual factor |
+|---:|---:|---:|
+| 3.8 GB | 8.6 GB | 2.3 |
+| 6.7 GB | 19.0 GB | 2.8 |
+| 5.3 GB | 18.6 GB | 3.5 |
+| 1.8 GB | 8.0 GB | 4.4 |
+
+The spread depends on the language, on how densely the files are packed with code, and on what the folder contains, so the factor cannot be predicted up front — it is tuned from the log, which records both the estimate and the decision.
+
+| Situation | Value | Result |
+|---|---:|---|
+| Little RAM, weak machine | 4.0 and up | Disk more often: slower, but predictable, with no risk of running out. On weak machines this is the direction that matters |
+| Ordinary machine | 3.0 | Default |
+| Plenty of RAM, willing to check the log | 2.0–2.5 | More folders go to RAM, indexing is faster. The risk is real: usage above the estimate is at least as common as below, and running out of memory aborts the folder |
+
+Zero, negative or non-numeric values are treated as a typo — the default is used, and the log shows which multiplier was actually applied.
 - **debounce_ms** — milliseconds to wait after a file change before triggering re-indexing (collects burst edits into one pass)
 - **batch_ms** — upper bound on how long the watcher keeps accumulating events after the first one in a batch
 - **batch_size** — number of records per SQLite transaction during indexing (higher = faster bulk inserts, higher peak memory)

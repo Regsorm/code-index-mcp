@@ -307,6 +307,7 @@ ip = "192.0.2.10"      # репо на этой же машине
 | `batch_size` | `2000` | Записей в одной транзакции |
 | `storage_mode` | `"auto"` | Режим SQLite: `auto` / `memory` / `disk` |
 | `memory_max_percent` | `25` | Максимум RAM для in-memory в auto-режиме |
+| `memory_estimate_factor` | `3.0` | Во сколько раз работа в памяти дороже веса исходников (auto-режим) |
 | `debounce_ms` | `1500` | Задержка watcher (мс) |
 | `batch_ms` | `2000` | Максимальное время накопления батча (мс) |
 | `flush_interval_sec` | `30` | Интервал периодической записи на диск |
