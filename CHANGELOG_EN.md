@@ -5,6 +5,29 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.62.0] — 2026-08-21
+
+**A form event handler no longer looks uncalled. "Who calls this" used to answer "0 edges" for such a procedure — now the binding itself comes back: the form, the event, the form element and the description file.**
+
+> Context. A handler procedure is declared in the form module, but the platform runs it per an entry in the form description (`<Event name="BeforeWriteAtServer">BeforeWriteAtServer1</Event>`). It has no call in the code and cannot have one, so the call graph answered an honest zero — which read as "this procedure is used nowhere". A user reported that on such an answer a model doubted the index was fresh, went off to parse the form description with a separate tool and found the bindings by hand. The index was complete all along: the data lives in a different table, and the wrong tool had been asked.
+
+### Added
+
+- **Form handler bindings in the "who calls" answer** (`kind: form_binding`). A record carries the owning form, the event, the form element (when the handler belongs to an element rather than the form itself) and the path to the description file. That path goes into the dependent files list, so editing the description invalidates the cached answer precisely.
+- **An extension point on the language processor** — "callers that are absent from the code call graph". The core still knows nothing about 1C forms: the declarative branch lives entirely in the 1C extension and is empty for every other language.
+- **A hint in the search tools** (symbol search, code search, procedure body search, function search). One or two matches for a name is the typical picture for a handler: only the declaration was found. In that case the answer says the name has a binding outside the code and names the next step. The check runs only on a bare identifier with no regex metacharacters and only on a small result set — a mass search does no extra work.
+
+### Two branches, because a procedure is addressed by name
+
+The question is asked by procedure name, not by its file. Handler names usually match the event name, so a single name covers many distinct procedures: in a typical trade configuration `OnOpen` is declared 2,246 times, with 2,132 forms carrying such a binding.
+
+- **The name belongs to one procedure** — the binding is returned in full. This is the case the whole change was made for: it is never truncated.
+- **The name belongs to several procedures** — instead of a list of thousands of forms, a single record arrives: the name is ambiguous, plus a ready sample call for the handlers of a specific form.
+
+### What will not show up in the answer
+
+The link is resolved through the form module file, not through the handler name: names like `OnOpen` occur in hundreds of forms, and matching by name would pull in bindings of unrelated forms. Every candidate is additionally verified against the description of ITS OWN form — a same-named procedure inside a form module is not yet a binding. Verified on a live database: the common module function `ObjectAttributeValue` had four same-named procedures in form modules, none of them assigned as a handler — and the answer says nothing about bindings.
+
 ## [0.61.0] — 2026-08-21
 
 **Indexing with the database on disk writes noticeably less and finishes faster. The multiplier that estimates memory usage moved into the folder settings — on a weak machine you can now raise it to make sure the work goes to disk.**
