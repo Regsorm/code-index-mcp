@@ -10,6 +10,15 @@ on:
   push:
     tags:
       - 'v*'
+  # Ручной запуск — чтобы опубликовать уже существующий тег, не выпуская
+  # новую версию. Нужен, когда выкладка сорвалась по причине, не связанной с
+  # кодом: истёк ключ, не отвечал реестр. Перезапуск прежнего прогона тут не
+  # помогает — он берёт процесс в том виде, в каком тот был на момент тега.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег выпуска, который нужно опубликовать (например v0.61.0)'
+        required: true
 
 jobs:
   publish:
@@ -17,15 +26,23 @@ jobs:
 
     permissions:
       contents: read
-      id-token: write   # нужно для аутентификации mcp-publisher через GitHub OIDC
+      # Право подписывать запросы от имени этого запуска. Нужно обоим шагам
+      # публикации: и npm (доверенный издатель), и mcp-publisher (реестр).
+      id-token: write
 
     env:
-      TAG: ${{ github.ref_name }}
+      # При запуске по тегу — сам тег; при ручном — тот, что назвали в поле.
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
       REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
 
     steps:
+      # Берём содержимое ИМЕННО того тега, который публикуем: при ручном
+      # запуске процесс идёт из главной ветки, а выложить нужно то, что было
+      # в выпуске.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
 
       - name: Compute version from tag
         id: ver
@@ -57,17 +74,31 @@ jobs:
           mv npm/package.json.tmp npm/package.json
 
       # --- Публикация npm-обёртки ---
+      #
+      # Публикуется без ключа доступа: на стороне npm настроен доверенный
+      # издатель (пакет ↔ этот репозиторий и этот файл), и право на выкладку
+      # подтверждает сам GitHub — тем же способом, что и для реестра ниже.
+      # Ключам, которые прежде лежали в секретах, взяться неоткуда: они
+      # истекали каждые 90 дней и молча роняли выпуск, а npm вдобавок
+      # сворачивает разновидность с обходом второго фактора.
+      #
+      # `registry-url` здесь НЕ указываем нарочно: он готовит файл настроек
+      # npm под подстановку ключа из переменной, а ключа нет.
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '22'
+
+      # Доверенная публикация появилась в npm 11.5.1, а в готовом образе
+      # стоит версия постарше.
+      - name: Update npm to a version that supports trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       - name: Publish npm package
         working-directory: npm
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # --- Публикация визитки в официальный MCP-реестр ---
       # mcp-publisher тянем из релизов реестра (linux amd64).
