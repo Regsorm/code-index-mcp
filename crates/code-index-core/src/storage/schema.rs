@@ -389,7 +389,7 @@ pub fn migrate_v5(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         let mut ins_fts =
             conn.prepare("INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)")?;
         for (file_id, content) in rows {
-            let blob = zstd::encode_all(content.as_bytes(), ZSTD_LEVEL)
+            let blob = zstd::bulk::compress(content.as_bytes(), ZSTD_LEVEL)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             ins_tc.execute(rusqlite::params![file_id, blob])?;
             ins_fts.execute(rusqlite::params![file_id, content])?;

@@ -744,7 +744,15 @@ impl Storage {
     /// Вынесено отдельной функцией, чтобы массовая индексация могла сжимать
     /// в фазе параллельного парсинга (rayon), а не в единственном потоке-писателе.
     pub fn compress_content(content: &str) -> Result<Vec<u8>> {
-        zstd::encode_all(content.as_bytes(), Self::FILE_CONTENTS_ZSTD_LEVEL)
+        // Именно bulk, а не encode_all: потоковый кодировщик не знает размер
+        // источника и пишет в заголовок кадра уровневое окно распаковки 2 МБ.
+        // Распаковщик заводит буфер окна такого размера НА КАЖДЫЙ файл, и при
+        // разборе на всех ядрах рабочий набор перестаёт помещаться в кэш
+        // процессора: полный перебор по содержимому почти не ускоряется от
+        // числа ядер. С известным размером окно ужимается до размера файла.
+        // Замер на 18.7 тыс. текстовых файлов (598 МБ после распаковки):
+        // сжатых 57.1 МБ до и после, распаковка на 16 ядрах 596 → 121 мс.
+        zstd::bulk::compress(content.as_bytes(), Self::FILE_CONTENTS_ZSTD_LEVEL)
             .context("compress_content: zstd encode")
     }
 
@@ -921,81 +929,191 @@ impl Storage {
         context_lines: usize,
         max_total_bytes: usize,
     ) -> Result<(Vec<GrepTextMatch>, bool, usize)> {
+        // Распаковка zstd и разбор содержимого — счётная работа, и на полном
+        // переборе (совпадений мало или нет вовсе) она занимает практически всё
+        // время ответа. Идём порциями: внутри порции файлы разбираются на всех
+        // ядрах, порции — последовательно. Порядок выдачи, потолки limit и
+        // max_total_bytes, ранний выход и счётчик непрочитанных остаются ровно
+        // те же, что при пофайловом обходе; в памяти материализуется одна
+        // порция, а не весь репозиторий.
+        //
+        // Порция растёт от CHUNK_MIN к CHUNK_MAX. Маленькая первая порция
+        // оставляет дешёвым ранний выход на частом образце (совпадения
+        // набираются с первых же файлов). Дальше порция удваивается: на
+        // маленькой порции ядра простаивают на общем барьере, пока самый
+        // крупный файл разбирается, и полный перебор из-за этого теряет
+        // заметную часть выигрыша (замер на 40 тыс. файлов: порция 64 —
+        // 682 мс, порция 4096 — 448 мс при нижней границе 424 мс).
+        const CHUNK_MIN: usize = 64;
+        const CHUNK_MAX: usize = 4096;
+        let mut chunk_cap = CHUNK_MIN;
+
         let mut results: Vec<GrepTextMatch> = Vec::new();
         let mut total_bytes: usize = 0;
         let mut unreadable: usize = 0;
+        let mut chunk: Vec<(String, Vec<u8>)> = Vec::with_capacity(chunk_cap);
+
         for row in rows {
-            // Безопасный decode zstd с лимитом размера (защита от zstd-bomb).
-            // Битые blob'ы или превышение лимита пропускаем — не валим весь поиск.
-            let (path, blob) = row?;
-            let bytes = match Self::decode_zstd_safe(&blob) {
-                Ok(b) => b,
-                Err(_) => {
-                    unreadable += 1;
-                    continue;
-                }
-            };
-            let content = match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(_) => {
-                    unreadable += 1;
-                    continue;
-                }
-            };
-            // H-2: файлы с окончаниями строк CRLF. Отсев ниже применяет выражение
-            // к тексту ЦЕЛИКОМ, где строка кончается на `\r\n`, а построчный обход —
-            // к строкам из `lines()`, где `\r` уже убран. Из-за расхождения `$` не
-            // совпадал, и файл отсекался целиком ещё до обхода. Нормализуем один
-            // раз; копия делается, только если возврат каретки реально есть.
-            let content = if content.contains('\r') {
-                content.replace("\r\n", "\n")
-            } else {
-                content
-            };
-            // Быстрый отказ: если в файле нет ни одного совпадения — не
-            // тратим время на построчный обход.
-            if !compiled.is_match(&content) {
+            chunk.push(row?);
+            if chunk.len() < chunk_cap {
                 continue;
             }
-            let lines: Vec<&str> = content.lines().collect();
-            for (i, line) in lines.iter().enumerate() {
-                if !compiled.is_match(line) {
-                    continue;
-                }
-                let line_no = i + 1;
-                let context = if context_lines > 0 {
-                    let from = i.saturating_sub(context_lines);
-                    let to = (i + context_lines + 1).min(lines.len());
-                    (from..to)
-                        .map(|j| ContextLine {
-                            line: j + 1,
-                            content: lines[j].to_string(),
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                let row_bytes = line.len()
-                    + context.iter().map(|c| c.content.len()).sum::<usize>()
-                    + path.len();
-                total_bytes = total_bytes.saturating_add(row_bytes);
-                if total_bytes > max_total_bytes {
-                    // Упёрлись в байтовый потолок ответа — результат обрезан.
-                    return Ok((results, true, unreadable));
-                }
-                results.push(GrepTextMatch {
-                    path: path.clone(),
-                    line: line_no,
-                    content: line.to_string(),
-                    context,
-                });
-                if results.len() >= limit {
-                    // Достигнут лимит совпадений — возможно, есть ещё.
-                    return Ok((results, true, unreadable));
-                }
+            let (stop, u) = Self::grep_zstd_chunk(
+                &chunk,
+                compiled,
+                limit,
+                context_lines,
+                max_total_bytes,
+                &mut results,
+                &mut total_bytes,
+            );
+            unreadable += u;
+            chunk.clear();
+            chunk_cap = (chunk_cap * 2).min(CHUNK_MAX);
+            chunk.reserve(chunk_cap.saturating_sub(chunk.capacity()));
+            if stop {
+                return Ok((results, true, unreadable));
+            }
+        }
+        if !chunk.is_empty() {
+            let (stop, u) = Self::grep_zstd_chunk(
+                &chunk,
+                compiled,
+                limit,
+                context_lines,
+                max_total_bytes,
+                &mut results,
+                &mut total_bytes,
+            );
+            unreadable += u;
+            if stop {
+                return Ok((results, true, unreadable));
             }
         }
         Ok((results, false, unreadable))
+    }
+
+    /// Одна порция файлов: распаковка и отсев идут параллельно, слияние в
+    /// результат — последовательно и строго в порядке путей, поэтому потолки
+    /// срабатывают на том же файле и той же строке, что и при обходе по одному.
+    /// Возвращает (упёрлись в потолок, число непрочитанных файлов ДО остановки).
+    fn grep_zstd_chunk(
+        chunk: &[(String, Vec<u8>)],
+        compiled: &regex::Regex,
+        limit: usize,
+        context_lines: usize,
+        max_total_bytes: usize,
+        results: &mut Vec<GrepTextMatch>,
+        total_bytes: &mut usize,
+    ) -> (bool, usize) {
+        use rayon::prelude::*;
+
+        // Параллельно делается только тяжёлая часть — распаковка и отсев по
+        // файлу целиком. Построчный разбор с набором контекста идёт ниже,
+        // последовательно и лишь для файлов, которые реально попадут в ответ:
+        // иначе на частом образце порция целиком обходится построчно, а в
+        // ответ уходит десяток строк. Файлы под разбор разжимаются второй раз,
+        // но их не больше `limit` штук — против десятков тысяч в порции.
+        let matched: Vec<Option<bool>> = chunk
+            .par_iter()
+            .map(|(_, blob)| Self::grep_zstd_probe(blob, compiled))
+            .collect();
+
+        let mut unreadable: usize = 0;
+        for ((path, blob), flag) in chunk.iter().zip(matched) {
+            let Some(has_match) = flag else {
+                unreadable += 1;
+                continue;
+            };
+            if !has_match {
+                continue;
+            }
+            let need = limit.saturating_sub(results.len()).max(1);
+            for m in Self::grep_zstd_lines(path, blob, compiled, context_lines, need) {
+                let row_bytes = m.content.len()
+                    + m.context.iter().map(|c| c.content.len()).sum::<usize>()
+                    + m.path.len();
+                *total_bytes = total_bytes.saturating_add(row_bytes);
+                if *total_bytes > max_total_bytes {
+                    // Упёрлись в байтовый потолок ответа — результат обрезан.
+                    return (true, unreadable);
+                }
+                results.push(m);
+                if results.len() >= limit {
+                    // Достигнут лимит совпадений — возможно, есть ещё.
+                    return (true, unreadable);
+                }
+            }
+        }
+        (false, unreadable)
+    }
+
+    /// Разжать blob и привести переводы строк к `\n`.
+    ///
+    /// H-2: файлы с окончаниями строк CRLF. Отсев применяет выражение к тексту
+    /// ЦЕЛИКОМ, где строка кончается на `\r\n`, а построчный обход — к строкам
+    /// из `lines()`, где `\r` уже убран. Из-за расхождения `$` не совпадал, и
+    /// файл отсекался целиком ещё до обхода. Нормализуем один раз; копия
+    /// делается, только если возврат каретки реально есть.
+    ///
+    /// `None` — файл не прочитан: битый blob, превышение лимита распаковки
+    /// (защита от zstd-bomb) или не-UTF-8 содержимое.
+    fn grep_zstd_text(blob: &[u8]) -> Option<String> {
+        let bytes = Self::decode_zstd_safe(blob).ok()?;
+        let content = String::from_utf8(bytes).ok()?;
+        Some(if content.contains('\r') {
+            content.replace("\r\n", "\n")
+        } else {
+            content
+        })
+    }
+
+    /// Отсев по файлу целиком: `None` — файл не прочитан, иначе есть ли в нём
+    /// хоть одно совпадение. Построчный обход для несовпавших не нужен.
+    fn grep_zstd_probe(blob: &[u8], compiled: &regex::Regex) -> Option<bool> {
+        Self::grep_zstd_text(blob).map(|c| compiled.is_match(&c))
+    }
+
+    /// Построчные совпадения одного файла с контекстом, не более `need` штук.
+    fn grep_zstd_lines(
+        path: &str,
+        blob: &[u8],
+        compiled: &regex::Regex,
+        context_lines: usize,
+        need: usize,
+    ) -> Vec<GrepTextMatch> {
+        let Some(content) = Self::grep_zstd_text(blob) else {
+            return Vec::new();
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let mut out: Vec<GrepTextMatch> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !compiled.is_match(line) {
+                continue;
+            }
+            let context = if context_lines > 0 {
+                let from = i.saturating_sub(context_lines);
+                let to = (i + context_lines + 1).min(lines.len());
+                (from..to)
+                    .map(|j| ContextLine {
+                        line: j + 1,
+                        content: lines[j].to_string(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            out.push(GrepTextMatch {
+                path: path.to_string(),
+                line: i + 1,
+                content: line.to_string(),
+                context,
+            });
+            if out.len() >= need {
+                break;
+            }
+        }
+        out
     }
 
     pub fn grep_code_filtered(
