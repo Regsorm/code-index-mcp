@@ -83,6 +83,11 @@ pub(crate) const HINT_CALL_GRAPH_EMPTY: &str = "0 рёбер в графе вы�
 (Выполнить/Вычислить со сборкой имени из строк, типовой паттерн диспетчеров) — \
 проверьте grep_code по фрагменту имени: он найдёт и строковые литералы.";
 
+/// get_callers вернул декларативные привязки — записи с полем `kind`.
+pub(crate) const HINT_DECLARATIVE_CALLERS: &str = "Часть записей — декларативные привязки \
+(поле kind): вызова в коде у них нет, процедуру выполняет платформа по записи в описании \
+объекта. Строка привязки — в файле из поля path.";
+
 /// list_files вернул 0 файлов.
 pub(crate) const HINT_LIST_FILES_EMPTY: &str = "0 файлов. pattern — glob от корня репо \
 (например '**/*.bsl', '**/Documents/**'). Проверьте path_prefix=/language=; \
@@ -460,6 +465,66 @@ pub(crate) fn build_path_matcher(glob: &str) -> Result<globset::GlobSet, String>
         .map_err(|e| format!("невалидный glob '{}': {}", glob, e))
 }
 
+/// Спросить у процессора языка декларативные привязки процедуры — вызовы,
+/// которых нет в графе вызовов кода (обработчик события формы и т.п.).
+/// Для репо без процессора (remote, неизвестный язык) — пусто.
+pub(crate) fn declarative_callers_of(
+    entry: &RepoEntry,
+    storage: &crate::storage::Storage,
+    function_name: &str,
+) -> Vec<serde_json::Value> {
+    match entry.processor.as_ref() {
+        Some(p) => p.declarative_callers(storage, function_name),
+        None => Vec::new(),
+    }
+}
+
+/// Подсказка для поисковых инструментов: найдено одно-два вхождения имени, и
+/// это выглядит как «процедура нигде не используется», хотя у неё есть
+/// декларативная привязка вне кода. Возвращает `None`, если `candidate` — не
+/// голое имя (регулярное выражение со спецсимволами) или привязок нет.
+pub(crate) fn declarative_binding_hint(
+    entry: &RepoEntry,
+    storage: &crate::storage::Storage,
+    candidate: &str,
+) -> Option<String> {
+    if entry.processor.is_none() || !is_plain_identifier(candidate) {
+        return None;
+    }
+    let found = declarative_callers_of(entry, storage, candidate);
+    let first = found.first()?;
+    // Имя неоднозначно — расширение само назвало следующий шаг (обработчики
+    // конкретной формы), повторять его своими словами незачем.
+    if let Some(next) = first.get("hint").and_then(|v| v.as_str()) {
+        return Some(format!(
+            "У «{}» есть привязка вне кода, вызова в коде нет. {}",
+            candidate, next
+        ));
+    }
+    Some(format!(
+        "У «{}» есть привязка вне кода: процедуру выполняет платформа по записи в описании \
+         объекта, вызова в коде нет. Кто и по какому событию — \
+         get_callers(function_name='{}').",
+        candidate, candidate
+    ))
+}
+
+/// Порог «мало совпадений» для подсказки о декларативных привязках. Одно-два
+/// вхождения имени — типичная картина обработчика: только объявление в модуле.
+/// На массовой выдаче подсказка не нужна и стоила бы лишнего запроса.
+pub(crate) const DECLARATIVE_HINT_MAX_HITS: usize = 3;
+
+/// Голое имя без спецсимволов регулярного выражения: буква/подчёркивание в
+/// начале, дальше буквы, цифры и подчёркивания. Кириллица считается буквой.
+fn is_plain_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
 /// Lookup пути по file_id через storage. Любая ошибка/отсутствие → пустая строка
 /// (она не пройдёт ни один matcher, так что результат честно отбросится).
 /// Storage уже заблокирован вызывающей стороной (передаётся через `&MutexGuard`).
@@ -649,6 +714,14 @@ pub async fn search_function(
                 sql_limit,
                 r.len(),
             );
+            // Одно-два совпадения по имени процедуры — типичная картина
+            // обработчика: только объявление. Подсказываем про привязку вне кода.
+            let extra = extra.or_else(|| {
+                (r.len() <= DECLARATIVE_HINT_MAX_HITS)
+                    .then(|| declarative_binding_hint(entry, &storage, &query))
+                    .flatten()
+                    .map(|h| serde_json::json!({ "hint": h }))
+            });
             // Поисковая выдача БЕЗ тел функций: только имя/путь/строки/сигнатура +
             // обрезанный docstring. Полные тела 20 результатов раздували ответ до
             // 20-45K символов (слабое место прогона УТ-11). Тело — get_function.
@@ -931,10 +1004,10 @@ pub async fn get_callers(
             if truncated {
                 r.truncate(cap);
             }
-            let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            let mut deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
             // Обогащаем каждую запись путём файла-источника (file_id → path):
             // различает одноимённые функции из разных модулей.
-            let enriched: Vec<serde_json::Value> = r
+            let mut enriched: Vec<serde_json::Value> = r
                 .iter()
                 .map(|cr| {
                     serde_json::json!({
@@ -948,17 +1021,38 @@ pub async fn get_callers(
                     })
                 })
                 .collect();
-            let extra = if truncated {
-                Some(serde_json::json!({
-                    "truncated": true, "total": total, "limit": cap,
-                    "hint": "Показаны первые N вызывателей (горячая функция). Уточните limit= для большего числа или сузьте language=.",
-                }))
+            // Декларативные привязки: процедуру зовёт платформа по записи в
+            // описании объекта (обработчик события формы), ребра в графе
+            // вызовов кода у неё нет и быть не может. Лимитом не режем —
+            // записей единицы: на неоднозначном имени расширение отдаёт не
+            // список, а одну запись с подсказкой.
+            let declarative = declarative_callers_of(entry, &storage, &function_name);
+            deps.extend(
+                declarative
+                    .iter()
+                    .filter_map(|d| d.get("path").and_then(|v| v.as_str()).map(str::to_string)),
+            );
+            let declarative_count = declarative.len();
+            enriched.extend(declarative);
+
+            let mut extra = serde_json::Map::new();
+            if truncated {
+                extra.insert("truncated".into(), serde_json::json!(true));
+                extra.insert("total".into(), serde_json::json!(total));
+                extra.insert("limit".into(), serde_json::json!(cap));
+                extra.insert("hint".into(), serde_json::json!(
+                    "Показаны первые N вызывателей (горячая функция). Уточните limit= для большего числа или сузьте language=."
+                ));
+            }
+            if declarative_count > 0 {
+                if !extra.contains_key("hint") {
+                    extra.insert("hint".into(), serde_json::json!(HINT_DECLARATIVE_CALLERS));
+                }
             } else if r.is_empty() {
                 // На пустом результате — hint (модель повторяет тот же вызов).
-                Some(serde_json::json!({ "hint": HINT_CALL_GRAPH_EMPTY }))
-            } else {
-                None
-            };
+                extra.insert("hint".into(), serde_json::json!(HINT_CALL_GRAPH_EMPTY));
+            }
+            let extra = (!extra.is_empty()).then(|| serde_json::Value::Object(extra));
             wrap_with_meta_extra(&storage, &enriched, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
@@ -1258,6 +1352,9 @@ pub async fn find_symbol(
                     "totals": { "functions": f_total, "classes": c_total, "variables": v_total, "imports": i_total },
                     "hint": "Локаций больше cap — показаны первые по каждой категории. Сузьте path_glob к нужному файлу.",
                 }))
+            } else if f_total + c_total + v_total + i_total <= DECLARATIVE_HINT_MAX_HITS {
+                declarative_binding_hint(entry, &storage, &name)
+                    .map(|h| serde_json::json!({ "hint": h }))
             } else {
                 None
             };
@@ -1649,8 +1746,18 @@ pub async fn grep_body(
                 "limit": want,
                 "truncated": truncated,
             });
-            let hint =
-                if shown == 0 { Some(grep_body_empty_hint(entry.language.as_deref())) } else { None };
+            let declarative = (1..=DECLARATIVE_HINT_MAX_HITS)
+                .contains(&shown)
+                .then(|| {
+                    let candidate = regex.as_deref().or(pattern.as_deref()).unwrap_or_default();
+                    declarative_binding_hint(entry, &storage, candidate)
+                })
+                .flatten();
+            let hint = if shown == 0 {
+                Some(grep_body_empty_hint(entry.language.as_deref()))
+            } else {
+                declarative.as_deref()
+            };
             wrap_with_meta_hint(&storage, &payload, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"grep_body: {}\"}}", e),
@@ -1923,8 +2030,15 @@ pub async fn grep_code(
                 "truncated": truncated,
             });
             annotate_unreadable(&mut payload, unreadable);
-            let hint =
-                if shown == 0 { Some(grep_code_empty_hint(entry.language.as_deref())) } else { None };
+            let declarative = (1..=DECLARATIVE_HINT_MAX_HITS)
+                .contains(&shown)
+                .then(|| declarative_binding_hint(entry, &storage, &regex))
+                .flatten();
+            let hint = if shown == 0 {
+                Some(grep_code_empty_hint(entry.language.as_deref()))
+            } else {
+                declarative.as_deref()
+            };
             wrap_with_meta_hint(&storage, &payload, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"grep_code: {}\"}}", e),

@@ -22,7 +22,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::extension::{IndexTool, ProcessorRegistry};
+use crate::extension::{IndexTool, LanguageProcessor, ProcessorRegistry};
 use crate::serve_cache::ServeCache;
 use crate::serve_dedup::SessionDedup;
 use crate::federation::client::RemoteClientPool;
@@ -67,6 +67,11 @@ pub struct RepoEntry {
     /// Используется для conditional registration MCP-tools и для
     /// валидации совместимости в `IndexTool::execute`.
     pub language: Option<String>,
+    /// Процессор языка этого репо (из `ProcessorRegistry` по `language`).
+    /// Нужен tool-слою, чтобы спросить у расширения декларативные привязки
+    /// (`LanguageProcessor::declarative_callers`). `None` — remote-репо,
+    /// язык не определён либо сервер собран без реестра.
+    pub processor: Option<Arc<dyn LanguageProcessor>>,
 }
 
 impl RepoEntry {
@@ -447,9 +452,10 @@ impl CodeIndexServer {
     /// собираются из `additional_tools()` каждого зарегистрированного
     /// процессора, чьё имя входит в множество активных языков.
     pub fn with_repos_and_registry(
-        repos: BTreeMap<String, RepoEntry>,
+        mut repos: BTreeMap<String, RepoEntry>,
         registry: ProcessorRegistry,
     ) -> Self {
+        attach_processors(&mut repos, Some(&registry));
         let active_languages = collect_active_languages(&repos);
         let extension_tools = collect_extension_tools(&active_languages, &registry);
         Self {
@@ -503,6 +509,7 @@ impl CodeIndexServer {
                     port: repo.port,
                     is_local: true,
                     language: local_languages.get(&repo.alias).cloned(),
+                    processor: None,
                 }
             } else {
                 RepoEntry {
@@ -512,10 +519,12 @@ impl CodeIndexServer {
                     port: repo.port,
                     is_local: false,
                     language: None,
+                    processor: None,
                 }
             };
             map.insert(repo.alias, entry);
         }
+        attach_processors(&mut map, registry.as_ref());
         let active_languages = collect_active_languages(&map);
         let extension_tools = match registry.as_ref() {
             Some(reg) => collect_extension_tools(&active_languages, reg),
@@ -553,6 +562,7 @@ impl CodeIndexServer {
                 port: crate::federation::client::DEFAULT_REMOTE_PORT,
                 is_local: true,
                 language: None,
+                processor: None,
             });
         }
         Ok(Self::with_repos(map))
@@ -573,6 +583,7 @@ impl CodeIndexServer {
             port: crate::federation::client::DEFAULT_REMOTE_PORT,
             is_local: true,
             language: None,
+            processor: None,
         });
         Self::with_repos(map)
     }
@@ -827,6 +838,27 @@ impl CodeIndexServer {
 // (например, BSL-процессор в `bsl-indexer`, но `daemon.toml` сейчас
 // содержит только Python-репо). Их tools не попадают в `extension_tools`
 // — клиент не должен видеть невалидных вариантов.
+
+/// Проставить каждому local-репо процессор его языка. Делается один раз при
+/// сборке сервера: tool-слой обращается к процессору по каждому вызову
+/// (декларативные привязки), и искать его в реестре каждый раз незачем.
+/// Для remote-репо и репо без языка поле остаётся `None`.
+fn attach_processors(
+    repos: &mut BTreeMap<String, RepoEntry>,
+    registry: Option<&ProcessorRegistry>,
+) {
+    let Some(registry) = registry else { return };
+    for entry in repos.values_mut() {
+        if !entry.is_local {
+            continue;
+        }
+        entry.processor = entry
+            .language
+            .as_deref()
+            .and_then(|lang| registry.get(lang))
+            .cloned();
+    }
+}
 
 fn collect_active_languages(repos: &BTreeMap<String, RepoEntry>) -> BTreeSet<String> {
     repos
@@ -2072,6 +2104,7 @@ mod conditional_registration_tests {
             port: crate::federation::client::DEFAULT_REMOTE_PORT,
             is_local: false,
             language: language.map(String::from),
+            processor: None,
         }
     }
 

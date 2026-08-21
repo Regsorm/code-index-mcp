@@ -279,6 +279,7 @@ mod tests {
             port: crate::federation::client::DEFAULT_REMOTE_PORT,
             is_local: false,
             language: None,
+            processor: None,
         }
     }
 

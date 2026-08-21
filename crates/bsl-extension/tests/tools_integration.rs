@@ -905,3 +905,209 @@ async fn search_terms_respects_limit() {
     let results = res["results"].as_array().unwrap();
     assert_eq!(results.len(), 2);
 }
+
+// ── Привязки обработчиков форм (declarative_callers) ──────────────────────
+//
+// Обработчик формы объявлен в модуле, но в коде его никто не вызывает —
+// выполняет его платформа по записи в описании формы. `get_callers` без этого
+// отдавал ноль рёбер, и ответ читался как «процедура нигде не используется».
+
+/// Форма с одним обработчиком: модуль, описание и запись в `metadata_forms`.
+async fn seed_form_with_handler(
+    storage: &Arc<StoragePool>,
+    owner_folder: &str,
+    object: &str,
+    form: &str,
+    handler: &str,
+) {
+    let s = storage.get().await.unwrap();
+    let conn = s.conn();
+    let form_root = format!("base/{}/{}/Forms/{}", owner_folder, object, form);
+    let module_path = format!("{}/Ext/Form/Module.bsl", form_root);
+    let descriptor_path = format!("{}/Ext/Form.xml", form_root);
+    for (path, lang) in [(&module_path, "bsl"), (&descriptor_path, "text")] {
+        conn.execute(
+            "INSERT INTO files (path, content_hash, language) VALUES (?, ?, ?)",
+            params![path, "hash", lang],
+        )
+        .unwrap();
+    }
+    let file_id: i64 = conn
+        .query_row(
+            "SELECT id FROM files WHERE path = ?",
+            params![&module_path],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO functions (file_id, name, line_start, line_end) VALUES (?, ?, ?, ?)",
+        params![file_id, handler, 10, 20],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+         VALUES (?, ?, ?, ?)",
+        params![
+            REPO,
+            format!("{}.{}", owner_folder, object),
+            form,
+            serde_json::json!([{"event": "ПередЗаписьюНаСервере", "handler": handler}]).to_string()
+        ],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn form_handler_binding_is_reported_as_caller() {
+    let (_tmp, storage) = fresh_storage();
+    seed_form_with_handler(&storage, "Catalogs", "Контрагенты", "ФормаЭлемента", "ПередЗаписью1")
+        .await;
+
+    let s = storage.get().await.unwrap();
+    let found = bsl_extension::form_bindings::form_bindings(&s, "ПередЗаписью1");
+    assert_eq!(found.len(), 1, "привязка обработчика должна находиться: {found:?}");
+    assert_eq!(found[0]["kind"].as_str(), Some("form_binding"));
+    assert_eq!(found[0]["event"].as_str(), Some("ПередЗаписьюНаСервере"));
+    assert_eq!(
+        found[0]["path"].as_str(),
+        Some("base/Catalogs/Контрагенты/Forms/ФормаЭлемента/Ext/Form.xml"),
+        "путь описания нужен для сброса кэша по файлу"
+    );
+    assert!(
+        found[0]["caller"].as_str().unwrap().contains("ФормаЭлемента"),
+        "в caller должна быть видна форма"
+    );
+}
+
+#[tokio::test]
+async fn same_handler_name_in_other_form_is_not_mixed_in() {
+    // Имена вроде «ПриОткрытии» встречаются в сотнях форм. Связь идёт по файлу
+    // модуля, поэтому чужая форма с тем же именем обработчика подмешаться
+    // не должна — иначе выдача полна ложных привязок.
+    let (_tmp, storage) = fresh_storage();
+    seed_form_with_handler(&storage, "Catalogs", "Контрагенты", "ФормаЭлемента", "ПриОткрытии")
+        .await;
+    {
+        // Вторая форма: запись в metadata_forms с тем же обработчиком есть,
+        // а объявления процедуры в её модуле нет.
+        let s = storage.get().await.unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+                 VALUES (?, ?, ?, ?)",
+                params![
+                    REPO,
+                    "Documents.Заказ",
+                    "ФормаДокумента",
+                    serde_json::json!([{"event": "ПриОткрытии", "handler": "ПриОткрытии"}])
+                        .to_string()
+                ],
+            )
+            .unwrap();
+    }
+
+    let s = storage.get().await.unwrap();
+    let found = bsl_extension::form_bindings::form_bindings(&s, "ПриОткрытии");
+    assert_eq!(found.len(), 1, "должна найтись ровно одна форма: {found:?}");
+    assert!(
+        found[0]["caller"].as_str().unwrap().contains("Контрагенты"),
+        "найдена не та форма: {found:?}"
+    );
+}
+
+#[tokio::test]
+async fn shared_event_name_yields_one_record_pointing_at_get_form_handlers() {
+    // Имя `ПриОткрытии` носят разные процедуры в разных формах, у каждой своя
+    // привязка. Список из тысяч форм ничего не говорит о нужной процедуре,
+    // поэтому вместо него — одна запись со счётом и готовым следующим вызовом.
+    let (_tmp, storage) = fresh_storage();
+    for n in 0..12 {
+        seed_form_with_handler(
+            &storage,
+            "Catalogs",
+            &format!("Объект{n}"),
+            "ФормаЭлемента",
+            "ПриОткрытии",
+        )
+        .await;
+    }
+    let s = storage.get().await.unwrap();
+    let found = bsl_extension::form_bindings::form_bindings(&s, "ПриОткрытии");
+    assert_eq!(found.len(), 1, "ожидаем одну сводную запись: {found:?}");
+    assert_eq!(found[0]["kind"].as_str(), Some("form_binding_ambiguous"));
+    let hint = found[0]["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("get_form_handlers(owner_full_name='Catalogs.Объект0', form_name='ФормаЭлемента')"),
+        "подсказка должна нести образец вызова: {hint}"
+    );
+}
+
+#[tokio::test]
+async fn same_name_in_form_modules_without_binding_is_not_reported() {
+    // Одноимённые процедуры в модулях форм — ещё НЕ привязка: имя может просто
+    // повторяться (в формах объявлена своя функция с именем функции общего
+    // модуля). Утверждать «у каждой своя привязка», не сверившись с описанием
+    // формы, нельзя — это выдача догадки за факт.
+    let (_tmp, storage) = fresh_storage();
+    let s = storage.get().await.unwrap();
+    let conn = s.conn();
+    for n in 0..4 {
+        let module_path =
+            format!("base/Catalogs/Объект{n}/Forms/ФормаЭлемента/Ext/Form/Module.bsl");
+        conn.execute(
+            "INSERT INTO files (path, content_hash, language) VALUES (?, ?, ?)",
+            params![&module_path, "hash", "bsl"],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path = ?", params![&module_path], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO functions (file_id, name, line_start, line_end) VALUES (?, ?, ?, ?)",
+            params![file_id, "ЗначениеРеквизитаОбъекта", 1, 5],
+        )
+        .unwrap();
+        // Форма в индексе есть, но этой процедуры среди её обработчиков нет.
+        conn.execute(
+            "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) \
+             VALUES (?, ?, ?, ?)",
+            params![
+                REPO,
+                format!("Catalogs.Объект{n}"),
+                "ФормаЭлемента",
+                serde_json::json!([{"event": "ПриОткрытии", "handler": "ПриОткрытии"}]).to_string()
+            ],
+        )
+        .unwrap();
+    }
+    let found = bsl_extension::form_bindings::form_bindings(&s, "ЗначениеРеквизитаОбъекта");
+    assert!(found.is_empty(), "привязок нет — и говорить о них нельзя: {found:?}");
+}
+
+#[tokio::test]
+async fn ordinary_procedure_has_no_form_bindings() {
+    // Процедура общего модуля к формам отношения не имеет — привязок нет,
+    // и лишних запросов быть не должно.
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        conn.execute(
+            "INSERT INTO files (path, content_hash, language) VALUES (?, ?, ?)",
+            params!["base/CommonModules/ОбщегоНазначения/Ext/Module.bsl", "hash", "bsl"],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO functions (file_id, name, line_start, line_end) VALUES (?, ?, ?, ?)",
+            params![file_id, "ЗначениеРеквизита", 1, 5],
+        )
+        .unwrap();
+    }
+    let s = storage.get().await.unwrap();
+    assert!(bsl_extension::form_bindings::form_bindings(&s, "ЗначениеРеквизита").is_empty());
+}

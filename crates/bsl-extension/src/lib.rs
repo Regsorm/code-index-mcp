@@ -15,6 +15,7 @@
 
 pub mod code_usages;
 pub mod enrichment;
+pub mod form_bindings;
 pub mod index_extras;
 pub mod module_constants;
 pub mod parse_collector;

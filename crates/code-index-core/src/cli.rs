@@ -929,6 +929,7 @@ async fn cmd_serve(
                     port: crate::federation::client::DEFAULT_REMOTE_PORT,
                     is_local: true,
                     language: None,
+                    processor: None,
                 });
             }
             CodeIndexServer::with_repos_and_registry(map, reg)

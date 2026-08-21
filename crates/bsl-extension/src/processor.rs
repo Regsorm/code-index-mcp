@@ -197,6 +197,17 @@ impl LanguageProcessor for BslLanguageProcessor {
             .unwrap_or(0);
         terms > 0
     }
+
+    /// Обработчики событий форм: процедура объявлена в модуле формы, а зовёт
+    /// её платформа по записи в описании формы — ребра в графе вызовов кода
+    /// нет. Без этого `get_callers` по обработчику отвечал «0 рёбер».
+    fn declarative_callers(
+        &self,
+        storage: &Storage,
+        function_name: &str,
+    ) -> Vec<serde_json::Value> {
+        crate::form_bindings::form_bindings(storage, function_name)
+    }
 }
 
 #[cfg(test)]
