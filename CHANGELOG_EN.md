@@ -5,6 +5,56 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.64.0] — 2026-08-22
+
+**Content search is 3–4× faster exactly where it used to be slow: when matches are few or absent. Output did not change by a single byte. Separately, substring search over procedure bodies is fixed: a Cyrillic substring in a different case is no longer lost.**
+
+> Context. Code and text search took 1.1–1.6 s on a rare pattern: the match limit was never reached, so the whole repository had to be scanned. Profiling showed the time was not spent on searching at all — it did not depend on pattern complexity (1273 / 1306 / 1271 ms for three patterns of very different cost) — but on fetching content and decompressing it on a single thread while sixteen cores sat idle. The worst case was exactly the one that returns nothing: a second spent for an empty answer.
+
+### Changed
+
+- **Content is scanned on all cores.** Files are processed in batches; the batch grows from 64 to 4096. A small first batch keeps early exit cheap for a frequent pattern, while large batches remove the idle time at the shared barrier: with a small batch every core waits for the largest file in it. Only decompression and the whole-file reject run in parallel; per-line extraction with context stays sequential and runs only for files that actually reach the answer. Result order, the match and response-size caps, the truncation flag and the unreadable-files counter are unchanged.
+- **Content is compressed with a known source size.** The previous call did not tell the encoder the source size, so the frame header carried the level's full decompression window — 2 MB. The decoder allocates a window buffer of that size per file, and across sixteen threads the working set stops fitting in the CPU cache: total CPU work inflated fifteen-fold versus single-threaded. The window now shrinks to the file size — median over text files 2048 KB → 9 KB. Storage size is unchanged.
+
+### Measurements on a copy of a typical trade configuration (57,072 files)
+
+Minimum of five runs, serve cache flushed before each.
+
+| Scenario                    | before, ms | after, ms |      |
+|-----------------------------|-----------:|----------:|------|
+| code search, no matches     |     1641.9 |     478.1 | ×3.4 |
+| code search, rare pattern   |     1558.0 |     471.9 | ×3.3 |
+| text search, no matches     |     1190.6 |     278.6 | ×4.3 |
+| text search, rare pattern   |     1151.0 |     284.4 | ×4.1 |
+| text search, frequent one   |     1142.0 |     275.5 | ×4.1 |
+
+Breakdown of the second before the fix (40,675 code files, 725 MB decompressed): decompression 866 ms, encoding validation 713 ms, line-ending normalization 90 ms, the pattern itself 38 ms.
+
+Other scenarios are at parity: frequent pattern, search with context, search over a path subset, a 200-match limit. Output is byte-identical across all twelve scenarios. Index size is unchanged: 3845.5 MB before, 3845.9 MB after.
+
+### Fixed
+
+- **Substring search over procedure bodies is no longer case-sensitive.** The whole-body reject used the database's substring comparison, which folds case for Latin letters only. A body containing `ЗначениеЗаполнено` failed the reject for the substring `значениезаполнено` and never reached the per-line pass — even though that pass folds case in full, Cyrillic included. The reject was stricter than the pass and threw away exactly what the pass would have found: the tool silently answered "0 matches" and suggested other tools. Same class as the earlier reject-versus-pass mismatches on line anchors and line endings. A substring is now checked by the same condition as a ready pattern: special characters escaped, case ignored.
+- **Percent and underscore in a substring are now ordinary characters.** The reject treated them as wildcards while the per-line pass did not, so `Значение%Заполнено` meant "anything in between" at the first stage and literal text at the second. Both stages now read a substring the same way: literally.
+
+Measured on a copy of a typical accounting configuration (88,284 files, 532,595 procedures, 552 MB of bodies), minimum of three runs:
+
+| Scenario                                  | before, ms        | after, ms      |
+|-------------------------------------------|------------------:|---------------:|
+| substring, Cyrillic in a different case   | 2285 (0 matches)  | 23 (matches)   |
+| fruitless full scan by substring          | 2285              | 3230           |
+| full scan by a ready pattern              | 2971              | 2962           |
+
+The second row is the price: folding Cyrillic case costs more than comparing Latin only. The ready-pattern path is unchanged, and output across the other eleven scenarios is byte-identical.
+
+### Getting this on an existing index
+
+The first change applies immediately after the upgrade. The second one affects newly written content, so faster text search appears after a forced rebuild: `bsl-indexer index <path> --force`. New indexes get it right away.
+
+### Tried and rejected
+
+Every item was rejected by measurement, not by opinion: link-time optimization and a single codegen unit (1188.5 → 1196.0 ms — within noise); mimalloc as the allocator (does not link with the local toolchain); cached prepared statements in the 1C extension and three leading-wildcard `LIKE` scans (they affect tools that answer in 0.5–4 ms against a 15 ms measurement floor); the rusqlite profiling hook (diagnosis did not need it); planner statistics refresh (already done); treating content as bytes (3% once behavior is preserved).
+
 ## [0.63.0] — 2026-08-21
 
 **Object templates are now present in the object registry. Previously they were absent entirely: the file on disk was readable, yet a search by name answered "nothing found" — which read as an incomplete index.**
