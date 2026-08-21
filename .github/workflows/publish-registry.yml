@@ -96,9 +96,40 @@ jobs:
           npm install -g npm@latest
           npm --version
 
+      # Публикация терпима к повтору: если версия в npm уже есть (прошлый
+      # прогон дошёл до сюда, а споткнулся дальше), шаг не считается провалом.
+      # Иначе починить сорвавшийся выпуск было бы нечем — номер версии занят
+      # навсегда, а повторная попытка падала бы на первом же шаге.
       - name: Publish npm package
         working-directory: npm
-        run: npm publish --access public
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          if npm publish --access public; then
+            echo "Опубликовано: $VERSION"
+          else
+            echo "Публикация не прошла — проверяю, не опубликована ли версия ранее."
+            npm view "@regsorm/code-index-mcp@$VERSION" version \
+              || { echo "Версии $VERSION в npm нет — это настоящая ошибка публикации."; exit 1; }
+            echo "Версия $VERSION уже была опубликована, продолжаю."
+          fi
+
+      # Каталог MCP при регистрации сам ходит в npm и проверяет, что версия
+      # там есть. npm же предупреждает: «пакет обрабатывается, это займёт
+      # несколько минут». Без ожидания регистрация падает с 404 на только что
+      # опубликованной версии — так сорвался прогон 0.61.0.
+      - name: Wait for the version to appear in npm
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          for i in $(seq 1 40); do
+            if npm view "@regsorm/code-index-mcp@$VERSION" version >/dev/null 2>&1; then
+              echo "Версия $VERSION видна в npm."
+              exit 0
+            fi
+            echo "Жду появления $VERSION в npm... попытка $i"
+            sleep 15
+          done
+          echo "Версия $VERSION не появилась в npm за 10 минут."
+          exit 1
 
       # --- Публикация визитки в официальный MCP-реестр ---
       # mcp-publisher тянем из релизов реестра (linux amd64).
