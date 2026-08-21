@@ -1340,8 +1340,9 @@ impl Storage {
 
     /// Поиск подстроки или regex в телах функций и классов.
     ///
-    /// `pattern` — буквальная подстрока (LIKE), `regex_pattern` — регулярное выражение (REGEXP).
-    /// Указать одно из двух. Возвращает список совпадений с путём, именем и строками.
+    /// `pattern` — буквальная подстрока (регистр не учитывается, подстановочных
+    /// знаков нет), `regex_pattern` — регулярное выражение. Указать одно из двух.
+    /// Возвращает список совпадений с путём, именем и строками.
     pub fn grep_body(
         &self,
         pattern: Option<&str>,
@@ -1349,9 +1350,8 @@ impl Storage {
         language: Option<&str>,
         limit: usize,
     ) -> Result<Vec<GrepBodyMatch>> {
-        // Определяем условие WHERE для body
         let (body_condition, body_param) = match (pattern, regex_pattern) {
-            (Some(p), _) => ("body LIKE ?1".to_string(), format!("%{}%", p)),
+            (Some(p), _) => ("body REGEXP ?1".to_string(), body_substring_param(p)),
             (_, Some(r)) => ("body REGEXP ?1".to_string(), r.to_string()),
             _ => anyhow::bail!("Необходимо указать pattern или regex"),
         };
@@ -2555,9 +2555,9 @@ impl Storage {
         context_lines: usize,
         max_total_bytes: usize,
     ) -> Result<(Vec<GrepBodyMatch>, bool)> {
-        // Базовое условие body
+        // Базовое условие body (см. `body_substring_param` о подстроке)
         let (body_condition, body_param) = match (pattern, regex_pattern) {
-            (Some(p), _) => ("body LIKE ?".to_string(), format!("%{}%", p)),
+            (Some(p), _) => ("body REGEXP ?".to_string(), body_substring_param(p)),
             (_, Some(r)) => ("body REGEXP ?".to_string(), r.to_string()),
             _ => anyhow::bail!("Необходимо указать pattern или regex"),
         };
@@ -2912,6 +2912,21 @@ fn build_fts_or_query(query: &str) -> String {
         .map(|t| format!("\"{}\"*", t))
         .collect::<Vec<_>>()
         .join(" OR ")
+}
+
+/// Отсев тела по подстроке — тем же условием REGEXP, что и готовое выражение.
+///
+/// Прежде подстрока шла через LIKE, а он игнорирует регистр только у латиницы.
+/// Тело с `ЗначениеЗаполнено` не проходило отбор по подстроке
+/// `значениезаполнено` и не доходило до построчного обхода — хотя тот регистр
+/// приводит целиком, вместе с кириллицей. Отсев был строже обхода и выбрасывал
+/// ровно то, что обход нашёл бы: поиск молча отвечал «0 совпадений».
+///
+/// Особые знаки экранируются — подстрока остаётся подстрокой, а не превращается
+/// в выражение. Заодно `%` и `_` перестают быть подстановочными знаками LIKE;
+/// построчный обход их подстановочными никогда и не считал.
+fn body_substring_param(pattern: &str) -> String {
+    format!("(?i){}", regex::escape(pattern))
 }
 
 /// Нормализация glob-паттерна для SQLite GLOB.
@@ -4570,6 +4585,46 @@ mod tests {
             .grep_body(None, Some(r"^    return x \+ y$"), None, 100)
             .unwrap();
         assert_eq!(m.len(), 1, "$ обязан совпадать и в теле с CRLF");
+    }
+
+    /// Подстрока с кириллицей в другом регистре. Отсев стоял на LIKE, а он
+    /// игнорирует регистр только у латиницы: тело выбрасывалось до построчного
+    /// обхода, хотя обход регистр приводит целиком. Поиск молча давал ноль.
+    #[test]
+    fn test_grep_body_pattern_ignores_cyrillic_case() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file_full("/m.bsl", "bsl", 10)).unwrap();
+        let mut f = make_function(file_id, "Проверка");
+        f.body = "Процедура Проверка()\n    Если ЗначениеЗаполнено(Ссылка) Тогда\n    КонецЕсли;\nКонецПроцедуры".to_string();
+        storage.insert_functions(&[f]).unwrap();
+
+        let m = storage
+            .grep_body(Some("значениезаполнено"), None, None, 100)
+            .unwrap();
+        assert_eq!(m.len(), 1, "подстрока обязана находиться в любом регистре");
+        assert!(
+            !m[0].match_lines.is_empty(),
+            "построчный обход обязан подтвердить совпадение, а не отдать пустые строки"
+        );
+    }
+
+    /// Подстрока остаётся подстрокой: особые знаки регулярных выражений в ней
+    /// экранируются. Без экранирования `Значение(` — незакрытая группа (поиск
+    /// упал бы с ошибкой), а `Итого*2` означало бы «Итог, сколько угодно о, 2»
+    /// и мимо буквального текста прошло бы.
+    #[test]
+    fn test_grep_body_pattern_is_literal() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file_full("/m.bsl", "bsl", 10)).unwrap();
+        let mut f = make_function(file_id, "Расчёт");
+        f.body = "Процедура Расчёт()\n    Если Значение(Итого*2) Тогда\n    КонецЕсли;\nКонецПроцедуры".to_string();
+        storage.insert_functions(&[f]).unwrap();
+
+        let m = storage.grep_body(Some("Значение("), None, None, 100).unwrap();
+        assert_eq!(m.len(), 1, "незакрытая скобка в подстроке не должна ронять поиск");
+
+        let m = storage.grep_body(Some("Итого*2"), None, None, 100).unwrap();
+        assert_eq!(m.len(), 1, "звёздочка в подстроке — обычный символ");
     }
 
     #[test]
