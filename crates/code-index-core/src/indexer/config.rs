@@ -81,6 +81,44 @@ pub struct IndexConfig {
     #[serde(default = "default_memory_max_percent")]
     pub memory_max_percent: u8,
 
+    /// Во сколько раз работа с базой в памяти обходится дороже, чем весят
+    /// исходники папки. Используется только при `storage_mode = "auto"`.
+    ///
+    /// Решение принимается так:
+    ///
+    /// ```text
+    /// ожидаемый расход = вес исходников × memory_estimate_factor
+    /// разрешено занять = свободная память × memory_max_percent / 100
+    ///
+    /// ожидаемый расход ≤ разрешено занять → база собирается в памяти
+    /// иначе                               → база сразу на диске
+    /// ```
+    ///
+    /// Вес исходников — сумма размеров файлов, которые пойдут в индекс (с теми
+    /// же исключениями каталогов, что и при индексации). Оба числа и принятое
+    /// решение пишутся в журнал.
+    ///
+    /// По умолчанию 3 — это середина наблюдаемого разброса, а НЕ запас сверху.
+    /// Замеры на разных папках дают примерно от 2 до 4 с лишним: 3,8 ГБ
+    /// исходников → 8,6 ГБ израсходованной памяти (×2,3), 6,7 ГБ → 19,0 ГБ
+    /// (×2,8), 5,3 ГБ → 18,6 ГБ (×3,5), 1,8 ГБ → 8,0 ГБ (×4,4). Разброс
+    /// зависит от языка, плотности кода в файлах и состава папки, поэтому
+    /// предсказать множитель заранее нельзя — он подбирается по журналу.
+    ///
+    /// Когда увеличивать (4 и выше): памяти мало, машина слабая, и уйти на
+    /// диск безопаснее, чем рисковать нехваткой. Индексация будет медленнее,
+    /// но предсказуемее. На слабых машинах это направление и есть основное.
+    ///
+    /// Когда уменьшать (2,0–2,5): памяти заведомо много и есть готовность
+    /// сверяться с журналом. Больше папок пойдёт в память — индексация
+    /// быстрее. Риск реальный: расход выше оценки встречается чаще, чем ниже,
+    /// и при нехватке памяти работа с папкой прервётся.
+    ///
+    /// Ноль, отрицательное или нечисловое значение считается опиской — берётся
+    /// умолчание.
+    #[serde(default = "default_memory_estimate_factor")]
+    pub memory_estimate_factor: f32,
+
     /// Задержка debounce для file watcher в миллисекундах.
     ///
     /// Ждёт `debounce_ms` тишины после последнего события, затем обрабатывает батч.
@@ -132,6 +170,10 @@ fn default_storage_mode() -> String {
 
 fn default_memory_max_percent() -> u8 {
     50
+}
+
+fn default_memory_estimate_factor() -> f32 {
+    crate::indexer::DEFAULT_MEMORY_ESTIMATE_FACTOR
 }
 
 fn default_debounce_ms() -> u64 {
@@ -202,6 +244,7 @@ impl Default for IndexConfig {
             batch_size: default_batch_size(),
             storage_mode: default_storage_mode(),
             memory_max_percent: default_memory_max_percent(),
+            memory_estimate_factor: default_memory_estimate_factor(),
             debounce_ms: default_debounce_ms(),
             batch_ms: default_batch_ms(),
             bulk_batch_threshold: default_bulk_batch_threshold(),
@@ -232,6 +275,31 @@ impl IndexConfig {
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(config_path, content)?;
         Ok(())
+    }
+
+    /// Во что примерно обойдётся работа в памяти с папкой такого веса, в байтах.
+    ///
+    /// Это левая часть расчёта, по которому в режиме `auto` выбирается место
+    /// для базы: вес исходников, умноженный на [`IndexConfig::memory_estimate_factor`].
+    /// Правая часть — разрешённая доля свободной памяти — считается в
+    /// `storage::memory`.
+    pub fn memory_estimate_bytes(&self, source_bytes: u64) -> u64 {
+        // Приведение f64 → u64 в Rust насыщающее: переполнения не будет.
+        (source_bytes as f64 * self.memory_estimate_factor_effective() as f64) as u64
+    }
+
+    /// Множитель, который будет применён на самом деле.
+    ///
+    /// Ноль, отрицательное или нечисловое значение в файле настроек — описка.
+    /// Молча взять его нельзя: нулевая оценка увела бы папку на диск, и человек
+    /// списал бы это на сам расчёт, а не на свою опечатку. Берётся умолчание, и
+    /// в журнале видно, с каким числом на самом деле считали.
+    pub fn memory_estimate_factor_effective(&self) -> f32 {
+        if self.memory_estimate_factor.is_finite() && self.memory_estimate_factor > 0.0 {
+            self.memory_estimate_factor
+        } else {
+            crate::indexer::DEFAULT_MEMORY_ESTIMATE_FACTOR
+        }
     }
 
     /// Проверить, нужно ли исключить директорию
@@ -273,6 +341,54 @@ mod tests {
         assert_eq!(cfg.max_files, 0);
         assert!(cfg.exclude_dirs.is_empty());
         assert!(cfg.extra_text_extensions.is_empty());
+    }
+
+    #[test]
+    fn test_memory_estimate_default_factor() {
+        let cfg = IndexConfig::default();
+        assert_eq!(cfg.memory_estimate_factor, 3.0);
+        // 1 ГБ исходников при множителе 3 — 3 ГБ ожидаемого расхода.
+        assert_eq!(cfg.memory_estimate_bytes(1_000_000_000), 3_000_000_000);
+    }
+
+    #[test]
+    fn test_memory_estimate_fractional_factor() {
+        let cfg = IndexConfig {
+            memory_estimate_factor: 1.8,
+            ..Default::default()
+        };
+        // Дробный множитель хранится с одинарной точностью, поэтому на
+        // гигабайте оценка расходится с точным произведением на десятки байт.
+        // Для решения «память или диск» это безразлично, сверяем с допуском.
+        let expected = 1_800_000_000_i64;
+        let got = cfg.memory_estimate_bytes(1_000_000_000) as i64;
+        assert!(
+            (got - expected).abs() < 1_000,
+            "оценка {} слишком далека от {}",
+            got,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_memory_estimate_bad_factor_falls_back_to_default() {
+        // Ноль, отрицательное и нечисловое — описка в файле настроек: берётся
+        // умолчание, а не молчаливый уход на диск по нулевой оценке.
+        for bad in [0.0, -2.0, f32::NAN, f32::INFINITY] {
+            let cfg = IndexConfig {
+                memory_estimate_factor: bad,
+                ..Default::default()
+            };
+            assert_eq!(cfg.memory_estimate_factor_effective(), 3.0);
+            assert_eq!(cfg.memory_estimate_bytes(1_000_000_000), 3_000_000_000);
+        }
+    }
+
+    #[test]
+    fn test_memory_estimate_factor_absent_in_file() {
+        // Файл настроек, написанный до появления настройки, читается как прежде.
+        let cfg: IndexConfig = serde_json::from_str(r#"{"storage_mode":"auto"}"#).unwrap();
+        assert_eq!(cfg.memory_estimate_factor, 3.0);
     }
 
     #[test]

@@ -734,20 +734,20 @@ pub fn run_worker(
         // машина работу в памяти. Размер пустого файла базы об этом молчит.
         let weigh_started = std::time::Instant::now();
         let source_bytes = crate::indexer::estimate_source_bytes(&path, &index_config);
-        storage_config.expected_bytes =
-            source_bytes.saturating_mul(crate::indexer::MEMORY_ESTIMATE_FACTOR);
+        storage_config.expected_bytes = index_config.memory_estimate_bytes(source_bytes);
 
         let planned = crate::storage::memory::determine_storage_mode(&storage_config, &db_path);
         worked_in_memory = matches!(planned, crate::storage::memory::StorageMode::InMemory);
         tracing::info!(
             "[{}] новая база — режим хранилища: {} (настройка «{}»; исходники {}, \
-             работа в памяти обошлась бы примерно в {}, свободно {}, разрешено занять {} % — \
-             взвешивание заняло {} мс)",
+             работа в памяти обошлась бы примерно в {} (множитель {}), свободно {}, \
+             разрешено занять {} % — взвешивание заняло {} мс)",
             path.display(),
             storage_mode_ru(&planned),
             storage_config.mode,
             crate::logging::human_bytes(source_bytes),
             crate::logging::human_bytes(storage_config.expected_bytes),
+            index_config.memory_estimate_factor_effective(),
             crate::logging::human_bytes(crate::storage::memory::available_ram()),
             storage_config.memory_max_percent,
             weigh_started.elapsed().as_millis()

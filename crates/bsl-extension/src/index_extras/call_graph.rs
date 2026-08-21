@@ -238,13 +238,49 @@ pub(crate) fn rebuild_call_graph_extension_override(conn: &rusqlite::Connection)
 }
 
 
+/// Вторичные индексы таблиц графа — те же, что заводит расширение схемы.
+///
+/// На полном пересборе снимаются перед заливкой и поднимаются после неё. Ключи
+/// рёбер приходят вперемешку, поэтому вставка миллиона строк при живых индексах
+/// правит их деревья в случайных местах — на дешёвом накопителе это самая
+/// дорогая работа из возможных. Построение заново идёт одним проходом с
+/// сортировкой. Список обязан совпадать со `schema.rs`: расходятся — после
+/// пересбора часть индексов не вернётся, и выдача просядет молча.
+const GRAPH_INDEX_NAMES: &[&str] = &[
+    "idx_pcg_repo",
+    "idx_pcg_caller",
+    "idx_pcg_callee_name",
+    "idx_pcg_call_type",
+    "idx_def_source",
+];
+
+const GRAPH_INDEX_DDL: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_pcg_repo ON proc_call_graph(repo);",
+    "CREATE INDEX IF NOT EXISTS idx_pcg_caller ON proc_call_graph(repo, caller_proc_key);",
+    "CREATE INDEX IF NOT EXISTS idx_pcg_callee_name ON proc_call_graph(repo, callee_proc_name);",
+    "CREATE INDEX IF NOT EXISTS idx_pcg_call_type ON proc_call_graph(repo, call_type);",
+    "CREATE INDEX IF NOT EXISTS idx_def_source ON direct_edge_files(repo, source_file);",
+];
+
 pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+
+    // Снимаем вне транзакции: DDL внутри неё сложил бы страницы удаляемых
+    // деревьев в тот же журнал, от роста которого мы и уходим. Обрыв между
+    // снятием и подъёмом оставляет таблицу без вторичных индексов — данные
+    // целы, а сами индексы вернёт ближайшее открытие базы (расширение схемы
+    // создаёт их с `IF NOT EXISTS`).
+    for name in GRAPH_INDEX_NAMES {
+        conn.execute_batch(&format!("DROP INDEX IF EXISTS {name};"))?;
+    }
+
     conn.execute("BEGIN", [])?;
+    let t_step = std::time::Instant::now();
     conn.execute(
         "DELETE FROM proc_call_graph WHERE repo = ?",
         params![REPO_DEFAULT],
     )?;
+    tracing::debug!("удаление прежних рёбер — {} мс", t_step.elapsed().as_millis());
 
     // ── direct: из core::calls ────────────────────────────────────────
     // Таблица `calls` core содержит ребра «caller имя → callee имя»
@@ -262,19 +298,53 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     // в индексируемую таблицу деградировал сильнее суммы частей. Собираем
     // распарсенное множество рёбер во временную таблицу один раз и наполняем
     // из неё обе таблицы простыми вставками без повторного JOIN/DISTINCT.
+    let t_step = std::time::Instant::now();
     conn.execute_batch("DROP TABLE IF EXISTS tmp_direct_raw; CREATE TEMP TABLE tmp_direct_raw AS SELECT DISTINCT f.path AS path, c.caller AS caller, c.callee AS callee FROM calls c JOIN files f ON f.id = c.file_id WHERE c.caller IS NOT NULL AND c.callee IS NOT NULL;")?;
+    tracing::debug!("выборка рёбер из вызовов — {} мс", t_step.elapsed().as_millis());
 
-    let direct_count = conn.execute(
-        "INSERT OR IGNORE INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) SELECT ?, path || '::' || caller, callee, 'direct' FROM tmp_direct_raw",
+    // Рёбра слоя `direct` собираются во временной таблице и там же проходят
+    // резолв и отсев. Прежде они попадали в основную таблицу сразу, целиком: на
+    // типовой торговой конфигурации это 1,17 млн строк, из которых отсев тут же
+    // выбрасывал 622 тыс. — больше половины вставок делалось, чтобы через
+    // минуту быть удалёнными, и каждая обновляла ключ уникальности и четыре
+    // индекса, а её страницы ложились в журнал. Временная таблица живёт в
+    // памяти (SQLite собран с `SQLITE_TEMP_STORE=2`), индексов и журнала у неё
+    // нет. Набор колонок повторяет основную таблицу, чтобы запросы резолва были
+    // дословно теми же — иначе полный пересбор и точечное обновление разошлись
+    // бы двумя реализациями одного правила.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_direct;
+         CREATE TEMP TABLE tmp_pcg_direct (
+             repo TEXT NOT NULL,
+             caller_proc_key TEXT NOT NULL,
+             callee_proc_name TEXT NOT NULL,
+             callee_proc_key TEXT,
+             call_type TEXT NOT NULL
+         );",
+    )?;
+    conn.execute(
+        "INSERT INTO tmp_pcg_direct (repo, caller_proc_key, callee_proc_name, call_type) \
+         SELECT ?, path || '::' || caller, callee, 'direct' FROM tmp_direct_raw",
         params![REPO_DEFAULT],
     )?;
 
+    // Побочная таблица источников рёбер: строк столько же, сколько рёбер до
+    // отсева (1,17 млн на типовой торговой конфигурации), и у неё свой ключ
+    // уникальности из четырёх текстовых полей. Порядок вставки задан этим
+    // ключом — строки ложатся в его дерево по возрастанию, а не вразнобой.
+    let t_step = std::time::Instant::now();
     conn.execute("DELETE FROM direct_edge_files WHERE repo = ?", params![REPO_DEFAULT])?;
-    conn.execute(
-        "INSERT OR IGNORE INTO direct_edge_files (repo, caller, callee, source_file) SELECT ?, caller, callee, path FROM tmp_direct_raw",
+    let def_count = conn.execute(
+        "INSERT OR IGNORE INTO direct_edge_files (repo, caller, callee, source_file) \
+         SELECT ?, caller, callee, path FROM tmp_direct_raw ORDER BY caller, callee, path",
         params![REPO_DEFAULT],
     )?;
     conn.execute_batch("DROP TABLE IF EXISTS tmp_direct_raw;")?;
+    tracing::debug!(
+        "таблица источников рёбер: {} строк за {} мс",
+        def_count,
+        t_step.elapsed().as_millis()
+    );
 
     // ── subscription: event_subscriptions → ребро ────────────────────
     // caller_proc_key для подписок — это «виртуальный триггер» вида
@@ -363,9 +433,39 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     // ── этап 4e + 4e-D + 4e-prune: резолв callee_proc_key + отсев балласта ──
     // Общий с инкрементом хелпер: run_incremental_extras зовёт его же ОДИН раз
     // после пофайловой вставки рёбер батча → идентичность full↔incremental.
-    resolve_and_prune_direct_edges(conn, EdgeScope::All)?;
+    resolve_and_prune_direct_edges(conn, EdgeScope::All, "tmp_pcg_direct")?;
 
+    // Выжившие рёбра — в основную таблицу. Порядок вставки задан ключом
+    // уникальности: строки ложатся в его дерево по возрастанию, а не вразнобой,
+    // и страниц переписывается меньше.
+    let t_step = std::time::Instant::now();
+    let direct_count = conn.execute(
+        "INSERT OR IGNORE INTO proc_call_graph \
+         (repo, caller_proc_key, callee_proc_name, callee_proc_key, call_type) \
+         SELECT repo, caller_proc_key, callee_proc_name, callee_proc_key, call_type \
+         FROM tmp_pcg_direct ORDER BY caller_proc_key, callee_proc_name",
+        [],
+    )?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_direct;")?;
+    tracing::debug!(
+        "перенос выживших рёбер в граф: {} строк за {} мс",
+        direct_count,
+        t_step.elapsed().as_millis()
+    );
+
+    let t_step = std::time::Instant::now();
     conn.execute("COMMIT", [])?;
+    tracing::debug!("фиксация — {} мс", t_step.elapsed().as_millis());
+
+    // Индексы обратно — уже по готовому набору рёбер, одним проходом на каждый.
+    let idx_started = std::time::Instant::now();
+    for ddl in GRAPH_INDEX_DDL {
+        conn.execute_batch(ddl)?;
+    }
+    tracing::debug!(
+        "индексы графа подняты заново за {} мс",
+        idx_started.elapsed().as_millis()
+    );
 
     code_index_core::logging::stage_detail(code_index_core::logging::plural(
         (direct_count + subscription_count + form_count + override_count) as u64,
@@ -373,6 +473,9 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
         "ребра",
         "рёбер",
     ));
+    // Число рёбер слоя `direct` — то, что осталось ПОСЛЕ отсева балласта:
+    // вставляются теперь только выжившие. Прежде здесь стояло число вставленных
+    // до отсева, и итог расходился с содержимым таблицы вдвое.
     tracing::info!(
         "proc_call_graph: {} direct + {} subscription + {} form_event + {} extension_override ребер",
         direct_count,
@@ -396,9 +499,13 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
 /// Трогает ТОЛЬКО рёбра с `callee_proc_key IS NULL` → идемпотентен: результат
 /// идентичен при вызове из `build_call_graph` (после полной вставки рёбер) и из
 /// `run_incremental_extras` (после пофайловой вставки рёбер батча).
+/// `edges` — имя таблицы рёбер. Полный пересбор ведёт эту работу на временной
+/// таблице (она в памяти, без индексов и без журнала) и переносит в основную
+/// уже выживший набор; точечное обновление правит основную таблицу на месте.
 pub(crate) fn resolve_and_prune_direct_edges(
     conn: &rusqlite::Connection,
     scope: EdgeScope,
+    edges: &str,
 ) -> Result<()> {
     // При полном пересборе справочник экспортных процедур собирается заново:
     // все процедуры конфигурации тут и так читаются. При точечном обновлении
@@ -415,16 +522,16 @@ pub(crate) fn resolve_and_prune_direct_edges(
     // Времена шагов — на уровне отладки: по общей строке «граф вызовов» не
     // видно, какой именно шаг сколько занял.
     let t = std::time::Instant::now();
-    resolve_direct_callee_keys(conn, scope)?;
+    resolve_direct_callee_keys(conn, scope, edges)?;
     tracing::debug!("резолв: локальные и экспортные адреса — {} мс", t.elapsed().as_millis());
     let t = std::time::Instant::now();
-    resolve_callee_keys_by_manager(conn, scope)?;
+    resolve_callee_keys_by_manager(conn, scope, edges)?;
     tracing::debug!("резолв: адреса через менеджеры — {} мс", t.elapsed().as_millis());
     let t = std::time::Instant::now();
-    prune_platform_balast(conn, scope)?;
+    prune_platform_balast(conn, scope, edges)?;
     tracing::debug!("отсев: платформенный балласт — {} мс", t.elapsed().as_millis());
     let t = std::time::Instant::now();
-    prune_object_method_calls(conn, scope)?;
+    prune_object_method_calls(conn, scope, edges)?;
     tracing::debug!("отсев: вызовы методов объектов — {} мс", t.elapsed().as_millis());
     Ok(())
 }
@@ -515,6 +622,7 @@ pub(crate) fn drop_batch_scope(conn: &rusqlite::Connection) -> Result<()> {
 pub(crate) fn resolve_direct_callee_keys(
     conn: &rusqlite::Connection,
     scope: EdgeScope,
+    edges: &str,
 ) -> Result<()> {
     // Карта уникальных экспортных имён → путь единственного носителя. Берётся
     // из справочника: он и есть перечень экспортных процедур, читать заново
@@ -544,19 +652,23 @@ pub(crate) fn resolve_direct_callee_keys(
                WHERE fn.name IS NOT NULL AND fn.name != '';
              CREATE INDEX tmp_pcg_funcs_idx ON tmp_pcg_funcs(path, nm);",
         )?;
-        "SELECT 1 FROM tmp_pcg_funcs t \
-         WHERE t.path = substr(proc_call_graph.caller_proc_key, 1, \
-                               instr(proc_call_graph.caller_proc_key, '::') - 1) \
-           AND t.nm = proc_call_graph.callee_proc_name"
+        format!(
+            "SELECT 1 FROM tmp_pcg_funcs t \
+             WHERE t.path = substr({edges}.caller_proc_key, 1, \
+                                   instr({edges}.caller_proc_key, '::') - 1) \
+               AND t.nm = {edges}.callee_proc_name"
+        )
     } else {
-        "SELECT 1 FROM functions fn JOIN files fl ON fl.id = fn.file_id \
-         WHERE fl.path = substr(proc_call_graph.caller_proc_key, 1, \
-                                instr(proc_call_graph.caller_proc_key, '::') - 1) \
-           AND fn.name = proc_call_graph.callee_proc_name"
+        format!(
+            "SELECT 1 FROM functions fn JOIN files fl ON fl.id = fn.file_id \
+             WHERE fl.path = substr({edges}.caller_proc_key, 1, \
+                                    instr({edges}.caller_proc_key, '::') - 1) \
+               AND fn.name = {edges}.callee_proc_name"
+        )
     };
     conn.execute(
         &format!(
-            "UPDATE proc_call_graph \
+            "UPDATE {edges} \
              SET callee_proc_key = substr(caller_proc_key, 1, instr(caller_proc_key, '::') - 1) \
                                    || '::' || callee_proc_name \
              WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
@@ -570,10 +682,10 @@ pub(crate) fn resolve_direct_callee_keys(
     // (б) уникальный экспорт: имя callee экспортно ровно в одном месте.
     conn.execute(
         &format!(
-            "UPDATE proc_call_graph \
+            "UPDATE {edges} \
              SET callee_proc_key = ( \
                  SELECT u.path || '::' || u.nm FROM tmp_pcg_uexp u \
-                 WHERE u.nm = proc_call_graph.callee_proc_name) \
+                 WHERE u.nm = {edges}.callee_proc_name) \
              WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
                AND callee_proc_name IN (SELECT nm FROM tmp_pcg_uexp){}",
             scope.clause()
@@ -587,7 +699,7 @@ pub(crate) fn resolve_direct_callee_keys(
     // экспортных в ≥2 модулях. Только вызовы с ОДНОЙ точкой (общий модуль);
     // цепочки `Справочники.X.Метод` (менеджеры) — следующий шаг, остаются NULL.
     build_common_module_methods(conn)?;
-    resolve_callee_keys_by_qualifier(conn, scope)?;
+    resolve_callee_keys_by_qualifier(conn, scope, edges)?;
 
     conn.execute_batch(
         "DROP TABLE IF EXISTS tmp_pcg_funcs; \
@@ -625,20 +737,21 @@ pub(crate) fn build_common_module_methods(conn: &rusqlite::Connection) -> Result
 pub(crate) fn resolve_callee_keys_by_qualifier(
     conn: &rusqlite::Connection,
     scope: EdgeScope,
+    edges: &str,
 ) -> Result<()> {
-    let mut sql = String::from(
-        "UPDATE proc_call_graph \
+    let mut sql = format!(
+        "UPDATE {edges} \
          SET callee_proc_key = ( \
              SELECT MIN(cm.path || '::' || cm.method) FROM tmp_pcg_cmeth cm \
-             WHERE cm.mname = substr(proc_call_graph.callee_proc_name, 1, instr(proc_call_graph.callee_proc_name,'.')-1) \
-               AND cm.method = substr(proc_call_graph.callee_proc_name, instr(proc_call_graph.callee_proc_name,'.')+1)) \
+             WHERE cm.mname = substr({edges}.callee_proc_name, 1, instr({edges}.callee_proc_name,'.')-1) \
+               AND cm.method = substr({edges}.callee_proc_name, instr({edges}.callee_proc_name,'.')+1)) \
          WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
            AND instr(callee_proc_name,'.') > 0 \
            AND instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') = 0 \
            AND EXISTS ( \
              SELECT 1 FROM tmp_pcg_cmeth cm \
-             WHERE cm.mname = substr(proc_call_graph.callee_proc_name, 1, instr(proc_call_graph.callee_proc_name,'.')-1) \
-               AND cm.method = substr(proc_call_graph.callee_proc_name, instr(proc_call_graph.callee_proc_name,'.')+1))",
+             WHERE cm.mname = substr({edges}.callee_proc_name, 1, instr({edges}.callee_proc_name,'.')-1) \
+               AND cm.method = substr({edges}.callee_proc_name, instr({edges}.callee_proc_name,'.')+1))",
     );
     sql.push_str(scope.clause());
     conn.execute(&sql, params![REPO_DEFAULT])?;
@@ -687,7 +800,11 @@ pub(crate) const PLATFORM_BALAST: &[&str] = &[
 /// в конфигурации, не трогается вовсе (адаптивно к размеру конфигурации). `file_scope=
 /// Some(rel)` ограничивает удаление рёбрами одного файла (инкремент), `None` —
 /// весь граф (полный пересбор).
-pub(crate) fn prune_platform_balast(conn: &rusqlite::Connection, scope: EdgeScope) -> Result<()> {
+pub(crate) fn prune_platform_balast(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
     // Имена — статические кириллические идентификаторы без SQL-метасимволов,
     // поэтому инлайн в IN(...) безопасен (не пользовательский ввод).
     let in_list = PLATFORM_BALAST
@@ -709,7 +826,7 @@ pub(crate) fn prune_platform_balast(conn: &rusqlite::Connection, scope: EdgeScop
     let meth = "substr(callee_proc_name, CASE WHEN instr(callee_proc_name,'.')>0 \
                 THEN instr(callee_proc_name,'.')+1 ELSE 1 END)";
     let mut sql = format!(
-        "DELETE FROM proc_call_graph \
+        "DELETE FROM {edges} \
          WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
            AND {meth} IN ({in_list}) \
            AND {meth} NOT IN (SELECT name FROM exported_procs)"
@@ -752,7 +869,11 @@ pub(crate) const METADATA_COLLECTIONS: &[&str] = &[
 ///      вызовы менеджеров, резолв отложен).
 /// Удаляются только рёбра с `callee_proc_key IS NULL`. `file_scope=Some(rel)` —
 /// в области одного файла (инкремент).
-pub(crate) fn prune_object_method_calls(conn: &rusqlite::Connection, scope: EdgeScope) -> Result<()> {
+pub(crate) fn prune_object_method_calls(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
     // tmp_pmods — имена общих модулей (сегмент пути после CommonModules/).
     conn.execute_batch(
         "DROP TABLE IF EXISTS tmp_pmods;\n\
@@ -777,7 +898,7 @@ pub(crate) fn prune_object_method_calls(conn: &rusqlite::Connection, scope: Edge
     // (1) ОДНОТОЧЕЧНЫЕ объектные вызовы `Объект.Метод`: первый сегмент НЕ общий
     //     модуль и НЕ коллекция метаданных → это метод локального объекта.
     let mut sql1 = format!(
-        "DELETE FROM proc_call_graph \
+        "DELETE FROM {edges} \
          WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
            AND instr(callee_proc_name,'.') > 0 AND {single_dot} \
            AND {first} NOT IN (SELECT q FROM tmp_pmods) \
@@ -789,7 +910,7 @@ pub(crate) fn prune_object_method_calls(conn: &rusqlite::Connection, scope: Edge
     //     Tier D его уже проверил и не нашёл юзер-экспорт). Цепочки общих модулей
     //     (first = модуль) щадим. Резолвленные менеджер-вызовы тут не NULL.
     let mut sql2 = format!(
-        "DELETE FROM proc_call_graph \
+        "DELETE FROM {edges} \
          WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
            AND instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') > 0 \
            AND {first} NOT IN (SELECT q FROM tmp_pmods)"
@@ -844,10 +965,14 @@ pub(crate) fn build_collection_folder_map(conn: &rusqlite::Connection) -> Result
 /// `<Папка>/<Объект>/[Ext/]ManagerModule.bsl`. Платформенные методы менеджера
 /// (`ПустаяСсылка`, `НайтиПоКоду`) не экспортны в модуле → остаются NULL.
 /// `scope` = `Batch` — в области файлов пакета.
-pub(crate) fn resolve_callee_keys_by_manager(conn: &rusqlite::Connection, scope: EdgeScope) -> Result<()> {
+pub(crate) fn resolve_callee_keys_by_manager(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
     build_manager_module_methods(conn)?;
     build_collection_folder_map(conn)?;
-    let col = "proc_call_graph.callee_proc_name";
+    let col = format!("{edges}.callee_proc_name");
     let s1 = format!("substr({col},1,instr({col},'.')-1)");
     let rest = format!("substr({col},instr({col},'.')+1)");
     let s2 = format!("substr({rest},1,instr({rest},'.')-1)");
@@ -855,7 +980,7 @@ pub(crate) fn resolve_callee_keys_by_manager(conn: &rusqlite::Connection, scope:
     let twodots = format!("(length({col})-length(replace({col},'.','')))=2");
     let join_cond = format!("cc.coll = {s1} AND mm.object = {s2} AND mm.method = {s3}");
     let mut sql = format!(
-        "UPDATE proc_call_graph \
+        "UPDATE {edges} \
          SET callee_proc_key = ( \
              SELECT MIN(mm.path || '::' || mm.method) \
              FROM tmp_pcg_coll cc JOIN tmp_pcg_mmeth mm ON mm.folder = cc.folder \

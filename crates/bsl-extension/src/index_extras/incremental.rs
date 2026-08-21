@@ -594,7 +594,7 @@ pub fn run_incremental_extras(
         create_batch_scope(conn, &scope_paths)?;
         let _ = conn.execute("ROLLBACK", []);
         conn.execute("BEGIN", [])?;
-        resolve_and_prune_direct_edges(conn, EdgeScope::Batch)?;
+        resolve_and_prune_direct_edges(conn, EdgeScope::Batch, "proc_call_graph")?;
         conn.execute("COMMIT", [])?;
         drop_batch_scope(conn)?;
     }
@@ -1387,7 +1387,7 @@ pub(crate) fn run_incremental_extras_edt(
     if !bsl_changed.is_empty() {
         let _ = conn.execute("ROLLBACK", []);
         conn.execute("BEGIN", [])?;
-        resolve_and_prune_direct_edges(conn, EdgeScope::Batch)?;
+        resolve_and_prune_direct_edges(conn, EdgeScope::Batch, "proc_call_graph")?;
         conn.execute("COMMIT", [])?;
         rebuild_call_graph_extension_override(conn)?;
     }

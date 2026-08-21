@@ -121,6 +121,14 @@ fn register_sql_functions(conn: &Connection) -> Result<()> {
 /// Основная структура хранилища — обёртка над SQLite-соединением
 pub struct Storage {
     conn: Connection,
+    /// База собрана в оперативной памяти и на диске её ещё нет.
+    ///
+    /// От этого зависит, нужен ли сброс на диск в конце работы. Для базы,
+    /// которая и так лежит на диске, сброс — копирование файла самого в себя:
+    /// замер на типовой торговой конфигурации дал 21,8 с, 8 ГБ лишней записи и
+    /// журнал, разросшийся до 4,3 ГБ. Признак несёт сам объект, потому что
+    /// снаружи режим известен только тому, кто базу открывал.
+    in_memory: bool,
 }
 
 /// Исход поиска пути в графе вызовов ([`Storage::find_call_path`]).
@@ -148,7 +156,13 @@ impl Storage {
         schema::initialize(&conn).context("Ошибка инициализации схемы БД")?;
         register_sql_functions(&conn)?;
         set_stmt_cache(&conn);
-        Ok(Self { conn })
+        Ok(Self { conn, in_memory: false })
+    }
+
+    /// Собрана ли база в оперативной памяти. `false` — она уже на диске, и
+    /// сброс на диск для неё не нужен (см. поле `in_memory`).
+    pub fn is_in_memory(&self) -> bool {
+        self.in_memory
     }
 
     /// Применить дополнительный DDL (CREATE TABLE/INDEX/...) поверх базовой
@@ -190,7 +204,7 @@ impl Storage {
         .with_context(|| format!("Не удалось открыть БД (readonly): {}", path.display()))?;
         schema::initialize_readonly(&conn).context("Ошибка инициализации readonly-схемы")?;
         register_sql_functions(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, in_memory: false })
     }
 
     /// Открыть базу данных в памяти (используется в тестах)
@@ -199,7 +213,7 @@ impl Storage {
         schema::initialize(&conn).context("Ошибка инициализации схемы in-memory БД")?;
         register_sql_functions(&conn)?;
         set_stmt_cache(&conn);
-        Ok(Self { conn })
+        Ok(Self { conn, in_memory: true })
     }
 
     /// Открыть хранилище с автоопределением режима (in-memory или disk).
@@ -248,7 +262,7 @@ impl Storage {
                     schema::apply_all_migrations(&memory_conn)
                         .context("Ошибка применения миграций (in-memory)")?;
                     register_sql_functions(&memory_conn)?;
-                    Ok(Self { conn: memory_conn })
+                    Ok(Self { conn: memory_conn, in_memory: true })
                 } else {
                     // Новая БД — чистая in-memory со схемой
                     Self::open_in_memory()

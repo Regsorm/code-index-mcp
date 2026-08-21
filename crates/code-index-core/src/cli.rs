@@ -1085,8 +1085,8 @@ fn cmd_index(
     let storage_config = StorageConfig {
         mode: config.storage_mode.clone(),
         memory_max_percent: config.memory_max_percent,
-        expected_bytes: crate::indexer::estimate_source_bytes(&abs_path, &config)
-            .saturating_mul(crate::indexer::MEMORY_ESTIMATE_FACTOR),
+        expected_bytes: config
+            .memory_estimate_bytes(crate::indexer::estimate_source_bytes(&abs_path, &config)),
     };
     let mut storage = Storage::open_auto(&db_path, &storage_config)?;
 
@@ -1161,8 +1161,13 @@ fn cmd_index(
     // 7. Если работаем в in-memory режиме — сохранить результаты на диск.
     // Должно идти ПОСЛЕ index_extras, иначе записи расширения
     // попадут только в in-memory копию.
+    // Базу, которая и так лежит на диске, сбрасывать некуда: копирование файла
+    // самого в себя стоило на типовой торговой конфигурации 21,8 с, 8 ГБ записи
+    // и журнала, разросшегося до 4,3 ГБ. Демон эту развилку уже делает.
     let flush_start = std::time::Instant::now();
-    storage.flush_to_disk(&db_path)?;
+    if storage.is_in_memory() {
+        storage.flush_to_disk(&db_path)?;
+    }
     let flush_ms = flush_start.elapsed().as_millis();
 
     // 7a. Схлопнуть журнал WAL целевого файла. Демон это делает после каждой
@@ -1202,6 +1207,12 @@ fn cmd_index(
     // На 1С-репо сопоставимое время уходит на extras (метаданные, формы,
     // граф вызовов процедур), поэтому печатаем полное время и разбивку —
     // иначе половина работы не видна ни в логе, ни в замерах.
+    // Раскладка по этапам — та же, что печатает демон в итоге по папке. Без неё
+    // разовый прогон отдаёт одно число на всю надстройку, и на чём именно стоит
+    // время (граф вызовов, термины, слой метаданных) не видно.
+    for line in crate::logging::stages_block(&crate::logging::stages_take()) {
+        println!("{}", line);
+    }
     println!(
         "Индексация завершена за {} мс (ядро {} + extras {} + сброс на диск {})",
         result.elapsed_ms as u128 + extras_ms + flush_ms,
