@@ -5,6 +5,36 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.63.0] — 2026-08-21
+
+**Object templates are now present in the object registry. Previously they were absent entirely: the file on disk was readable, yet a search by name answered "nothing found" — which read as an incomplete index.**
+
+> Context. A user reported that a model searched for an object's templates by name substring, found one, and doubted the index was fresh — even though the form description read fine from disk. A check on a copy of a typical trade configuration confirmed it: only COMMON templates made it into the registry (the common templates folder, 237 of them), while 1,709 templates belonging to objects made it nowhere — neither as their own row nor as a section on the owning object.
+
+### Added
+
+- **A template passport in the registry** — a row such as `Catalog.Counterparties.Template.PrintCard`: name, synonym, owning object and template kind (spreadsheet document, data composition schema, etc.). The template is now found by name substring like any other object and can be requested directly by its full name.
+- **An honest flag about the content** and a named reason when it is missing. The content file is located by fact rather than by a guessed name: a spreadsheet document and a data composition schema keep it in `Template.xml`, a text document in `Template.txt`, binary data and add-ins in their own formats. The passport carries `content_indexed`, the size and the reason: no file in the dump, binary content, or the file exceeds the text file size limit (the `max_file_size` setting, 1 MB by default). Previously "no content" and "no object" looked identical — an empty answer.
+- **Point updates in the watcher.** Editing a template description refreshes its passport, deleting the file removes the row, and deleting the owning object takes its templates with it — no full reindex required.
+
+### Measurements on a copy of a typical trade configuration (57,072 files)
+
+| Metric | Value |
+|---|---:|
+| Object templates registered | 1,709 |
+| Of those, with indexed content | 1,528 |
+| Without content: binary | 110 |
+| Without content: over the size limit | 67 |
+| Without content: no file in the dump | 4 |
+| Phase duration | 2.8 s |
+| Full forced reindex, end to end | 120 s |
+
+Limit boundary measured: the largest template with indexed content is 992,946 bytes, the smallest without content is 1,149,823 bytes, and the largest template in the configuration is 8.9 MB.
+
+### How to get this on an already built database
+
+The extension layer is not rebuilt when the data has not changed, so on an existing database templates appear only after a one-off forced rebuild: `bsl-indexer index <path> --force`. Fresh databases get them right away.
+
 ## [0.62.0] — 2026-08-21
 
 **A form event handler no longer looks uncalled. "Who calls this" used to answer "0 edges" for such a procedure — now the binding itself comes back: the form, the event, the form element and the description file.**
