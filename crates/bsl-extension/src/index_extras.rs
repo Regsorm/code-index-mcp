@@ -171,6 +171,12 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
     phase("синонимы", "object_synonyms", || {
         index_object_synonyms(repo_root, conn)
     });
+    // Макеты объектов — своими строками перечня. Строго ПОСЛЕ
+    // index_metadata_objects (та сносит перечень репо целиком) и после
+    // синонимов (те делают UPDATE по перечню и макетов не касаются).
+    phase("макеты", "object_templates", || {
+        index_object_templates(repo_root, conn)
+    });
     phase("формы", "metadata_forms", || {
         index_metadata_forms(repo_root, conn)
     });

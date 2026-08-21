@@ -19,7 +19,7 @@ use crate::xml::metadata_refs::{
 };
 use crate::xml::object_attributes::{
     parse_object_attributes_file, parse_object_header_xml,
-    parse_object_structure_file, ObjectStructure,
+    parse_object_structure_file, parse_template_type, ObjectStructure,
 };
 
 use super::*;
@@ -1188,6 +1188,212 @@ pub(crate) fn index_metadata_forms(repo_root: &Path, conn: &rusqlite::Connection
     ));
     tracing::info!("metadata_forms: проиндексировано {} форм", count);
     Ok(())
+}
+
+
+/// Макеты, принадлежащие объектам (`<Вид>/<Объект>/Templates/<Имя>.xml`), —
+/// в перечень объектов отдельными строками `<Вид>.<Объект>.Template.<Имя>`.
+/// Общие макеты (папка `CommonTemplates`) сюда не попадают: они объекты
+/// верхнего уровня и заводятся перечнем из оглавления конфигурации.
+///
+/// В перечень идёт только ПАСПОРТ макета: имя, синоним, владелец и вид
+/// (табличный документ, схема компоновки…). Содержимое макета — отдельный
+/// разговор: печатные формы доходят до десятков мегабайт и в индекс
+/// намеренно не берутся. Чтобы отсутствие содержимого не выглядело как
+/// пропажа объекта, в паспорт пишется признак `content_indexed` и размер
+/// файла — по ним видно, что макет существует, а искать по его тексту
+/// нельзя.
+///
+/// Идемпотентно: DELETE своих строк репо + INSERT. Обязана идти ПОСЛЕ
+/// `index_metadata_objects` — та чистит весь перечень репо целиком.
+pub(crate) fn index_object_templates(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let mut rows: Vec<TemplateRow> = Vec::new();
+    for entry in WalkDir::new(repo_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("xml") {
+            continue;
+        }
+        // Описание макета лежит ПРЯМО в папке `Templates` объекта:
+        // `<...>/<ПапкаВида>/<Объект>/Templates/<Имя>.xml`. Всё остальное
+        // внутри (`<Имя>/Ext/Template.xml` — само содержимое) пропускаем.
+        if path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) != Some("Templates") {
+            continue;
+        }
+        if let Some(row) = template_row_from_path(repo_root, path) {
+            rows.push(row);
+        }
+    }
+
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_objects WHERE repo = ? AND meta_type = 'Template'",
+        params![REPO_DEFAULT],
+    )?;
+    let mut count = 0usize;
+    let mut without_content = 0usize;
+    for row in &rows {
+        let (inserted, content_indexed) = insert_template_row(conn, row)?;
+        count += inserted;
+        if !content_indexed {
+            without_content += 1;
+        }
+    }
+    conn.execute("COMMIT", [])?;
+
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        count as u64,
+        "макет",
+        "макета",
+        "макетов",
+    ));
+    tracing::info!(
+        "object_templates: заведено {} макетов объектов, из них без содержимого в индексе {}",
+        count,
+        without_content
+    );
+    Ok(())
+}
+
+/// Паспорт одного макета до записи в перечень.
+pub(crate) struct TemplateRow {
+    pub full_name: String,
+    name: String,
+    synonym: Option<String>,
+    owner_full_name: String,
+    template_type: Option<String>,
+    content_rel: Option<String>,
+    content_size: Option<u64>,
+}
+
+/// Двоичное ли содержимое макета — по расширению файла. Такие в текстовый
+/// индекс не попадают в принципе, и списывать это на предел размера неверно.
+fn is_binary_template_content(rel: &str) -> bool {
+    let ext = rel.rsplit('.').next().unwrap_or_default().to_lowercase();
+    !matches!(ext.as_str(), "xml" | "txt" | "html" | "htm" | "json" | "css" | "js")
+}
+
+/// Файл с содержимым макета: `Templates/<Имя>/Ext/Template.<чем-то>`.
+///
+/// Расширение зависит от вида макета и по имени не угадывается: табличный
+/// документ и схема компоновки лежат в `.xml`, текстовый документ — в `.txt`,
+/// двоичные данные и внешние компоненты — в своих форматах. Поэтому смотрим,
+/// что реально лежит в папке, а не подставляем `.xml` всем подряд.
+fn template_content_path(descriptor: &Path) -> Option<std::path::PathBuf> {
+    let ext_dir = descriptor.with_extension("").join("Ext");
+    let entries = std::fs::read_dir(&ext_dir).ok()?;
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_file()
+                && p.file_stem().and_then(|s| s.to_str()) == Some("Template")
+        })
+}
+
+/// Собрать паспорт макета по пути его описания. `None` — файл не читается,
+/// это не описание макета либо папка вида неизвестна.
+pub(crate) fn template_row_from_path(repo_root: &Path, path: &Path) -> Option<TemplateRow> {
+    let owner_full_name = template_owner_from_path(path)?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let (meta_type, name, synonym) = parse_object_header_xml(&content)?;
+    if meta_type != "Template" {
+        return None;
+    }
+    let template_type = parse_template_type(&content);
+    let content_path = template_content_path(path);
+    let content_size = content_path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len());
+    let content_rel = content_path.as_ref().map(|p| rel_path(repo_root, p));
+    Some(TemplateRow {
+        full_name: format!("{}.Template.{}", owner_full_name, name),
+        name,
+        synonym,
+        owner_full_name,
+        template_type,
+        content_rel,
+        content_size,
+    })
+}
+
+/// Записать паспорт макета в перечень. Возвращает (сколько строк добавлено,
+/// проиндексировано ли содержимое). Транзакцию ведёт вызывающий.
+///
+/// Заимствованный расширением макет даёт то же полное имя — приоритет за
+/// первой записью, как у форм и объектов.
+pub(crate) fn insert_template_row(
+    conn: &rusqlite::Connection,
+    row: &TemplateRow,
+) -> Result<(usize, bool)> {
+    let content_indexed = match &row.content_rel {
+        Some(rel) => conn
+            .query_row("SELECT 1 FROM files WHERE path = ?1", params![rel], |_| Ok(()))
+            .is_ok(),
+        None => false,
+    };
+    let mut passport = serde_json::json!({
+        "owner": row.owner_full_name,
+        "content_indexed": content_indexed,
+    });
+    if let Some(t) = &row.template_type {
+        passport["template_type"] = serde_json::json!(t);
+    }
+    if let Some(rel) = &row.content_rel {
+        passport["content_file"] = serde_json::json!(rel);
+    }
+    if let Some(size) = row.content_size {
+        passport["content_size_bytes"] = serde_json::json!(size);
+    }
+    if !content_indexed {
+        // Причина называется по факту, а не общей фразой: искать по тексту
+        // нельзя в обоих случаях, но «файл двоичный» и «файл слишком велик» —
+        // разные ответы на вопрос «а что с этим делать».
+        passport["content_note"] = serde_json::json!(match &row.content_rel {
+            None => "у макета нет файла содержимого в выгрузке — есть только его описание",
+            Some(rel) if is_binary_template_content(rel) =>
+                "содержимое макета двоичное (внешняя компонента, двоичные данные) — \
+                 в индекс не берётся; сам макет существует",
+            Some(_) =>
+                "содержимое макета не проиндексировано: файл превышает предел размера \
+                 текстового файла (настройка max_file_size) — поиск по его тексту \
+                 работать не будет, сам макет существует",
+        });
+    }
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO metadata_objects \
+         (repo, full_name, meta_type, name, synonym, attributes_json, full_name_key) \
+         VALUES (?, ?, 'Template', ?, ?, ?, ?)",
+        params![
+            REPO_DEFAULT,
+            &row.full_name,
+            &row.name,
+            &row.synonym,
+            &passport.to_string(),
+            &row.full_name.to_lowercase(),
+        ],
+    )?;
+    Ok((inserted, content_indexed))
+}
+
+/// Владелец макета по пути его описания: `<...>/Catalogs/Контрагенты/Templates/X.xml`
+/// → `Catalog.Контрагенты`. `None`, если раскладка не похожа на выгрузку 1С
+/// либо папка вида неизвестна.
+pub(crate) fn template_owner_from_path(path: &Path) -> Option<String> {
+    let templates_dir = path.parent()?;
+    let object_dir = templates_dir.parent()?;
+    let object = object_dir.file_name()?.to_str()?;
+    let folder = object_dir.parent()?.file_name()?.to_str()?;
+    let meta_type = ALL_OBJECT_FOLDERS
+        .iter()
+        .find(|(plural, _)| *plural == folder)
+        .map(|(_, singular)| *singular)?;
+    Some(format!("{}.{}", meta_type, object))
 }
 
 

@@ -1410,6 +1410,271 @@ fn fills_metadata_forms_from_dump_layout() {
     assert!(row.2.contains("ПриОткрытии"));
 }
 
+/// Макет объекта заводится в перечень отдельной строкой — с владельцем,
+/// синонимом и видом макета. До этого макетов объектов в перечне не было
+/// вовсе: файл на диске читался, а поиск по имени отвечал «ничего нет», и
+/// ответ выглядел как устаревший индекс.
+#[test]
+fn object_template_registered_with_passport() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(
+        &repo.join("Configuration.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Catalog>Контрагенты</Catalog>
+</ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    write(
+        &repo.join("Catalogs").join("Контрагенты.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Catalog><Properties><Name>Контрагенты</Name></Properties>
+<ChildObjects/></Catalog></MetaDataObject>"#,
+    );
+    let template_dir = repo.join("Catalogs").join("Контрагенты").join("Templates");
+    write(
+        &template_dir.join("ПечатьКарточки.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject xmlns:v8="v8"><Template><Properties>
+  <Name>ПечатьКарточки</Name>
+  <Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Печать карточки</v8:content></v8:item></Synonym>
+  <TemplateType>SpreadsheetDocument</TemplateType>
+</Properties></Template></MetaDataObject>"#,
+    );
+    write(
+        &template_dir.join("ПечатьКарточки").join("Ext").join("Template.xml"),
+        "<Document/>",
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let (name, synonym, passport): (String, Option<String>, String) = storage
+        .conn()
+        .query_row(
+            "SELECT name, synonym, attributes_json FROM metadata_objects \
+             WHERE repo = ? AND full_name = 'Catalog.Контрагенты.Template.ПечатьКарточки'",
+            params![REPO_DEFAULT],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("макет объекта должен быть в перечне");
+    assert_eq!(name, "ПечатьКарточки");
+    assert_eq!(synonym.as_deref(), Some("Печать карточки"));
+    let passport: serde_json::Value = serde_json::from_str(&passport).unwrap();
+    assert_eq!(passport["owner"].as_str(), Some("Catalog.Контрагенты"));
+    assert_eq!(passport["template_type"].as_str(), Some("SpreadsheetDocument"));
+    // Сам объект-владелец из перечня никуда не делся.
+    let owners: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM metadata_objects WHERE repo = ? AND full_name = 'Catalog.Контрагенты'",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owners, 1);
+}
+
+/// Расширение файла содержимого зависит от вида макета: табличный документ и
+/// схема компоновки лежат в `.xml`, текстовый документ — в `.txt`. Подставлять
+/// `.xml` всем подряд нельзя: у текстовых макетов паспорт тогда указывает на
+/// несуществующий файл и лживо сообщает «содержимого нет в индексе».
+#[test]
+fn text_template_content_file_found_by_real_extension() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(
+        &repo.join("Configuration.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Catalog>Классификаторы</Catalog>
+</ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    let templates = repo.join("Catalogs").join("Классификаторы").join("Templates");
+    write(
+        &templates.join("ДанныеКлассификатора.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Template><Properties><Name>ДанныеКлассификатора</Name>
+<TemplateType>TextDocument</TemplateType></Properties></Template></MetaDataObject>"#,
+    );
+    write(
+        &templates.join("ДанныеКлассификатора").join("Ext").join("Template.txt"),
+        "код;наименование\n001;первый\n",
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let passport: String = storage
+        .conn()
+        .query_row(
+            "SELECT attributes_json FROM metadata_objects \
+             WHERE repo = ? AND full_name = 'Catalog.Классификаторы.Template.ДанныеКлассификатора'",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let passport: serde_json::Value = serde_json::from_str(&passport).unwrap();
+    assert!(
+        passport["content_file"].as_str().unwrap_or_default().ends_with("Template.txt"),
+        "у текстового макета содержимое в .txt: {passport}"
+    );
+    assert!(
+        passport["content_size_bytes"].as_u64().unwrap_or(0) > 0,
+        "размер файла содержимого должен быть известен: {passport}"
+    );
+}
+
+/// Двоичное содержимое (внешняя компонента, двоичные данные) в текстовый
+/// индекс не попадает в принципе. Списывать это на предел размера неверно —
+/// причина в паспорте должна называться по факту.
+#[test]
+fn binary_template_content_note_names_the_real_reason() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(
+        &repo.join("Configuration.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Catalog>Оборудование</Catalog>
+</ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    let templates = repo.join("Catalogs").join("Оборудование").join("Templates");
+    write(
+        &templates.join("ДрайверУстройства.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Template><Properties><Name>ДрайверУстройства</Name>
+<TemplateType>AddIn</TemplateType></Properties></Template></MetaDataObject>"#,
+    );
+    write(
+        &templates.join("ДрайверУстройства").join("Ext").join("Template.zip"),
+        "PK\u{3}\u{4}двоичное",
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let passport: String = storage
+        .conn()
+        .query_row(
+            "SELECT attributes_json FROM metadata_objects \
+             WHERE repo = ? AND full_name = 'Catalog.Оборудование.Template.ДрайверУстройства'",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let passport: serde_json::Value = serde_json::from_str(&passport).unwrap();
+    assert_eq!(passport["content_indexed"].as_bool(), Some(false));
+    assert!(
+        passport["content_note"].as_str().unwrap_or_default().contains("двоичное"),
+        "причина должна называться по факту, а не сваливаться на размер: {passport}"
+    );
+}
+
+/// Содержимое крупного макета в индекс не берётся (печатные формы доходят до
+/// девяти мегабайт). Паспорт обязан честно об этом сказать, иначе поиск по
+/// тексту макета молча вернёт ноль и это опять прочтётся как «индекс неполон».
+#[test]
+fn template_without_indexed_content_is_marked() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(
+        &repo.join("Configuration.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Document>Реализация</Document>
+</ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    write(
+        &repo.join("Documents").join("Реализация").join("Templates").join("Накладная.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Template><Properties><Name>Накладная</Name></Properties></Template></MetaDataObject>"#,
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let passport: String = storage
+        .conn()
+        .query_row(
+            "SELECT attributes_json FROM metadata_objects \
+             WHERE repo = ? AND full_name = 'Document.Реализация.Template.Накладная'",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .expect("макет должен быть в перечне и без проиндексированного содержимого");
+    let passport: serde_json::Value = serde_json::from_str(&passport).unwrap();
+    assert_eq!(passport["content_indexed"].as_bool(), Some(false));
+    assert!(
+        passport["content_note"].as_str().unwrap_or_default().contains("нет файла содержимого"),
+        "у макета без файла содержимого причина должна называться прямо: {passport}"
+    );
+}
+
+/// Точечная ветка наблюдателя: правка описания макета обновляет его паспорт,
+/// удаление файла — убирает строку из перечня.
+#[test]
+fn incremental_updates_and_removes_object_template() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(
+        &repo.join("Configuration.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Catalog>Номенклатура</Catalog>
+</ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    let template_xml = repo
+        .join("Catalogs")
+        .join("Номенклатура")
+        .join("Templates")
+        .join("Ценник.xml");
+    write(
+        &template_xml,
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Template><Properties><Name>Ценник</Name>
+<TemplateType>SpreadsheetDocument</TemplateType></Properties></Template></MetaDataObject>"#,
+    );
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    // Вид макета сменили — паспорт обязан догнать.
+    write(
+        &template_xml,
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Template><Properties><Name>Ценник</Name>
+<TemplateType>DataCompositionSchema</TemplateType></Properties></Template></MetaDataObject>"#,
+    );
+    update_object_template_for_file(&repo, storage.conn(), &template_xml).unwrap();
+    let passport: String = storage
+        .conn()
+        .query_row(
+            "SELECT attributes_json FROM metadata_objects \
+             WHERE repo = ? AND full_name = 'Catalog.Номенклатура.Template.Ценник'",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        passport.contains("DataCompositionSchema"),
+        "вид макета должен обновиться: {passport}"
+    );
+
+    // Файл удалён — строка уходит.
+    std::fs::remove_file(&template_xml).unwrap();
+    update_object_template_for_file(&repo, storage.conn(), &template_xml).unwrap();
+    let left: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM metadata_objects \
+             WHERE repo = ? AND full_name = 'Catalog.Номенклатура.Template.Ценник'",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "макет удалённого файла не должен оставаться в перечне");
+}
+
 /// Вложенная подсистема должна попадать в реестр объектов (в
 /// Configuration.xml её нет — там только верхний уровень), а цель состава,
 /// записанная идентификатором (так выгружаются заимствованные объекты в

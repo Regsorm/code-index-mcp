@@ -795,6 +795,39 @@ pub fn parse_predefined_xml(content: &str) -> Vec<String> {
     out
 }
 
+/// Вид макета из его описания: `<TemplateType>SpreadsheetDocument</TemplateType>`
+/// (табличный документ, схема компоновки данных, двоичные данные, текстовый
+/// документ и т.д.). Возвращает `None`, если тега нет — у части макетов вид
+/// не указан явно, и тогда платформа считает его табличным документом.
+pub fn parse_template_type(content: &str) -> Option<String> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut want_value = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
+                if local == "TemplateType" {
+                    want_value = true;
+                }
+            }
+            Ok(Event::Text(t)) if want_value => {
+                let txt = t
+                    .unescape()
+                    .map(|s| s.into_owned())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                return (!txt.is_empty()).then_some(txt);
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
 /// Распарсить содержимое XML объекта в полную структуру.
 /// Лёгкий парс ШАПКИ объекта: `meta_type` (корневой тег под `MetaDataObject`),
 /// имя (`<Name>` в `<Properties>`) и синоним (`<Synonym>` ru-представление).

@@ -250,6 +250,49 @@ pub(crate) fn update_metadata_forms_for_file(
 }
 
 
+/// Per-file обновление паспорта макета объекта по его описанию. Файл удалён —
+/// строка просто уходит из перечня.
+///
+/// Имя макета берётся из пути (`Templates/<Имя>.xml`), а не только из шапки:
+/// у удалённого файла шапку прочитать уже нельзя, а снести его строку нужно.
+pub(crate) fn update_object_template_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    template_xml_path: &Path,
+) -> Result<()> {
+    let Some(owner) = template_owner_from_path(template_xml_path) else {
+        return Ok(());
+    };
+    let Some(stem) = template_xml_path.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(());
+    };
+    let full_name = format!("{}.Template.{}", owner, stem);
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_objects WHERE repo = ? AND meta_type = 'Template' AND full_name = ?",
+        params![REPO_DEFAULT, &full_name],
+    )?;
+    if template_xml_path.is_file() {
+        if let Some(row) = template_row_from_path(repo_root, template_xml_path) {
+            // Имя в шапке может отличаться от имени файла (переименование
+            // мимо выгрузки) — тогда строка заводится под именем из шапки,
+            // а прежняя уже снесена выше.
+            if row.full_name != full_name {
+                conn.execute(
+                    "DELETE FROM metadata_objects \
+                     WHERE repo = ? AND meta_type = 'Template' AND full_name = ?",
+                    params![REPO_DEFAULT, &row.full_name],
+                )?;
+            }
+            insert_template_row(conn, &row)?;
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+
 /// Per-file обновление строки `event_subscriptions` по её XML. Слой
 /// `subscription` графа пересобирается отдельно (после всех подписок батча).
 pub(crate) fn update_event_subscription_for_file(conn: &rusqlite::Connection, xml_path: &Path) -> Result<()> {
@@ -347,6 +390,8 @@ pub fn run_incremental_extras(
     let mut all_object_xmls: Vec<&std::path::PathBuf> = Vec::new();
     let mut form_xmls: Vec<&std::path::PathBuf> = Vec::new();
     let mut sub_xmls: Vec<&std::path::PathBuf> = Vec::new();
+    // Описания макетов объектов (`<Объект>/Templates/<Имя>.xml`).
+    let mut template_xmls: Vec<&std::path::PathBuf> = Vec::new();
     // Источники data_links конфиг-уровня / role_rights изменились в этом батче.
     // Они лежат вне OBJECT_FOLDERS и не привязаны к одному объекту → при
     // попадании дешевле полностью пересобрать соответствующую таблицу.
@@ -385,6 +430,11 @@ pub fn run_incremental_extras(
             }
         } else if fname == "Form.xml" {
             form_xmls.push(p);
+        } else if ext == "xml"
+            && p.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) == Some("Templates")
+        {
+            // Описание макета объекта: паспорт в перечне обновляется точечно.
+            template_xmls.push(p);
         } else if p
             .parent()
             .and_then(|d| d.file_name())
@@ -481,6 +531,11 @@ pub fn run_incremental_extras(
         let t = std::time::Instant::now();
         update_metadata_forms_for_file(repo_root, conn, p)?;
         code_index_core::logging::stage_add("формы", t.elapsed());
+    }
+    for p in &template_xmls {
+        let t = std::time::Instant::now();
+        update_object_template_for_file(repo_root, conn, p)?;
+        code_index_core::logging::stage_add("макеты", t.elapsed());
     }
     for p in &sub_xmls {
         let t = std::time::Instant::now();
@@ -694,6 +749,12 @@ pub(crate) fn delete_object_cascade(
     conn.execute(
         "DELETE FROM metadata_objects WHERE repo = ? AND full_name = ?",
         params![REPO_DEFAULT, full_name],
+    )?;
+    // Макеты объекта — его же строки перечня (`<Объект>.Template.<Имя>`).
+    conn.execute(
+        "DELETE FROM metadata_objects \
+         WHERE repo = ? AND meta_type = 'Template' AND full_name LIKE ? ESCAPE '\\'",
+        params![REPO_DEFAULT, format!("{}.Template.%", like_escape(full_name))],
     )?;
     conn.execute(
         "DELETE FROM data_links WHERE repo = ? AND (from_object = ? OR to_object = ?)",
@@ -1194,6 +1255,12 @@ fn delete_edt_object(
     conn.execute(
         "DELETE FROM metadata_objects WHERE repo = ? AND full_name = ?",
         params![REPO_DEFAULT, &full_name],
+    )?;
+    // Макеты объекта — его же строки перечня (`<Объект>.Template.<Имя>`).
+    conn.execute(
+        "DELETE FROM metadata_objects \
+         WHERE repo = ? AND meta_type = 'Template' AND full_name LIKE ? ESCAPE '\\'",
+        params![REPO_DEFAULT, format!("{}.Template.%", like_escape(&full_name))],
     )?;
     conn.execute(
         "DELETE FROM data_links WHERE repo = ? AND from_object = ?",
