@@ -5,6 +5,58 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.61.0] — 2026-08-21
+
+**Indexing with the database on disk writes noticeably less and finishes faster. The multiplier that estimates memory usage moved into the folder settings — on a weak machine you can now raise it to make sure the work goes to disk.**
+
+> Context. Release 0.60.0 taught the program to choose between RAM and disk by calculation. It turned out the disk path itself had never been optimised: it was treated as the fallback. Yet on a machine with modest memory it is the main one — the calculation almost always picks disk. A measurement on a copy of a typical trade configuration (60,294 files, 3.66 GB of sources) showed 26 GB written to the drive in a single pass.
+
+### Fixed
+
+- **The one-shot index command no longer flushes a database that already lives on disk.** The flush is meant for a database built in RAM; for a disk-backed one it turned into copying that file onto itself — 21.8 s and 8 GB of writes wasted on every run. The daemon already made this distinction, so the change brings the one-shot command in line with it: **daemon users are unaffected by this item**.
+
+### Changed
+
+- **Secondary indexes of the call graph are dropped before the load and rebuilt after.** Previously every insert updated indexes that were rebuilt anyway.
+- **Resolution and filtering of edges now happen in a temporary table, and only the surviving set reaches the database.** Previously every discovered edge was written and half were deleted afterwards: 1.17 M rows written against 550 K kept — 51 % of the writes thrown away.
+- **Inserts follow the order of the uniqueness keys** — database pages are touched sequentially instead of at random.
+- **The one-shot index command prints a per-stage breakdown**, the way the daemon does.
+
+### Added
+
+- **The `memory_estimate_factor` setting** — the multiplier that turns source weight into expected memory usage. The value 3 used to be hard-coded. The full calculation:
+
+  ```text
+  expected usage = source weight × memory_estimate_factor
+  allowed usage  = free memory × memory_max_percent / 100
+
+  expected usage ≤ allowed usage → the database is built in RAM
+  otherwise                      → the database goes straight to disk
+  ```
+
+  The default 3.0 is **the middle of the observed spread, not headroom on top of it**. Measured actual usage across folders: 3.8 GB of sources — 8.6 GB of memory (×2.3), 6.7 GB — 19.0 GB (×2.8), 5.3 GB — 18.6 GB (×3.5), 1.8 GB — 8.0 GB (×4.4). The spread depends on the language, code density and folder contents, and cannot be predicted up front.
+
+  Short on memory — set 4 or above: disk more often, slower, but with no risk of running out. Plenty of memory and willing to check the log — 2.0–2.5: more folders go to RAM and indexing is faster. Zero, negative and non-numeric values are treated as a typo: the default is used, and the applied multiplier appears in the log next to the estimate.
+
+### Measurements
+
+Copy of a typical trade configuration, 60,294 files, database **on disk**, measured with the **one-shot index command**:
+
+| | before | after |
+|---|---:|---:|
+| total time | 199–215 s | 138 s |
+| extension layer | 102–108 s | 68 s |
+| call graph | 69 s | 32 s |
+| flush to disk | 19–22 s | 0 |
+| written to the drive | 25.5–26.2 GB | 13.2 GB |
+| peak write-ahead log size | 4.36 GB | 1.07 GB |
+
+**What a daemon user should expect from this table.** The "flush to disk" row never applied to them — roughly 20 s and about 8 GB of the difference shown belong to the one-shot command alone. Their gain comes from the call graph and the secondary indexes: measured across six configurations on a network node (374,525 files, databases in RAM), the extension layer is 3–12 % faster, the core and the flush unchanged. Writes are cheap in RAM, so the gain there is smaller — all of it lands exactly where the change is.
+
+### Correctness check
+
+The new database was compared against a reference built by the previous release across every table — row counts and a checksum of the contents. 34 tables out of 38 matched exactly, including the call graph (595,516 rows), file links, calls and functions. The four differences — timestamps and the block order of the full-text index — reproduce between two runs of the very same previous build, so they are not a property of this change.
+
 ## [0.60.0] — 2026-08-20
 
 **Indexing now decides for itself whether to build the database in RAM or on disk — from the folder's weight and the machine's free memory, not from an accidental signal. After working in RAM, the memory is returned to the system. The bulk-processing threshold moved into the daemon settings. The log no longer passes off a first-time index as a change check.**
