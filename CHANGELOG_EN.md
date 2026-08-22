@@ -5,7 +5,27 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
-## [0.64.0] — 2026-08-22
+## [0.65.0] — 2026-08-22
+
+**Eight small audit findings closed in a single release. None of them changes index content — no reindex required.**
+
+> Context. In the audit registry these were all marked "cosmetic": debt, readability, wasted work — no effect on the correctness of results. Individually none justified a release; together they form a coherent set: two cases where an empty result was indistinguishable from an error, two small recognition failures, two wasted costs in hot code, and two inconsistencies.
+
+### Fixed
+
+- **A quote character in a full-text query no longer breaks query parsing.** The query was wrapped in quotes when special characters were present, but an inner quote was not doubled as the full-text engine requires. Searching for a single quote returned the parser error "unterminated string" instead of an empty result. The inner quote is now doubled, and the quote character itself is treated as special alongside minus, plus and asterisk: the answer is an empty list with a hint.
+- **A typo in a repository's language list is no longer silent.** An unknown language name was dropped without a word in the log: files were classified as code but never parsed — no functions, no calls, with an apparently healthy index. Every unknown name now produces a warning stating the consequence.
+- **Extension directives with a space after the hash are recognized.** Blanking of removed blocks compared the start of the line against patterns without a space, while the neighbouring source normalization already handles exactly that spelling (hundreds of occurrences in real code). A block left un-blanked can cut a string literal in half, and then string masking slips: query text below starts being treated as code.
+- **Module method collection now reports whether parsing succeeded.** An empty list was indistinguishable from a module with no methods, though there are three causes of emptiness: a binary vendor module, a language failure, and the parsing deadline. A parsed flag is returned next to the list — the same one fact collection already provided.
+- **Both module parsing paths got the same preprocessing.** Declaration collection blanked extension directive blocks while method collection worked on the raw text — on an extension module where a removed block cuts a string literal, the two paths disagreed. Preprocessing is now shared; offsets do not shift because blanking preserves byte length.
+
+### Changed
+
+- **The index command accepts a path in both forms.** Its path was positional while stats, clean and query used a named `--path`; mixing them up is easy, and the error message did not hint at the right form. Both `index <path>` and `index --path <path>` now work; with neither form given it falls back to the current directory, like the neighbouring commands.
+- **Mass-mode description trimming is anchored to an explicit constant.** The description tail was cut by a substring spelled out inline: had anyone reworded the description, the schema parameter would still have been removed while the promise of batching stayed in the text, and the model would call an unavailable mode. The marker now lives in one place, and a new test keeps descriptions and marker together.
+- **Redundant string copies removed from the hot traversal loop.** Four language parsers cloned the function name at EVERY child node of its body, although the name outlives the traversal and a reference is enough — the remaining languages already pass a reference in the same spot. Behaviour is unchanged: the call graph matched for all four languages on verification.
+
+
 
 **Content search is 3–4× faster exactly where it used to be slow: when matches are few or absent. Output did not change by a single byte. Separately, substring search over procedure bodies is fixed: a Cyrillic substring in a different case is no longer lost.**
 
