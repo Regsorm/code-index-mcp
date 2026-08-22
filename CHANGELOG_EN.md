@@ -25,6 +25,10 @@ Versioning — [SemVer](https://semver.org/).
 - **Mass-mode description trimming is anchored to an explicit constant.** The description tail was cut by a substring spelled out inline: had anyone reworded the description, the schema parameter would still have been removed while the promise of batching stayed in the text, and the model would call an unavailable mode. The marker now lives in one place, and a new test keeps descriptions and marker together.
 - **Redundant string copies removed from the hot traversal loop.** Four language parsers cloned the function name at EVERY child node of its body, although the name outlives the traversal and a reference is enough — the remaining languages already pass a reference in the same spot. Behaviour is unchanged: the call graph matched for all four languages on verification.
 
+### Published contents
+
+- **The ignore-rules file and the helper scripts directory are no longer published.** Both are tied to the developer's working environment and to the layout of particular machines, and are of no use to an outside reader. Neither the code nor the tool output is affected; when cloning the repository you will need your own ignore rules — at least for the build directory.
+
 
 
 **Content search is 3–4× faster exactly where it used to be slow: when matches are few or absent. Output did not change by a single byte. Separately, substring search over procedure bodies is fixed: a Cyrillic substring in a different case is no longer lost.**
