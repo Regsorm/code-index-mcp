@@ -219,7 +219,7 @@ fn visit_function_declaration(
     if let Some(body_node) = node.child_by_field_name("body") {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
-            visit_node(child, ctx, class_name, Some(&name.clone()), body_node.kind(), 1);
+            visit_node(child, ctx, class_name, Some(&name), body_node.kind(), 1);
         }
     }
 }
@@ -278,7 +278,7 @@ fn visit_method_definition(
         if let Some(body_node) = func_val.child_by_field_name("body") {
             let mut cursor = body_node.walk();
             for child in body_node.children(&mut cursor) {
-                visit_node(child, ctx, class_name, Some(&name.clone()), body_node.kind(), 1);
+                visit_node(child, ctx, class_name, Some(&name), body_node.kind(), 1);
             }
         }
     }
@@ -364,7 +364,7 @@ fn visit_variable_declarator(
                 if let Some(body_node) = val.child_by_field_name("body") {
                     let mut cursor = body_node.walk();
                     for child in body_node.children(&mut cursor) {
-                        visit_node(child, ctx, class_name, Some(&var_name.clone()), body_node.kind(), depth + 1);
+                        visit_node(child, ctx, class_name, Some(&var_name), body_node.kind(), depth + 1);
                     }
                 }
             }

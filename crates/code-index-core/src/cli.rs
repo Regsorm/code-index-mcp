@@ -69,8 +69,15 @@ enum Commands {
 
     /// Проиндексировать директорию (однократно)
     Index {
-        /// Путь к директории
-        path: String,
+        /// Путь к директории (позиционно). Соседние команды принимают путь как
+        /// `--path`, поэтому здесь работают ОБЕ формы: `index C:\Repo` и
+        /// `index --path C:\Repo`.
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+
+        /// Путь к директории — именованная форма, как у `stats`/`clean`/`query`.
+        #[arg(short, long = "path", value_name = "PATH", conflicts_with = "path")]
+        path_named: Option<String>,
 
         /// Принудительная полная переиндексация (игнорировать хеши)
         #[arg(short, long)]
@@ -614,7 +621,10 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             cmd_serve(path, transport, host, port, config, serve_config, registry).await?;
         }
 
-        Commands::Index { path, force } => {
+        Commands::Index { path, path_named, force } => {
+            // Обе формы равноправны; не задана ни одна — текущий каталог,
+            // как у соседних команд.
+            let path = path_named.or(path).unwrap_or_else(|| ".".to_string());
             cmd_index(path, force, registry)?;
         }
 

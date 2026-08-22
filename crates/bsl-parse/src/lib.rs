@@ -633,6 +633,19 @@ fn count_arguments(method_call: tree_sitter::Node) -> usize {
 ///
 /// Поэтому удаляемые строки и сами строки-маркеры затираются пробелами до всякого
 /// разбора. Позиции сохраняются: и номера строк, и колонки остаются прежними.
+/// Начало строки в нижнем регистре, где между `#` и словом убраны пробелы и
+/// табы: `# Удаление` → `#удаление`. Форма с пробелом на живом коде встречается
+/// (у условной компиляции — сотни случаев), и нормализация исходника её уже
+/// обходит; здесь распознавание должно быть таким же, иначе удаляемый блок
+/// останется незатёртым.
+fn directive_head(line: &str) -> String {
+    let trimmed = line.trim_start().to_lowercase();
+    match trimmed.strip_prefix('#') {
+        Some(rest) => format!("#{}", rest.trim_start_matches([' ', '\t'])),
+        None => trimmed,
+    }
+}
+
 pub fn strip_extension_directives(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = bytes.to_vec();
@@ -641,7 +654,7 @@ pub fn strip_extension_directives(src: &str) -> String {
 
     for line in src.split_inclusive('\n') {
         let body_len = line.trim_end_matches(['\n', '\r']).len();
-        let head = line.trim_start().to_lowercase();
+        let head = directive_head(line);
 
         let starts_delete = head.starts_with("#удаление") || head.starts_with("#delete");
         let ends_delete = head.starts_with("#конецудаления") || head.starts_with("#enddelete");
@@ -809,13 +822,31 @@ pub struct MethodDecl {
     pub params: Option<String>,
 }
 
+/// Результат сбора методов: список и признак того, что дерево вообще получено.
+///
+/// Без признака пустой список неотличим от модуля без методов, хотя причин
+/// пустоты три: двоичный модуль поставщика, отказ языка и срабатывание
+/// дедлайна разбора. Тот же признак `parsed` возвращает и сбор фактов.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MethodScan {
+    pub methods: Vec<MethodDecl>,
+    pub parsed: bool,
+}
+
+impl MethodScan {
+    /// Разбор не состоялся: методов нет и знать о модуле нечего.
+    fn not_parsed() -> Self {
+        Self { methods: Vec::new(), parsed: false }
+    }
+}
+
 /// Методы, объявленные в модуле. Дерево + нормализация (та же, что в collect_facts).
 /// Текстовой страховки здесь НЕТ: она даёт только имена, без строк и параметров.
-pub fn collect_methods(source: &str) -> Vec<MethodDecl> {
+pub fn collect_methods(source: &str) -> MethodScan {
     // Двоичный .bsl (EDT-защищённые модули поставщика) — не отдаём в
     // tree-sitter, см. collect_facts.
     if source.as_bytes().iter().take(8192).any(|&b| b == 0) {
-        return Vec::new();
+        return MethodScan::not_parsed();
     }
 
     let mut parser = tree_sitter::Parser::new();
@@ -823,15 +854,19 @@ pub fn collect_methods(source: &str) -> Vec<MethodDecl> {
         .set_language(&tree_sitter_bsl::LANGUAGE.into())
         .is_err()
     {
-        return Vec::new();
+        return MethodScan::not_parsed();
     }
     #[allow(deprecated)]
     parser.set_timeout_micros(10_000 * 1000);
 
-    // Разбираем нормализованный текст, читаем — оригинальный: смещения совпадают.
-    let for_parser = normalize_for_parser(source);
+    // Предобработка та же, что у сбора объявлений модуля: удаляемые блоки
+    // расширения затираются пробелами (их код может обрывать строковый литерал
+    // на середине). Затирание и нормализация сохраняют длину В БАЙТАХ, поэтому
+    // тексты по-прежнему читаются из ОРИГИНАЛА по координатам дерева.
+    let stripped = strip_extension_directives(source);
+    let for_parser = normalize_for_parser(&stripped);
     let Some(tree) = parser.parse(for_parser.as_ref(), None) else {
-        return Vec::new();
+        return MethodScan::not_parsed();
     };
 
     let src = source.as_bytes();
@@ -884,7 +919,7 @@ pub fn collect_methods(source: &str) -> Vec<MethodDecl> {
         }
     }
 
-    methods
+    MethodScan { methods, parsed: true }
 }
 
 #[cfg(test)]
@@ -1203,7 +1238,9 @@ mod tests {
 
     #[test]
     fn collect_methods_directive_and_export() {
-        let methods = collect_methods("&НаСервере\nПроцедура Тест(А, Знач Б = 1) Экспорт\nКонецПроцедуры");
+        let scan = collect_methods("&НаСервере\nПроцедура Тест(А, Знач Б = 1) Экспорт\nКонецПроцедуры");
+        assert!(scan.parsed);
+        let methods = scan.methods;
         assert_eq!(methods.len(), 1);
         let m = &methods[0];
         assert_eq!(m.name, "Тест");
@@ -1216,7 +1253,7 @@ mod tests {
 
     #[test]
     fn collect_methods_function_export() {
-        let methods = collect_methods("Функция Ф() Экспорт\n  Возврат 1;\nКонецФункции");
+        let methods = collect_methods("Функция Ф() Экспорт\n  Возврат 1;\nКонецФункции").methods;
         assert_eq!(methods.len(), 1);
         assert!(methods[0].is_function);
         assert!(methods[0].is_export);
@@ -1224,15 +1261,50 @@ mod tests {
 
     #[test]
     fn collect_methods_normalizes_yo() {
-        let methods = collect_methods("Процедура СчётаУчёта()\nКонецПроцедуры");
+        let methods = collect_methods("Процедура СчётаУчёта()\nКонецПроцедуры").methods;
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0].name, "СчётаУчёта");
     }
 
     #[test]
     fn collect_methods_override_directive() {
-        let methods = collect_methods("&Вместо(\"Ф\")\nПроцедура Р()\nКонецПроцедуры");
+        let methods = collect_methods("&Вместо(\"Ф\")\nПроцедура Р()\nКонецПроцедуры").methods;
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0].directive.as_deref(), Some("Вместо"));
+    }
+
+    #[test]
+    fn collect_methods_reports_binary_module_as_not_parsed() {
+        // Двоичный модуль поставщика: пустой список ДОЛЖЕН отличаться от
+        // честного «методов нет».
+        let scan = collect_methods("\0\0\0двоичный модуль");
+        assert!(!scan.parsed);
+        assert!(scan.methods.is_empty());
+
+        let scan = collect_methods("// модуль без единой процедуры");
+        assert!(scan.parsed);
+        assert!(scan.methods.is_empty());
+    }
+
+    #[test]
+    fn collect_methods_skips_deleted_extension_block() {
+        // Та же предобработка, что у module_declarations: процедура внутри
+        // удаляемого блока в скомпилированный модуль не попадает.
+        let scan = collect_methods(
+            "#Удаление\nПроцедура Убрана()\nКонецПроцедуры\n#КонецУдаления\nПроцедура Оставлена()\nКонецПроцедуры",
+        );
+        let names: Vec<&str> = scan.methods.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["Оставлена"]);
+    }
+
+    #[test]
+    fn strip_extension_directives_handles_space_after_hash() {
+        // Форма с пробелом после решётки распознаётся так же, как слитная —
+        // ровно как её обходит нормализация исходника.
+        let src = "# Удаление\nА = \"обрыв;\n# КонецУдаления\nБ = 2;";
+        let stripped = strip_extension_directives(src);
+        assert_eq!(stripped.len(), src.len(), "длина сохраняется побайтно");
+        assert!(!stripped.contains("обрыв"), "удаляемый блок затёрт: {stripped}");
+        assert!(stripped.contains("Б = 2;"), "код после блока цел");
     }
 }

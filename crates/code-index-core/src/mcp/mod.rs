@@ -1839,6 +1839,12 @@ impl ServerHandler for CodeIndexServer {
 /// пачки в `tools/list`. Plural-параметры массовых инструментов опциональны,
 /// поэтому из `required` они не удаляются (их там и нет), но на всякий случай
 /// фильтруем и `required`.
+/// Начало фразы про массовый режим в описании инструмента. Обрезка хвоста
+/// описания привязана к этой строке, поэтому она вынесена в одно место: тест
+/// `mass_mode_marker_present_in_descriptions` следит, чтобы описания массовых
+/// инструментов и эта константа не разошлись при переформулировке.
+const MASS_MODE_MARKER: &str = "МАССОВЫЙ РЕЖИМ";
+
 fn strip_mass_mode_param(tool: &mut Tool, plural: &str) {
     let mut schema = tool.input_schema.as_ref().clone();
     if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties") {
@@ -1848,10 +1854,10 @@ fn strip_mass_mode_param(tool: &mut Tool, plural: &str) {
         req.retain(|v| v.as_str() != Some(plural));
     }
     tool.input_schema = Arc::new(schema);
-    // Фраза «МАССОВ…» всегда в конце описаний массовых инструментов —
+    // Фраза про массовый режим всегда в конце описаний массовых инструментов —
     // обрезаем хвост, чтобы описание не обещало недоступную опцию.
     if let Some(desc) = tool.description.as_ref() {
-        if let Some(idx) = desc.find("МАССОВ") {
+        if let Some(idx) = desc.find(MASS_MODE_MARKER) {
             let trimmed = desc[..idx].trim_end().to_string();
             tool.description = Some(std::borrow::Cow::Owned(trimmed));
         }
@@ -1973,6 +1979,25 @@ mod mass_mode_tests {
         assert!(names.contains("get_class"));
         assert!(names.contains("get_object_structure"));
         assert_eq!(MASS_MODE_PARAMS.len(), 3);
+    }
+
+    /// M-15: обрезка хвоста описания ищет [`MASS_MODE_MARKER`]. Стоит
+    /// переписать описание другими словами — параметр из схемы уберётся, а
+    /// обещание пачки в описании останется, и модель позовёт недоступный режим.
+    /// Тест держит описания и маркер вместе.
+    #[test]
+    fn mass_mode_marker_present_in_descriptions() {
+        let router = CodeIndexServer::tool_router();
+        for (name, _) in MASS_MODE_PARAMS {
+            // BSL-инструменты приходят из расширения — в core-роутере их нет.
+            let Some(tool) = router.get(name) else { continue };
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                desc.contains(MASS_MODE_MARKER),
+                "описание '{name}' потеряло маркер '{MASS_MODE_MARKER}' — \
+                 обрезка массового режима перестанет работать: {desc}"
+            );
+        }
     }
 
     /// M-13: у ответа пачки должно быть общее `_meta` — объединение зависимых

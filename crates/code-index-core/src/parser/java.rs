@@ -284,7 +284,7 @@ fn visit_method(
     if let Some(body_node) = node.child_by_field_name("body") {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
-            visit_node(child, ctx, class_name, Some(&name.clone()), body_node.kind(), 1);
+            visit_node(child, ctx, class_name, Some(&name), body_node.kind(), 1);
         }
     }
 }
@@ -337,7 +337,7 @@ fn visit_constructor(
     if let Some(body_node) = node.child_by_field_name("body") {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
-            visit_node(child, ctx, class_name, Some(&name.clone()), body_node.kind(), 1);
+            visit_node(child, ctx, class_name, Some(&name), body_node.kind(), 1);
         }
     }
 }

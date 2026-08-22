@@ -2872,10 +2872,14 @@ impl Storage {
 /// FTS5 интерпретирует дефис как NOT, «+» и «*» как операторы.
 /// Если запрос содержит такие символы внутри слова — оборачиваем всё в кавычки,
 /// чтобы FTS5 искал буквальную фразу.
+///
+/// Сама кавычка тоже спецсимвол: внутри фразы её надо УДВОИТЬ, иначе разборщик
+/// FTS5 видит незакрытую строку и наружу вылезает `unterminated string` вместо
+/// пустого результата.
 fn sanitize_fts_query(query: &str) -> String {
     // Проверяем наличие FTS-спецсимволов внутри токенов
-    if query.contains('-') || query.contains('+') || query.contains('*') {
-        format!("\"{}\"", query)
+    if query.contains('-') || query.contains('+') || query.contains('*') || query.contains('"') {
+        format!("\"{}\"", query.replace('"', "\"\""))
     } else {
         query.to_string()
     }
@@ -3879,6 +3883,11 @@ mod tests {
         assert_eq!(build_fts_or_query("a-b c"), "\"a\"* OR \"b\"* OR \"c\"*");
         // Мусор без алфанумерики → откат на sanitize_fts_query (старое поведение).
         assert_eq!(build_fts_or_query("__"), sanitize_fts_query("__"));
+        // Кавычка внутри фразы удваивается — иначе FTS5 отвечает
+        // «unterminated string» вместо пустого результата.
+        assert_eq!(sanitize_fts_query("\""), "\"\"\"\"");
+        assert_eq!(sanitize_fts_query("a-\"b"), "\"a-\"\"b\"");
+        assert_eq!(build_fts_or_query("\""), "\"\"\"\"");
     }
 
     #[test]
