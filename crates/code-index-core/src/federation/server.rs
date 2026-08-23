@@ -20,10 +20,10 @@ use axum::{
 };
 
 use crate::mcp::{
-    tools, CallTreeParams, CodeIndexServer, ExtensionToolParams, FilePathParams, FindPathParams,
-    FunctionNameParams, GrepBodyParams, GrepCodeParams, GrepTextParams, ImportParams,
-    ListFilesParams, NameParams, ReadFileParams, RepoEntry, SearchParams, StatFileParams,
-    StatsParams,
+    grep_regex_from_params, tools, CallTreeParams, CodeIndexServer, ExtensionToolParams,
+    FilePathParams, FindPathParams, FunctionNameParams, GrepBodyParams, GrepCodeParams,
+    GrepTextParams, ImportParams, ListFilesParams, NameParams, ReadFileParams, RepoEntry,
+    SearchParams, StatFileParams, StatsParams,
 };
 
 use super::dispatcher::federation_error;
@@ -354,12 +354,13 @@ async fn handle_grep_text(
         Ok(e) => e,
         Err(r) => return r,
     };
-    // `query` — алиас для `regex` (см. GrepTextParams).
-    let regex = match p.regex.clone().or_else(|| p.query.clone()) {
-        Some(r) if !r.trim().is_empty() => r,
-        _ => {
+    // `query` — алиас для `regex`, `pattern` — буквальная подстрока
+    // (см. GrepTextParams).
+    let regex = match grep_regex_from_params(p.regex.clone(), p.query.clone(), p.pattern.clone()) {
+        Some(r) => r,
+        None => {
             return ok_json(
-                "{\"error\": \"grep_text: укажите regex= (синтаксис crate regex), не query=.\"}"
+                "{\"error\": \"grep_text: укажите regex= (синтаксис crate regex) либо pattern= (буквальная подстрока).\"}"
                     .to_string(),
             )
         }
@@ -385,12 +386,13 @@ async fn handle_grep_code(
         Ok(e) => e,
         Err(r) => return r,
     };
-    // `query` — алиас для `regex` (см. GrepCodeParams).
-    let regex = match p.regex.clone().or_else(|| p.query.clone()) {
-        Some(r) if !r.trim().is_empty() => r,
-        _ => {
+    // `query` — алиас для `regex`, `pattern` — буквальная подстрока
+    // (см. GrepCodeParams).
+    let regex = match grep_regex_from_params(p.regex.clone(), p.query.clone(), p.pattern.clone()) {
+        Some(r) => r,
+        None => {
             return ok_json(
-                "{\"error\": \"grep_code: укажите regex= (синтаксис crate regex), не query=.\"}"
+                "{\"error\": \"grep_code: укажите regex= (синтаксис crate regex) либо pattern= (буквальная подстрока).\"}"
                     .to_string(),
             )
         }

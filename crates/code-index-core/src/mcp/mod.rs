@@ -285,6 +285,26 @@ pub struct ReadFileParams {
     pub line_end: Option<usize>,
 }
 
+/// Свести входные ключи grep-инструментов к одному регулярному выражению.
+///
+/// Приоритет: `regex` → `query` (алиас) → `pattern`. Последний трактуется как
+/// буквальная подстрока без учёта регистра — та же семантика, что у
+/// одноимённого параметра `grep_body`: одно имя не должно значить в семействе
+/// разное. Пустая строка равносильна незаданному ключу.
+///
+/// `None` — не задан ни один ключ; вызывающий отдаёт свою подсказку.
+pub fn grep_regex_from_params(
+    regex: Option<String>,
+    query: Option<String>,
+    pattern: Option<String>,
+) -> Option<String> {
+    let filled = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    if let Some(r) = filled(regex).or_else(|| filled(query)) {
+        return Some(r);
+    }
+    filled(pattern).map(|p| format!("(?i){}", ::regex::escape(&p)))
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GrepTextParams {
     /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
@@ -295,6 +315,11 @@ pub struct GrepTextParams {
     /// Алиас для `regex` (частая путаница: модели передают `query`).
     /// Если `regex` не задан — используется `query` как regex.
     pub query: Option<String>,
+    /// Буквальная подстрока без учёта регистра — как одноимённый параметр
+    /// `grep_body` (подстановочных знаков нет). Берётся, когда не заданы ни
+    /// `regex`, ни `query`: модели переносят имя из соседних инструментов
+    /// семейства, и без этого ключа вызов терял ход на подсказке.
+    pub pattern: Option<String>,
     /// Glob по path. Хотя бы один из {path_glob, language} желателен —
     /// иначе работает full-scan по всем text-файлам.
     pub path_glob: Option<String>,
@@ -315,6 +340,11 @@ pub struct GrepCodeParams {
     /// Алиас для `regex` (частая путаница: модели передают `query`).
     /// Если `regex` не задан — используется `query` как regex.
     pub query: Option<String>,
+    /// Буквальная подстрока без учёта регистра — как одноимённый параметр
+    /// `grep_body` (подстановочных знаков нет). Берётся, когда не заданы ни
+    /// `regex`, ни `query`: модели переносят имя из соседних инструментов
+    /// семейства, и без этого ключа вызов терял ход на подсказке.
+    pub pattern: Option<String>,
     /// Glob по path. Хотя бы один из {path_glob, language} желателен —
     /// иначе full-scan по всем code-файлам репо (zstd-decode каждого) дорогой.
     pub path_glob: Option<String>,
@@ -1191,35 +1221,47 @@ impl CodeIndexServer {
         tools::read_file(entry, p.path, p.line_start, p.line_end).await
     }
 
-    #[tool(description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=). path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
-    async fn grep_text(&self, Parameters(p): Parameters<GrepTextParams>) -> String {
+    #[tool(description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body). path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
+    async fn grep_text(&self, Parameters(mut p): Parameters<GrepTextParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        // `query` — алиас для `regex`, `pattern` — буквальная подстрока
+        // (частая путаница моделей: имя переносится от grep_body/list_files).
+        let regex = match grep_regex_from_params(p.regex.clone(), p.query.clone(), p.pattern.clone()) {
+            Some(r) => r,
+            None => return "{\"error\": \"grep_text: укажите regex= (синтаксис crate regex) либо pattern= (буквальная подстрока). Для кода .bsl/.py/.rs — grep_code; для тел функций — grep_body.\"}".to_string(),
+        };
         if !entry.is_local {
+            // Ключи сводим ДО пересылки: узел может быть на прежней сборке, где
+            // поля `pattern` ещё нет, и при разборе оно бы потерялось.
+            p.regex = Some(regex);
+            p.query = None;
+            p.pattern = None;
             return crate::federation::dispatcher::dispatch_remote(
                 &self.clients, &entry.ip, entry.port, "grep_text", &p,
             ).await;
         }
-        // `query` — алиас для `regex` (частая путаница моделей).
-        let regex = match p.regex.clone().or_else(|| p.query.clone()) {
-            Some(r) if !r.trim().is_empty() => r,
-            _ => return "{\"error\": \"grep_text: укажите regex= (синтаксис crate regex), не query=. Для кода .bsl/.py/.rs — grep_code(regex=…) или grep_body.\"}".to_string(),
-        };
         tools::grep_text(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
-    #[tool(description = "Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=): ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
-    async fn grep_code(&self, Parameters(p): Parameters<GrepCodeParams>) -> String {
+    #[tool(description = "Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body): ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
+    async fn grep_code(&self, Parameters(mut p): Parameters<GrepCodeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
+        // `query` — алиас для `regex`, `pattern` — буквальная подстрока
+        // (частая путаница моделей: имя переносится от grep_body/list_files).
+        let regex = match grep_regex_from_params(p.regex.clone(), p.query.clone(), p.pattern.clone()) {
+            Some(r) => r,
+            None => return "{\"error\": \"grep_code: укажите regex= (синтаксис crate regex) либо pattern= (буквальная подстрока). Для тел функций/классов — grep_body; для xml/md/yaml — grep_text.\"}".to_string(),
+        };
         if !entry.is_local {
+            // Ключи сводим ДО пересылки: узел может быть на прежней сборке, где
+            // поля `pattern` ещё нет, и при разборе оно бы потерялось.
+            p.regex = Some(regex);
+            p.query = None;
+            p.pattern = None;
             return crate::federation::dispatcher::dispatch_remote(
                 &self.clients, &entry.ip, entry.port, "grep_code", &p,
             ).await;
         }
-        // `query` — алиас для `regex` (частая путаница моделей).
-        let regex = match p.regex.clone().or_else(|| p.query.clone()) {
-            Some(r) if !r.trim().is_empty() => r,
-            _ => return "{\"error\": \"grep_code: укажите regex= (синтаксис crate regex), не query=. Для тел функций/классов — grep_body; для xml/md/yaml — grep_text(regex=…).\"}".to_string(),
-        };
         tools::grep_code(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
     }
 
@@ -2073,6 +2115,60 @@ mod param_alias_tests {
         )
         .expect("канонический ключ function_name");
         assert_eq!(canon.function_name, "X");
+    }
+
+    // ── Сведение ключей grep_code/grep_text к одному выражению ──────────────
+
+    // Явное выражение сильнее обоих запасных ключей и не экранируется.
+    #[test]
+    fn regex_сильнее_query_и_pattern() {
+        let got = grep_regex_from_params(
+            Some(r"Функция\s+\w+".to_string()),
+            Some("иначе".to_string()),
+            Some("тоже иначе".to_string()),
+        );
+        assert_eq!(got.as_deref(), Some(r"Функция\s+\w+"));
+    }
+
+    // Пустые (и пробельные) ключи равносильны незаданным — иначе `regex: ""`
+    // маскировал бы заданный `pattern`.
+    #[test]
+    fn пустые_ключи_считаются_незаданными() {
+        assert!(grep_regex_from_params(Some("  ".into()), Some("".into()), None).is_none());
+        assert!(grep_regex_from_params(None, None, None).is_none());
+        let got = grep_regex_from_params(Some("".into()), None, Some("Тест".into()));
+        assert_eq!(got.as_deref(), Some("(?i)Тест"));
+    }
+
+    // `pattern` — буквальная подстрока: спецсимволы экранируются, регистр не
+    // учитывается. Иначе `Модуль.Метод(` падал бы на незакрытой скобке.
+    #[test]
+    fn pattern_экранируется_и_ищется_без_учёта_регистра() {
+        let got = grep_regex_from_params(None, None, Some("Модуль.Метод(".to_string()))
+            .expect("pattern даёт выражение");
+        assert_eq!(got, r"(?i)Модуль\.Метод\(");
+        let re = ::regex::Regex::new(&got).expect("выражение компилируется");
+        assert!(re.is_match("    модуль.метод(Параметр);"));
+        // Точка экранирована — произвольный символ на её месте не подходит.
+        assert!(!re.is_match("МодульXМетод("));
+    }
+
+    // Ключ `pattern` доходит до разбора у обоих инструментов — иначе serde
+    // отбросил бы неизвестное поле, и подсказка «укажите regex» вернулась бы
+    // на осмысленном вызове.
+    #[test]
+    fn grep_params_принимают_pattern() {
+        let code: GrepCodeParams = serde_json::from_value(
+            serde_json::json!({"repo": "ut", "pattern": "ИмяФункции", "path_glob": "**/*.bsl"}),
+        )
+        .expect("grep_code должен принимать pattern");
+        assert_eq!(code.pattern.as_deref(), Some("ИмяФункции"));
+        assert!(code.regex.is_none());
+
+        let text: GrepTextParams =
+            serde_json::from_value(serde_json::json!({"repo": "ut", "pattern": "ИмяФункции"}))
+                .expect("grep_text должен принимать pattern");
+        assert_eq!(text.pattern.as_deref(), Some("ИмяФункции"));
     }
 }
 
