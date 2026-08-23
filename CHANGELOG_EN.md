@@ -5,6 +5,26 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.66.0] — 2026-08-23
+
+**Content search over code and text accepts a `pattern` key — a literal substring, with exactly the meaning it already has in body search. These two tools had no such key before, and a call using it wasted a turn on a hint.**
+
+> Context. Inside one tool family the same name meant different things: in body search `pattern` is a literal substring, in the file listing it is a path mask, and in code and text content search the key did not exist at all. A model that had just used a neighbouring tool carried the familiar name over, got the hint "specify regex", and asked again correctly on the next turn. Every such call burned a turn — a recurring pattern, not a one-off slip.
+
+### Added
+
+- **`grep_code` and `grep_text` accept `pattern`.** The value is treated as a literal, case-insensitive substring — the same meaning the key already has in body search. The string is escaped before searching, so parentheses, dots and asterisks inside a method name no longer break the call: the very same text passed as a regular expression is rejected by the parser on the unbalanced parenthesis. The existing keys are untouched: `regex` wins over everything, `query` remains its synonym, and an empty value counts as absent instead of masking a filled key.
+- **The hint for a call with no keys now names both options.** The previous one offered a regular expression only, although a literal substring is usually what is wanted.
+
+### Changed
+
+- **Keys are reduced to a single expression before forwarding to a remote node.** Previously the request was forwarded verbatim and the unknown key was silently dropped by the parser on the other side — the new option would have required both sides to be upgraded at once. The receiving side now gets a ready expression in a key it has always understood, and a node on the previous build answers correctly. Verified against a remote repository before the node was updated.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-targets` — 798 passed, 0 failed, zero build warnings. Five new ones cover key precedence, an empty value counting as absent, escaping together with a check of the resulting expression against real text, and both parameter sets accepting the key.
+- **Live check on the federation node (Linux):** requests sent straight to the receiving side, bypassing the local serving process. A substring with an unbalanced parenthesis — three matches; the same text as an expression — "invalid regex"; the same substring in upper case — the same matches (Cyrillic, case-insensitive); text search with a substring — a match; a call with no keys — the new hint.
+
 ## [0.65.0] — 2026-08-22
 
 **Eight small audit findings closed in a single release. None of them changes index content — no reindex required.**
