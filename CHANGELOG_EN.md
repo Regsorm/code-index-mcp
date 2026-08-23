@@ -5,6 +5,31 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.67.0] — 2026-08-23
+
+**A file held by another process at read time no longer stays in the index at its previous version. The event is deferred and retried on a schedule, and the names of unapplied files moved out of debug logging into the ordinary log.**
+
+> Context. A configuration export does not write its files instantly. The watcher catches the change and reaches for the file while the export still holds it open exclusively — the read fails with "file is used by another process". Such an event used to be dropped silently, leaving the file in the index at its previous version until its next edit. For the configuration composition file that means the object inventory diverges from disk indefinitely: the next edit may be weeks away. The log meanwhile said "processed INCOMPLETELY, 1 failure" without a single name — finding out which file lagged behind required reproducing the case with debug logging on.
+
+### Added
+
+- **A deferred-retry queue per watched folder.** An event that failed because the file was busy is no longer dropped but queued in that folder's worker thread: the file path, the event itself, the number of attempts made and the time of the next one. The queue lives in the thread's memory and is separate for every folder. The pauses grow: 2 → 5 → 15 → 30 → 60 seconds, six attempts counting the first — about two minutes in total, enough for an ordinary export.
+- **A due retry forms a batch on its own.** When the folder is quiet, the watch loop checks the queue and takes the files whose time has come. Without this a retry would wait for some other file in the same folder to be edited, and once the export is finished there will be no such edit.
+- **Running out of attempts is visible in the log.** A persistently unreadable file is named together with the number of attempts made and a note that the stale version in the index will be refreshed on the file's next change or on a daemon restart. The queue entry is released at that point — there are no endless retries.
+
+### Changed
+
+- **Applying an event now has three outcomes instead of two.** Previously "succeeded / failed"; a transient cause is now told apart. A parse failure, a database write failure or a delete failure is pointless to retry — the result would be the same, and such events are dropped as before. Only a failed read from disk is treated separately: what got in the way was the circumstances, not the file's content.
+- **Names of unapplied files are logged at the ordinary level, not the debug one.** Up to five names with a reason each go into the summary; if there are more, a counter of the rest is appended. The full list is still not printed: on a broken export there are thousands of them and they would drown the log.
+- **The batch summary names busy files separately.** The old wording "these files stayed in the index at their previous version" read as a loss without that qualifier, even though a retry has already been scheduled.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-features` — 812 passed, 0 failed, zero build warnings. Five new ones cover: a due retry joining a batch on its own; a file that arrived through its own event not being duplicated by a second copy from the queue; a successful attempt removing the file from the queue; attempts being bounded so the queue does not grow; busy files being named separately in the summary text.
+- **Stand on an isolated daemon (Windows), two scenarios.** The file is held exclusively the same way an export holds it. First scenario — hold and release: the busy state was recognised, the retry started on its own, the new content reached the index (verified by content hash). Second — hold longer than all the pauses: six attempts on schedule (2, 5, 15, 30, 60 s), a refusal naming the file, retries stopped, and the next edit of the same file was picked up by the ordinary path.
+- **Live check on the working daemon.** A temporary file in a watched folder of a typical trade configuration: the busy state was named in the log at the ordinary level, the retry fired, the index caught up with disk.
+- **Live check on the federation node (Linux).** Windows-style locks do not exist there, so unreadability is produced by revoking permissions — for the code this is the same "could not read" outcome. The retry was checked while the permissions were still revoked: there are no filesystem events during that time, so only the queue timer could have produced the attempt. All four checks passed.
+
 ## [0.66.0] — 2026-08-23
 
 **Content search over code and text accepts a `pattern` key — a literal substring, with exactly the meaning it already has in body search. These two tools had no such key before, and a call using it wasted a turn on a hint.**
