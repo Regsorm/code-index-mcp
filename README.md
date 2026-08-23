@@ -505,7 +505,7 @@ Starting with v0.5, `code-index` uses a **one-writer / many-readers** architectu
 `code-index daemon run` starts a long-running process that:
 
 1. Loads the list of watched folders from `daemon.toml`.
-2. For each folder: opens `.code-index/index.db`, runs full reindex with mtime fast-path (v0.4.0), then switches to a `notify` watcher that re-indexes on change (1.5s debounce, 2s batch).
+2. For each folder: opens `.code-index/index.db`, runs full reindex with mtime fast-path (v0.4.0), then switches to a `notify` watcher that re-indexes on change (1.5s debounce, 2s batch). A file held by another process at read time (a configuration export still writing it) is not lost: the event is deferred and retried with a growing pause of 2 → 5 → 15 → 30 → 60 s, six attempts counting the first. Once they run out, the daemon names the file in the log.
 3. Exposes a local health / management HTTP endpoint on loopback (port written to `daemon.json` in the state directory).
 4. Holds a global PID-lock (`daemon.pid`) to prevent two daemons per machine.
 
