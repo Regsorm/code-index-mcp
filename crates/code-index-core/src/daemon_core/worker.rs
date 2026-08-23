@@ -20,7 +20,7 @@ use crate::parser::LanguageParser;
 use crate::parser::ParserRegistry;
 use crate::storage::memory::StorageConfig;
 use crate::storage::Storage;
-use crate::watcher::{create_watcher, poll_batch, FileEvent, WatcherConfig};
+use crate::watcher::{create_watcher, event_path, poll_batch, FileEvent, WatcherConfig};
 
 use super::cache_client::CacheClient;
 use super::config::{IndexerSection, PathEntry};
@@ -89,6 +89,26 @@ struct BatchContext<'a> {
     index_config: &'a IndexConfig,
 }
 
+/// Паузы перед повторной попыткой прочитать занятый файл, в секундах. Длина
+/// массива — и есть предел числа повторов: в сумме они покрывают выгрузку
+/// примерно на две минуты, дальше файл отпускается с записью в журнал.
+const BUSY_RETRY_DELAYS_SEC: [u64; 5] = [2, 5, 15, 30, 60];
+
+/// Сколько имён не применённых файлов называть в сводке по пакету. На сломанной
+/// выгрузке их тысячи, и полный список утопил бы журнал; точное их число
+/// остаётся в счётчике «сбоев N».
+const STUCK_NAMES_IN_SUMMARY: usize = 5;
+
+/// Отложенный повтор по одному файлу.
+struct BusyRetry {
+    /// Что повторяем — то же событие, что пришло от наблюдателя.
+    event: FileEvent,
+    /// Сколько попыток уже сделано, считая первую. По нему берётся пауза.
+    attempts: usize,
+    /// Когда пробовать снова.
+    due: std::time::Instant,
+}
+
 /// Обработать один пакет событий файловой системы: пометить пути «грязными» в
 /// кэше выдачи, применить каждое событие, зафиксировать транзакцию, пересобрать
 /// надстройку по изменившимся файлам, сбросить кэш и выставить итоговый статус.
@@ -96,10 +116,16 @@ struct BatchContext<'a> {
 /// Вынесено из `run_worker` (находка G-2): цикл слежения теперь читается как
 /// «взять пакет → обработать → решить, продолжать ли», а сама обработка стала
 /// самостоятельной единицей.
+///
+/// В `busy_out` складываются события, которые не применились из-за занятого
+/// файла: вызывающий откладывает их на повтор. Полный проход (пачка больше
+/// порога) занятые файлы не различает и `busy_out` не трогает — там устаревшее
+/// подберёт следующая сверка по времени изменения.
 fn process_batch(
     ctx: &BatchContext<'_>,
     storage: &mut Storage,
     batch: &[FileEvent],
+    busy_out: &mut Vec<FileEvent>,
 ) -> BatchStep {
     // Ранний mark-dirty (#1471): сообщаем cache-ci об изменённых путях с
     // observed-mtime ДО переразбора/commit. Это даёт прокси сразу пометить
@@ -181,8 +207,13 @@ fn process_batch(
     // Сколько событий батча применить не удалось. Ненулевой счётчик означает
     // неполный срез: часть файлов осталась в индексе прежней версии.
     let mut failed = 0usize;
+    // Из них — не прочитанных из-за занятого файла: их вызывающий повторит.
+    let mut busy = 0usize;
+    // Имена не применённых файлов для сводки: без них в журнале видно только
+    // «сбоев N», и выяснять, какие это файлы, приходится с включённой отладкой.
+    let mut stuck_names: Vec<String> = Vec::new();
     for event in batch {
-        if !apply_event(
+        match apply_event(
             storage,
             ctx.path,
             event,
@@ -191,7 +222,17 @@ fn process_batch(
             ctx.repo_language,
             ctx.extra_text_extensions,
         ) {
-            failed += 1;
+            ApplyOutcome::Applied => {}
+            ApplyOutcome::Failed => {
+                failed += 1;
+                remember_stuck(&mut stuck_names, ctx.path, event, "не применён");
+            }
+            ApplyOutcome::Busy => {
+                failed += 1;
+                busy += 1;
+                busy_out.push(event.clone());
+                remember_stuck(&mut stuck_names, ctx.path, event, "занят");
+            }
         }
         done += 1;
         if done % 50 == 0 || done == batch_len {
@@ -225,6 +266,22 @@ fn process_batch(
     crate::logging::stage_set_detail("разбор файлов", applied.clone());
     crate::logging::stage_set_detail("запись в базу", applied);
     let _ = apply_started;
+
+    // Имена — обычным уровнем, не отладкой: без них по журналу не понять, какой
+    // именно файл отстал, а включать отладку задним числом уже поздно.
+    if !stuck_names.is_empty() {
+        let more = failed - stuck_names.len();
+        tracing::warn!(
+            "[{}] не применены файлы: {}{}",
+            ctx.path.display(),
+            stuck_names.join(", "),
+            if more > 0 {
+                format!(" и ещё {}", more)
+            } else {
+                String::new()
+            }
+        );
+    }
 
     // Файлы применены: снять отметку об этапе и обнулить счётчик. Иначе строка
     // состояния демона продолжает показывать «применение файлов, 2000/2000
@@ -313,6 +370,7 @@ fn process_batch(
         BatchResult {
             commit_ok,
             failed,
+            busy,
             batch_len,
             extras_ok,
             extras_ms,
@@ -421,8 +479,10 @@ fn process_batch_full_pass(
         BatchResult {
             commit_ok: core_ok,
             // Полный проход не считает сбои по отдельным файлам: он либо
-            // прошёл целиком, либо вернул ошибку.
+            // прошёл целиком, либо вернул ошибку. Занятых файлов он поэтому
+            // тоже не различает — устаревшее подберёт следующая сверка.
             failed: 0,
+            busy: 0,
             batch_len,
             extras_ok,
             extras_ms,
@@ -436,6 +496,9 @@ fn process_batch_full_pass(
 struct BatchResult {
     commit_ok: bool,
     failed: usize,
+    /// Сколько из `failed` — не прочитанные из-за занятого файла: они
+    /// поставлены на повтор, и в сводке это сказано отдельно.
+    busy: usize,
     batch_len: usize,
     extras_ok: bool,
     extras_ms: u128,
@@ -457,6 +520,7 @@ fn finish_batch(
     let BatchResult {
         commit_ok,
         failed,
+        busy,
         batch_len,
         extras_ok,
         extras_ms,
@@ -498,7 +562,7 @@ fn finish_batch(
     // применение каждого события, фиксация транзакции и пересборка extras.
     // Провал любого из них означает неполный срез, а Ready на нём — ложное
     // «готово»: сервер выдачи начал бы отдавать устаревшее как актуальное.
-    let outcome = batch_outcome(commit_ok, failed, batch_len, extras_ok);
+    let outcome = batch_outcome(commit_ok, failed, busy, batch_len, extras_ok);
     // Сводка того же вида, что у первичной индексации: начало, этапы, конец.
     // Печатается при любой настройке подробности.
     let stages = crate::logging::stages_take();
@@ -1146,6 +1210,14 @@ pub fn run_worker(
         index_config: &index_config,
     };
 
+    // Отложенные повторы по занятым файлам: путь → событие, счётчик попыток и
+    // срок следующей. Живут в памяти этого потока, то есть свои у каждой папки.
+    // Потерять их при перезапуске демона не страшно: по не применённому файлу в
+    // базе осталось прежнее время изменения, и стартовая сверка возьмёт его
+    // заново.
+    let mut retries: std::collections::HashMap<PathBuf, BusyRetry> =
+        std::collections::HashMap::new();
+
     loop {
         if shutdown_received(&mut shutdown_rx) {
             break;
@@ -1177,17 +1249,45 @@ pub fn run_worker(
                         batch_ms
                     );
                 }
-                b
+                b.events
             }
-            Ok(None) => continue, // idle timeout — проверим shutdown на следующей итерации
-            Err(_) => break,      // канал закрыт — watcher дропнут
+            // Тишина в папке. Это ещё не повод идти на новый круг: мог подойти
+            // срок повтора по занятому файлу, а своего события по нему больше
+            // не будет — выгрузка закончилась, менять уже нечего.
+            Ok(None) => Vec::new(),
+            Err(_) => break, // канал закрыт — watcher дропнут
         };
-        let batch = collected.events;
+
+        let from_watcher = collected.len();
+        let now = std::time::Instant::now();
+        let (batch, retried) = with_due_retries(collected, &retries, now);
         if batch.is_empty() {
             continue;
         }
+        if retried > 0 {
+            let files = crate::logging::plural(retried as u64, "файл", "файла", "файлов");
+            if from_watcher == 0 {
+                // Своей строки о сборе изменений у такой пачки нет — черту
+                // ставим сами, иначе её сводка приклеится к прошлой работе.
+                crate::logging::block_separator();
+                tracing::info!(
+                    "[{}] повторная попытка по файлам, которые были заняты: {}",
+                    path.display(),
+                    files
+                );
+            } else {
+                tracing::info!(
+                    "[{}] к пачке добавлено на повторную попытку: {}",
+                    path.display(),
+                    files
+                );
+            }
+        }
 
-        match process_batch(&ctx, &mut storage, &batch) {
+        let mut busy: Vec<FileEvent> = Vec::new();
+        let step = process_batch(&ctx, &mut storage, &batch, &mut busy);
+        note_busy_retries(&mut retries, &batch, busy, std::time::Instant::now(), &path);
+        match step {
             BatchStep::Continue => {}
             BatchStep::Stop => break,
         }
@@ -1235,6 +1335,7 @@ async fn acquire_initial_slot(
 fn batch_outcome(
     commit_ok: bool,
     failed: usize,
+    busy: usize,
     batch_len: usize,
     extras_ok: bool,
 ) -> Result<(), String> {
@@ -1244,10 +1345,18 @@ fn batch_outcome(
         );
     }
     if failed > 0 {
+        // Занятый файл упоминаем отдельно: он поставлен в очередь на повтор, и
+        // без этой оговорки строка про «прежнюю версию» читается как потеря,
+        // хотя на обычной выгрузке конфигурации файл доедет через секунды.
+        let busy_note = if busy > 0 {
+            format!(" (занятых файлов {} — поставлены на повтор)", busy)
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "батч применён частично: {} из {} событий не удалось — эти файлы \
+            "батч применён частично: {} из {} событий не удалось{} — эти файлы \
              остались в индексе прежней версии, см. журнал демона",
-            failed, batch_len
+            failed, batch_len, busy_note
         ));
     }
     if !extras_ok {
@@ -1258,13 +1367,101 @@ fn batch_outcome(
     Ok(())
 }
 
+/// Запомнить имя не применённого файла для сводки по пакету — но не больше
+/// `STUCK_NAMES_IN_SUMMARY` штук.
+fn remember_stuck(names: &mut Vec<String>, root: &PathBuf, event: &FileEvent, why: &str) {
+    if names.len() >= STUCK_NAMES_IN_SUMMARY {
+        return;
+    }
+    let abs = event_path(event);
+    let rel = abs
+        .strip_prefix(root)
+        .unwrap_or(abs)
+        .to_string_lossy()
+        .replace('\\', "/");
+    names.push(format!("{} ({})", rel, why));
+}
+
+/// Добавить к пачке от наблюдателя отложенные повторы, чей срок подошёл.
+/// Возвращает пачку и число добавленного.
+///
+/// Файлы, по которым событие пришло своим ходом, повторно не добавляем: они и
+/// так будут применены в этой пачке, а запись о повторе снимет
+/// `note_busy_retries` по её итогам.
+fn with_due_retries(
+    mut batch: Vec<FileEvent>,
+    retries: &std::collections::HashMap<PathBuf, BusyRetry>,
+    now: std::time::Instant,
+) -> (Vec<FileEvent>, usize) {
+    let in_batch: std::collections::HashSet<PathBuf> =
+        batch.iter().map(|e| event_path(e).clone()).collect();
+    let due: Vec<FileEvent> = retries
+        .values()
+        .filter(|r| r.due <= now && !in_batch.contains(event_path(&r.event)))
+        .map(|r| r.event.clone())
+        .collect();
+    let added = due.len();
+    batch.extend(due);
+    (batch, added)
+}
+
+/// Обновить очередь повторов по итогам пачки.
+///
+/// Файл, который снова оказался занят, получает +1 к счётчику попыток и новый
+/// срок; исчерпав их, уходит из очереди с записью в журнал. Всё остальное из
+/// пачки из очереди снимается: событие либо применено, либо провалилось
+/// насовсем — повторять нечего.
+fn note_busy_retries(
+    retries: &mut std::collections::HashMap<PathBuf, BusyRetry>,
+    batch: &[FileEvent],
+    busy: Vec<FileEvent>,
+    now: std::time::Instant,
+    root: &Path,
+) {
+    let busy_paths: std::collections::HashSet<PathBuf> =
+        busy.iter().map(|e| event_path(e).clone()).collect();
+    for event in batch {
+        let p = event_path(event);
+        if !busy_paths.contains(p) {
+            retries.remove(p);
+        }
+    }
+    for event in busy {
+        let p = event_path(&event).clone();
+        let attempts = retries.get(&p).map(|r| r.attempts).unwrap_or(0) + 1;
+        match BUSY_RETRY_DELAYS_SEC.get(attempts - 1) {
+            Some(&delay) => {
+                retries.insert(
+                    p,
+                    BusyRetry {
+                        event,
+                        attempts,
+                        due: now + std::time::Duration::from_secs(delay),
+                    },
+                );
+            }
+            None => {
+                retries.remove(&p);
+                tracing::warn!(
+                    "[{}] файл {} занят другим процессом: после {} попыток прочитать не удалось. \
+                     В индексе осталась прежняя версия — она обновится при следующем изменении \
+                     файла или при перезапуске демона",
+                    root.display(),
+                    p.display(),
+                    attempts
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn готово_только_когда_прошли_все_три_шага() {
-        assert!(batch_outcome(true, 0, 5, true).is_ok());
+        assert!(batch_outcome(true, 0, 0, 5, true).is_ok());
     }
 
     /// Ограничение не задано — слот не нужен, воркер идёт дальше без ожидания.
@@ -1295,7 +1492,7 @@ mod tests {
 
     #[test]
     fn провал_фиксации_не_даёт_готово() {
-        let err = batch_outcome(false, 0, 5, true).unwrap_err();
+        let err = batch_outcome(false, 0, 0, 5, true).unwrap_err();
         assert!(err.contains("фиксация"), "текст: {err}");
     }
 
@@ -1303,7 +1500,7 @@ mod tests {
     /// объявлялась готовой на неполном срезе.
     #[test]
     fn частично_применённый_батч_не_даёт_готово() {
-        let err = batch_outcome(true, 2, 7, true).unwrap_err();
+        let err = batch_outcome(true, 2, 0, 7, true).unwrap_err();
         assert!(err.contains("2 из 7"), "текст: {err}");
     }
 
@@ -1311,7 +1508,7 @@ mod tests {
     /// срезе вводит в заблуждение, и признака рассогласования в выдаче нет.
     #[test]
     fn провал_пересборки_extras_не_даёт_готово() {
-        let err = batch_outcome(true, 0, 3, false).unwrap_err();
+        let err = batch_outcome(true, 0, 0, 3, false).unwrap_err();
         assert!(err.contains("extras"), "текст: {err}");
     }
 
@@ -1319,8 +1516,100 @@ mod tests {
     /// без фиксации остальные причины вторичны.
     #[test]
     fn провал_фиксации_важнее_прочих_причин() {
-        let err = batch_outcome(false, 3, 3, false).unwrap_err();
+        let err = batch_outcome(false, 3, 0, 3, false).unwrap_err();
         assert!(err.contains("фиксация"), "текст: {err}");
+    }
+
+    /// Занятый файл поставлен на повтор — в тексте это должно быть сказано,
+    /// иначе «остались в индексе прежней версии» читается как потеря.
+    #[test]
+    fn занятые_файлы_названы_отдельно() {
+        let err = batch_outcome(true, 1, 1, 7, true).unwrap_err();
+        assert!(err.contains("занятых файлов 1"), "текст: {err}");
+        assert!(err.contains("повтор"), "текст: {err}");
+    }
+
+    fn занятый(путь: &str) -> FileEvent {
+        FileEvent::Modified(PathBuf::from(путь))
+    }
+
+    /// Срок повтора подошёл, своего события по файлу больше нет — он обязан
+    /// попасть в пачку сам. Иначе повтор дождётся правки чужого файла, а её на
+    /// законченной выгрузке уже не будет.
+    #[test]
+    fn созревший_повтор_попадает_в_пачку_сам() {
+        let now = std::time::Instant::now();
+        let mut retries = std::collections::HashMap::new();
+        let mut busy = Vec::new();
+        busy.push(занятый("C:/repo/Configuration.xml"));
+        note_busy_retries(&mut retries, &[], busy, now, Path::new("C:/repo"));
+
+        // Сразу срок не подошёл — пачка пустая.
+        let (пачка, добавлено) = with_due_retries(Vec::new(), &retries, now);
+        assert!(пачка.is_empty() && добавлено == 0);
+
+        // Через паузу первой попытки — файл сам просится в работу.
+        let позже = now + std::time::Duration::from_secs(BUSY_RETRY_DELAYS_SEC[0] + 1);
+        let (пачка, добавлено) = with_due_retries(Vec::new(), &retries, позже);
+        assert_eq!(добавлено, 1);
+        assert_eq!(пачка.len(), 1);
+    }
+
+    /// Файл пришёл своим событием — вторым экземпляром из очереди его в ту же
+    /// пачку класть нельзя: он был бы разобран и записан дважды.
+    #[test]
+    fn пришедший_своим_событием_не_дублируется() {
+        let now = std::time::Instant::now();
+        let mut retries = std::collections::HashMap::new();
+        note_busy_retries(
+            &mut retries,
+            &[],
+            vec![занятый("C:/repo/Configuration.xml")],
+            now - std::time::Duration::from_secs(600),
+            Path::new("C:/repo"),
+        );
+        let (пачка, добавлено) = with_due_retries(
+            vec![занятый("C:/repo/Configuration.xml")],
+            &retries,
+            now,
+        );
+        assert_eq!(добавлено, 0);
+        assert_eq!(пачка.len(), 1);
+    }
+
+    /// Файл прочитался — запись о повторе должна исчезнуть, иначе он будет
+    /// перечитываться по кругу до конца жизни демона.
+    #[test]
+    fn удачная_попытка_снимает_файл_с_очереди() {
+        let now = std::time::Instant::now();
+        let mut retries = std::collections::HashMap::new();
+        let событие = занятый("C:/repo/Configuration.xml");
+        note_busy_retries(&mut retries, &[], vec![событие.clone()], now, Path::new("C:/repo"));
+        assert_eq!(retries.len(), 1);
+
+        // Тот же файл в пачке, среди занятых его нет — значит применён.
+        note_busy_retries(&mut retries, &[событие], Vec::new(), now, Path::new("C:/repo"));
+        assert!(retries.is_empty());
+    }
+
+    /// Устойчиво занятый файл не должен крутиться в очереди вечно: попытки
+    /// кончаются, запись снимается, имя уходит в журнал.
+    #[test]
+    fn попытки_ограничены_и_очередь_не_растёт() {
+        let now = std::time::Instant::now();
+        let mut retries = std::collections::HashMap::new();
+        let событие = занятый("C:/repo/Configuration.xml");
+        // Первая неудача плюс все повторы — на последнем файл отпускается.
+        for _ in 0..=BUSY_RETRY_DELAYS_SEC.len() {
+            note_busy_retries(
+                &mut retries,
+                &[],
+                vec![событие.clone()],
+                now,
+                Path::new("C:/repo"),
+            );
+        }
+        assert!(retries.is_empty(), "очередь: {}", retries.len());
     }
 
     /// Пустая база, созданная сервером выдачи заранее, не должна считаться
@@ -1459,12 +1748,37 @@ const CORE_STAGES: [&str; 7] = [
     "дозаполнение содержимого",
 ];
 
+/// Исход применения одного события файловой системы.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyOutcome {
+    /// Событие применено: индекс в этом месте догнал диск.
+    Applied,
+    /// Применить не удалось, и повтор ничего не изменит: файл не разобран
+    /// парсером, не записан в БД или не удалён из неё.
+    Failed,
+    /// Файл не прочитан, потому что его держит другой процесс. На выгрузке
+    /// конфигурации 1С это обычное дело: наблюдатель успевает дёрнуть файл,
+    /// пока выгрузка его ещё пишет. Причина временная — событие стоит повторить.
+    Busy,
+}
+
+impl ApplyOutcome {
+    /// Худший из двух исходов: `Failed` перевешивает `Busy`, `Busy` — `Applied`.
+    /// Нужен обходу каталога, где исход складывается из многих файлов.
+    fn worse(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Failed, _) | (_, Self::Failed) => Self::Failed,
+            (Self::Busy, _) | (_, Self::Busy) => Self::Busy,
+            _ => Self::Applied,
+        }
+    }
+}
+
 /// Обработать одно событие файловой системы: пересчитать хеш, записать/удалить в БД.
 ///
-/// Возвращает `false`, если применить событие не удалось: файл не прочитан по
-/// причине кроме NotFound, не разобран парсером, не записан в БД или не удалён
-/// из неё. Вызывающий считает такие случаи и не выдаёт по батчу статус «готово»:
-/// индекс в этом месте остался на прежнем срезе, и «готово» было бы ложным.
+/// И `Failed`, и `Busy` означают, что индекс в этом месте остался на прежнем
+/// срезе: вызывающий считает такие случаи и не выдаёт по батчу статус «готово» —
+/// оно было бы ложным. Разница между ними только в том, есть ли смысл повторять.
 ///
 /// Исчезнувший файл (NotFound) ошибкой НЕ считается — это штатный ход
 /// atomic-save через `.tmp` → rename, иначе каждое сохранение из редактора
@@ -1477,7 +1791,7 @@ fn apply_event(
     max_code_file_size: usize,
     repo_language: Option<&str>,
     extra_text_extensions: &[String],
-) -> bool {
+) -> ApplyOutcome {
     match event {
         FileEvent::Modified(abs) | FileEvent::Created(abs) => {
             // Событие на существующем каталоге = папку создали или переименовали.
@@ -1502,14 +1816,19 @@ fn apply_event(
                     // NotFound — не ошибка, тихо игнорируем.
                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                         if io_err.kind() == std::io::ErrorKind::NotFound {
-                            return true;
+                            return ApplyOutcome::Applied;
                         }
                     }
                     // Пофайловые сбои — на уровне отладки: на сломанной выгрузке
                     // их тысячи, и в обычном журнале они топят всё остальное.
                     // Сводку по пакету даёт `batch_outcome`.
                     tracing::debug!("[{}] не прочитан {}: {}", root.display(), abs.display(), e);
-                    return false;
+                    // Помешало не содержимое файла, а обстоятельства: единственный
+                    // источник ошибки здесь — чтение с диска, и почти всегда это
+                    // чужой процесс, держащий файл (выгрузка конфигурации ещё
+                    // идёт). Просим повтора; на устойчивой причине (нет прав)
+                    // повторы кончатся по счётчику, и файл уйдёт в журнал по имени.
+                    return ApplyOutcome::Busy;
                 }
             };
 
@@ -1656,7 +1975,11 @@ fn apply_event(
                 }
                 FileCategory::Binary => {}
             }
-            ok
+            if ok {
+                ApplyOutcome::Applied
+            } else {
+                ApplyOutcome::Failed
+            }
         }
         FileEvent::Deleted(abs) => {
             let delete_started = std::time::Instant::now();
@@ -1695,7 +2018,11 @@ fn apply_event(
                 }
             }
             crate::logging::stage_add("удаление исчезнувших", delete_started.elapsed());
-            ok
+            if ok {
+                ApplyOutcome::Applied
+            } else {
+                ApplyOutcome::Failed
+            }
         }
     }
 }
@@ -1709,7 +2036,9 @@ fn apply_event(
 /// пропускаем: без этого демон поймал бы собственные записи WAL и ушёл в петлю
 /// переиндексации.
 ///
-/// Возвращает `false`, если хотя бы один файл внутри применить не удалось.
+/// Возвращает худший исход по файлам внутри: `Failed`, если хоть один не
+/// применён насовсем, иначе `Busy`, если хоть один занят и ждёт повтора,
+/// иначе `Applied`.
 fn apply_dir_scan(
     storage: &mut Storage,
     root: &PathBuf,
@@ -1718,21 +2047,22 @@ fn apply_dir_scan(
     max_code_file_size: usize,
     repo_language: Option<&str>,
     extra_text_extensions: &[String],
-) -> bool {
+) -> ApplyOutcome {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
             // Каталог мог исчезнуть между событием и обходом — это гонка, а не
             // поломка индекса: сообщение о его удалении придёт своим событием.
             if e.kind() == std::io::ErrorKind::NotFound {
-                return true;
+                return ApplyOutcome::Applied;
             }
             tracing::debug!("[{}] обход каталога {}: {}", root.display(), dir.display(), e);
-            return false;
+            // Причина та же, что у занятого файла, и лечится тем же повтором.
+            return ApplyOutcome::Busy;
         }
     };
 
-    let mut ok = true;
+    let mut worst = ApplyOutcome::Applied;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -1744,7 +2074,7 @@ fn apply_dir_scan(
             if excluded {
                 continue;
             }
-            if !apply_dir_scan(
+            worst = worst.worse(apply_dir_scan(
                 storage,
                 root,
                 &path,
@@ -1752,11 +2082,9 @@ fn apply_dir_scan(
                 max_code_file_size,
                 repo_language,
                 extra_text_extensions,
-            ) {
-                ok = false;
-            }
-        } else if path.is_file()
-            && !apply_event(
+            ));
+        } else if path.is_file() {
+            worst = worst.worse(apply_event(
                 storage,
                 root,
                 &FileEvent::Created(path.clone()),
@@ -1764,10 +2092,8 @@ fn apply_dir_scan(
                 max_code_file_size,
                 repo_language,
                 extra_text_extensions,
-            )
-        {
-            ok = false;
+            ));
         }
     }
-    ok
+    worst
 }

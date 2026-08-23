@@ -300,7 +300,7 @@ pub struct Batch {
 }
 
 /// Вспомогательная функция: извлечь путь из события
-fn event_path(event: &FileEvent) -> &PathBuf {
+pub(crate) fn event_path(event: &FileEvent) -> &PathBuf {
     match event {
         FileEvent::Created(p) | FileEvent::Modified(p) | FileEvent::Deleted(p) => p,
     }
