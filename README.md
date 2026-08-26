@@ -595,7 +595,8 @@ reports zero size — the file is being written all along, read its contents.
   "batch_size": 500,
   "storage_mode": "auto",
   "memory_max_percent": 50,
-  "memory_estimate_factor": 3.0,
+  "memory_estimate_factor": 2.0,
+  "chunk_budget_bytes": 536870912,
   "debounce_ms": 1500,
   "batch_ms": 2000
 }
@@ -605,7 +606,8 @@ Key fields:
 
 - **storage_mode** — `auto` decides by calculation (see below); `memory` forces in-memory; `disk` forces on-disk
 - **memory_max_percent** — share of FREE memory the in-memory database may use in `auto` mode (50% by default)
-- **memory_estimate_factor** — how many times working in RAM costs more than the source files weigh (3.0 by default)
+- **memory_estimate_factor** — how many times working in RAM costs more than the source files weigh (2.0 by default)
+- **chunk_budget_bytes** — how many bytes of sources go into one pass of a full parse (512 MB by default); zero turns chunking off
 
 **How `auto` works.** Before indexing, the folder is weighed: the size of the files that will be indexed is summed (metadata only, 1–3 seconds for 60,000 files). Then the calculation:
 
@@ -619,22 +621,45 @@ otherwise                      → the database goes straight to disk
 
 Free memory is re-read for every folder, not once at startup. After working in RAM the freed memory is returned to the system, so the next folder gets it back. Both sides of the calculation, the multiplier and the decision are logged.
 
-**When to change `memory_estimate_factor`.** The default 3.0 is the middle of the observed spread, not headroom on top of it. Measurements across folders range from about 2 to over 4:
+**Parsing runs in chunks (v0.68.0).** Peak memory is set by `chunk_budget_bytes` (512 MB by default), not by how large the folder is. Files are read, parsed, compressed and written to the database in chunks of that size, and the memory of each chunk is released before the next one starts. Previously the entire folder content and its parse trees were held at once, so on a large folder usage hit the ceiling of the machine or container.
 
-| Source weight | Memory used | Actual factor |
-|---:|---:|---:|
-| 3.8 GB | 8.6 GB | 2.3 |
-| 6.7 GB | 19.0 GB | 2.8 |
-| 5.3 GB | 18.6 GB | 3.5 |
-| 1.8 GB | 8.0 GB | 4.4 |
+Measured on a 1C configuration of 57,072 files (database on disk, initial indexing from scratch):
 
-The spread depends on the language, on how densely the files are packed with code, and on what the folder contains, so the factor cannot be predicted up front — it is tuned from the log, which records both the estimate and the decision.
+| Chunk budget | Peak memory | Core time |
+|---|---:|---:|
+| chunking off (as before) | 4.40 GB | 49.4 s |
+| 512 MB (default) | 1.42 GB | 52.2 s |
+
+On a forced full parse of the same repository a 128 MB budget brings the peak down to 0.67 GB, against 4.46 GB with chunking off.
+
+Chunk boundaries cost a few percent of time: the single-threaded database write does not overlap with parsing the next chunk.
+
+The setting works both in the per-folder settings file and globally in `daemon.toml`:
+
+```toml
+[indexer]
+chunk_budget_bytes = 134217728   # 128 MB — for a container with a hard memory limit
+```
+
+Zero turns chunking off: the whole tree is read at once, as before. Chunking applies where the whole tree goes into parsing — initial indexing, a forced full parse, and resuming an interrupted load; ordinary edits touch few files and are unaffected.
+
+**Resuming an interrupted load.** If the process was killed mid-way through initial indexing (out of memory, a reboot), the chunks already written stay in the database along with a marker that the load is unfinished. The next run sees it, reads only the missing files and builds the indexes, instead of starting over. While the marker is set the database is not treated as ready: its indexes and full-text search are not built yet.
+
+**When to change `memory_estimate_factor`.** The default 2.0 is the middle of the observed spread, not headroom on top of it. Measurements of initial indexing with the database in RAM:
+
+| Source weight | Files | Memory used | Actual factor |
+|---:|---:|---:|---:|
+| 1.4 GB | 191,417 | 2.4 GB | 1.7 |
+| 3.7 GB | 60,294 | 4.4 GB | 1.2 |
+| 5.3 GB | 92,300 | 8.8 GB | 1.6 |
+
+Before chunked parsing the same folders ranged from 1.7 to 3.2 and the default was 3.0. The spread depends on the language, on how densely the files are packed with code, and on what the folder contains, so the factor cannot be predicted up front — it is tuned from the log, which records both the estimate and the decision.
 
 | Situation | Value | Result |
 |---|---:|---|
-| Little RAM, weak machine | 4.0 and up | Disk more often: slower, but predictable, with no risk of running out. On weak machines this is the direction that matters |
-| Ordinary machine | 3.0 | Default |
-| Plenty of RAM, willing to check the log | 2.0–2.5 | More folders go to RAM, indexing is faster. The risk is real: usage above the estimate is at least as common as below, and running out of memory aborts the folder |
+| Little RAM, weak machine | 3.0 and up | Disk more often: slower, but predictable, with no risk of running out. On weak machines this is the direction that matters |
+| Ordinary machine | 2.0 | Default |
+| Plenty of RAM, willing to check the log | 1.3–1.7 | More folders go to RAM, indexing is faster. The risk is real: usage above the estimate is at least as common as below, and running out of memory aborts the folder |
 
 Zero, negative or non-numeric values are treated as a typo — the default is used, and the log shows which multiplier was actually applied.
 - **debounce_ms** — milliseconds to wait after a file change before triggering re-indexing (collects burst edits into one pass)
