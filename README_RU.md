@@ -600,13 +600,13 @@ code-index get-file-summary "src/auth/login.py" --path /my/project
   "max_files": 0,
   "bulk_threshold": 10,
   "languages": ["python", "javascript", "typescript", "java", "rust", "go", "bsl", "php", "c", "cpp", "csharp", "ruby", "swift", "html"],
-  "batch_size": 500,
+  "batch_size": 2000,
   "storage_mode": "auto",
   "memory_max_percent": 50,
   "memory_estimate_factor": 2.0,
   "chunk_budget_bytes": 536870912,
   "debounce_ms": 1500,
-  "batch_ms": 2000
+  "batch_ms": 30000
 }
 ```
 
