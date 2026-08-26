@@ -5,6 +5,33 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.68.0] — 2026-08-26
+
+**A full parse now runs in chunks: peak memory is set by a setting, not by the size of the folder. A load interrupted mid-way resumes where it stopped instead of starting over.**
+
+> Context. Initial indexing used to read the whole folder at once: the content of every file, its parse trees and the compressed copies all lived in memory together. On a 7 GB folder that came to over twenty gigabytes, and in a container capped at eight the process was killed at the stage "parsing N files across threads". The choice of where the database lives did not help: it decides where the database sits, not how much reading and parsing costs. Reported in issue #6.
+
+### Added
+
+- **Chunked parsing and the `chunk_budget_bytes` setting.** Files are read, parsed, compressed and written to the database in chunks of a given source weight (512 MB by default); the memory of a chunk is released before the next one starts. The setting is available both in the per-folder settings file and globally under `[indexer]` in the daemon settings. Zero turns chunking off — the whole tree is read at once, as before. Chunking applies where the whole tree goes into parsing: initial indexing, a forced full parse, and resuming an interrupted load.
+- **A marker for an unfinished load.** Before the indexes are dropped the database records that the load is unfinished, and the marker is cleared once they are rebuilt. If the process is killed mid-way, the chunks already written stay in the database and the next run reads only the missing files and builds the indexes. Previously an interruption threw all the work away: the next run started from scratch.
+- **An unfinished database no longer spends time on indexes that are about to be dropped.** When a database carrying that marker is opened, building the indexes and the full-text triggers is skipped: the next pass drops them anyway to read the remaining files, and on a non-empty database building them costs minutes.
+
+### Changed
+
+- **The memory estimate multiplier is lowered from 3.0 to 2.0.** It was tuned against the old pipeline, where reading and parsing every file counted towards usage in full. New measurements of initial indexing with the database in RAM: a site of 191,417 files (1.4 GB of sources) — 2.4 GB of memory (×1.7); a typical trade configuration (3.7 GB, 60,294 files) — 4.4 GB (×1.2); a typical accounting one (5.3 GB, 92,300 files) — 8.8 GB (×1.6). The same folders used to give ×3.2, ×1.7 and ×2.5. More folders now pass the calculation into RAM, which means they index faster.
+- **The extension raw-data collector flushes after every chunk.** It used to accumulate object references and procedure comments for the whole tree at once — gigabytes of their own on a large configuration, which chunking would not have contained. Clearing the layer is now a separate step before the first chunk, so each following chunk does not wipe the previous ones.
+- **File content is moved into parsing instead of being copied.** A clone used to stand at the entrance to parsing, so every byte read lived in memory twice.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 807 passed, 0 failed. Four new ones cover: splitting into chunks by budget (including a file heavier than the budget and a zero budget); identical results from chunked and whole parsing; resuming an interrupted load with index rebuild and marker clearing; no duplicates for a file changed between the interruption and the next run.
+- **Initial indexing from scratch, database on disk** (a 1C configuration, 57,072 files): peak 4.40 GB before the change and 1.42 GB after, core time 49.4 → 52.2 s. Chunk boundaries cost a few percent: the single-threaded database write does not overlap with parsing the next chunk.
+- **A forced full parse of the same repository, database on disk:** 4.46 GB with chunking off, 1.50 GB at a 512 MB budget, 0.67 GB at 128 MB. Usage is driven by the setting.
+- **Database in RAM, three folders of different make-up:** the site 4.45 → 2.40 GB, the trade configuration 6.17 → 4.41 GB, the accounting one 13.34 → 8.76 GB.
+- **Local deployment and a live check:** both services run the new build, the test repository database was rebuilt by it and reads normally (57,072 files, 261,548 functions, content search answers).
+- **Federation node:** the image was rebuilt from the local build, both containers are healthy, the start-up check ran across every database on the node, and queries to remote repositories answer.
+
 ## [0.67.0] — 2026-08-23
 
 **A file held by another process at read time no longer stays in the index at its previous version. The event is deferred and retried on a schedule, and the names of unapplied files moved out of debug logging into the ordinary log.**
