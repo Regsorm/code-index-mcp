@@ -117,6 +117,16 @@ pub struct IndexerSection {
     /// `None` → используется hardcoded дефолт 8000 файлов.
     #[serde(default)]
     pub bulk_batch_threshold: Option<usize>,
+
+    /// Сколько байт исходников идёт в один заход полного разбора.
+    /// `None` → умолчание `IndexConfig` (512 МБ). Ноль отключает деление на
+    /// порции: всё дерево читается разом.
+    ///
+    /// Это главная ручка расхода памяти при первичной индексации: пик держит
+    /// не база, а содержимое и разбор файлов, и они живут только внутри одной
+    /// порции. В контейнере с жёстким лимитом памяти значение уменьшают.
+    #[serde(default)]
+    pub chunk_budget_bytes: Option<usize>,
 }
 
 /// Запись в секции `[[cache_targets]]`. Описывает один cache-ci endpoint,
@@ -719,6 +729,7 @@ mod tests {
         let indexer_with_global = IndexerSection {
             max_code_file_size_bytes: Some(2048),
             bulk_batch_threshold: None,
+            chunk_budget_bytes: None,
         };
         assert_eq!(
             entry_with_override.effective_max_code_file_size(&indexer_with_global),

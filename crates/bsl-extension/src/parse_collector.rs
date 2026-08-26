@@ -16,6 +16,7 @@
 // (`index_extras_for_files`) сборщик не использует.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use rusqlite::params;
@@ -55,6 +56,12 @@ pub struct BslParseCollector {
     /// Сырьё термов процедур (имя + объект + комментарий), собранное в
     /// парсинге. Синоним объекта подставляется позже, при сборке из staging.
     proc_terms: Mutex<Vec<StagedProcTerm>>,
+    /// Сколько обращений, модулей и процедур уже сброшено в базу. Считаются
+    /// отдельно: буферы после каждого сброса пусты, а в журнал нужен итог по
+    /// всему проходу.
+    written_usages: AtomicUsize,
+    written_files: AtomicUsize,
+    written_terms: AtomicUsize,
 }
 
 impl BslParseCollector {
@@ -105,22 +112,54 @@ impl ParseExtrasCollector for BslParseCollector {
         }
     }
 
-    fn write(&self, storage: &mut Storage) -> Result<()> {
+    fn begin(&self, storage: &mut Storage) -> Result<()> {
         let conn = storage.conn();
-        let files = self
-            .code_usages
-            .lock()
-            .expect("BslParseCollector.code_usages mutex");
-
         // Полный пересбор metadata_code_usages для repo — как в
         // index_metadata_code_usages (DELETE по repo + INSERT всех обращений).
+        // Раньше DELETE стоял в write, рядом со вставкой; теперь вставок много
+        // (по одной на порцию), и очистка вынесена сюда — иначе каждая
+        // следующая порция стирала бы предыдущие.
         let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
-        conn.execute("BEGIN", [])?;
         conn.execute(
             "DELETE FROM metadata_code_usages WHERE repo = ?",
             params![REPO_DEFAULT],
         )?;
-        let mut total: usize = 0;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS _proc_terms_staging; \
+             CREATE TEMP TABLE _proc_terms_staging (proc_key TEXT, proc_name TEXT, object_meta_type TEXT, object_name TEXT, comment TEXT);",
+        )?;
+        Ok(())
+    }
+
+    fn flush(&self, storage: &mut Storage) -> Result<()> {
+        // Буферы забираем целиком и сразу освобождаем: смысл порционного сброса
+        // в том, чтобы сырьё не копилось по всему дереву.
+        let files: Vec<(String, Vec<CodeUsage>)> = {
+            let mut guard = self
+                .code_usages
+                .lock()
+                .expect("BslParseCollector.code_usages mutex");
+            std::mem::take(&mut *guard)
+        };
+        let terms: Vec<StagedProcTerm> = {
+            let mut guard = self
+                .proc_terms
+                .lock()
+                .expect("BslParseCollector.proc_terms mutex");
+            std::mem::take(&mut *guard)
+        };
+        if files.is_empty() && terms.is_empty() {
+            return Ok(());
+        }
+
+        let conn = storage.conn();
+        // Таблица сырья термов создаётся в begin; здесь страховка на случай
+        // вызова flush без него (одиночный проход старым порядком).
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _proc_terms_staging (proc_key TEXT, proc_name TEXT, object_meta_type TEXT, object_name TEXT, comment TEXT);",
+        )?;
+        conn.execute("BEGIN", [])?;
+        let mut usages_written: usize = 0;
         {
             let mut stmt = conn.prepare(
                 "INSERT INTO metadata_code_usages \
@@ -138,46 +177,46 @@ impl ParseExtrasCollector for BslParseCollector {
                         file_path,
                         u.line as i64,
                     ])?;
-                    total += 1;
+                    usages_written += 1;
                 }
+            }
+        }
+        {
+            let mut stmt = conn.prepare("INSERT INTO _proc_terms_staging (proc_key, proc_name, object_meta_type, object_name, comment) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+            for t in terms.iter() {
+                stmt.execute(params![&t.proc_key, &t.proc_name, t.object_meta_type, &t.object_name, &t.comment])?;
             }
         }
         conn.execute("COMMIT", [])?;
 
-        // Пометить, что этот слой наполнен сборщиком в текущем проходе —
-        // чтобы run_index_extras не делал повторный disk-rebuild.
+        self.written_usages.fetch_add(usages_written, Ordering::Relaxed);
+        self.written_files.fetch_add(files.len(), Ordering::Relaxed);
+        self.written_terms.fetch_add(terms.len(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn write(&self, storage: &mut Storage) -> Result<()> {
+        // Остаток буферов (одиночный проход без порций попадает сюда целиком).
+        self.flush(storage)?;
+        let conn = storage.conn();
+
+        // Пометить, что слои наполнены сборщиком в текущем проходе — чтобы
+        // run_index_extras не делал повторный disk-rebuild.
         mark_done(conn, MARK_CODE_USAGES)?;
+        mark_done(conn, MARK_PROC_TERMS)?;
 
         tracing::info!(
             "metadata_code_usages (parse-collector): {} обращений из {} .bsl",
-            total,
-            files.len()
+            self.written_usages.load(Ordering::Relaxed),
+            self.written_files.load(Ordering::Relaxed)
         );
-
-        // Слой 2: сырьё термов процедур → temp-таблица _proc_terms_staging.
-        // Финальная сборка термов (build_terms с синонимом объекта) — позже,
-        // в build_procedure_terms_from_staging, ПОСЛЕ заполнения синонимов
-        // XML-слоем. Здесь только сброс накопленного сырья.
-        {
-            let terms = self
-                .proc_terms
-                .lock()
-                .expect("BslParseCollector.proc_terms mutex");
-            conn.execute_batch("DROP TABLE IF EXISTS _proc_terms_staging; CREATE TEMP TABLE _proc_terms_staging (proc_key TEXT, proc_name TEXT, object_meta_type TEXT, object_name TEXT, comment TEXT);")?;
-            conn.execute("BEGIN", [])?;
-            {
-                let mut stmt = conn.prepare("INSERT INTO _proc_terms_staging (proc_key, proc_name, object_meta_type, object_name, comment) VALUES (?1, ?2, ?3, ?4, ?5)")?;
-                for t in terms.iter() {
-                    stmt.execute(params![&t.proc_key, &t.proc_name, t.object_meta_type, &t.object_name, &t.comment])?;
-                }
-            }
-            conn.execute("COMMIT", [])?;
-            mark_done(conn, MARK_PROC_TERMS)?;
-            tracing::info!(
-                "procedure_terms (parse-collector): {} процедур в staging",
-                terms.len()
-            );
-        }
+        // Финальная сборка термов (build_terms с синонимом объекта) — позже, в
+        // build_procedure_terms_from_staging, ПОСЛЕ заполнения синонимов
+        // XML-слоем. Здесь только сырьё.
+        tracing::info!(
+            "procedure_terms (parse-collector): {} процедур в staging",
+            self.written_terms.load(Ordering::Relaxed)
+        );
 
         Ok(())
     }

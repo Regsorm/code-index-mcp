@@ -2790,6 +2790,41 @@ impl Storage {
         }
     }
 
+    /// Ключ отметки «массовая загрузка не завершена» в таблице `index_state`.
+    pub const BULK_IN_PROGRESS_KEY: &'static str = schema::BULK_IN_PROGRESS_KEY;
+
+    /// Поставить или снять отметку «массовая загрузка не завершена».
+    ///
+    /// Ставится перед снятием индексов, снимается после их пересоздания. Пишется
+    /// отдельной транзакцией, вне батчей записи файлов: весь смысл отметки в том,
+    /// чтобы пережить убийство процесса, поэтому она должна попасть на диск сразу.
+    pub fn set_bulk_in_progress(&self, on: bool) -> Result<()> {
+        if on {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO index_state (key, value) VALUES (?1, '1')",
+                    params![Self::BULK_IN_PROGRESS_KEY],
+                )
+                .context("set_bulk_in_progress: не удалось поставить отметку")?;
+        } else {
+            self.conn
+                .execute(
+                    "DELETE FROM index_state WHERE key = ?1",
+                    params![Self::BULK_IN_PROGRESS_KEY],
+                )
+                .context("set_bulk_in_progress: не удалось снять отметку")?;
+        }
+        Ok(())
+    }
+
+    /// Осталась ли в базе отметка о незавершённой массовой загрузке.
+    ///
+    /// Отсутствие таблицы (база от прежней версии) читается как «отметки нет»:
+    /// такие базы собирались одним куском и либо достроены, либо пусты.
+    pub fn bulk_in_progress(&self) -> bool {
+        schema::bulk_load_in_progress(&self.conn)
+    }
+
     pub fn prepare_bulk_load(&self) -> Result<()> {
         schema::drop_indexes_and_triggers(&self.conn)
             .context("prepare_bulk_load: ошибка удаления индексов и триггеров")?;

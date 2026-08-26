@@ -206,6 +206,7 @@ pub fn apply_all_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<()>
     migrate_v4(conn)?;
     migrate_v5(conn)?;
     migrate_v6(conn)?;
+    migrate_v7(conn)?;
     Ok(())
 }
 
@@ -230,6 +231,41 @@ fn migrate_v6(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Миграция v7: таблица `index_state` — служебные отметки о ходе индексации.
+///
+/// Пока отметка одна — «массовая загрузка не завершена». Она ставится перед
+/// снятием индексов и снимается после того, как они пересозданы. Если процесс
+/// убили посередине (нехватка памяти, перезагрузка машины), отметка остаётся в
+/// базе, и следующий запуск понимает: записанные порции в базе есть, но
+/// индексов и полнотекстового поиска на них нет — базу нельзя считать готовой,
+/// нужно дочитать остаток файлов и достроить индексы.
+fn migrate_v7(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS index_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+/// Ключ отметки «массовая загрузка не завершена» в таблице `index_state`.
+pub const BULK_IN_PROGRESS_KEY: &str = "bulk_load_in_progress";
+
+/// Осталась ли в базе отметка о незавершённой массовой загрузке.
+///
+/// Отсутствие таблицы (база от прежней версии) читается как «отметки нет»:
+/// такие базы собирались одним куском и либо достроены, либо пусты.
+pub fn bulk_load_in_progress(conn: &rusqlite::Connection) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM index_state WHERE key = ?1",
+        rusqlite::params![BULK_IN_PROGRESS_KEY],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        == 1
+}
+
 /// Инициализирует базу данных: применяет PRAGMA и создаёт схему
 pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // Включаем WAL для параллельного чтения/записи
@@ -251,6 +287,13 @@ pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // Применяем DDL-схему: таблицы и FTS-виртуальные таблицы
     conn.execute_batch(SQL_SCHEMA)?;
     apply_all_migrations(conn)?;
+    // Прошлая массовая загрузка оборвалась: индексы и триггеры сейчас строить
+    // незачем — ближайший проход всё равно снимет их, чтобы дочитать остаток
+    // файлов, а на непустой базе их построение стоит минуты. Достроит их тот
+    // же проход, когда дойдёт до конца.
+    if bulk_load_in_progress(conn) {
+        return Ok(());
+    }
     // Создаём триггеры
     conn.execute_batch(TRIGGERS_SQL)?;
     // Создаём индексы

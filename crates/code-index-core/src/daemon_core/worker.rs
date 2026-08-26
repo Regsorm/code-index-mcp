@@ -690,6 +690,11 @@ pub fn run_worker(
     // per-path → глобальный `[indexer]` → дефолт. Настройки демона сильнее
     // JSON-конфига проекта: правит их тот же человек, что и остальной daemon.toml.
     index_config.bulk_batch_threshold = entry.effective_bulk_batch_threshold(&indexer_section);
+    // Бюджет одной порции полного разбора: `[indexer].chunk_budget_bytes` →
+    // умолчание IndexConfig (512 МБ). Ноль отключает деление на порции.
+    if let Some(budget) = indexer_section.chunk_budget_bytes {
+        index_config.chunk_budget_bytes = budget;
+    }
     // Язык репозитория из `[[paths]] language` — разрешает неоднозначные
     // расширения (`.h`: заголовок C или C++). Демон заполняет это поле на
     // старте автоопределением, если в конфиге его не указали.

@@ -21,14 +21,20 @@ use config::IndexConfig;
 /// Во сколько раз работа в памяти обходится дороже веса исходников папки —
 /// значение по умолчанию.
 ///
-/// Замеры на разных папках дают примерно от 2 до 4 с лишним: 3,8 ГБ исходников
-/// — 8,6 ГБ израсходованной памяти, 6,7 ГБ — 19,0 ГБ, 5,3 ГБ — 18,6 ГБ, 1,8 ГБ
-/// — 8,0 ГБ. Тройка — середина этого разброса, а не запас сверху: расход выше
-/// оценки встречается не реже, чем ниже.
+/// Замеры первичной индексации с базой в памяти: сайт из 191 тыс. мелких
+/// файлов (1,4 ГБ исходников) — 2,4 ГБ памяти (×1,7); типовая торговая
+/// конфигурация (3,7 ГБ, 60 тыс. файлов) — 4,4 ГБ (×1,2); типовая учётная
+/// (5,3 ГБ, 92 тыс. файлов) — 8,8 ГБ (×1,6). Двойка — середина этого разброса,
+/// а не запас сверху: расход выше оценки встречается не реже, чем ниже.
+///
+/// До порционного разбора те же папки давали ×1,7–3,2, и умолчание стояло 3:
+/// содержимое всех файлов и их разбор держались в памяти целиком. Теперь они
+/// живут порцией (`chunk_budget_bytes`), и в пике остаются сама база и слои
+/// надстройки, которые растут к концу прохода.
 ///
 /// Значение переопределяется настройкой `memory_estimate_factor` в файле
 /// настроек папки — там же и описано, когда его стоит менять.
-pub const DEFAULT_MEMORY_ESTIMATE_FACTOR: f32 = 3.0;
+pub const DEFAULT_MEMORY_ESTIMATE_FACTOR: f32 = 2.0;
 
 /// Сколько весят файлы папки, которые пойдут в работу.
 ///
@@ -255,13 +261,29 @@ impl<'a> Indexer<'a> {
         // Определяем: это первичная индексация (пустая БД) или обновление
         let is_fresh_db = existing_files.is_empty();
 
+        // Осталась ли отметка о незавершённой массовой загрузке. Она значит,
+        // что прошлый проход убили посередине: часть файлов в базе есть, но
+        // индексов и полнотекстового поиска на них нет. Такой проход дочитывает
+        // остаток и обязан достроить индексы, чем бы дело ни кончилось по числу
+        // файлов.
+        let resume = self.storage.bulk_in_progress();
+        if resume {
+            tracing::warn!(
+                "[{}] прошлая загрузка не была завершена: записанные файлы в базе есть, \
+                 но индексы и полнотекстовый поиск на них не построены — дочитываю остаток",
+                root.display()
+            );
+        }
+
         // Сборщик extras участвует ТОЛЬКО в полном парсинге (--force или свежая
         // БД): тогда парсятся все файлы и его полный DELETE+rebuild корректен.
         // При частичном mtime-fast-path (демон с изменениями) сборщик выключаем
-        // — extras-слои пересобирает index_extras как раньше (с диска).
+        // — extras-слои пересобирает index_extras как раньше (с диска). Сюда же
+        // попадает продолжение прерванной загрузки: разбирается только остаток
+        // файлов, и слой, собранный по нему одному, был бы неполным.
         let collector = if force || is_fresh_db { collector } else { None };
 
-        // ── Этап 1: сбор кандидатов (параллельный read+hash) ─────────────────
+        // ── Этап 1: обход дерева (без чтения содержимого) ────────────────────
         // О начале каждого тяжёлого этапа сообщаем ДО его выполнения: если
         // этап встанет, в журнале останется имя того, на чём встали, а не
         // тишина после отчёта о предыдущем этапе.
@@ -279,26 +301,61 @@ impl<'a> Indexer<'a> {
         }
         crate::logging::stage_begin("обход дерева и сверка файлов");
         let candidates_start = std::time::Instant::now();
-        let (candidate_files, seen_paths, metadata_updates) = self.collect_candidates(root, force, &existing_files, &mut result)?;
+        let (entries, seen_paths) = self.collect_entries(root, &mut result)?;
+        let entries_to_read = self.filter_entries_by_mtime(&entries, force, &existing_files, &mut result);
         let candidates_dur = candidates_start.elapsed();
-        let candidates_ms = candidates_dur.as_millis();
         tracing::info!(
-            "обход дерева закончен за {} мс: просмотрено {} файлов, изменившихся {}",
-            candidates_ms,
+            "обход дерева закончен за {} мс: просмотрено {} файлов, к чтению {}",
+            candidates_dur.as_millis(),
             result.files_scanned,
-            candidate_files.len()
+            entries_to_read.len()
         );
         crate::logging::stage_detail(format!(
-            "просмотрено {}, изменившихся {}",
+            "просмотрено {}, к чтению {}",
             result.files_scanned,
-            candidate_files.len()
+            entries_to_read.len()
         ));
         crate::logging::stage_done("обход дерева и сверка файлов", candidates_dur);
 
+        // Файлы, у которых изменились только время и размер: содержимое то же,
+        // переиндексировать нечего — обновляются одни сведения о файле. Копятся
+        // по всем порциям, применяются одним проходом в конце.
+        let mut metadata_updates: Vec<(String, i64, i64)> = Vec::new();
+
+        // Порционный разбор нужен там, где в работу идёт всё дерево: первичная
+        // индексация, принудительный полный разбор и продолжение прерванной
+        // загрузки. Только в этих случаях список кандидатов известен заранее —
+        // значит и решение о пакетном режиме, и удаление прежних строк можно
+        // сделать до цикла, один раз, пока вторичные индексы ещё на месте.
+        //
+        // На обычных правках (наблюдатель, сверка при старте) файлов мало,
+        // деление на порции ничего не экономит, а число кандидатов там заранее
+        // неизвестно — оно выясняется только сверкой содержимого.
+        let chunked = (is_fresh_db || force || resume) && self.config.chunk_budget_bytes > 0;
+
+        // Непорционный путь читает всех кандидатов сразу: от их числа зависит и
+        // пакетный режим, и пакетное удаление прежних строк.
+        let preread: Option<Vec<Candidate>> = if chunked {
+            None
+        } else {
+            Some(self.read_entries(
+                &entries_to_read,
+                force,
+                &existing_files,
+                &mut result,
+                &mut metadata_updates,
+            ))
+        };
+
         // Изменений нет — дальше все этапы отработают вхолостую и напечатают
         // по строке нулей каждый. Читать в них нечего, поэтому выходим сразу:
-        // вызывающий напечатает единственную осмысленную строку итога.
-        if candidate_files.is_empty() && metadata_updates.is_empty() {
+        // вызывающий напечатает единственную осмысленную строку итога. При
+        // недостроенной базе так выйти нельзя — индексы всё равно надо поднять.
+        let nothing_to_do = match &preread {
+            Some(candidates) => candidates.is_empty(),
+            None => entries_to_read.is_empty(),
+        };
+        if nothing_to_do && metadata_updates.is_empty() && !resume {
             let ничего_не_исчезло = !existing_files.keys().any(|p| !seen_paths.contains(p));
             if ничего_не_исчезло {
                 result.elapsed_ms = start.elapsed().as_millis() as u64;
@@ -306,8 +363,16 @@ impl<'a> Indexer<'a> {
             }
         }
 
-        // Включаем bulk-load если количество файлов для индексации превышает порог
-        let bulk_mode = candidate_files.len() > self.config.bulk_threshold;
+        let candidate_count = match &preread {
+            Some(candidates) => candidates.len(),
+            None => entries_to_read.len(),
+        };
+
+        // Включаем bulk-load если количество файлов для индексации превышает порог.
+        // При продолжении прерванной загрузки — принудительно: индексов в базе
+        // всё равно нет, и достроить их обязан этот проход, сколько бы файлов
+        // ни осталось дочитать.
+        let bulk_mode = resume || candidate_count > self.config.bulk_threshold;
 
         // В bulk-режиме построчный DELETE в фазе записи пропускаем:
         //   • свежая БД — удалять нечего;
@@ -315,12 +380,19 @@ impl<'a> Indexer<'a> {
         //     пакетным проходом ниже, пока индексы idx_*_file ещё живы.
         let skip_delete = bulk_mode || is_fresh_db;
 
-        if bulk_mode && is_fresh_db {
+        // Отметку ставим ДО снятия индексов и снимаем после того, как они
+        // пересозданы: всё это время база недостроена, и обрыв посередине
+        // должен быть виден следующему запуску.
+        if bulk_mode {
+            self.storage.set_bulk_in_progress(true)?;
+        }
+
+        if bulk_mode && (is_fresh_db || resume) {
             // Первичная индексация: таблицы уже созданы через initialize(),
             // дропаем индексы которые были созданы вместе со схемой
             tracing::info!(
                 "[пакетный режим] первичная индексация {} файлов (порог {}): индексы временно снимаются",
-                candidate_files.len(),
+                candidate_count,
                 self.config.bulk_threshold
             );
             self.storage.prepare_bulk_load()?;
@@ -335,20 +407,30 @@ impl<'a> Indexer<'a> {
             //   3) дропнуть B-tree индексы перед массовой вставкой.
             tracing::info!(
                 "[пакетный режим] обновление {} файлов (порог {}): пакетное удаление прежних строк и снятие индексов",
-                candidate_files.len(),
+                candidate_count,
                 self.config.bulk_threshold
             );
             self.storage.drop_fts_triggers()?;
             // Только те кандидаты, что реально есть в БД (у новых файлов старых
             // строк нет). file_id берём из уже загруженной карты existing_files.
-            let victim_ids: Vec<i64> = candidate_files
-                .iter()
-                .filter_map(|c| existing_files.get(c.0.as_str()).map(|e| e.0))
-                .collect();
+            let victim_ids: Vec<i64> = match &preread {
+                Some(candidates) => candidates
+                    .iter()
+                    .filter_map(|c| existing_files.get(c.0.as_str()).map(|e| e.0))
+                    .collect(),
+                // Порционный путь доходит сюда только при принудительном полном
+                // разборе: сверка содержимого тогда не делается, поэтому
+                // кандидаты — ровно все найденные обходом файлы, и прежние
+                // строки каждого из них надо убрать заранее.
+                None => entries_to_read
+                    .iter()
+                    .filter_map(|e| existing_files.get(e.rel_path.as_str()).map(|v| v.0))
+                    .collect(),
+            };
             tracing::info!(
                 "[пакетный режим] пакетное удаление прежних строк: {} из {} кандидатов уже были в базе",
                 victim_ids.len(),
-                candidate_files.len()
+                candidate_count
             );
             self.storage.delete_file_data_bulk(&victim_ids)?;
             self.storage.prepare_bulk_load()?;
@@ -360,276 +442,66 @@ impl<'a> Indexer<'a> {
         // ParserRegistry: Send + Sync, что требуется для par_iter.
         let registry = ParserRegistry::from_languages(&self.config.languages);
 
-        // ── Этап 2: параллельный парсинг (CPU-bound) ─────────────────────────
-        // tree-sitter парсинг выполняется в нескольких потоках через rayon.
-        // Чтение файлов уже выполнено в collect_candidates — здесь только AST.
-        tracing::info!("разбираю {} изменившихся файлов в несколько потоков", candidate_files.len());
-        let parse_start = std::time::Instant::now();
-        // Лимит для `file_contents` — копия в замыкание: сжатие идёт здесь же,
-        // в rayon-потоках, а не в единственном потоке-писателе (v0.47.0).
-        let max_code_size = self.config.max_code_file_size_bytes;
-        let mut parse_results: Vec<ParsedFile> = candidate_files
-            .par_iter()
-            .map(|(rel_path, content, hash, category, mtime, file_size)| {
-                match category {
-                    FileCategory::Code(language) => {
-                        // Определяем парсер по расширению файла
-                        let ext = Path::new(rel_path.as_str())
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("")
-                            .to_lowercase();
-
-                        match registry.get_parser(&ext) {
-                            Some(parser) => {
-                                match parser.parse_guarded(content, rel_path) {
-                                    Ok(pr) => ParsedFile::Code {
-                                        rel_path: rel_path.clone(),
-                                        content_hash: hash.clone(),
-                                        language: language.clone(),
-                                        lines_total: pr.lines_total,
-                                        parse_result: pr,
-                                        mtime: *mtime,
-                                        file_size: *file_size,
-                                        text_for_fts: if super::indexer::file_types::is_dual_indexed_language(language) {
-                                            Some(content.clone())
-                                        } else {
-                                            None
-                                        },
-                                        raw_content: content.clone(),
-                                        content_blob: None,
-                                    },
-                                    Err(e) => ParsedFile::Error {
-                                        rel_path: rel_path.clone(),
-                                        error: e.to_string(),
-                                    },
-                                }
-                            }
-                            None => ParsedFile::Error {
-                                rel_path: rel_path.clone(),
-                                error: format!("Нет парсера для расширения: {}", ext),
-                            },
-                        }
-                    }
-                    FileCategory::Text => {
-                        // Проверяем: это XML-файл выгрузки 1С?
-                        let ext = Path::new(rel_path.as_str())
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("");
-                        if ext == "xml" {
-                            let xml_parser = crate::parser::xml_1c::Xml1CParser;
-                            if let Ok(pr) = xml_parser.parse(content, rel_path) {
-                                if !pr.functions.is_empty()
-                                    || !pr.classes.is_empty()
-                                    || !pr.variables.is_empty()
-                                {
-                                    return ParsedFile::Code {
-                                        rel_path: rel_path.clone(),
-                                        content_hash: hash.clone(),
-                                        language: "xml_1c".to_string(),
-                                        lines_total: pr.lines_total,
-                                        parse_result: pr,
-                                        mtime: *mtime,
-                                        file_size: *file_size,
-                                        text_for_fts: None,
-                                        raw_content: content.clone(),
-                                        content_blob: None,
-                                    };
-                                }
-                            }
-                        }
-                        // Fallback: текстовая индексация
-                        let text_result = TextParser::parse(content);
-                        ParsedFile::Text {
-                            rel_path: rel_path.clone(),
-                            content_hash: hash.clone(),
-                            lines_total: text_result.lines_total,
-                            content: text_result.content,
-                            mtime: *mtime,
-                            file_size: *file_size,
-                        }
-                    }
-                    FileCategory::Binary => unreachable!("бинарные файлы не должны попасть сюда"),
-                }
-            })
-            .collect();
-        let parse_dur = parse_start.elapsed();
-        let parse_ms = parse_dur.as_millis();
-        tracing::info!("разбор закончен за {} мс ({} файлов)", parse_ms, parse_results.len());
-        crate::logging::stage_detail(format!(
-            "{} разобрано",
-            crate::logging::plural(parse_results.len() as u64, "файл", "файла", "файлов")
-        ));
-        crate::logging::stage_done("разбор файлов", parse_dur);
-
-        // ── Этап 2b: сбор extras-сырья (bsl-indexer) ─────────────────────────
-        // Пока parse_results ещё горячие в RAM — параллельно отдаём каждый
-        // файл сборщику расширения (обращения к объектам, комментарии, XML).
-        // Диск не перечитывается. Для универсальной сборки collector = None →
-        // проход пропускается, накладных расходов ноль.
+        // Сборщик extras очищает свои слои один раз, до первой порции: сброс
+        // теперь идёт после каждой порции, и очистка внутри него стирала бы
+        // собранное предыдущими.
         if let Some(collector) = collector {
-            use crate::extension::ParsedFileCtx;
-            parse_results.par_iter().for_each(|pf| match pf {
-                ParsedFile::Code { rel_path, language, parse_result, raw_content, .. } => {
-                    collector.on_parsed(ParsedFileCtx {
-                        rel_path,
-                        language,
-                        content: raw_content,
-                        parse_result: Some(parse_result),
-                    });
-                }
-                ParsedFile::Text { rel_path, content, .. } => {
-                    collector.on_parsed(ParsedFileCtx {
-                        rel_path,
-                        language: "text",
-                        content,
-                        parse_result: None,
-                    });
-                }
-                ParsedFile::Error { .. } => {}
-            });
+            collector.begin(&mut *self.storage)?;
         }
 
-        // ── Этап 2c: параллельное сжатие content (v0.47.0) ───────────────────
-        // Раньше zstd вызывался в фазе записи, то есть в единственном потоке-
-        // писателе: на боевом PHP-сайте (151 тыс. файлов) это 37 с из 65 с
-        // записи. Здесь то же сжатие раскладывается на все ядра rayon, а
-        // исходная строка сразу освобождается — пик RAM не растёт.
-        // Сборщику extras (фаза 2b) сырой content уже отдан.
-        let compress_start = std::time::Instant::now();
-        // Компрессор создаётся ОДИН раз на поток (`for_each_init`), а не на файл:
-        // при 151 тыс. мелких файлов инициализация zstd-контекста на каждый вызов
-        // стоила дороже самого сжатия. `clear()` без `shrink_to_fit()` — намеренно:
-        // возврат буфера аллокатору на каждой итерации сериализует потоки.
-        parse_results.par_iter_mut().for_each_init(
-            || zstd::bulk::Compressor::new(Storage::FILE_CONTENTS_ZSTD_LEVEL).ok(),
-            |compressor, pf| {
-                if let ParsedFile::Code { raw_content, content_blob, .. } = pf {
-                    *content_blob = if raw_content.len() > max_code_size {
-                        None
-                    } else {
-                        match compressor {
-                            Some(c) => c.compress(raw_content.as_bytes()).ok(),
-                            None => Storage::compress_content(raw_content).ok(),
-                        }
-                    };
-                    raw_content.clear();
-                }
-            },
-        );
-        let compress_dur = compress_start.elapsed();
-        let compress_ms = compress_dur.as_millis();
-        tracing::info!("содержимое файлов сжато за {} мс", compress_ms);
-        crate::logging::stage_done("сжатие содержимого", compress_dur);
-
-        // ── Этап 3: последовательная запись в SQLite ──────────────────────────
-        // SQLite не поддерживает параллельную запись — пишем из основного потока.
-        tracing::info!("записываю разобранное в базу");
-        let write_start = std::time::Instant::now();
-        let batch_size = self.config.batch_size;
-        let mut batch_count = 0usize;
-
-        // Открываем первую транзакцию перед началом цикла
-        self.storage.begin_batch()?;
-
-        // Прогресс — по времени, а не по размеру транзакции: шаг в файлах на
-        // лёгких файлах сыплет строками, на тяжёлых молчит минутами, а на
-        // репозитории меньше batch_size файлов не печатает ничего.
-        let mut progress = crate::logging::Heartbeat::every_secs(5);
-        for parsed in &parse_results {
-            let total_processed = result.files_indexed + result.errors.len();
-            if total_processed > 0 && progress.due() {
-                tracing::info!(
-                    "записано в базу {} из {} изменившихся файлов",
-                    total_processed,
-                    parse_results.len()
-                );
+        // ── Этапы 2–3: чтение, разбор, сжатие и запись ───────────────────────
+        // Порция за порцией: память, занятая содержимым и разбором, живёт
+        // только внутри одного захода. Именно это, а не место базы, держит
+        // потолок расхода — в памяти база или на диске, содержимое всё равно
+        // читается и разбирается целиком.
+        match preread {
+            Some(candidates) => {
+                self.process_chunk(
+                    candidates,
+                    &registry,
+                    collector,
+                    ChunkPolicy { skip_delete, existing_files: None, label: None },
+                    &mut result,
+                )?;
             }
-
-            match parsed {
-                ParsedFile::Code {
-                    rel_path,
-                    content_hash,
-                    language,
-                    lines_total,
-                    parse_result,
-                    mtime,
-                    file_size,
-                    text_for_fts,
-                    content_blob,
-                    raw_content: _,
-                } => {
-                    match self.write_code_to_db(
-                        rel_path,
-                        content_hash,
-                        language,
-                        *lines_total,
-                        parse_result,
-                        skip_delete,
-                        Some(*mtime),
-                        Some(*file_size),
-                        text_for_fts.as_deref(),
-                        match content_blob {
-                            Some(b) => ContentInput::Blob(b),
-                            None => ContentInput::Oversize,
+            None => {
+                let chunks = chunk_by_budget(&entries_to_read, self.config.chunk_budget_bytes);
+                let total = chunks.len();
+                if total > 1 {
+                    tracing::info!(
+                        "файлы пойдут порциями: {} порций примерно по {} — память освобождается после каждой",
+                        total,
+                        crate::logging::human_bytes(self.config.chunk_budget_bytes as u64)
+                    );
+                }
+                for (i, chunk) in chunks.into_iter().enumerate() {
+                    let candidates = self.read_entries(
+                        chunk,
+                        force,
+                        &existing_files,
+                        &mut result,
+                        &mut metadata_updates,
+                    );
+                    self.process_chunk(
+                        candidates,
+                        &registry,
+                        collector,
+                        ChunkPolicy {
+                            skip_delete,
+                            // При продолжении прерванной загрузки пакетного
+                            // удаления не было, а часть файлов в базе уже есть:
+                            // такие чистят свои прежние строки сами.
+                            existing_files: if resume { Some(&existing_files) } else { None },
+                            label: if total > 1 { Some((i + 1, total)) } else { None },
                         },
-                    ) {
-                        Ok(_) => {
-                            result.files_indexed += 1;
-                            result.note_changed(rel_path);
-                            batch_count += 1;
-                        }
-                        Err(e) => {
-                            result.errors.push((rel_path.clone(), e.to_string()));
-                        }
-                    }
+                        &mut result,
+                    )?;
                 }
-                ParsedFile::Text {
-                    rel_path,
-                    content_hash,
-                    lines_total,
-                    content,
-                    mtime,
-                    file_size,
-                } => {
-                    match self.write_text_to_db(rel_path, content_hash, *lines_total, content, skip_delete, Some(*mtime), Some(*file_size)) {
-                        Ok(_) => {
-                            result.files_indexed += 1;
-                            result.note_changed(rel_path);
-                            batch_count += 1;
-                        }
-                        Err(e) => {
-                            result.errors.push((rel_path.clone(), e.to_string()));
-                        }
-                    }
-                }
-                ParsedFile::Error { rel_path, error } => {
-                    result.errors.push((rel_path.clone(), error.clone()));
-                }
-            }
-
-            // Коммитим накопленный батч и открываем новую транзакцию
-            if batch_count >= batch_size {
-                self.storage.commit_batch()?;
-                self.storage.begin_batch()?;
-                batch_count = 0;
             }
         }
 
-        // Коммитим оставшиеся записи последнего неполного батча
-        self.storage.commit_batch()?;
-        let write_dur = write_start.elapsed();
-        let write_ms = write_dur.as_millis();
-        tracing::info!("запись в базу закончена за {} мс ({} файлов)", write_ms, result.files_indexed);
-        crate::logging::stage_detail(format!(
-            "{} записано, {} без изменений",
-            result.files_indexed, result.files_skipped
-        ));
-        crate::logging::stage_done("запись в базу", write_dur);
-
-        // Сброс накопленного сборщиком extras сырья (серийно, после фазы
-        // записи ядра). Для универсальной сборки collector = None.
+        // Сброс остатка сырья сборщика extras и отметка «слои построены» —
+        // серийно, после последней порции.
         if let Some(collector) = collector {
             collector.write(&mut *self.storage)?;
         }
@@ -662,7 +534,10 @@ impl<'a> Indexer<'a> {
         }
 
         // ── Этап 4: индексы + FTS rebuild ────────────────────────────────────
-        // Завершаем bulk-load: пересоздаём индексы, триггеры, rebuild FTS
+        // Завершаем bulk-load: пересоздаём индексы, триггеры, rebuild FTS.
+        // Делается ОДИН раз на весь проход, а не на каждую порцию: пересоздание
+        // индексов и перестройка полнотекстового поиска идут по всей базе, и на
+        // каждой порции это выродилось бы в квадратичную работу.
         if bulk_mode {
             let idx_start = std::time::Instant::now();
             tracing::info!("создаю индексы и перестраиваю полнотекстовый поиск");
@@ -671,6 +546,8 @@ impl<'a> Indexer<'a> {
             let idx_ms = idx_dur.as_millis();
             tracing::info!("индексы и полнотекстовый поиск готовы за {} мс", idx_ms);
             crate::logging::stage_done("индексы и полнотекстовый поиск", idx_dur);
+            // База снова согласована — отметку о незавершённой загрузке снимаем.
+            self.storage.set_bulk_in_progress(false)?;
         }
 
         // ── Этап 5: удаление устаревших записей ──────────────────────────────
@@ -697,7 +574,6 @@ impl<'a> Indexer<'a> {
             ));
             crate::logging::stage_done("удаление исчезнувших", cleanup_dur);
         }
-
         // ── Этап 6: Phase 2 backfill для file_contents ──────────────────────
         // Отдельная фаза от write-step — она работает только для файлов,
         // у которых hash изменился (write_code_to_db уже вызвал upsert_file_content).
@@ -766,6 +642,318 @@ impl<'a> Indexer<'a> {
         Ok(result)
     }
 
+
+    /// Разобрать, сжать и записать одну порцию файлов.
+    ///
+    /// Всё, что порция занимает в памяти — содержимое, разбор, сжатые копии —
+    /// живёт внутри вызова и освобождается на выходе. Поэтому расход зависит от
+    /// бюджета порции, а не от того, сколько весит папка целиком.
+    fn process_chunk(
+        &mut self,
+        candidates: Vec<Candidate>,
+        registry: &ParserRegistry,
+        collector: Option<&dyn crate::extension::ParseExtrasCollector>,
+        policy: ChunkPolicy<'_>,
+        result: &mut IndexResult,
+    ) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        // Пометка порции в журнале: без неё на большом дереве строки этапов
+        // повторяются десятками и непонятно, к какой порции какая относится.
+        let tag = match policy.label {
+            Some((n, total)) => format!("[порция {} из {}] ", n, total),
+            None => String::new(),
+        };
+
+        // ── Этап 2: параллельный парсинг (CPU-bound) ─────────────────────────
+        // tree-sitter парсинг выполняется в нескольких потоках через rayon.
+        // Чтение файлов уже выполнено в read_entries — здесь только AST.
+        tracing::info!("{}разбираю {} изменившихся файлов в несколько потоков", tag, candidates.len());
+        let parse_start = std::time::Instant::now();
+        // Лимит для `file_contents` — копия в замыкание: сжатие идёт здесь же,
+        // в rayon-потоках, а не в единственном потоке-писателе (v0.47.0).
+        let max_code_size = self.config.max_code_file_size_bytes;
+        // Содержимое ПЕРЕДАЁТСЯ в разбор, а не копируется: раньше здесь стоял
+        // clone, и весь прочитанный текст жил в памяти дважды.
+        let mut parse_results: Vec<ParsedFile> = candidates
+            .into_par_iter()
+            .map(|(rel_path, content, hash, category, mtime, file_size)| {
+                match category {
+                    FileCategory::Code(language) => {
+                        // Определяем парсер по расширению файла
+                        let ext = Path::new(rel_path.as_str())
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+
+                        match registry.get_parser(&ext) {
+                            Some(parser) => {
+                                match parser.parse_guarded(&content, &rel_path) {
+                                    Ok(pr) => ParsedFile::Code {
+                                        content_hash: hash,
+                                        lines_total: pr.lines_total,
+                                        parse_result: pr,
+                                        mtime,
+                                        file_size,
+                                        text_for_fts: if file_types::is_dual_indexed_language(&language) {
+                                            Some(content.clone())
+                                        } else {
+                                            None
+                                        },
+                                        language,
+                                        rel_path,
+                                        raw_content: content,
+                                        content_blob: None,
+                                    },
+                                    Err(e) => ParsedFile::Error {
+                                        rel_path,
+                                        error: e.to_string(),
+                                    },
+                                }
+                            }
+                            None => ParsedFile::Error {
+                                rel_path,
+                                error: format!("Нет парсера для расширения: {}", ext),
+                            },
+                        }
+                    }
+                    FileCategory::Text => {
+                        // Проверяем: это XML-файл выгрузки 1С?
+                        let is_xml = Path::new(rel_path.as_str())
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| e == "xml")
+                            .unwrap_or(false);
+                        if is_xml {
+                            let xml_parser = crate::parser::xml_1c::Xml1CParser;
+                            if let Ok(pr) = xml_parser.parse(&content, &rel_path) {
+                                if !pr.functions.is_empty()
+                                    || !pr.classes.is_empty()
+                                    || !pr.variables.is_empty()
+                                {
+                                    return ParsedFile::Code {
+                                        rel_path,
+                                        content_hash: hash,
+                                        language: "xml_1c".to_string(),
+                                        lines_total: pr.lines_total,
+                                        parse_result: pr,
+                                        mtime,
+                                        file_size,
+                                        text_for_fts: None,
+                                        raw_content: content,
+                                        content_blob: None,
+                                    };
+                                }
+                            }
+                        }
+                        // Fallback: текстовая индексация
+                        let text_result = TextParser::parse(&content);
+                        ParsedFile::Text {
+                            rel_path,
+                            content_hash: hash,
+                            lines_total: text_result.lines_total,
+                            content: text_result.content,
+                            mtime,
+                            file_size,
+                        }
+                    }
+                    FileCategory::Binary => unreachable!("бинарные файлы не должны попасть сюда"),
+                }
+            })
+            .collect();
+        let parse_dur = parse_start.elapsed();
+        tracing::info!("{}разбор закончен за {} мс ({} файлов)", tag, parse_dur.as_millis(), parse_results.len());
+        crate::logging::stage_detail(format!(
+            "{} разобрано",
+            crate::logging::plural(parse_results.len() as u64, "файл", "файла", "файлов")
+        ));
+        crate::logging::stage_done("разбор файлов", parse_dur);
+
+        // ── Этап 2b: сбор extras-сырья (bsl-indexer) ─────────────────────────
+        // Пока parse_results ещё горячие в RAM — параллельно отдаём каждый
+        // файл сборщику расширения (обращения к объектам, комментарии, XML).
+        // Диск не перечитывается. Для универсальной сборки collector = None →
+        // проход пропускается, накладных расходов ноль.
+        if let Some(collector) = collector {
+            use crate::extension::ParsedFileCtx;
+            parse_results.par_iter().for_each(|pf| match pf {
+                ParsedFile::Code { rel_path, language, parse_result, raw_content, .. } => {
+                    collector.on_parsed(ParsedFileCtx {
+                        rel_path,
+                        language,
+                        content: raw_content,
+                        parse_result: Some(parse_result),
+                    });
+                }
+                ParsedFile::Text { rel_path, content, .. } => {
+                    collector.on_parsed(ParsedFileCtx {
+                        rel_path,
+                        language: "text",
+                        content,
+                        parse_result: None,
+                    });
+                }
+                ParsedFile::Error { .. } => {}
+            });
+        }
+
+        // ── Этап 2c: параллельное сжатие content (v0.47.0) ───────────────────
+        // Раньше zstd вызывался в фазе записи, то есть в единственном потоке-
+        // писателе: на боевом PHP-сайте (151 тыс. файлов) это 37 с из 65 с
+        // записи. Здесь то же сжатие раскладывается на все ядра rayon, а
+        // исходная строка сразу освобождается — пик RAM не растёт.
+        // Сборщику extras (фаза 2b) сырой content уже отдан.
+        let compress_start = std::time::Instant::now();
+        // Компрессор создаётся ОДИН раз на поток (`for_each_init`), а не на файл:
+        // при 151 тыс. мелких файлов инициализация zstd-контекста на каждый вызов
+        // стоила дороже самого сжатия. `clear()` без `shrink_to_fit()` — намеренно:
+        // возврат буфера аллокатору на каждой итерации сериализует потоки.
+        parse_results.par_iter_mut().for_each_init(
+            || zstd::bulk::Compressor::new(Storage::FILE_CONTENTS_ZSTD_LEVEL).ok(),
+            |compressor, pf| {
+                if let ParsedFile::Code { raw_content, content_blob, .. } = pf {
+                    *content_blob = if raw_content.len() > max_code_size {
+                        None
+                    } else {
+                        match compressor {
+                            Some(c) => c.compress(raw_content.as_bytes()).ok(),
+                            None => Storage::compress_content(raw_content).ok(),
+                        }
+                    };
+                    raw_content.clear();
+                    raw_content.shrink_to_fit();
+                }
+            },
+        );
+        let compress_dur = compress_start.elapsed();
+        tracing::info!("{}содержимое файлов сжато за {} мс", tag, compress_dur.as_millis());
+        crate::logging::stage_done("сжатие содержимого", compress_dur);
+
+        // ── Этап 3: последовательная запись в SQLite ──────────────────────────
+        // SQLite не поддерживает параллельную запись — пишем из основного потока.
+        tracing::info!("{}записываю разобранное в базу", tag);
+        let write_start = std::time::Instant::now();
+        let batch_size = self.config.batch_size;
+        let mut batch_count = 0usize;
+        let indexed_before = result.files_indexed;
+
+        // Открываем первую транзакцию перед началом цикла
+        self.storage.begin_batch()?;
+
+        // Прогресс — по времени, а не по размеру транзакции: шаг в файлах на
+        // лёгких файлах сыплет строками, на тяжёлых молчит минутами, а на
+        // репозитории меньше batch_size файлов не печатает ничего.
+        let mut progress = crate::logging::Heartbeat::every_secs(5);
+        for parsed in &parse_results {
+            let total_processed = result.files_indexed + result.errors.len();
+            if total_processed > 0 && progress.due() {
+                tracing::info!(
+                    "{}записано в базу {} из {} изменившихся файлов",
+                    tag,
+                    result.files_indexed - indexed_before,
+                    parse_results.len()
+                );
+            }
+
+            match parsed {
+                ParsedFile::Code {
+                    rel_path,
+                    content_hash,
+                    language,
+                    lines_total,
+                    parse_result,
+                    mtime,
+                    file_size,
+                    text_for_fts,
+                    content_blob,
+                    raw_content: _,
+                } => {
+                    match self.write_code_to_db(
+                        rel_path,
+                        content_hash,
+                        language,
+                        *lines_total,
+                        parse_result,
+                        policy.skip_delete_for(rel_path),
+                        Some(*mtime),
+                        Some(*file_size),
+                        text_for_fts.as_deref(),
+                        match content_blob {
+                            Some(b) => ContentInput::Blob(b),
+                            None => ContentInput::Oversize,
+                        },
+                    ) {
+                        Ok(_) => {
+                            result.files_indexed += 1;
+                            result.note_changed(rel_path);
+                            batch_count += 1;
+                        }
+                        Err(e) => {
+                            result.errors.push((rel_path.clone(), e.to_string()));
+                        }
+                    }
+                }
+                ParsedFile::Text {
+                    rel_path,
+                    content_hash,
+                    lines_total,
+                    content,
+                    mtime,
+                    file_size,
+                } => {
+                    match self.write_text_to_db(rel_path, content_hash, *lines_total, content, policy.skip_delete_for(rel_path), Some(*mtime), Some(*file_size)) {
+                        Ok(_) => {
+                            result.files_indexed += 1;
+                            result.note_changed(rel_path);
+                            batch_count += 1;
+                        }
+                        Err(e) => {
+                            result.errors.push((rel_path.clone(), e.to_string()));
+                        }
+                    }
+                }
+                ParsedFile::Error { rel_path, error } => {
+                    result.errors.push((rel_path.clone(), error.clone()));
+                }
+            }
+
+            // Коммитим накопленный батч и открываем новую транзакцию
+            if batch_count >= batch_size {
+                self.storage.commit_batch()?;
+                self.storage.begin_batch()?;
+                batch_count = 0;
+            }
+        }
+
+        // Коммитим оставшиеся записи последнего неполного батча
+        self.storage.commit_batch()?;
+        let write_dur = write_start.elapsed();
+        tracing::info!(
+            "{}запись в базу закончена за {} мс ({} файлов)",
+            tag,
+            write_dur.as_millis(),
+            result.files_indexed - indexed_before
+        );
+        crate::logging::stage_detail(format!(
+            "{} записано, {} без изменений",
+            result.files_indexed, result.files_skipped
+        ));
+        crate::logging::stage_done("запись в базу", write_dur);
+
+        // Разобранное больше не нужно: освобождаем до возврата, чтобы следующая
+        // порция начинала с чистой памяти.
+        drop(parse_results);
+
+        // Сырьё сборщика extras сбрасывается сразу за порцией — иначе оно
+        // копилось бы по всему дереву и деление на порции не удержало бы расход.
+        if let Some(collector) = collector {
+            collector.flush(&mut *self.storage)?;
+        }
+
+        Ok(())
+    }
     /// Записать код-файл в БД: метаданные + символы (функции, классы, импорты и т.д.)
     /// skip_delete: при первичной индексации пропускать DELETE (БД пуста, удалять нечего)
     /// content: Phase 2 (v0.8.0). `Raw` — сжать на месте (одиночные файлы),
@@ -988,17 +1176,19 @@ impl<'a> Indexer<'a> {
     /// Возвращает (candidates, seen_paths, metadata_updates).
     /// seen_paths используется для очистки удалённых файлов без повторного обхода дерева.
     /// metadata_updates содержит файлы, у которых хеш не изменился, но mtime/size обновились.
-    fn collect_candidates(
+    /// Первый проход: обойти директорию и собрать список файлов — пути,
+    /// категорию, время изменения и размер. Содержимое НЕ читается.
+    ///
+    /// Возвращает (entries, seen_paths). seen_paths используется для очистки
+    /// удалённых файлов без повторного обхода дерева.
+    fn collect_entries(
         &self,
         root: &Path,
-        force: bool,
-        existing_files: &HashMap<String, (i64, String, Option<i64>, Option<i64>)>,
         result: &mut IndexResult,
-    ) -> Result<(Vec<(String, String, String, FileCategory, i64, i64)>, HashSet<String>, Vec<(String, i64, i64)>)> {
+    ) -> Result<(Vec<FileEntry>, HashSet<String>)> {
         let config_for_filter = self.config.clone();
         let file_matcher = self.config.build_file_exclude_matcher();
 
-        // ── Фаза 1a: WalkDir — собрать пути + metadata (без чтения содержимого) ──
         let walker = WalkDir::new(root).into_iter().filter_entry(move |e| {
             if e.file_type().is_dir() {
                 if let Some(name) = e.file_name().to_str() {
@@ -1008,13 +1198,6 @@ impl<'a> Indexer<'a> {
             true
         });
 
-        struct FileEntry {
-            abs_path: std::path::PathBuf,
-            rel_path: String,
-            category: FileCategory,
-            mtime: i64,
-            file_size: i64,
-        }
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut seen_paths: HashSet<String> = HashSet::new();
 
@@ -1054,9 +1237,9 @@ impl<'a> Indexer<'a> {
             // Лимит размера — только для текстовых файлов, код индексируем всегда.
             // Исключение — файлы выгрузки 1С, по которым реально ищут: оглавление
             // конфигурации, права ролей, структура формы. В крупных конфигурациях
-            // они перерастают мегабайт (в УТ Configuration.xml — 1,2 МБ, Rights.xml
-            // до 5 МБ) и молча выпадали из индекса целиком. Макеты печатных форм
-            // (Template.xml, до 78 МБ) и служебная опись выгрузки под исключение НЕ
+            // они перерастают мегабайт (в типовой торговой Configuration.xml — 1,2 МБ,
+            // Rights.xml до 5 МБ) и молча выпадали из индекса целиком. Макеты печатных
+            // форм (Template.xml, до 78 МБ) и служебная опись выгрузки под исключение НЕ
             // подпадают: искать по ним нечего, а места занимают больше всего.
             if !matches!(category, FileCategory::Code(_))
                 && !file_types::is_size_exempt(path)
@@ -1094,28 +1277,51 @@ impl<'a> Indexer<'a> {
             });
         }
 
-        // ── Фаза 1b: быстрая фильтрация по mtime+size (без чтения файлов) ──
-        let (entries_to_read, mtime_skipped): (Vec<&FileEntry>, usize) = if force {
-            (entries.iter().collect(), 0)
-        } else {
-            let mut to_read = Vec::new();
-            let mut skipped = 0usize;
-            for entry in &entries {
-                match existing_files.get(&entry.rel_path) {
-                    Some((_, _, Some(stored_mtime), Some(stored_size)))
-                        if *stored_mtime == entry.mtime && *stored_size == entry.file_size =>
-                    {
-                        skipped += 1;
-                    }
-                    _ => to_read.push(entry),
-                }
-            }
-            (to_read, skipped)
-        };
-        result.files_skipped += mtime_skipped;
+        Ok((entries, seen_paths))
+    }
 
-        // ── Фаза 1c: параллельное чтение + хеш изменённых файлов (rayon) ────
-        let read_results: Vec<_> = entries_to_read
+    /// Быстрая фильтрация по времени изменения и размеру — без чтения файлов.
+    /// Совпали оба с записанными в базе — файл считается неизменившимся.
+    fn filter_entries_by_mtime<'e>(
+        &self,
+        entries: &'e [FileEntry],
+        force: bool,
+        existing_files: &HashMap<String, (i64, String, Option<i64>, Option<i64>)>,
+        result: &mut IndexResult,
+    ) -> Vec<&'e FileEntry> {
+        if force {
+            return entries.iter().collect();
+        }
+        let mut to_read = Vec::new();
+        let mut skipped = 0usize;
+        for entry in entries {
+            match existing_files.get(&entry.rel_path) {
+                Some((_, _, Some(stored_mtime), Some(stored_size)))
+                    if *stored_mtime == entry.mtime && *stored_size == entry.file_size =>
+                {
+                    skipped += 1;
+                }
+                _ => to_read.push(entry),
+            }
+        }
+        result.files_skipped += skipped;
+        to_read
+    }
+
+    /// Прочитать и захешировать порцию файлов (параллельно, rayon), отсеяв те,
+    /// у которых содержимое не изменилось.
+    ///
+    /// Возвращает кандидатов на индексацию; файлы с прежним содержимым уходят в
+    /// `metadata_updates` — им нужно обновить только время и размер.
+    fn read_entries(
+        &self,
+        entries: &[&FileEntry],
+        force: bool,
+        existing_files: &HashMap<String, (i64, String, Option<i64>, Option<i64>)>,
+        result: &mut IndexResult,
+        metadata_updates: &mut Vec<(String, i64, i64)>,
+    ) -> Vec<Candidate> {
+        let read_results: Vec<_> = entries
             .par_iter()
             .map(|entry| {
                 match hasher::file_hash(&entry.abs_path) {
@@ -1135,9 +1341,7 @@ impl<'a> Indexer<'a> {
             })
             .collect();
 
-        // ── Фаза 1d: фильтрация по hash + metadata-only updates ────────────
         let mut candidates = Vec::new();
-        let mut metadata_updates: Vec<(String, i64, i64)> = Vec::new();
         for item in read_results {
             match item {
                 Ok((rel_path, content, hash, category, mtime, file_size)) => {
@@ -1165,8 +1369,76 @@ impl<'a> Indexer<'a> {
             }
         }
 
-        Ok((candidates, seen_paths, metadata_updates))
+        candidates
     }
+}
+
+/// Один файл, найденный обходом дерева: путь и сведения о нём. Содержимое ещё
+/// не прочитано — оно читается порциями, уже после того, как отсеяны файлы с
+/// неизменившимися временем и размером.
+struct FileEntry {
+    abs_path: std::path::PathBuf,
+    rel_path: String,
+    category: FileCategory,
+    mtime: i64,
+    file_size: i64,
+}
+
+/// Кандидат на индексацию: путь, содержимое, хеш, категория, время и размер.
+type Candidate = (String, String, String, FileCategory, i64, i64);
+
+/// Как порция пишется в базу — решения, принятые один раз на весь проход.
+struct ChunkPolicy<'p> {
+    /// Пропускать построчное удаление прежних строк файла: в пакетном режиме
+    /// они убраны одним проходом заранее, при первичной индексации их нет вовсе.
+    skip_delete: bool,
+    /// Файлы, которые в базе уже есть. Задаётся только при продолжении
+    /// прерванной загрузки: пакетного удаления там не было, поэтому те немногие
+    /// файлы, что успели записаться до обрыва, чистят свои строки сами.
+    existing_files: Option<&'p HashMap<String, (i64, String, Option<i64>, Option<i64>)>>,
+    /// Номер порции и общее их число — только для журнала.
+    label: Option<(usize, usize)>,
+}
+
+impl ChunkPolicy<'_> {
+    /// Пропускать ли удаление прежних строк конкретного файла.
+    fn skip_delete_for(&self, rel_path: &str) -> bool {
+        match self.existing_files {
+            Some(existing) => self.skip_delete && !existing.contains_key(rel_path),
+            None => self.skip_delete,
+        }
+    }
+}
+
+/// Нарезать список файлов на порции так, чтобы вес исходников в каждой не
+/// превышал бюджет.
+///
+/// Файл тяжелее бюджета идёт отдельной порцией — резать его нечем. Нулевой
+/// бюджет означает «без деления»: весь список одной порцией.
+fn chunk_by_budget<'e>(entries: &'e [&'e FileEntry], budget: usize) -> Vec<&'e [&'e FileEntry]> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    if budget == 0 {
+        return vec![entries];
+    }
+    let budget = budget as u64;
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut acc: u64 = 0;
+    for (i, entry) in entries.iter().enumerate() {
+        let size = entry.file_size.max(0) as u64;
+        if i > start && acc + size > budget {
+            chunks.push(&entries[start..i]);
+            start = i;
+            acc = 0;
+        }
+        acc += size;
+    }
+    if start < entries.len() {
+        chunks.push(&entries[start..]);
+    }
+    chunks
 }
 
 #[cfg(test)]
@@ -1226,6 +1498,163 @@ class App:
         assert!(stats.total_functions >= 2, "минимум 2 функции: hello + run");
         assert!(stats.total_classes >= 1, "минимум 1 класс: App");
         assert!(stats.total_text_files >= 1, "минимум 1 текстовый файл: readme.md");
+    }
+
+
+    /// Нарезка на порции: файлы копятся, пока не исчерпан бюджет; файл тяжелее
+    /// бюджета уходит в порцию один; нулевой бюджет отключает деление.
+    #[test]
+    fn test_chunk_by_budget() {
+        let mk = |name: &str, size: i64| FileEntry {
+            abs_path: std::path::PathBuf::from(name),
+            rel_path: name.to_string(),
+            category: FileCategory::Text,
+            mtime: 0,
+            file_size: size,
+        };
+        let entries = vec![mk("a", 40), mk("b", 40), mk("c", 40), mk("d", 500)];
+        let refs: Vec<&FileEntry> = entries.iter().collect();
+
+        let chunks = chunk_by_budget(&refs, 100);
+        assert_eq!(chunks.len(), 3, "40+40 | 40 | 500 — три порции");
+        assert_eq!(chunks[0].len(), 2);
+        assert_eq!(chunks[1].len(), 1);
+        assert_eq!(chunks[2].len(), 1, "файл тяжелее бюджета идёт порцией в одиночку");
+
+        assert_eq!(chunk_by_budget(&refs, 0).len(), 1, "нулевой бюджет — без деления");
+        assert!(chunk_by_budget(&[], 100).is_empty(), "пустой список — ни одной порции");
+    }
+
+    /// Порционный разбор даёт ровно тот же результат, что и разбор одним куском:
+    /// бюджет режет работу, а не данные.
+    #[test]
+    fn test_chunked_initial_index_matches_whole() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..12 {
+            fs::write(
+                tmp.path().join(format!("mod{}.py", i)),
+                format!("def f{}():\n    return {}\n", i, i),
+            )
+            .unwrap();
+        }
+
+        // Одним куском.
+        let mut whole_storage = Storage::open_in_memory().unwrap();
+        let whole = {
+            let mut indexer = Indexer::with_config(
+                &mut whole_storage,
+                IndexConfig { chunk_budget_bytes: 0, ..IndexConfig::default() },
+            );
+            indexer.full_reindex(tmp.path(), false).unwrap()
+        };
+
+        // Порциями: бюджета в 30 байт хватает на один-два таких файла.
+        let mut chunked_storage = Storage::open_in_memory().unwrap();
+        let chunked = {
+            let mut indexer = Indexer::with_config(
+                &mut chunked_storage,
+                IndexConfig { chunk_budget_bytes: 30, ..IndexConfig::default() },
+            );
+            indexer.full_reindex(tmp.path(), false).unwrap()
+        };
+
+        assert_eq!(chunked.errors.len(), 0, "ошибок быть не должно");
+        assert_eq!(chunked.files_indexed, whole.files_indexed, "записано столько же файлов");
+
+        let whole_stats = whole_storage.get_stats().unwrap();
+        let chunked_stats = chunked_storage.get_stats().unwrap();
+        assert_eq!(chunked_stats.total_files, 12);
+        assert_eq!(chunked_stats.total_files, whole_stats.total_files);
+        assert_eq!(chunked_stats.total_functions, whole_stats.total_functions);
+
+        // Пакетный режим отработал до конца: отметка о незавершённой загрузке снята.
+        assert!(!chunked_storage.bulk_in_progress(), "отметка должна быть снята");
+    }
+
+    /// Продолжение прерванной загрузки: отметка осталась с прошлого раза, часть
+    /// файлов в базе уже есть. Проход дочитывает остаток, достраивает индексы и
+    /// снимает отметку.
+    #[test]
+    fn test_resume_after_interrupted_bulk() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..3 {
+            fs::write(
+                tmp.path().join(format!("a{}.py", i)),
+                format!("def f{}():\n    pass\n", i),
+            )
+            .unwrap();
+        }
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        {
+            let mut indexer = Indexer::new(&mut storage);
+            indexer.full_reindex(tmp.path(), false).unwrap();
+        }
+
+        // Изображаем обрыв: отметка стоит, индексы сняты, часть файлов не дописана.
+        storage.set_bulk_in_progress(true).unwrap();
+        storage.prepare_bulk_load().unwrap();
+        for i in 3..6 {
+            fs::write(
+                tmp.path().join(format!("a{}.py", i)),
+                format!("def f{}():\n    pass\n", i),
+            )
+            .unwrap();
+        }
+
+        let result = {
+            let mut indexer = Indexer::new(&mut storage);
+            indexer.full_reindex(tmp.path(), false).unwrap()
+        };
+
+        assert_eq!(result.files_indexed, 3, "дочитан только остаток");
+        assert!(!storage.bulk_in_progress(), "отметка снята");
+
+        let stats = storage.get_stats().unwrap();
+        assert_eq!(stats.total_files, 6);
+        assert_eq!(stats.total_functions, 6);
+
+        // Индексы достроены — иначе база осталась бы пригодной только для полного
+        // скана, а поиск молча стал бы медленным.
+        let index_count: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_files_path'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1, "индекс по пути файла должен быть на месте");
+    }
+
+    /// При докатке файл, записанный до обрыва и с тех пор изменившийся,
+    /// переписывается без дублей: пакетного удаления в таком проходе не было,
+    /// поэтому прежние строки он чистит сам.
+    #[test]
+    fn test_resume_rewrites_changed_file_without_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("one.py");
+        fs::write(&file, "def было():\n    pass\n").unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        {
+            let mut indexer = Indexer::new(&mut storage);
+            indexer.full_reindex(tmp.path(), false).unwrap();
+        }
+
+        storage.set_bulk_in_progress(true).unwrap();
+        // Другая длина содержимого — файл не отсеется сверкой времени и размера
+        // даже в пределах одной секунды.
+        fs::write(&file, "def стало_другим_именем():\n    return 42\n").unwrap();
+
+        {
+            let mut indexer = Indexer::new(&mut storage);
+            indexer.full_reindex(tmp.path(), false).unwrap();
+        }
+
+        let stats = storage.get_stats().unwrap();
+        assert_eq!(stats.total_files, 1);
+        assert_eq!(stats.total_functions, 1, "прежняя функция не должна остаться рядом с новой");
     }
 
     /// S-6: списки путей нужны старту демона, чтобы звать точечный пересбор
