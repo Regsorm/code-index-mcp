@@ -128,12 +128,11 @@ fn visit_node(
         }
         "method_invocation" => {
             visit_call(node, ctx, current_func);
-            // Рекурсивно обходим аргументы
-            if let Some(args_node) = node.child_by_field_name("arguments") {
-                let mut cursor = args_node.walk();
-                for arg in args_node.children(&mut cursor) {
-                    visit_node(arg, ctx, class_name, current_func, args_node.kind(), depth + 1);
-                }
+            // Обходим ВСЕХ детей: вложенный вызов бывает и в объекте-получателе
+            // цепочки (`get(x).run()`), не только в аргументах.
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
             }
         }
         "field_declaration" => {
@@ -411,12 +410,9 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
         return;
     }
 
-    // Объект, на котором вызывается метод
-    let callee = if let Some(obj) = node.child_by_field_name("object") {
-        format!("{}.{}", node_text(obj, source), method_name)
-    } else {
-        method_name
-    };
+    // Объект-получатель в имя не идёт: поиск по графу сверяет имя точным
+    // равенством, а сам получатель попадёт в граф своим узлом, если это вызов.
+    let callee = method_name;
 
     let caller = current_func.unwrap_or("<module>").to_string();
     ctx.calls.push(ParsedCall { caller, callee, line });

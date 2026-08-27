@@ -4,6 +4,7 @@ use super::types::{
     sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер Rust-файлов на основе tree-sitter
@@ -152,22 +153,19 @@ fn visit_node(
         }
         "call_expression" => {
             visit_call_expr(node, ctx, current_func);
-            // Рекурсивно обходим аргументы
-            if let Some(args) = node.child_by_field_name("arguments") {
-                let mut cur = args.walk();
-                for arg in args.children(&mut cur) {
-                    visit_node(arg, ctx, impl_type, current_func, args.kind(), depth + 1);
-                }
+            // Обходим ВСЕХ детей: вложенный вызов бывает и в получателе
+            // цепочки (`Self::f(x).context(..)` прячет `f` внутри узла-функции
+            // внешнего вызова), не только в аргументах.
+            let mut cur = node.walk();
+            for child in node.children(&mut cur) {
+                visit_node(child, ctx, impl_type, current_func, node.kind(), depth + 1);
             }
         }
         "method_call_expression" => {
             visit_method_call(node, ctx, current_func);
-            // Рекурсивно обходим аргументы
-            if let Some(args) = node.child_by_field_name("arguments") {
-                let mut cur = args.walk();
-                for arg in args.children(&mut cur) {
-                    visit_node(arg, ctx, impl_type, current_func, args.kind(), depth + 1);
-                }
+            let mut cur = node.walk();
+            for child in node.children(&mut cur) {
+                visit_node(child, ctx, impl_type, current_func, node.kind(), depth + 1);
             }
         }
         "static_item" => {
@@ -617,16 +615,14 @@ fn visit_call_expr(
     let source = ctx.source;
     let line = node.start_position().row + 1;
 
-    // Callee: поле function
-    let callee = if let Some(func_node) = node.child_by_field_name("function") {
-        node_text(func_node, source).to_string()
-    } else {
-        return;
+    // Callee: имя из поля function (`Self::f` → `f`, `a.b` → `b`)
+    let callee = match node
+        .child_by_field_name("function")
+        .and_then(|n| callee_name(n, source))
+    {
+        Some(name) => name,
+        None => return,
     };
-
-    if callee.is_empty() {
-        return;
-    }
 
     let caller = current_func.unwrap_or("<module>").to_string();
     ctx.calls.push(ParsedCall { caller, callee, line });
@@ -648,12 +644,10 @@ fn visit_method_call(
         return;
     };
 
-    // Получатель: поле receiver
-    let callee = if let Some(recv) = node.child_by_field_name("receiver") {
-        format!("{}.{}", node_text(recv, source), method_name)
-    } else {
-        method_name
-    };
+    // Получатель в имя не идёт: искать вызовы `.context(...)` по тексту
+    // получателя всё равно нельзя, а сам получатель — если это вызов —
+    // попадёт в граф своим узлом.
+    let callee = method_name;
 
     let caller = current_func.unwrap_or("<module>").to_string();
     ctx.calls.push(ParsedCall { caller, callee, line });
@@ -813,6 +807,34 @@ use anyhow::Result;
 "#;
         let result = parser.parse(source, "test.rs").unwrap();
         assert!(result.imports.len() >= 3);
+    }
+
+    /// В граф вызовов идут ИМЕНА функций, а не текст выражения. Прежде
+    /// callee склеивался из текста узла: `Self::compress(&x)\n.context` —
+    /// такое ребро поиск по имени не находил никогда.
+    #[test]
+    fn test_parse_rust_calls_are_plain_names() {
+        let parser = RustParser::new();
+        let source = r#"
+fn run(&self, x: &str) -> Result<()> {
+    let blob = Self::compress(x)
+        .context("compress")?;
+    Storage::open_file(&self.path)?;
+    self.registry.lookup(x).unwrap();
+    (self.callback)();
+    Ok(())
+}
+"#;
+        let result = parser.parse(source, "test.rs").unwrap();
+        let names: Vec<&str> = result.calls.iter().map(|c| c.callee.as_str()).collect();
+
+        for expected in ["compress", "context", "open_file", "lookup", "unwrap"] {
+            assert!(names.contains(&expected), "{expected} не найден: {names:?}");
+        }
+        assert!(
+            !names.iter().any(|n| n.contains('(') || n.contains('\n') || n.contains("::")),
+            "в callee попал текст выражения: {names:?}"
+        );
     }
 
     #[test]

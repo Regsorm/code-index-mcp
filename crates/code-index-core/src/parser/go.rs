@@ -4,6 +4,7 @@ use super::types::{
     sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер Go-файлов на основе tree-sitter
@@ -128,12 +129,11 @@ fn visit_node(
         }
         "call_expression" => {
             visit_call_expr(node, ctx, current_func);
-            // Рекурсивно обходим аргументы вызова
-            if let Some(args) = node.child_by_field_name("arguments") {
-                let mut cur = args.walk();
-                for child in args.children(&mut cur) {
-                    visit_node(child, ctx, current_func, false, depth + 1);
-                }
+            // Обходим ВСЕХ детей: вложенный вызов бывает и в получателе
+            // цепочки (`f(x).Method()`), не только в аргументах.
+            let mut cur = node.walk();
+            for child in node.children(&mut cur) {
+                visit_node(child, ctx, current_func, false, depth + 1);
             }
         }
         "short_var_declaration" => {
@@ -512,16 +512,14 @@ fn visit_call_expr(
     let source = ctx.source;
     let line = node.start_position().row + 1;
 
-    // В Go call_expression: поле function — выражение-функция
-    let callee = if let Some(func_node) = node.child_by_field_name("function") {
-        node_text(func_node, source).to_string()
-    } else {
-        return;
+    // В Go call_expression: поле function — выражение-функция (`pkg.Func` → `Func`)
+    let callee = match node
+        .child_by_field_name("function")
+        .and_then(|n| callee_name(n, source))
+    {
+        Some(name) => name,
+        None => return,
     };
-
-    if callee.is_empty() {
-        return;
-    }
 
     let caller = current_func.unwrap_or("<module>").to_string();
     ctx.calls.push(ParsedCall { caller, callee, line });
@@ -697,5 +695,9 @@ type Handler interface {\n\tHandle()\n}\n";
             "Должно быть минимум 2 вызова, найдено: {}",
             result.calls.len()
         );
+        let names: Vec<&str> = result.calls.iter().map(|c| c.callee.as_str()).collect();
+        // Селектор пакета в имя не идёт: ищем `Println`, а не `fmt.Println`.
+        assert!(names.contains(&"Println"), "callee: {names:?}");
+        assert!(names.contains(&"process"), "callee: {names:?}");
     }
 }

@@ -4,6 +4,7 @@ use super::types::{
     sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер Python-файлов на основе tree-sitter
@@ -123,12 +124,12 @@ fn visit_node(
         }
         "call" => {
             visit_call(node, ctx, current_func);
-            // Рекурсивно обходим аргументы вызова для вложенных вызовов
+            // Обходим ВСЕХ детей: вложенные вызовы бывают не только в
+            // аргументах, но и в получателе цепочки — `json.dumps(x).encode()`
+            // прячет вызов `dumps` внутри узла-функции внешнего вызова.
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if child.kind() != "function" && child.kind() != "identifier" && child.kind() != "attribute" {
-                    visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
-                }
+                visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
             }
         }
         "expression_statement" => {
@@ -455,11 +456,13 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     let source = ctx.source;
     let line = node.start_position().row + 1;
 
-    // Callee: поле function узла call
-    let callee = if let Some(func_node) = node.child_by_field_name("function") {
-        node_text(func_node, source).to_string()
-    } else {
-        return;
+    // Callee: имя из поля function (`obj.method` → `method`)
+    let callee = match node
+        .child_by_field_name("function")
+        .and_then(|n| callee_name(n, source))
+    {
+        Some(name) => name,
+        None => return,
     };
 
     // Caller: имя ближайшей функции-контейнера или "<module>"
@@ -625,6 +628,28 @@ print("done")
         let module_call = result.calls.iter().find(|c| c.callee == "print");
         assert!(module_call.is_some());
         assert_eq!(module_call.unwrap().caller, "<module>");
+    }
+
+    /// Цепочка `json.dumps(payload).encode()` даёт ДВА ребра с именами
+    /// методов, а не одно с текстом выражения.
+    #[test]
+    fn test_parse_calls_are_plain_names() {
+        let parser = PythonParser::new();
+        let source = r#"
+def post(payload):
+    body = json.dumps(payload).encode()
+    handlers[0]()
+    return body
+"#;
+        let result = parser.parse(source, "test.py").unwrap();
+        let names: Vec<&str> = result.calls.iter().map(|c| c.callee.as_str()).collect();
+
+        assert!(names.contains(&"dumps"), "callee: {names:?}");
+        assert!(names.contains(&"encode"), "callee: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains('(') || n.contains('.')),
+            "в callee попал текст выражения: {names:?}"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use super::types::{
     ParsedVariable,
 };
 use super::LanguageParser;
+use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 use super::types::PARSE_TIMEOUT_MS;
 
@@ -336,18 +337,10 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     };
 
     // Для `obj.Method()` берём только имя метода, для `Method()` — сам идентификатор
-    let callee = if func_node.kind() == "member_access_expression" {
-        func_node
-            .child_by_field_name("name")
-            .map(|n| node_text(n, source).to_string())
-            .unwrap_or_default()
-    } else {
-        node_text(func_node, source).to_string()
+    let callee = match callee_name(func_node, source) {
+        Some(name) => name,
+        None => return,
     };
-
-    if callee.is_empty() {
-        return;
-    }
 
     let caller = current_func.unwrap_or("<module>").to_string();
     ctx.calls.push(ParsedCall { caller, callee, line });

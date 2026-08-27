@@ -5,6 +5,7 @@ use super::types::{
     ParsedVariable,
 };
 use super::LanguageParser;
+use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 use super::types::PARSE_TIMEOUT_MS;
 
@@ -344,14 +345,10 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
         .child_by_field_name("function")
         .or_else(|| node.child_by_field_name("name"));
 
-    let callee = match callee_node {
-        Some(n) => node_text(n, source).to_string(),
+    let callee = match callee_node.and_then(|n| callee_name(n, source)) {
+        Some(name) => name,
         None => return,
     };
-
-    if callee.is_empty() {
-        return;
-    }
 
     let caller = current_func.unwrap_or("<module>").to_string();
     ctx.calls.push(ParsedCall { caller, callee, line });

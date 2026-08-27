@@ -5,6 +5,7 @@ use super::types::{
     ParsedVariable,
 };
 use super::LanguageParser;
+use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 use super::types::PARSE_TIMEOUT_MS;
 
@@ -307,19 +308,10 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     };
 
     // `obj.method()` → navigation_expression, берём только имя после точки
-    let callee = if target.kind() == "navigation_expression" {
-        target
-            .child_by_field_name("suffix")
-            .and_then(|s| s.child_by_field_name("suffix"))
-            .map(|n| node_text(n, source).to_string())
-            .unwrap_or_default()
-    } else {
-        node_text(target, source).to_string()
+    let callee = match callee_name(target, source) {
+        Some(name) => name,
+        None => return,
     };
-
-    if callee.is_empty() || callee.contains('\n') {
-        return;
-    }
 
     let caller = current_func.unwrap_or("<module>").to_string();
     ctx.calls.push(ParsedCall { caller, callee, line });

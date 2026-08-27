@@ -5,6 +5,7 @@ use super::types::{
     ParseResult, ParsedCall, ParsedFunction, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::callee::is_plain_qualifier;
 use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер BSL-файлов (1С:Предприятие / OneScript) на основе tree-sitter-bsl
@@ -312,10 +313,15 @@ fn record_method_call(
             {
                 let receiver = parent.named_child(0).expect("named_child_count() > 1");
                 let q = node_text(receiver, ctx.source);
-                if q.is_empty() {
-                    method
-                } else {
+                // Квалификатор — только цепочка имён (`ОбщегоНазначения`,
+                // `Справочники.Номенклатура`). Получатель-выражение
+                // (`Ф(1).Метод()`, `Массив[0].Метод()`) в имя не идёт: там
+                // оказывался кусок исходника со скобками и переносами строк,
+                // который поиск по графу не находил никогда.
+                if is_plain_qualifier(q) {
                     format!("{q}.{method}")
+                } else {
+                    method
                 }
             }
             _ => method,
@@ -489,6 +495,24 @@ mod tests {
         let names: Vec<&str> = result.calls.iter().map(|c| c.callee.as_str()).collect();
         assert!(names.contains(&"ОбщийМодуль.Метод"), "callee: {:?}", names);
         assert!(names.contains(&"ГолыйВызов"), "callee: {:?}", names);
+    }
+
+    /// Квалификатор приклеивается только когда получатель — имя. Получатель-
+    /// выражение (`Ф(1).Метод()`) прежде давал callee `Ф(1).Метод` — кусок
+    /// исходника, который поиск по графу не находил.
+    #[test]
+    fn test_parse_bsl_calls_receiver_expression_not_qualified() {
+        let parser = BslParser::new();
+        let source = "Процедура Тест()\n    Ф(1).Метод();\n    Массив[0].Другой();\nКонецПроцедуры";
+        let result = parser.parse(source, "test.bsl").unwrap();
+        let names: Vec<&str> = result.calls.iter().map(|c| c.callee.as_str()).collect();
+
+        assert!(names.contains(&"Метод"), "callee: {names:?}");
+        assert!(names.contains(&"Другой"), "callee: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.contains('(') || n.contains('[')),
+            "в callee попал текст выражения: {names:?}"
+        );
     }
 
     #[test]

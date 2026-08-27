@@ -4,6 +4,7 @@ use super::types::{
     sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
 };
 use super::LanguageParser;
+use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 
 /// Парсер TypeScript/TSX-файлов на основе tree-sitter
@@ -135,14 +136,11 @@ fn visit_node(
         }
         "call_expression" => {
             visit_call(node, ctx, current_func);
+            // Обходим ВСЕХ детей: вложенный вызов бывает и в получателе
+            // цепочки (`fetch(url).then(..)`), не только в аргументах.
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if child.kind() == "arguments" || child.kind() == "type_arguments" {
-                    let mut arg_cursor = child.walk();
-                    for arg in child.children(&mut arg_cursor) {
-                        visit_node(arg, ctx, class_name, current_func, child.kind(), depth + 1);
-                    }
-                }
+                visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
             }
         }
         "lexical_declaration" | "variable_declaration" => {
@@ -588,10 +586,12 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     let source = ctx.source;
     let line = node.start_position().row + 1;
 
-    let callee = if let Some(func_node) = node.child_by_field_name("function") {
-        node_text(func_node, source).to_string()
-    } else {
-        return;
+    let callee = match node
+        .child_by_field_name("function")
+        .and_then(|n| callee_name(n, source))
+    {
+        Some(name) => name,
+        None => return,
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();

@@ -1,4 +1,6 @@
 pub mod types;
+/// Извлечение имени вызываемой функции из узла-выражения — общее для языков
+pub mod callee;
 pub mod python;
 pub mod javascript;
 pub mod typescript;
