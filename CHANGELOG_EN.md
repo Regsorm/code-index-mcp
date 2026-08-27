@@ -5,6 +5,30 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [0.69.0] — 2026-08-27
+
+**A call edge now stores the callee's name, not a slice of source text. Calls inside chains and through qualified paths became findable — previously they never were.**
+
+> Context. Call-graph lookups (`get_callers`, `get_callees`, `find_path`, `get_call_tree`) match the name by exact equality. The parsers, however, stored the text of the whole callee node: for a chain like `json.dumps(x).encode()` or a path like `Self::f(&y).context(..)` that text carried arguments and line breaks along with it. Such an edge exists in the graph but no query can find it by name. In the project's own repository only 22 % of edges held a bare name: 7,040 of 15,311 carried expression text, and more carried a `::` path. On languages with free chaining the question "who calls this function" answered zero while the calls were right there in the code.
+
+### Fixed
+
+- **The name is taken from the parse node instead of by trimming text.** A shared helper walks from the callee expression down to the name: `Self::f(x)` → `f`, `obj.method()` → `method`, `pkg.Func()` → `Func`. When there is no name at all — the call target is the result of an expression (`handlers[0]()`, `(*callback)()`) — no edge is written, rather than storing a source string nothing can look up. The change touches the parsers of eleven languages.
+- **The tree walk now descends into the receiver of a chain.** Previously only the arguments of a call node were walked, so a nested call inside a chain never reached the graph: `json.dumps(x).encode()` produced one edge instead of two. While the whole expression text sat in the name, the loss was invisible. All children of a call node are walked now, and a chain yields one edge per link.
+- **For 1C the qualifier is kept, but is no longer assembled from an expression.** The `Module.Method` gluing stays — the extension's resolver relies on it. One thing changed: only a chain of names goes into the qualifier, while an expression receiver (`F(1).Method()`, `Array[0].Method()`) yields the bare method name instead of a slice of source.
+
+### Upgrade note
+
+The stored form of the name changed, so already-built databases keep the old records: parsing skips files whose modification time has not changed. To get the fix, run a forced full parse of the folder (`index --force`) with the services stopped. Timing: 110 s for 57,072 files on the workstation, 146 s for 58,563 files on the federation node.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 813 passed, 0 failed, no compiler warnings. Four new ones cover: a chain and a qualified path in Rust, the `json.dumps(x).encode()` chain in Python, a package selector in Go, an expression receiver in 1C.
+- **The project's own repository (Rust), full parse:** edges 15,311 → 22,073 (chain links lost by the walk came back), of which those carrying expression text in the name 7,040 → **0**. "Who calls the content-compression function" used to answer zero; now three callers — exactly as many as a text search finds.
+- **A typical trade configuration (1C), full parse:** 2,039,735 edges, expression text 32,014 → **0**; glued `Module.Method` — 1,146,204, so the qualifiers are intact.
+- **Local deployment and a live check:** both services run the new build, two databases were rebuilt by it, `get_callers`/`get_callees` answers verified on both languages.
+- **Federation node:** the image was rebuilt from the local build, both containers healthy, a remote repository's database rebuilt on the node, queries through federation return the same numbers.
+
 ## [0.68.0] — 2026-08-26
 
 **A full parse now runs in chunks: peak memory is set by a setting, not by the size of the folder. A load interrupted mid-way resumes where it stopped instead of starting over.**
