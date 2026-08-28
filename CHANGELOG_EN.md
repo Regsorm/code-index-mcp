@@ -13,6 +13,7 @@ Versioning — [SemVer](https://semver.org/).
 
 ### Added
 
+- **One-command install on Windows.** `install.ps1` downloads the requested release, unpacks it, records the folder in an environment variable, writes a starter settings file and prints a ready block for the client's settings. An optional switch registers autostart at logon — through the user's startup folder, with no administrator rights and no visible windows; the scheduled-task variant stays behind its own switch and never overwrites an existing task without permission. Install folder, source folder, build flavor, version and both ports are parameters.
 - **`get_role_rights` — role rights in one call.** "Which roles have rights on this object" and "what is this role allowed to do" are answered from the rights table. Previously the question took raw SQL or a walk over the roles directory reading rights files piece by piece. Rewording the raw-SQL description did not help — a separate named tool did: on the control question the cost dropped from 1.45M tokens over 33 turns to 255–307K over 7–8 turns.
 
 ### Fixed

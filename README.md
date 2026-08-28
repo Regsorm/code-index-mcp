@@ -19,7 +19,30 @@
 
 ## Установка
 
-### Windows — готовый архив из выпуска
+### Windows — одной командой
+
+```powershell
+irm https://raw.githubusercontent.com/Regsorm/code-index-mcp/main/install.ps1 | iex
+```
+
+Скачивает последний выпуск в `C:\tools\code-index`, запоминает папку в
+переменной окружения, создаёт заготовку файла настроек и печатает готовый блок
+для `.mcp.json`.
+
+С параметрами — папка установки, папка с исходниками, автозапуск при входе в
+систему:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Regsorm/code-index-mcp/main/install.ps1))) `
+    -InstallDir 'D:\code-index' -Repo 'main=D:\Repo1C' -RegisterAutostart
+```
+
+Автозапуск идёт через папку автозагрузки пользователя: прав администратора не
+требует, окон не показывает. Остальные параметры — `-Flavor core` для сборки
+без 1С, `-Version 1.0.0` для конкретного выпуска, `-Port` и `-DaemonPort`, если
+порты по умолчанию заняты. Полный список — `Get-Help .\install.ps1 -Detailed`.
+
+### Windows — вручную, готовый архив из выпуска
 
 Скачивает последний выпуск, распаковывает в `C:\tools\code-index` и запоминает
 эту папку в переменной окружения:
@@ -35,7 +58,7 @@ Expand-Archive "$env:TEMP\code-index.zip" -DestinationPath $dst -Force
 setx CODE_INDEX_HOME $dst
 ```
 
-`bsl-indexer` — сборка с поддержкой 1С (31 инструмент). Нужна работа без 1С —
+`bsl-indexer` — сборка с поддержкой 1С (32 инструмента). Нужна работа без 1С —
 возьмите `code-index-windows-x64.zip` (20 инструментов). Для Linux и macOS в том
 же выпуске лежат `*-linux-x64.tar.gz` и `*-macos-arm64.tar.gz`.
 

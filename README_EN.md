@@ -12,7 +12,7 @@ Published on Infostart: [Code Index — структурный поиск по �
 
 **Rust-native code index for AI agents. Static binary. Production-grade BSL/1C support.**
 
-One static binary for Windows/Linux/macOS — no runtime, no dependencies. Indexes large repositories in seconds, returns results to AI agents over MCP in milliseconds. 31 tools: 20 universal + 11 BSL-specific for 1C:Enterprise configurations.
+One static binary for Windows/Linux/macOS — no runtime, no dependencies. Indexes large repositories in seconds, returns results to AI agents over MCP in milliseconds. 32 tools: 20 universal + 12 BSL-specific for 1C:Enterprise configurations.
 
 ## What's inside
 
