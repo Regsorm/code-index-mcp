@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="214" viewBox="0 0 880 214" role="img" aria-label="В среднем в 2,04 раза дешевле по токенам, в 1,78 раза быстрее, 51 процент экономии за сеанс">
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="440" y="20" font-size="13" fill="#8b949e" text-anchor="middle">В среднем: агент с сервером против агента с обычным поиском по файлам</text>
+
+    <rect x="0.5" y="38.5" width="281" height="121" rx="10" fill="#0d2d4e" stroke="#1f4b73"/>
+    <rect x="299.5" y="38.5" width="281" height="121" rx="10" fill="#0d2d4e" stroke="#1f4b73"/>
+    <rect x="598.5" y="38.5" width="281" height="121" rx="10" fill="#0d2d4e" stroke="#1f4b73"/>
+
+    <g text-anchor="middle">
+      <text x="141" y="110" font-size="52" font-weight="700" fill="#79c0ff">×2,04</text>
+      <text x="141" y="138" font-size="14" fill="#a5d6ff">дешевле по токенам</text>
+
+      <text x="440" y="110" font-size="52" font-weight="700" fill="#79c0ff">×1,78</text>
+      <text x="440" y="138" font-size="14" fill="#a5d6ff">быстрее по времени</text>
+
+      <text x="739" y="110" font-size="52" font-weight="700" fill="#79c0ff">51 %</text>
+      <text x="739" y="138" font-size="14" fill="#a5d6ff">экономия за сеанс</text>
+
+      <text x="440" y="196" font-size="13" fill="#8b949e">Типовые вопросы к коду: где определена процедура, кто её вызывает, состав объекта, связи данных.</text>
+    </g>
+  </g>
+</svg>
