@@ -1076,11 +1076,51 @@ pub async fn get_callees(
                 r.truncate(cap);
             }
             let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            // Место ОПРЕДЕЛЕНИЯ вызываемой процедуры. Без него модель добирала
+            // его отдельным поиском на каждое имя: в замере 28.08.2026 один
+            // вопрос «что вызывает процедура, с файлами» стоил 25+ лишних
+            // вызовов find_symbol. Разрешаем только однозначные имена — на
+            // тёзках место определения неизвестно, и врать нельзя.
+            // У BSL вызов хранится склеенно (`Модуль.Метод`), поэтому ищем по
+            // последнему сегменту имени.
+            let mut defs: std::collections::HashMap<String, Option<(String, usize)>> =
+                std::collections::HashMap::new();
+            for cr in r.iter() {
+                if defs.contains_key(&cr.callee) {
+                    continue;
+                }
+                // Квалификатор перед точкой — имя модуля (`СтроковыеФункции.Подставить`).
+                // На тёзках из разных модулей он и решает, какое определение наше:
+                // без него однозначных имён в 1С почти не бывает и поле не
+                // появлялось бы никогда.
+                let (module, short) = match cr.callee.rsplit_once('.') {
+                    Some((m, s)) => (Some(m), s.to_string()),
+                    None => (None, cr.callee.clone()),
+                };
+                let candidates = storage.get_function_by_name(&short).unwrap_or_default();
+                let with_paths: Vec<(String, usize)> = candidates
+                    .iter()
+                    .map(|f| (lookup_path(&storage, f.file_id), f.line_start))
+                    .collect();
+                let narrowed: Vec<&(String, usize)> = match module {
+                    Some(m) if !m.is_empty() => with_paths
+                        .iter()
+                        .filter(|(p, _)| p.contains(&format!("/{}/", m)))
+                        .collect(),
+                    _ => with_paths.iter().collect(),
+                };
+                let found = if narrowed.len() == 1 {
+                    Some(narrowed[0].clone())
+                } else {
+                    None
+                };
+                defs.insert(cr.callee.clone(), found);
+            }
             // Обогащаем каждую запись путём файла-источника (file_id → path).
             let enriched: Vec<serde_json::Value> = r
                 .iter()
                 .map(|cr| {
-                    serde_json::json!({
+                    let mut rec = serde_json::json!({
                         "caller": cr.caller,
                         "callee": cr.callee,
                         "line": cr.line,
@@ -1088,7 +1128,14 @@ pub async fn get_callees(
                         // (strip_plumbing_recursive) всё равно удаляет этот ключ
                         // перед отдачей — файл-источник несёт `path` (M-9).
                         "path": lookup_path(&storage, cr.file_id),
-                    })
+                    });
+                    if let Some(Some((def_path, def_line))) = defs.get(&cr.callee) {
+                        if let Some(obj) = rec.as_object_mut() {
+                            obj.insert("callee_path".into(), serde_json::json!(def_path));
+                            obj.insert("callee_line".into(), serde_json::json!(def_line));
+                        }
+                    }
+                    rec
                 })
                 .collect();
             let extra = if truncated {
@@ -1818,8 +1865,16 @@ pub async fn list_files(
                         "total": total,
                         "shown": r.len(),
                         "limit": want,
+                        // Подсказка в момент неверного пути: перебор списков ради
+                        // подсчёта — самый дорогой из наблюдавшихся сценариев
+                        // (замер 28.08.2026: 90 вызовов list_files подряд там,
+                        // где ответ даёт один запрос с группировкой).
                         "hint": "Показаны первые файлы по алфавиту — это НЕ весь список. \
-                                 Поднимите limit= либо сузьте pattern=/path_prefix=/language=.",
+                                 Поднимите limit= либо сузьте pattern=/path_prefix=/language=. \
+                                 Если считаете количество (сколько объектов какого вида, сколько \
+                                 модулей или форм) — НЕ листайте страницы: в репозитории 1С это \
+                                 один запрос bsl_sql с GROUP BY по metadata_objects / \
+                                 metadata_modules / metadata_forms.",
                     })
                 })
             } else if r.is_empty() {

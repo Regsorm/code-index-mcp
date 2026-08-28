@@ -118,6 +118,11 @@ impl LanguageProcessor for BslLanguageProcessor {
             // Регистраторы регистра / движения документа (recorder-рёбра
             // data_links): «кто пишет в регистр» и «куда пишет документ».
             Arc::new(crate::tools::GetRegisterWritersTool),
+            // get_role_rights — права ролей на объект и состав прав роли
+            // (таблица role_rights). Именованный tool вместо произвольного SQL:
+            // по замеру 28.08.2026 модель к bsl_sql за правами не шла и листала
+            // файлы Rights.xml, а именованные инструменты берёт уверенно.
+            Arc::new(crate::tools::GetRoleRightsTool),
             // search_terms — поиск по обогащённым termам (этап 5a).
             // Регистрируется всегда, даже без feature `enrichment`:
             // tool сам по себе read-only, не требует HTTP-клиента.
@@ -308,9 +313,10 @@ mod tests {
 
     #[test]
     fn additional_tools_registered() {
-        // 11 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
-        // + get_register_writers (регистраторы/движения) + bsl_sql (произвольный
-        // read-only SELECT) + get_object_profile (паспорт объекта за 1 вызов)
+        // 12 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
+        // + get_register_writers (регистраторы/движения) + get_role_rights
+        // (права ролей) + bsl_sql (произвольный read-only SELECT)
+        // + get_object_profile (паспорт объекта за 1 вызов)
         // + find_references (карта влияния: реверс data_links + код + права).
         let p = BslLanguageProcessor::new();
         let tools = p.additional_tools();
@@ -323,10 +329,11 @@ mod tests {
         assert!(names.contains(&"get_data_links"));
         assert!(names.contains(&"find_data_path"));
         assert!(names.contains(&"get_register_writers"));
+        assert!(names.contains(&"get_role_rights"));
         assert!(names.contains(&"bsl_sql"));
         assert!(names.contains(&"get_object_profile"));
         assert!(names.contains(&"find_references"));
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]

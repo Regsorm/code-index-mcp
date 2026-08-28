@@ -1076,7 +1076,7 @@ impl CodeIndexServer {
         tools::get_callers(entry, p.function_name, p.language, p.limit).await
     }
 
-    #[tool(description = "Найти что вызывает функция (callees) в указанном репо. limit — cap (default 200); при обрезке {truncated,total,limit}. Возвращает JSON-массив CallRecord.")]
+    #[tool(description = "Что вызывает данная функция (callees) — весь список за ОДИН вызов. В каждой записи уже есть caller, callee, line, path файла с вызовом, а для однозначных имён ещё и callee_path/callee_line — место, где вызываемая процедура ОПРЕДЕЛЕНА. Искать каждое вызываемое имя отдельным find_symbol/get_function НЕ нужно; если callee_path нет, значит имя носят несколько процедур — тогда спрашивай их одним grep_code с перечислением через | , а не по вызову на имя. limit — cap (default 200); при обрезке {truncated,total,limit}. Цепочка до конкретной функции — find_path, дерево на несколько уровней — get_call_tree.")]
     async fn get_callees(&self, Parameters(p): Parameters<FunctionNameParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1087,7 +1087,7 @@ impl CodeIndexServer {
         tools::get_callees(entry, p.function_name, p.language, p.limit).await
     }
 
-    #[tool(description = "Кратчайший путь в графе вызовов от функции 'from' до 'to' через таблицу calls (рекурсивный CTE, BFS, max_depth по умолчанию 5, [1..10]). Универсальный, любой язык. Возвращает {from,to,found,path:[{caller,callee,line}]}. Для BSL с call_type — find_path_bsl.")]
+    #[tool(description = "Цепочка вызовов между двумя функциями за ОДИН вызов. Бери его на вопросы вида «есть ли путь от A до B», «как из A попадают в B», «через что A вызывает B»: кратчайший путь по графу ищет сервер. НЕ восстанавливай цепочку вручную — обход через get_callers/get_callees по одному узлу и чтение тел стоит десятки вызовов и даёт тот же ответ. Параметры: from, to — имена функций; max_depth по умолчанию 5, [1..10]. Универсальный, любой язык. Возвращает {from,to,found,path:[{caller,callee,line}]}. Пути нет — ответ различает «дошли до потолка» и «подграф исчерпан». Для 1С есть отдельный find_path_bsl (учитывает вид вызова).")]
     async fn find_path(&self, Parameters(p): Parameters<FindPathParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1098,7 +1098,7 @@ impl CodeIndexServer {
         tools::find_path(entry, p.from, p.to, p.max_depth, p.language).await
     }
 
-    #[tool(description = "Дерево вызовов от функции 'root' на глубину max_depth (по умолчанию 3, [1..10]) через таблицу calls. direction: callees/down (что вызывает root вглубь, по умолчанию) или callers/up (кто вызывает root). max_nodes cap (default 200). Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}.")]
+    #[tool(description = "Дерево вызовов на НЕСКОЛЬКО уровней за ОДИН вызов. Бери его на вопросы вида «кто вызывает того, кто вызывает X», «цепочка вызовов вверх/вниз», «дерево вызовов на N уровней»: обход по уровням делает сервер. НЕ собирай такое дерево вручную — перебор узлов через get_callers/get_callees/grep_code/find_symbol стоит десятки лишних вызовов и даёт тот же ответ. Параметры: root — имя функции; direction: callers/up (кто вызывает root — для вопросов «кто выше по цепочке») либо callees/down (что вызывает сам root, по умолчанию); max_depth по умолчанию 3, [1..10]; max_nodes cap (default 200). Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}.")]
     async fn get_call_tree(&self, Parameters(p): Parameters<CallTreeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
