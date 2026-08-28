@@ -13,7 +13,7 @@ members = [
 version = "1.0.0"
 edition = "2021"
 license = "MIT"
-description = "Rust-native code index MCP server with first-class 1C:Enterprise (BSL) support. Static binary, 31 tools, tree-sitter AST for 14 languages, sub-ms search."
+description = "Rust-native code index MCP server with first-class 1C:Enterprise (BSL) support. Static binary, 32 tools, tree-sitter AST for 14 languages, sub-ms search."
 
 # Общие зависимости — задаём версии один раз, крейты подключают через
 # `dep_name = { workspace = true }`. Это исключает рассинхронизацию версий
