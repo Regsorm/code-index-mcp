@@ -5,6 +5,20 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.0.1] — 2026-08-28
+
+**A role-rights query no longer runs a spurious second branch, nor carries a hint about an object that was never asked for.**
+
+### Fixed
+
+- **A role name is no longer mistaken for an object name.** The role-rights tool took the object name from a shared helper that deliberately ignores the key name and returns the value of the first non-service parameter. This tool has two meaningful parameters, so a query by role had the role name picked up as an object as well: a pointless database query ran, and the correct answer came with the hint "no role mentions this object" attached. The object name is now read strictly by key name (`object`, `object_name`, `full_name`, `name`), and blank values are dropped. Argument parsing was extracted into separate functions and covered by four tests.
+- **An empty role result now explains itself.** A query for a non-existent role used to return an empty list with no explanation, which reads as "this role has no rights". It now carries a hint saying no role by that name appears in the rights, plus the query that lists the available roles. The object branch had such a hint from the start.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 817 passed, 0 failed.
+- **Live check:** a query for a non-existent role answers with no object field and no foreign hint; queries by object and by an existing role answer as before.
+
 ## [1.0.0] — 2026-08-28
 
 **First stable release. A named tool for role rights, call-chain search that no longer hangs on a dense graph, and callee lists that already carry the definition site.**
