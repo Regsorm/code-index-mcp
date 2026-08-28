@@ -5,6 +5,33 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.0.0] — 2026-08-28
+
+**First stable release. A named tool for role rights, call-chain search that no longer hangs on a dense graph, and callee lists that already carry the definition site.**
+
+> Context. The tool set was checked by a run where the same question was given to two agents: one with the server, one with plain file search. The run exposed three places where the agent spent dozens of turns instead of a single call — those are fixed below. From this release on, tool names and response shapes are considered settled: breaking changes will require a major version bump.
+
+### Added
+
+- **`get_role_rights` — role rights in one call.** "Which roles have rights on this object" and "what is this role allowed to do" are answered from the rights table. Previously the question took raw SQL or a walk over the roles directory reading rights files piece by piece. Rewording the raw-SQL description did not help — a separate named tool did: on the control question the cost dropped from 1.45M tokens over 33 turns to 255–307K over 7–8 turns.
+
+### Fixed
+
+- **1C call-chain search no longer hangs.** The traversal was rewritten from a recursive database query to a breadth-first walk with a visited set, a node ceiling and a time budget. The control question took 494 seconds; it now takes 112 milliseconds. The starting point may be given as a bare procedure name instead of a full key, and the response now reports whether the walk was cut short by time or by node count — so "no path" and "did not finish looking" are distinguishable.
+- **The hint on a missing path no longer misleads.** "No such calling procedure" was inferred from the number of resolved starting keys, and an exact key always yields exactly one — so every call with a full key claimed the procedure was not found even though the walk had honestly covered thousands of nodes. The signal is now the absence of outgoing edges.
+- **Callee lists carry the definition site.** For unambiguous names the response includes the declaration path and line, resolved with the module from a qualified call. Previously the agent looked up each name with a separate query: on the control question 1.32M tokens over 42 turns versus 619–684K over 14–18.
+
+### Changed
+
+- **Tool descriptions rewritten from the user's question.** Call tree, data links, file listing and raw SQL now say "reach for this on such-and-such question" and explicitly forbid assembling the answer by hand. On the call tree that meant 1.68M tokens over 70 turns versus 350K over 8; on data links 1.90M over 22 turns versus 680–813K over 11.
+- **The project's front page is now in Russian**, installation moved to the top, and community files were added: contributing guide, security policy, code of conduct.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 813 passed, 0 failed.
+- **Local deploy and live check:** both services running on the new build; role rights, callee lists and chain search verified against a trade configuration of 57,072 files. Both hint branches now differ correctly: with an existing start and no path the walk covers 3,795 nodes and reports "no path"; with a non-existent start it stops at one node and reports that the procedure was not found.
+- **Federation node:** image rebuilt from the local build, both containers healthy; role rights, callee lists and chain search verified through remote repositories.
+
 ## [0.69.0] — 2026-08-27
 
 **A call edge now stores the callee's name, not a slice of source text. Calls inside chains and through qualified paths became findable — previously they never were.**
