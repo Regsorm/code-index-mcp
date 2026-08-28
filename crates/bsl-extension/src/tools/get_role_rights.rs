@@ -71,12 +71,8 @@ impl IndexTool for GetRoleRightsTool {
         ctx: ToolContext<'a>,
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
-            let object = crate::tools::object_value(&args)
-                .map(|s| crate::code_usages::normalize_object_ref(s).into_owned());
-            let role = args
-                .get("role")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim_start_matches("Role.").to_string());
+            let object = object_arg(&args);
+            let role = role_arg(&args);
 
             if object.is_none() && role.is_none() {
                 return crate::tools::wrap_error(json!({
@@ -162,11 +158,46 @@ impl IndexTool for GetRoleRightsTool {
                 if truncated {
                     payload.insert("objects_truncated".into(), json!(true));
                 }
+                if objects.is_empty() {
+                    // Пустой ответ без объяснения агент читает как «прав нет»,
+                    // хотя обычная причина — роли с таким именем в конфигурации
+                    // нет. По объекту такая подсказка есть, по роли не было.
+                    payload.insert(
+                        "hint".into(),
+                        json!("Такой роли нет в правах: проверьте имя роли — \
+                               перечень ролей отдаёт bsl_sql запросом \
+                               'SELECT DISTINCT role_name FROM role_rights'."),
+                    );
+                }
             }
 
             crate::tools::wrap_with_meta("get_role_rights", Value::Object(payload), Vec::new())
         })
     }
+}
+
+/// Имя объекта — СТРОГО по имени ключа. Общий помощник `tools::object_value`
+/// здесь не годится: он игнорирует имя ключа и берёт значение первого
+/// неслужебного параметра, а у этого инструмента значимых параметра два. С ним
+/// запрос по роли подхватывал имя роли ещё и как объект: отрабатывала лишняя
+/// ветка — напрасный запрос к базе и подсказка про ненайденный объект рядом с
+/// успешным ответом по роли.
+fn object_arg(args: &Value) -> Option<String> {
+    ["object", "object_name", "full_name", "name"]
+        .iter()
+        .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| crate::code_usages::normalize_object_ref(s).into_owned())
+}
+
+/// Имя роли; префикс `Role.` необязателен.
+fn role_arg(args: &Value) -> Option<String> {
+    args.get("role")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_start_matches("Role.").to_string())
 }
 
 /// Выбрать пары (ключ, право) по готовому запросу с параметрами repo/ключ/потолок.
@@ -194,4 +225,46 @@ fn group(rows: Vec<(String, String)>, cap: usize) -> Vec<(String, Vec<String>)> 
         map.entry(key).or_default().push(right);
     }
     map.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn запрос_по_роли_не_считает_роль_объектом() {
+        let args = json!({ "repo": "ut", "role": "ПолныеПрава" });
+        assert_eq!(object_arg(&args), None);
+        assert_eq!(role_arg(&args).as_deref(), Some("ПолныеПрава"));
+    }
+
+    #[test]
+    fn запрос_по_объекту_читается_по_имени_ключа() {
+        let args = json!({ "repo": "ut", "object": "Catalog.Организации" });
+        assert_eq!(object_arg(&args).as_deref(), Some("Catalog.Организации"));
+        assert_eq!(role_arg(&args), None);
+    }
+
+    #[test]
+    fn синонимы_ключа_объекта_принимаются() {
+        for key in ["object", "object_name", "full_name", "name"] {
+            let args = json!({ "repo": "ut", key: "Catalog.Организации" });
+            assert_eq!(
+                object_arg(&args).as_deref(),
+                Some("Catalog.Организации"),
+                "ключ {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn префикс_role_необязателен_и_пустые_значения_отбрасываются() {
+        assert_eq!(
+            role_arg(&json!({ "role": "Role.ПолныеПрава" })).as_deref(),
+            Some("ПолныеПрава")
+        );
+        assert_eq!(role_arg(&json!({ "role": "   " })), None);
+        assert_eq!(object_arg(&json!({ "object": "" })), None);
+    }
 }
