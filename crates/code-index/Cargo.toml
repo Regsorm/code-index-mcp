@@ -31,3 +31,6 @@ rmcp = { workspace = true }
 
 # HTTP — для axum::Router::new() в serve_http
 axum = { workspace = true }
+
+[build-dependencies]
+winresource = { version = "0.1.31", default-features = false }
