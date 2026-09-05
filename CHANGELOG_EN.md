@@ -5,6 +5,21 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.0.2] — 2026-09-05
+
+**Windows executables now carry product and version information — visible in the file properties, without running them with a version flag.**
+
+### Added
+
+- **Version information in Windows builds.** Both executables now embed a version resource: product name, file description, company name, copyright notice, original and internal file name. File and product version are taken from the package version at build time. Previously all these fields were empty: the two executables were indistinguishable in the file properties, and the installed version could only be found by running the binary. The resource is embedded only when the build target is Windows — Linux and macOS builds are untouched and unchanged. Contributed by [@Borisskin](https://github.com/Borisskin) ([#7](https://github.com/Regsorm/code-index-mcp/pull/7)).
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 817 passed, 0 failed.
+- **Locally:** file properties of both Windows executables show product name, description, company and version 1.0.2; both services run the new build, and the register-writers query answers as before.
+- **Linux build:** the dynamically linked glibc ELF builds unchanged — resource embedding is skipped by target OS.
+- **Federation:** remote repositories answer through the new build on the node.
+
 ## [1.0.1] — 2026-08-28
 
 **A role-rights query no longer runs a spurious second branch, nor carries a hint about an object that was never asked for.**
