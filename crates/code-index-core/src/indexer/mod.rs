@@ -1234,6 +1234,12 @@ impl<'a> Indexer<'a> {
             // Получаем метаданные для всех файлов
             let meta = entry.metadata().ok();
 
+            let rel_path = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
             // Лимит размера — только для текстовых файлов, код индексируем всегда.
             // Исключение — файлы выгрузки 1С, по которым реально ищут: оглавление
             // конфигурации, права ролей, структура формы. В крупных конфигурациях
@@ -1241,14 +1247,17 @@ impl<'a> Indexer<'a> {
             // Rights.xml до 5 МБ) и молча выпадали из индекса целиком. Макеты печатных
             // форм (Template.xml, до 78 МБ) и служебная опись выгрузки под исключение НЕ
             // подпадают: искать по ним нечего, а места занимают больше всего.
-            if !matches!(category, FileCategory::Code(_))
-                && !file_types::is_size_exempt(path)
-            {
-                if let Some(ref m) = meta {
-                    if m.len() as usize > self.config.max_file_size {
-                        result.files_not_indexable += 1;
-                        continue;
-                    }
+            //
+            // Правило вынесено в `file_types::size_allowed` — то же самое применяет
+            // путь слежения за файлами (`daemon_core::worker::apply_event`).
+            if let Some(ref m) = meta {
+                if !file_types::size_allowed(path, &category, m.len(), self.config.max_file_size) {
+                    result.files_not_indexable += 1;
+                    // На диске файл есть, он просто не индексируется — в список
+                    // виденных путь всё равно заносим. Иначе этап уборки считает
+                    // файл исчезнувшим и удаляет его запись при каждом запуске.
+                    seen_paths.insert(rel_path);
+                    continue;
                 }
             }
 
@@ -1259,12 +1268,6 @@ impl<'a> Indexer<'a> {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let file_size_val = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-
-            let rel_path = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
 
             result.files_scanned += 1;
             seen_paths.insert(rel_path.clone());
@@ -1937,6 +1940,40 @@ class App:
             "big.txt не индексируется по размеру — это отдельный счётчик, не «без изменений»"
         );
         assert_eq!(r.files_skipped, 0, "неизменившихся файлов здесь нет");
+    }
+
+    /// Регресс: файл, пропущенный по размеру, не попадал в список виденных, и
+    /// этап уборки считал его исчезнувшим с диска. Запись, оставшуюся от
+    /// прежнего пути слежения, он удалял при каждом запуске — а на записях
+    /// огромных файлов удаление ещё и падало, унося индексацию всей папки.
+    #[test]
+    fn пропущенный_по_размеру_файл_не_считается_исчезнувшим() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("big.txt"), "y".repeat(4096)).unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let config = IndexConfig {
+            max_file_size: 1024,
+            ..Default::default()
+        };
+
+        // След прежнего поведения: запись файла, который нынешнее правило
+        // приёма в индекс не пустило бы.
+        {
+            let indexer = Indexer::with_config(&mut storage, config.clone());
+            indexer
+                .write_text_to_db("big.txt", "hash", 1, "y", false, Some(0), Some(4096))
+                .unwrap();
+        }
+
+        let mut indexer = Indexer::with_config(&mut storage, config);
+        let r = indexer.full_reindex(tmp.path(), false).unwrap();
+
+        assert_eq!(
+            r.files_deleted, 0,
+            "файл на диске есть — удалять его запись как исчезнувшего нельзя"
+        );
+        assert_eq!(r.files_not_indexable, 1, "он именно не индексируется");
     }
 
     /// Файлы выгрузки 1С, по которым реально ищут (оглавление конфигурации,

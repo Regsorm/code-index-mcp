@@ -107,6 +107,28 @@ pub fn is_size_exempt(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Проходит ли файл по ограничению размера.
+///
+/// Правило приёма одно на ОБА пути записи в индекс — обход дерева при старте и
+/// слежение за файлами. Расхождение между ними означает, что наблюдатель кладёт
+/// в базу то, что обход считает недопустимым, а этап уборки потом на этих
+/// записях спотыкается: так текстовые файлы в сотни мегабайт попадали в индекс
+/// мимо лимита и валили индексацию папки целиком при попытке их удалить
+/// (разжатие сохранённого текста упирается в защиту от «архивной бомбы»).
+///
+/// Код индексируется независимо от размера; для текста действует
+/// `max_file_size`, кроме файлов выгрузки 1С из [`SIZE_EXEMPT_FILES`].
+pub fn size_allowed(
+    path: &Path,
+    category: &FileCategory,
+    size: u64,
+    max_file_size: usize,
+) -> bool {
+    matches!(category, FileCategory::Code(_))
+        || is_size_exempt(path)
+        || size as usize <= max_file_size
+}
+
 /// Директории, которые следует исключать при обходе
 pub const EXCLUDE_DIRS: &[&str] = &[
     "node_modules", ".venv", "__pycache__", ".git",
@@ -217,6 +239,40 @@ mod tests {
             categorize_file(Path::new("script.py")),
             FileCategory::Code("python".to_string())
         );
+    }
+
+    #[test]
+    fn правило_размера_одно_для_кода_текста_и_выгрузки() {
+        let limit = 1024;
+        // Код — независимо от размера.
+        assert!(size_allowed(
+            Path::new("huge.py"),
+            &FileCategory::Code("python".to_string()),
+            10 * 1024 * 1024,
+            limit
+        ));
+        // Файлы выгрузки 1С — независимо от размера.
+        assert!(size_allowed(
+            Path::new("Configuration.xml"),
+            &FileCategory::Text,
+            10 * 1024 * 1024,
+            limit
+        ));
+        // Обычный текст в пределах лимита.
+        assert!(size_allowed(
+            Path::new("data.json"),
+            &FileCategory::Text,
+            limit as u64,
+            limit
+        ));
+        // Обычный текст сверх лимита — не берём. Ровно этот случай пропускал
+        // путь слежения, и в индекс попадали файлы в сотни мегабайт.
+        assert!(!size_allowed(
+            Path::new("data.json"),
+            &FileCategory::Text,
+            limit as u64 + 1,
+            limit
+        ));
     }
 
     #[test]

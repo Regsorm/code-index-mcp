@@ -615,7 +615,24 @@ impl Storage {
             .optional()
             .context("fts_text_delete: SELECT text_contents")?;
         if let Some(Some(blob)) = row {
-            let bytes = Self::decode_zstd_safe(&blob).context("fts_text_delete: zstd decode")?;
+            // Сбой разжатия не должен ронять индексацию всей папки. Такое
+            // возможно на записях, сделанных до появления единого правила
+            // приёма: текстовый файл в сотни мегабайт не проходит защиту от
+            // «архивной бомбы», и удаление его записи упиралось в эту ошибку —
+            // папка целиком уходила в статус «ошибка». Цена продолжения —
+            // осиротевшие слова в полнотекстовом указателе (в выдаче их
+            // отсеивает соединение с `files`), и это несравнимо дешевле.
+            let bytes = match Self::decode_zstd_safe(&blob) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        "снятие слов из полнотекстового поиска пропущено для file_id={}: {}",
+                        file_id,
+                        e
+                    );
+                    return Ok(());
+                }
+            };
             if let Ok(content) = String::from_utf8(bytes) {
                 self.conn
                     .prepare_cached(

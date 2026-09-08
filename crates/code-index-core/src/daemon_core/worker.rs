@@ -219,6 +219,7 @@ fn process_batch(
             event,
             ctx.registry,
             ctx.max_code_file_size,
+            ctx.index_config.max_file_size,
             ctx.repo_language,
             ctx.extra_text_extensions,
         ) {
@@ -620,6 +621,20 @@ fn finish_batch(
     BatchStep::Continue
 }
 
+/// Записать причину остановки воркера: сначала в журнал, потом в состояние папки.
+///
+/// Раньше причина уходила ТОЛЬКО в состояние. Снаружи это выглядело так: воркер
+/// молча возвращается, сторож перезапускает его пять раз за минуту и помечает
+/// папку сбойной — в журнале при этом ни слова о том, что именно случилось, а
+/// текст в состоянии перетирается сообщением сторожа о перезапусках.
+fn fail_worker(state: &DaemonState, path: &Path, reason: String) {
+    tracing::error!("[{}] воркер остановлен: {}", path.display(), reason);
+    let path = path.to_path_buf();
+    tokio_block_on(async {
+        state.set_error(&path, reason).await;
+    });
+}
+
 /// Выполнить initial reindex и запустить watcher-цикл для одной папки.
 ///
 /// Функция блокирующая. Runner вызывает её через `spawn_blocking`. По завершении
@@ -648,11 +663,7 @@ pub fn run_worker(
     let path = match entry.path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            tokio_block_on(async {
-                state
-                    .set_error(&entry.path, format!("Не удалось разрешить путь: {}", e))
-                    .await;
-            });
+            fail_worker(&state, &entry.path, format!("Не удалось разрешить путь: {}", e));
             return;
         }
     };
@@ -660,11 +671,7 @@ pub fn run_worker(
     // 1. Открыть/создать .code-index/index.db
     let db_dir = path.join(".code-index");
     if let Err(e) = std::fs::create_dir_all(&db_dir) {
-        tokio_block_on(async {
-            state
-                .set_error(&path, format!("Создание .code-index/: {}", e))
-                .await;
-        });
+        fail_worker(&state, &path, format!("Создание .code-index/: {}", e));
         return;
     }
     let db_path = db_dir.join("index.db");
@@ -673,11 +680,7 @@ pub fn run_worker(
     let mut index_config = match IndexConfig::load(&path) {
         Ok(c) => c,
         Err(e) => {
-            tokio_block_on(async {
-                state
-                    .set_error(&path, format!("Загрузка IndexConfig: {}", e))
-                    .await;
-            });
+            fail_worker(&state, &path, format!("Загрузка IndexConfig: {}", e));
             return;
         }
     };
@@ -789,9 +792,7 @@ pub fn run_worker(
         match Storage::open_file(&db_path) {
             Ok(s) => s,
             Err(e) => {
-                tokio_block_on(async {
-                    state.set_error(&path, format!("Storage::open_file: {}", e)).await;
-                });
+                fail_worker(&state, &path, format!("Storage::open_file: {}", e));
                 return;
             }
         }
@@ -824,9 +825,7 @@ pub fn run_worker(
         match Storage::open_auto(&db_path, &storage_config) {
             Ok(s) => s,
             Err(e) => {
-                tokio_block_on(async {
-                    state.set_error(&path, format!("Storage::open_auto: {}", e)).await;
-                });
+                fail_worker(&state, &path, format!("Storage::open_auto: {}", e));
                 return;
             }
         }
@@ -922,9 +921,9 @@ pub fn run_worker(
             result
         }
         Err(e) => {
-            tokio_block_on(async {
-                state.set_error(&path, format!("full_reindex: {}", e)).await;
-            });
+            // Причина обязана попасть в журнал: без неё видно только «worker
+            // завершился сам», а по чему именно упала индексация — неизвестно.
+            fail_worker(&state, &path, format!("full_reindex: {:#}", e));
             return;
         }
     };
@@ -1044,9 +1043,11 @@ pub fn run_worker(
         storage = match Storage::open_file(&db_path) {
             Ok(s) => s,
             Err(e) => {
-                tokio_block_on(async {
-                    state.set_error(&path, format!("Storage::open_file (disk reopen): {}", e)).await;
-                });
+                fail_worker(
+                    &state,
+                    &path,
+                    format!("Storage::open_file (disk reopen): {}", e),
+                );
                 return;
             }
         };
@@ -1177,9 +1178,7 @@ pub fn run_worker(
     let (watcher, rx) = match create_watcher(&path, &watcher_config) {
         Ok(pair) => pair,
         Err(e) => {
-            tokio_block_on(async {
-                state.set_error(&path, format!("create_watcher: {}", e)).await;
-            });
+            fail_worker(&state, &path, format!("create_watcher: {}", e));
             return;
         }
     };
@@ -1467,6 +1466,44 @@ mod tests {
     #[test]
     fn готово_только_когда_прошли_все_три_шага() {
         assert!(batch_outcome(true, 0, 0, 5, true).is_ok());
+    }
+
+    /// Регресс: слежение за файлами писало в индекс текстовый файл любого
+    /// размера, хотя обход дерева такие файлы отбрасывает по `max_file_size`.
+    /// Так в базу попали два файла по 354 МБ, и папка целиком ушла в статус
+    /// «ошибка»: удалить их записи мешает защита от «архивной бомбы».
+    /// Правило приёма теперь одно на оба пути — `file_types::size_allowed`.
+    #[test]
+    fn слежение_не_берёт_текстовый_файл_сверх_лимита() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("big.json"), "x".repeat(4096)).unwrap();
+        std::fs::write(root.join("small.json"), "y".repeat(16)).unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let registry = ParserRegistry::new_all();
+
+        for name in ["big.json", "small.json"] {
+            apply_event(
+                &mut storage,
+                &root,
+                &FileEvent::Created(root.join(name)),
+                &registry,
+                5 * 1024 * 1024,
+                1024, // max_file_size — 1 КБ
+                None,
+                &[],
+            );
+        }
+
+        assert!(
+            storage.get_file_by_path("small.json").unwrap().is_some(),
+            "файл в пределах лимита обязан попасть в индекс"
+        );
+        assert!(
+            storage.get_file_by_path("big.json").unwrap().is_none(),
+            "файл сверх лимита в индекс попадать не должен"
+        );
     }
 
     /// Ограничение не задано — слот не нужен, воркер идёт дальше без ожидания.
@@ -1794,6 +1831,7 @@ fn apply_event(
     event: &FileEvent,
     registry: &ParserRegistry,
     max_code_file_size: usize,
+    max_file_size: usize,
     repo_language: Option<&str>,
     extra_text_extensions: &[String],
 ) -> ApplyOutcome {
@@ -1809,10 +1847,35 @@ fn apply_event(
                     abs,
                     registry,
                     max_code_file_size,
+                    max_file_size,
                     repo_language,
                     extra_text_extensions,
                 );
             }
+
+            // Правило приёма — ровно то же, что у обхода дерева: текстовый файл
+            // крупнее `max_file_size` в индекс не берём. Проверяем ДО чтения:
+            // иначе файл сначала целиком читается в память ради хеша, и только
+            // потом выяснялось бы, что индексировать его нельзя.
+            //
+            // Категория здесь считается по имени файла — двоичность по
+            // содержимому выясняется ниже, при чтении, и на решение о размере
+            // не влияет: двоичный файл всё равно не попадёт в индекс.
+            if let Ok(meta) = std::fs::metadata(abs) {
+                let by_name =
+                    categorize_file_in_repo(abs, repo_language, extra_text_extensions);
+                if !crate::indexer::file_types::size_allowed(
+                    abs,
+                    &by_name,
+                    meta.len(),
+                    max_file_size,
+                ) {
+                    // Не ошибка: обход дерева такой файл тоже пропускает,
+                    // просто считая его неиндексируемым.
+                    return ApplyOutcome::Applied;
+                }
+            }
+
             let (content, hash, is_binary) = match hasher::file_hash(abs) {
                 Ok(triple) => triple,
                 Err(e) => {
@@ -2050,6 +2113,7 @@ fn apply_dir_scan(
     dir: &Path,
     registry: &ParserRegistry,
     max_code_file_size: usize,
+    max_file_size: usize,
     repo_language: Option<&str>,
     extra_text_extensions: &[String],
 ) -> ApplyOutcome {
@@ -2085,6 +2149,7 @@ fn apply_dir_scan(
                 &path,
                 registry,
                 max_code_file_size,
+                max_file_size,
                 repo_language,
                 extra_text_extensions,
             ));
@@ -2095,6 +2160,7 @@ fn apply_dir_scan(
                 &FileEvent::Created(path.clone()),
                 registry,
                 max_code_file_size,
+                max_file_size,
                 repo_language,
                 extra_text_extensions,
             ));
