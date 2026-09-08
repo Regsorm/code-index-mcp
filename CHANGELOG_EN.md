@@ -5,6 +5,23 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.0.3] — 2026-09-08
+
+**The file size admission rule is now shared by both write paths into the index: the file watcher no longer stores what the directory walk rejects.**
+
+### Fixed
+
+- **The file watcher applies the same size limit as the directory walk.** The text file limit (`max_file_size`, 1 MB by default) lived only in the startup directory walk. The watcher path — the one that applies changes on the fly — never checked it: a file of any size was read in full and written to the database, so text files of hundreds of megabytes ended up in the index. The rule now lives in a shared `size_allowed` function used by both paths, and the watcher checks the size *before* reading the file instead of after — such a file used to be loaded into memory in full just to compute its hash.
+- **A folder holding such a file no longer fails as a whole.** Deleting a text file record requires decompressing the stored content: the contentless full-text index needs the previous text to remove its terms. For a 354 MB file the decompression hit the zstd-bomb guard (256 MB limit); the error propagated up to the full startup check, the worker exited, and after five restarts within a minute the folder was marked failed — every tool for that folder answered with an error. A failed decompression is now a warning in the log and processing continues: orphaned terms in the index do not affect results, because the join with the files table filters them out.
+- **A file skipped by size is no longer treated as gone from disk.** The directory walk did not add such a file to the list of seen paths, so the cleanup stage deleted its record on every run. The path is now recorded before the size check.
+- **The reason a worker stops is written to the log.** It used to go only into the folder state, where the supervisor's restart message overwrote it: the log showed "worker exited on its own" and nothing about what happened. Eight exit points now go through a shared function that logs the reason first and only then stores it.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 820 passed, 0 failed. Three of them are new: the size rule is identical for code, text and 1C dump files; the watcher does not take a text file above the limit; a file skipped by size is not treated as vanished.
+- **Locally:** a working folder that had been failing for three and a half hours because of two 354 MB files came back to ready on the existing database — "deleted 0" in the summary instead of a crash, and its tools answer again.
+- **Federation:** the node was rebuilt on this build (the binary inside the container matches the built one by checksum) and remote repositories answer. A 2.2 MB text file created in a watched folder on the node was processed by the watcher and not written to the database — it is absent from the index.
+
 ## [1.0.2] — 2026-09-05
 
 **Windows executables now carry product and version information — visible in the file properties, without running them with a version flag.**
@@ -871,7 +888,7 @@ For diagnosing a stalled or slow index, `info` is enough: it shows both where it
 - **Unit tests:** `cargo test --workspace` — 659 passed, 0 failed (was 656; 3 added).
 - **Defect reproduction:** the old compilation was temporarily restored in `grep_text` — only its own test failed ("`^` must match the start of a line, not of the file"), while the `grep_code` and `grep_body` tests stayed green: each test is bound to its own pre-filter site.
 - **Live, local node:** four calls that returned zero before the fix — `grep_text` with `^## ` (6 headings) and with a `$`-anchored pattern (line 126), `grep_code` with `^fn is_cacheable_tool` (line 1186), `grep_body` with `^\s+let compiled = regex` (two functions).
-- **Federation smoke:** both nodes on 0.49.5; `grep_text(repo="ut", regex="^#")` over the root README found headings on lines 1, 5, 11, 23, 27 (only the first would have matched before); `grep_text(repo="zup", regex="^## ")` — five headings; `grep_code(repo="ut", regex="^Процедура ")` over a common module — lines 70, 101, 119; `bp-ss` stats over federation are normal.
+- **Federation smoke:** both nodes on 0.49.5; `grep_text(repo="ut", regex="^#")` over the root README found headings on lines 1, 5, 11, 23, 27 (only the first would have matched before); `grep_text(repo="zup", regex="^## ")` — five headings; `grep_code(repo="ut", regex="^Процедура ")` over a common module — lines 70, 101, 119; the Accounting base stats over federation are normal.
 
 ### Compatibility
 
@@ -900,7 +917,7 @@ For diagnosing a stalled or slow index, `info` is enough: it shows both where it
 - **Live, refusal with the daemon stopped (M-7):** the daemon was stopped, the call returned "daemon unavailable", and neither the entry count nor the hit count in the cache changed; after the daemon came back the same call immediately returned data rather than a stuck refusal.
 - **Live, file binding and lifetime:** after per-file invalidation on the edge source file a repeated `find_path` was a miss (the entry had been dropped); an empty search was a hit on repeat and a miss after 20 seconds.
 - **Live, `stat_file`:** after the file changed, the same call returned the fresh size and time; the cache counters did not move at all during those calls.
-- **Federated smoke:** both nodes on 0.49.4; `grep_text(repo="ut", path_glob="**/README.md")` found the root file on the remote node; queries over `zup`, `bp-ss`, `bp-tdk` and an object structure through federation behaved normally.
+- **Federated smoke:** both nodes on 0.49.4; `grep_text(repo="ut", path_glob="**/README.md")` found the root file on the remote node; queries over `zup` and two Accounting bases, plus an object structure through federation, behaved normally.
 
 ### Compatibility
 
@@ -1127,7 +1144,7 @@ Verification levels are listed separately — "tested" without saying at which l
 - `cargo test --workspace` — 579 passed, 0 failed.
 - Unit: `rollback_batch` (idempotent rollback, clears a hung transaction), `allow_respawn` (backoff — 5 respawns allowed in-window, 6th denied, reset after window).
 - Live smoke via panic injection in an isolated daemon: a controlled worker panic right after the `ReindexingBatch` status was set (the exact point where status used to get stuck) → the watchdog caught it (`worker … crashed … respawn`) → re-index → `Ready`; the probe function landed in the index only thanks to the respawn (the first worker panics before applying the batch).
-- Local node (Windows, 46 repos) and federated node (VM rag, 6 repos) — deployed 0.45.2, both `healthy`; functional federated smoke against `bp-ss` (`get_object_structure Catalog.Валюты`) via federation — correct structure.
+- Local node (Windows, 46 repos) and federated node (VM rag, 6 repos) — deployed 0.45.2, both `healthy`; functional federated smoke against the Accounting base (`get_object_structure Catalog.Валюты`) via federation — correct structure.
 
 ### Compatibility
 
@@ -1164,13 +1181,13 @@ Verification levels are listed separately — "tested" without saying at which l
 
 - **BSL grammar: `tree-sitter-onescript` → `tree-sitter-bsl` 0.1.7.** The `tree-sitter-onescript` dependency is removed from the workspace, `code-index-core` and `bsl-extension`. `.bsl` and `.os` files are parsed by the `tree-sitter-bsl` grammar.
 - **Unified BSL parsing layer `bsl-parse` (crate `crates/bsl-parse`).** Source normalization for `tree-sitter-bsl` grammar defects (`normalize_for_parser`) before feeding the parser. The crate is vendored into the repository (a copy of the shared layer used by the bsl-context project) — code-index builds self-contained, without external path dependencies.
-- **Call graph: false edges from constructors removed.** `Новый Массив`/`ТаблицаЗначений`/`Структура`/`Соответствие` and other platform-type constructors are no longer resolved as calls to same-named procedures. On a real UT 11.5: `Массив` 3525 → 0 edges, `total_calls` 2,139,478 → 2,021,203 (−118k false). Symmetric on ZUP, BP Smak-sultana, BP TDK.
+- **Call graph: false edges from constructors removed.** `Новый Массив`/`ТаблицаЗначений`/`Структура`/`Соответствие` and other platform-type constructors are no longer resolved as calls to same-named procedures. On a real UT 11.5: `Массив` 3525 → 0 edges, `total_calls` 2,139,478 → 2,021,203 (−118k false). Symmetric on ZUP and two Accounting bases.
 
 ### Testing
 
 - `cargo test --workspace --features enrichment` — 581 passed, 0 failed, 0 warnings.
 - Local live-smoke on a WMS dump (59 modules): indexing, call graph (`get-callees` resolves qualified calls), FTS, `grep-body` — green.
-- Federated rollout on the VM (musl ELF): reindex of all four production bases — `ut` (58k files), `zup` (40k), `bp-ss` (94k), `bp-tdk` (90k), `exit=0` each. Effect confirmed on all: `Массив` = 0, only genuine `ТаблицаЗначений` calls remain (4–5 edges).
+- Federated rollout on the VM (musl ELF): reindex of all four production bases — `ut` (58k files), `zup` (40k) and two Accounting bases (94k and 90k), `exit=0` each. Effect confirmed on all: `Массив` = 0, only genuine `ТаблицаЗначений` calls remain (4–5 edges).
 
 ### Compatibility
 
@@ -1319,8 +1336,8 @@ Verification levels are listed separately — "tested" without saying at which l
 ### Testing
 
 - 316 unit/integration tests green (including 2 new ones for binary-content detection).
-- Live smoke on the EDT export of BP TDK (23,155 files): indexing in 70 s versus an indefinite hang before the fix.
-- Regression on the federated Configurator repository BP TDK (90,024 files, force-reindex from scratch): index statistics matched the previous run bit-for-bit — the protection is strictly a no-op on normal repositories.
+- Live smoke on an EDT export of an Accounting base (23,155 files): indexing in 70 s versus an indefinite hang before the fix.
+- Regression on a federated Configurator repository of an Accounting base (90,024 files, force-reindex from scratch): index statistics matched the previous run bit-for-bit — the protection is strictly a no-op on normal repositories.
 
 ## [0.42.1] — 2026-06-29
 
@@ -1396,7 +1413,7 @@ Verification levels are listed separately — "tested" without saying at which l
 
 ### Fixed
 
-- **Gate against idle re-enrichment on daemon startup.** On startup, after `full_reindex` (mtime fast-path), the daemon **unconditionally** ran the full `index_extras` — rebuilding `metadata_objects`/`data_links`/`role_rights`/`code_usages`/`procedure_terms` (hundreds of thousands of procedures)/`forms`/`subscriptions`, even when mtime reported "0 changes". On the full federation (UT/BP-SS/BP-TDK/ZUP) that was ~15 minutes wasted on any container restart. Now `index_extras` is skipped when: the DB already existed, `full_reindex` indexed 0 and deleted 0 files, and the processor's extras tables are non-empty (`LanguageProcessor::extras_present` — for BSL: non-empty `metadata_objects` + mechanical terms in `procedure_enrichment`). Any data change, a new DB, or empty extras → a full pass as before; incremental edits are still handled by the watcher loop via `index_extras_for_files`.
+- **Gate against idle re-enrichment on daemon startup.** On startup, after `full_reindex` (mtime fast-path), the daemon **unconditionally** ran the full `index_extras` — rebuilding `metadata_objects`/`data_links`/`role_rights`/`code_usages`/`procedure_terms` (hundreds of thousands of procedures)/`forms`/`subscriptions`, even when mtime reported "0 changes". On the full federation (UT, ZUP and two Accounting bases) that was ~15 minutes wasted on any container restart. Now `index_extras` is skipped when: the DB already existed, `full_reindex` indexed 0 and deleted 0 files, and the processor's extras tables are non-empty (`LanguageProcessor::extras_present` — for BSL: non-empty `metadata_objects` + mechanical terms in `procedure_enrichment`). Any data change, a new DB, or empty extras → a full pass as before; incremental edits are still handled by the watcher loop via `index_extras_for_files`.
 - **Limitation:** the gate does not track the extras SCHEMA. If a release adds a new extras table, it will stay empty on unchanged data — such releases need a one-off full rebuild (`index --force` or a DB rebuild). Noted in the `extras_present` doc comment.
 
 ## [0.38.0] — 2026-06-17
@@ -1474,7 +1491,7 @@ Verification levels are listed separately — "tested" without saying at which l
 
 ### Resolution summary
 
-- Full UT (57k files): direct-edge resolution **52.1% → 82.1%**, **zero false bindings**. Federation (UT/BP-SS/BP-TDK/ZUP): **80-82%**.
+- Full UT (57k files): direct-edge resolution **52.1% → 82.1%**, **zero false bindings**. Federation (UT, ZUP and two Accounting bases): **80-82%**.
 
 ### Tests
 
@@ -2185,7 +2202,7 @@ The regression was discovered by us **while operating v0.8.0** (2026-05-06): an 
 ### Fixed
 
 - **The daemon now applies the processors' `schema_extensions` and `index_extras`.** In v0.8.0 these calls were only in the CLI `index <path>` command, while the daemon worker did not make them. The result: on any BSL repo indexed via `bsl-indexer.exe daemon run`, the BSL tools failed with `database error: no such table: metadata_objects`. Now the `daemon_core/worker.rs` worker resolves the processor itself using the rule "explicit `language` from `daemon.toml` → fallback `detect()`", applies `apply_schema_extensions` BEFORE `full_reindex` (creates empty tables — the DDL is idempotent), and calls `index_extras` BEFORE `flush_to_disk` (populates the tables from `Configuration.xml`). For repos without a `Configuration.xml` (e.g., old data-processor dumps) the tables are created empty — the tools respond with `[]` and no exception.
-- **Federation now forwards extension tools to remote nodes.** Previously any BSL-tool call on a remote repo (UT/BP_SS/BP_TDK/ZUP on the rag VM) returned `extension tool '...' currently supports only local repos`. A universal route `POST /federate/extension` was introduced with the payload `{tool_name, args}` — a single route for all extension tools, extensible when new LanguageProcessors are added. On the source side `mcp::call_tool` forwards the call through `dispatcher::dispatch_remote_value`. Both federation nodes must be upgraded to 0.8.1 synchronously — an old node will return 404 on the new route.
+- **Federation now forwards extension tools to remote nodes.** Previously any BSL-tool call on a remote repo (four production bases on the remote node) returned `extension tool '...' currently supports only local repos`. A universal route `POST /federate/extension` was introduced with the payload `{tool_name, args}` — a single route for all extension tools, extensible when new LanguageProcessors are added. On the source side `mcp::call_tool` forwards the call through `dispatcher::dispatch_remote_value`. Both federation nodes must be upgraded to 0.8.1 synchronously — an old node will return 404 on the new route.
 
 ### Added
 
@@ -2259,7 +2276,7 @@ The public API signature changes in `daemon_core::worker`/`runner`/`cli` are add
 
 ### Fixed
 
-- **Backfill now works for all code files on a stable DB (a bug fix for the first preview build).** Previously the backfill was embedded in the processing of `metadata_updates` in `full_reindex` — a container of files with a changed mtime/file_size but the same content_hash. On a "stable" DB (nobody touched files since the last indexing) `metadata_updates` is empty, so the backfill **did not run for UT/BP_SS/ZUP** — only repos with actually changed files were populated (BP_TDK got ~15 files out of 90K). Fix: moved into a **separate phase** `Stage 6` after removing stale entries, via the new Storage method `list_code_files_without_content() -> Vec<(file_id, path)>`. Now the backfill hits all code files that have no record in `file_contents` AND no record in `text_files`, regardless of whether the mtime changed. Real figures on the rag VM after the fix: UT 32599/32599 in 31.7 s, BP_SS 37535/37535 in 37.9 s, ZUP 19066/19066 in 17.5 s, BP_TDK likewise.
+- **Backfill now works for all code files on a stable DB (a bug fix for the first preview build).** Previously the backfill was embedded in the processing of `metadata_updates` in `full_reindex` — a container of files with a changed mtime/file_size but the same content_hash. On a "stable" DB (nobody touched files since the last indexing) `metadata_updates` is empty, so the backfill **did not run for three of the four bases** — only repos with actually changed files were populated (the fourth got ~15 files out of 90K). Fix: moved into a **separate phase** `Stage 6` after removing stale entries, via the new Storage method `list_code_files_without_content() -> Vec<(file_id, path)>`. Now the backfill hits all code files that have no record in `file_contents` AND no record in `text_files`, regardless of whether the mtime changed. Real figures on the remote node after the fix: the Trade base 32599/32599 in 31.7 s, an Accounting base 37535/37535 in 37.9 s, the Payroll base 19066/19066 in 17.5 s, the second Accounting base likewise.
 - **Backfill in batches instead of one mega-transaction.** For a 90K-file repo, the whole phase inside a `BEGIN TRANSACTION` without a commit would bloat the WAL to many GB. An intermediate `commit_batch + begin_batch` every `batch_size.max(500)` files keeps the WAL within reasonable bounds.
 
 ### Compatibility

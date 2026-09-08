@@ -1809,7 +1809,7 @@ impl ServerHandler for CodeIndexServer {
         //
         // Раньше (до 0.8.1) здесь стоял жёсткий Err «supports only local
         // repos» — это делало BSL-tools (`get_object_structure` и т.д.)
-        // нерабочими для federation-репо (UT/BP_SS/BP_TDK/ZUP на VM rag).
+        // нерабочими для federation-репо (боевые базы на удалённой ноде).
         if !entry.is_local {
             let payload = serde_json::json!({
                 "tool_name": tool_name,

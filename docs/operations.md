@@ -94,11 +94,11 @@
 
 ## Обновление tools/list при изменении backend (новые базы 1С, новые tools)
 
-**Проблема.** Все три инстанса универсального бинарника `mcp-cache-ci` (локальный `127.0.0.1:8011` перед `code-index serve`, `mcp-cache-1c` на ВМ rag `:8010` перед `1c-router`, `mcp-cache-rag` на ВМ rag `:8019` перед `rag-query`) **кэшируют ответ `tools/list`**. Когда в backend появляется новый tool ИЛИ меняется JSONSchema существующего (например, расширяется enum `base` в `mcp__1c__execute_query` после добавления новой базы в `bases.json` 1c-router) — клиенты MCP **продолжают видеть старую схему** через кэш-прокси, даже после рестарта самого backend.
+**Проблема.** Все три инстанса универсального бинарника `mcp-cache-ci` (локальный `127.0.0.1:8011` перед `code-index serve`, `mcp-cache-1c` на ВМ `:8010` перед `1c-router`, `mcp-cache-rag` на ВМ `:8019` перед `rag-query`) **кэшируют ответ `tools/list`**. Когда в backend появляется новый tool ИЛИ меняется JSONSchema существующего (например, расширяется enum `base` в `mcp__1c__execute_query` после добавления новой базы в `bases.json` 1c-router) — клиенты MCP **продолжают видеть старую схему** через кэш-прокси, даже после рестарта самого backend.
 
 Дополнительно: **MCP-клиент Claude Code** (VSCode-расширение, headless `claude -p`) читает `tools/list` ровно один раз при инициализации сессии и держит схему в памяти. После того как кэш-прокси обновился, клиент всё равно показывает старый enum — нужно перезапустить и его.
 
-**Канонический симптом** (зафиксирован 2026-05-15 при добавлении `tdk-bp-shadow` в 1c-router):
+**Канонический симптом** (зафиксирован 2026-05-15 при добавлении нового алиаса базы в 1c-router):
 
 - На стороне backend (`http://127.0.0.1:8014/mcp/`, прямой запрос к 1c-router) `tools/list` возвращает свежий enum со всеми базами.
 - На стороне кэш-прокси (`http://127.0.0.1:8010/mcp/`, mcp-cache-1c) — старый enum без новой базы.
@@ -107,13 +107,13 @@
 **Корректная процедура обновления — три шага в строгом порядке:**
 
 1. **Рестарт backend-сервера** (тот, кто реально пересоздаёт tools/list-схему):
-   - Для 1c-router (после правки `bases.json`): `ssh rag@<vm-rag> "cd /home/rag/docker-mcp && docker compose restart 1c-router"`
-   - Для rag-query (после нового tool): `ssh rag@<vm-rag> "cd /home/rag/docker-mcp && docker compose restart rag-query"`
+   - Для 1c-router (после правки `bases.json`): `ssh <vm-user>@<vm-host> "cd <vm-home>/docker-mcp && docker compose restart 1c-router"`
+   - Для rag-query (после нового tool): `ssh <vm-user>@<vm-host> "cd <vm-home>/docker-mcp && docker compose restart rag-query"`
    - Для code-index serve: рестарт `bsl-indexer.exe serve` (через mcp-supervisor: `Stop-Process -Id <pid>` + supervisor поднимет за пару секунд; либо `schtasks /End /TN CodeIndexDaemon && schtasks /Run /TN CodeIndexDaemon` — поднимет и daemon, и serve).
 
 2. **Рестарт соответствующего mcp-cache-***: иначе он будет отдавать клиентам старый кэш `tools/list`:
-   - `mcp-cache-1c` (ВМ rag, перед 1c-router): `ssh rag@<vm-rag> "cd /home/rag/docker-mcp && docker compose restart mcp-cache-1c"`
-   - `mcp-cache-rag` (ВМ rag, перед rag-query): `ssh rag@<vm-rag> "cd /home/rag/docker-mcp && docker compose restart mcp-cache-rag"`
+   - `mcp-cache-1c` (на ВМ, перед 1c-router): `ssh <vm-user>@<vm-host> "cd <vm-home>/docker-mcp && docker compose restart mcp-cache-1c"`
+   - `mcp-cache-rag` (на ВМ, перед rag-query): `ssh <vm-user>@<vm-host> "cd <vm-home>/docker-mcp && docker compose restart mcp-cache-rag"`
    - локальный `mcp-cache-ci` (перед code-index): `Stop-Process -Name mcp-cache-ci -Force` (mcp-supervisor поднимет за ~3 сек).
 
 3. **Перезагрузить MCP-клиент Claude Code**: VSCode-расширение перечитает `tools/list` при инициализации новой сессии. Способы:
@@ -124,7 +124,7 @@
 
 ```bash
 # Backend (порт 8014 — 1c-router): отдаёт ли свежий enum?
-ssh rag@<vm-rag> "curl -sS -X POST -H 'Content-Type: application/json' \
+ssh <vm-user>@<vm-host> "curl -sS -X POST -H 'Content-Type: application/json' \
   -H 'Accept: application/json,text/event-stream' \
   -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"x\",\"version\":\"1\"}}}' \
   http://127.0.0.1:8014/mcp/ -D /tmp/h.txt -o /dev/null && \
@@ -139,7 +139,7 @@ ssh rag@<vm-rag> "curl -sS -X POST -H 'Content-Type: application/json' \
        http://127.0.0.1:8014/mcp/ | sed -n 's/^data: //p'"
 
 # Cache-прокси (порт 8010 — mcp-cache-1c, stateless с 0.3.0): без session-id
-ssh rag@<vm-rag> "curl -sS -X POST -H 'Content-Type: application/json' \
+ssh <vm-user>@<vm-host> "curl -sS -X POST -H 'Content-Type: application/json' \
   -H 'Accept: application/json,text/event-stream' \
   -d '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}' \
   http://127.0.0.1:8010/mcp/"
