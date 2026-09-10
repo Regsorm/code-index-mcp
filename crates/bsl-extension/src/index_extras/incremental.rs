@@ -1452,10 +1452,17 @@ pub(crate) fn run_incremental_extras_edt(
     }
 
     if !bsl_changed.is_empty() {
+        // Область резолва — файлы пакета, как и в ветке формата Конфигуратора.
+        // Без временных таблиц области запрос падал на `tmp_pcg_keys`, и слой
+        // extras оставался несобранным до перезапуска демона (issue #8).
+        let scope_paths: Vec<String> =
+            bsl_changed.iter().map(|p| rel_path(repo_root, p)).collect();
+        create_batch_scope(conn, &scope_paths)?;
         let _ = conn.execute("ROLLBACK", []);
         conn.execute("BEGIN", [])?;
         resolve_and_prune_direct_edges(conn, EdgeScope::Batch, "proc_call_graph")?;
         conn.execute("COMMIT", [])?;
+        drop_batch_scope(conn)?;
         rebuild_call_graph_extension_override(conn)?;
     }
     if !forms.is_empty() {

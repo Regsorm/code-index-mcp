@@ -14,6 +14,32 @@ use crate::xml::object_uuid::{
 use super::*;
 
 
+/// Миграция: старый ключ UNIQUE(repo, full_name) без extension_name терял
+/// модули расширений-доработок (то же имя, что в base) через INSERT OR IGNORE,
+/// а `insert_module_row` с его `ON CONFLICT(repo, full_name, extension_name)`
+/// на такой таблице падает вовсе. Обнаружив старую схему — пересоздаём таблицу
+/// с новым ключом. Транзакцией управляет вызывающий.
+pub(crate) fn migrate_metadata_modules_key(conn: &rusqlite::Connection) -> Result<()> {
+    let old_ddl: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='metadata_modules'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(ddl) = old_ddl {
+        if !ddl.contains("extension_name)") {
+            conn.execute("DROP TABLE metadata_modules", [])?;
+            conn.execute(crate::schema::METADATA_MODULES_DDL, [])?;
+            for idx_ddl in crate::schema::METADATA_MODULES_INDEXES {
+                conn.execute(idx_ddl, [])?;
+            }
+            tracing::info!("metadata_modules: миграция схемы — UNIQUE ключ дополнен extension_name");
+        }
+    }
+    Ok(())
+}
+
 /// Заполнить `metadata_modules` — таблицу с UUID/property_id/configVersion
 /// каждого BSL-модуля, нужную для отладки через dbgs.
 ///
@@ -45,26 +71,7 @@ pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connecti
 
     let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
     conn.execute("BEGIN", [])?;
-    // Миграция: старый ключ UNIQUE(repo, full_name) без extension_name терял
-    // модули расширений-доработок (то же имя, что в base) через INSERT OR
-    // IGNORE. Обнаружив старую схему — пересоздаём таблицу с новым ключом.
-    let old_ddl: Option<String> = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='metadata_modules'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    if let Some(ddl) = old_ddl {
-        if !ddl.contains("extension_name)") {
-            conn.execute("DROP TABLE metadata_modules", [])?;
-            conn.execute(crate::schema::METADATA_MODULES_DDL, [])?;
-            for idx_ddl in crate::schema::METADATA_MODULES_INDEXES {
-                conn.execute(idx_ddl, [])?;
-            }
-            tracing::info!("metadata_modules: миграция схемы — UNIQUE ключ дополнен extension_name");
-        }
-    }
+    migrate_metadata_modules_key(conn)?;
     conn.execute(
         "DELETE FROM metadata_modules WHERE repo = ?",
         params![REPO_DEFAULT],
@@ -239,6 +246,9 @@ pub(crate) fn index_metadata_modules_edt(
 ) -> Result<()> {
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
+    // Та же миграция, что и у формата Конфигуратора: база прежних версий несёт
+    // ключ без extension_name, и запись модуля падала бы на ON CONFLICT.
+    migrate_metadata_modules_key(conn)?;
     conn.execute(
         "DELETE FROM metadata_modules WHERE repo = ?",
         params![REPO_DEFAULT],

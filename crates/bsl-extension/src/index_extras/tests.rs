@@ -3834,3 +3834,109 @@ fn edt_incremental_removes_deleted_object() {
         "модули удалённого объекта тоже убираются"
     );
 }
+
+#[test]
+fn edt_incremental_bsl_change_resolves_call_edges() {
+    // Правка `.bsl` в выгрузке EDT роняла точечное обновление надстройки:
+    // резолв рёбер звался с областью пакета (`EdgeScope::Batch`), а временные
+    // таблицы области не создавались — «no such table: tmp_pcg_keys». Базовый
+    // индекс при этом обновлялся, а граф вызовов и связи данных отставали
+    // до перезапуска демона (issue #8).
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand(&repo);
+
+    let callee_rel = "src/CommonModules/МодульА/Module.bsl";
+    let caller_rel = "src/CommonModules/МодульБ/Module.bsl";
+    write(
+        &repo.join(callee_rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        "Процедура ОбщийМетод() Экспорт КонецПроцедуры",
+    );
+    write(
+        &repo.join(caller_rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
+        "Процедура Вызывающая() КонецПроцедуры",
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    let f_callee = ensure_file(storage.conn(), callee_rel);
+    let f_caller = ensure_file(storage.conn(), caller_rel);
+    set_func(storage.conn(), f_callee, "ОбщийМетод", "() Экспорт");
+    set_func(storage.conn(), f_caller, "Вызывающая", "()");
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    // Правка вызывающего модуля: появился вызов экспортной процедуры соседа.
+    let caller_path = repo.join(caller_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+    write(
+        &caller_path,
+        "Процедура Вызывающая() МодульА.ОбщийМетод(); КонецПроцедуры",
+    );
+    set_calls(storage.conn(), f_caller, &[("Вызывающая", "МодульА.ОбщийМетод")]);
+
+    run_incremental_extras(&repo, &mut storage, &[caller_path], &[])
+        .expect("точечное обновление надстройки на правке .bsl в EDT обязано проходить");
+
+    let key: Option<String> = storage
+        .conn()
+        .query_row(
+            "SELECT callee_proc_key FROM proc_call_graph \
+             WHERE call_type='direct' AND caller_proc_key=?1 AND callee_proc_name=?2",
+            params![format!("{caller_rel}::Вызывающая"), "МодульА.ОбщийМетод"],
+            |r| r.get(0),
+        )
+        .expect("ребро вызова обязано появиться после точечного обновления");
+    assert_eq!(
+        key.as_deref(),
+        Some(format!("{callee_rel}::ОбщийМетод").as_str()),
+        "адрес вызываемой процедуры обязан быть проставлен резолвом по области пакета"
+    );
+}
+
+#[test]
+fn edt_metadata_modules_migrates_old_unique_key() {
+    // База, заведённая версией со старым ключом UNIQUE(repo, full_name),
+    // мигрировала только в ветке формата Конфигуратора. Для выгрузки EDT
+    // миграции не было, и запись модуля падала с «ON CONFLICT clause does not
+    // match any PRIMARY KEY or UNIQUE constraint» (issue #8).
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    // Откатываем таблицу к старой схеме — так выглядит база прежних версий.
+    storage
+        .conn()
+        .execute_batch(
+            "DROP TABLE metadata_modules; \
+             CREATE TABLE metadata_modules ( \
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                repo TEXT NOT NULL, full_name TEXT NOT NULL, object_name TEXT NOT NULL, \
+                module_type TEXT NOT NULL, object_id TEXT NOT NULL, property_id TEXT NOT NULL, \
+                config_version TEXT, code_path TEXT, extension_name TEXT, \
+                UNIQUE(repo, full_name) );",
+        )
+        .unwrap();
+
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let ddl: String = storage
+        .conn()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='metadata_modules'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        ddl.contains("extension_name)"),
+        "старый ключ обязан быть заменён и в ветке EDT: {ddl}"
+    );
+    let modules: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM metadata_modules WHERE object_name='Catalogs.Товары'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(modules, 1, "модуль объекта обязан попасть в перечень");
+}
