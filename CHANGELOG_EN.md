@@ -5,6 +5,21 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.0.4] — 2026-09-10
+
+**Editing a file in a 1C:EDT dump no longer breaks the incremental extension update: the call graph and data links now keep up with the base index.**
+
+### Fixed
+
+- **The incremental extension update completes for 1C:EDT dumps.** After editing any `.bsl` in such a dump the update failed with "no such table: tmp_pcg_keys", the folder went into the failed state, and the base index was still updated — so the call graph and data links lagged behind the code until the service was restarted. The cause: call address resolution ran with the batch scope, but the temporary tables of that scope were never created before the call. The Designer-format branch has had that wrapper from the start; the EDT branch did not. Both branches now build the scope from the changed files the same way — created before resolution and dropped after. A full reindex did not help: the very next edit broke the update again. Reported by [@ShcherbakovP](https://github.com/ShcherbakovP) ([#8](https://github.com/Regsorm/code-index-mcp/issues/8)).
+- **The 1C:EDT module registry migrates the outdated table key.** Replacing the uniqueness key with a composite one happened only in the Designer-format branch. A database created by an earlier version and then pointed at an EDT dump kept the old key, and writing a module row answered "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint". The key migration is now a shared function called by both branches.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --features enrichment` — 831 passed, 0 failed. Two of them are new: editing a `.bsl` in an EDT dump completes the incremental update and the call address is resolved; the EDT module registry migrates the outdated table key. On the pre-fix code both fail with exactly the messages described in the report.
+- **Locally:** an EDT dump stand under a live watcher service. On the previous build editing a `.bsl` produced two warnings, a failed folder and an empty call address; on the new one — no warnings, the folder is ready, the address is resolved. Both services run the new build, and all 51 watched folders reached ready.
+- **Federation:** the node was rebuilt on this build (the binary inside the container matches the built one by checksum) and remote repositories answer — procedure body, object structure and data links.
+
 ## [1.0.3] — 2026-09-08
 
 **The file size admission rule is now shared by both write paths into the index: the file watcher no longer stores what the directory walk rejects.**
