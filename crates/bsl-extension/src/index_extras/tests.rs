@@ -3940,3 +3940,147 @@ fn edt_metadata_modules_migrates_old_unique_key() {
         .unwrap();
     assert_eq!(modules, 1, "модуль объекта обязан попасть в перечень");
 }
+
+#[test]
+fn edt_incremental_keeps_exported_procs_registry() {
+    // Справочник экспортных процедур в ветке EDT не вёлся пофайлово: процедура,
+    // ставшая экспортной в этом же пакете, в справочник не попадала, и вызов к
+    // ней оставался без адреса до полного пересбора. В ветке формата
+    // Конфигуратора справочник обновляется вместе с модулем.
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand(&repo);
+
+    let callee_rel = "src/CommonModules/МодульА/Module.bsl";
+    let caller_rel = "src/CommonModules/МодульБ/Module.bsl";
+    let callee_path = repo.join(callee_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let caller_path = repo.join(caller_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+    write(&callee_path, "Процедура Старая() Экспорт КонецПроцедуры");
+    write(&caller_path, "Процедура Вызывающая() КонецПроцедуры");
+
+    let mut storage = fresh_storage(&tmp);
+    let f_callee = ensure_file(storage.conn(), callee_rel);
+    let f_caller = ensure_file(storage.conn(), caller_rel);
+    set_func(storage.conn(), f_callee, "Старая", "() Экспорт");
+    set_func(storage.conn(), f_caller, "Вызывающая", "()");
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    // Пакет правок: в модуле-адресате появилась новая экспортная процедура,
+    // в вызывающем — вызов к ней.
+    write(
+        &callee_path,
+        "Процедура Старая() Экспорт КонецПроцедуры\nПроцедура Новая() Экспорт КонецПроцедуры",
+    );
+    set_func(storage.conn(), f_callee, "Новая", "() Экспорт");
+    write(
+        &caller_path,
+        "Процедура Вызывающая() МодульА.Новая(); КонецПроцедуры",
+    );
+    set_calls(storage.conn(), f_caller, &[("Вызывающая", "МодульА.Новая")]);
+
+    run_incremental_extras(
+        &repo,
+        &mut storage,
+        &[callee_path.clone(), caller_path.clone()],
+        &[],
+    )
+    .unwrap();
+
+    let registered: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM exported_procs WHERE path = ?1 AND name = ?2",
+            params![callee_rel, "Новая"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(registered, 1, "новая экспортная процедура обязана попасть в справочник");
+
+    let key: Option<String> = storage
+        .conn()
+        .query_row(
+            "SELECT callee_proc_key FROM proc_call_graph \
+             WHERE call_type='direct' AND caller_proc_key=?1 AND callee_proc_name=?2",
+            params![format!("{caller_rel}::Вызывающая"), "МодульА.Новая"],
+            |r| r.get(0),
+        )
+        .expect("ребро вызова обязано появиться после точечного обновления");
+    assert_eq!(
+        key.as_deref(),
+        Some(format!("{callee_rel}::Новая").as_str()),
+        "адрес обязан проставиться по справочнику, обновлённому в том же пакете"
+    );
+
+    // Удаление модуля убирает его процедуры из справочника.
+    std::fs::remove_file(&callee_path).unwrap();
+    storage
+        .conn()
+        .execute("DELETE FROM functions WHERE file_id = ?", params![f_callee])
+        .unwrap();
+    run_incremental_extras(&repo, &mut storage, &[], &[callee_path]).unwrap();
+    let left: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM exported_procs WHERE path = ?1",
+            params![callee_rel],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "процедуры удалённого модуля обязаны уйти из справочника");
+}
+
+#[test]
+fn edt_incremental_migrates_old_unique_key() {
+    // Перенос ключа metadata_modules делали только полные проходы. На базе
+    // прежней версии точечное обновление продолжало отвечать «ON CONFLICT clause
+    // does not match any PRIMARY KEY or UNIQUE constraint» и строку модуля не
+    // записывало — а до полного прохода дело могло не дойти вовсе.
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    // Откатываем таблицу к старой схеме — так выглядит база прежних версий.
+    storage
+        .conn()
+        .execute_batch(
+            "DROP TABLE metadata_modules; \
+             CREATE TABLE metadata_modules ( \
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                repo TEXT NOT NULL, full_name TEXT NOT NULL, object_name TEXT NOT NULL, \
+                module_type TEXT NOT NULL, object_id TEXT NOT NULL, property_id TEXT NOT NULL, \
+                config_version TEXT, code_path TEXT, extension_name TEXT, \
+                UNIQUE(repo, full_name) );",
+        )
+        .unwrap();
+
+    let module_rel = "src/Catalogs/Товары/ObjectModule.bsl";
+    let module_path = repo.join(module_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+    write(&module_path, "Процедура ПередЗаписью(Отказ) Экспорт КонецПроцедуры");
+    let f = ensure_file(storage.conn(), module_rel);
+    set_func(storage.conn(), f, "ПередЗаписью", "(Отказ) Экспорт");
+
+    run_incremental_extras(&repo, &mut storage, &[module_path], &[]).unwrap();
+
+    let ddl: String = storage
+        .conn()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='metadata_modules'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        ddl.contains("extension_name)"),
+        "точечный путь обязан перенести старый ключ: {ddl}"
+    );
+    let modules: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM metadata_modules WHERE code_path = ?1",
+            params![module_rel],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(modules, 1, "строка модуля обязана записаться после переноса ключа");
+}

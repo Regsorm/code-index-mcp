@@ -575,6 +575,14 @@ pub fn run_incremental_extras(
     // по слоям: слои чередуются на каждом файле, и отметка менялась бы тысячи
     // раз в секунду, ничего не сообщая.
     code_index_core::logging::stage_begin("точечное обновление надстройки");
+    // База прежней версии несёт ключ metadata_modules без extension_name, и
+    // точечная запись строки модуля падает на ON CONFLICT. Перенос ключа делают
+    // полные проходы, а до них дело может не дойти вовсе — зовём и здесь.
+    if !bsl_paths.is_empty() {
+        if let Err(e) = migrate_metadata_modules_key_tx(conn) {
+            tracing::warn!("migrate_metadata_modules_key: {}", e);
+        }
+    }
     for p in &bsl_paths {
         files_done += 1;
         if progress.due() {
@@ -1431,10 +1439,24 @@ pub(crate) fn run_incremental_extras_edt(
 
     // Код-слой: те же точечные обновления, что и у формата Конфигуратора —
     // они разбирают содержимое `.bsl`, а не раскладку выгрузки.
+    if !bsl_changed.is_empty() {
+        // Ключ metadata_modules прежней версии — см. ветку Конфигуратора.
+        if let Err(e) = migrate_metadata_modules_key_tx(conn) {
+            tracing::warn!("migrate_metadata_modules_key: {}", e);
+        }
+    }
     for p in &bsl_changed {
         update_call_graph_direct_for_file(repo_root, conn, p)?;
         update_code_usages_for_file(repo_root, conn, p)?;
         update_procedure_terms_for_file(repo_root, conn, p)?;
+        // Справочник экспортных процедур ведётся вместе с модулем: по нему
+        // резолв узнаёт, куда ведут вызовы. Раскладку EDT `classify_module`
+        // распознаёт наравне с Конфигуратором, а без этой строки новая
+        // экспортная процедура не адресовалась бы до полного пересбора.
+        let rel = rel_path(repo_root, p);
+        if let Err(e) = update_exported_procs_for_file(conn, &rel) {
+            tracing::warn!("update_exported_procs_for_file {}: {}", rel, e);
+        }
         if let Err(e) = update_metadata_module_for_file_edt(repo_root, conn, p) {
             tracing::warn!("edt module {}: {}", p.display(), e);
         }
@@ -1449,9 +1471,23 @@ pub(crate) fn run_incremental_extras_edt(
             "DELETE FROM metadata_modules WHERE repo = ? AND code_path = ?",
             params![REPO_DEFAULT, &code_path],
         )?;
+        // Строк в `functions` для удалённого файла уже нет, поэтому вызов
+        // только убирает его процедуры из справочника.
+        if let Err(e) = update_exported_procs_for_file(conn, &code_path) {
+            tracing::warn!("update_exported_procs_for_file {}: {}", code_path, e);
+        }
     }
 
     if !bsl_changed.is_empty() {
+        // База, проиндексированная прежней версией, справочника не имеет — без
+        // него резолв ниже отработает вхолостую, не проставив ни одного адреса.
+        if exported_procs_empty(conn) {
+            tracing::info!("справочник экспортных процедур пуст — собираю целиком");
+            let _ = conn.execute("ROLLBACK", []);
+            conn.execute("BEGIN", [])?;
+            rebuild_exported_procs(conn)?;
+            conn.execute("COMMIT", [])?;
+        }
         // Область резолва — файлы пакета, как и в ветке формата Конфигуратора.
         // Без временных таблиц области запрос падал на `tmp_pcg_keys`, и слой
         // extras оставался несобранным до перезапуска демона (issue #8).

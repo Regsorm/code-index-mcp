@@ -40,6 +40,17 @@ pub(crate) fn migrate_metadata_modules_key(conn: &rusqlite::Connection) -> Resul
     Ok(())
 }
 
+/// Тот же перенос ключа, но в собственной транзакции — для точечных путей,
+/// которые своей не ведут. Полные проходы зовут `migrate_metadata_modules_key`
+/// напрямую, изнутри уже открытой транзакции.
+pub(crate) fn migrate_metadata_modules_key_tx(conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+    conn.execute("BEGIN", [])?;
+    migrate_metadata_modules_key(conn)?;
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
 /// Заполнить `metadata_modules` — таблицу с UUID/property_id/configVersion
 /// каждого BSL-модуля, нужную для отладки через dbgs.
 ///
