@@ -5,6 +5,22 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.0.5] — 2026-09-11
+
+**The incremental extension update for 1C:EDT dumps now matches the Designer-format branch: call addresses are resolved right away, and the module registry is filled even on a database from an earlier version.**
+
+### Fixed
+
+- **The exported-procedure registry is maintained for 1C:EDT dumps too.** That branch neither updated it per file nor rebuilt it whole when empty. Two consequences followed. On a database created by an earlier version (no registry) call address resolution ran for nothing — no error, but not a single address resolved. And a procedure that became exported in the same batch of edits never reached the registry, so calls to it stayed unresolved until a full rebuild. Both branches now maintain the registry the same way: a module's rows are refreshed with it, a deleted module's rows are removed, and an empty registry is rebuilt whole before address resolution.
+- **The outdated `metadata_modules` key migration now also runs on the incremental path.** Replacing the uniqueness key with a composite one happened only in full passes. On a database from an earlier version the incremental update kept answering "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint" and wrote no module row, while a full pass might never happen at all. The migration moved into a function with its own transaction and is called once per batch in both incremental branches.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --features enrichment` — 833 passed, 0 failed. Two of them are new; on the pre-fix code both fail with exactly the described symptoms — an empty registry and a missing module row.
+- **A live 1C:EDT dump stand under the watcher service, two builds compared.** On the previous one: no address for the call to the new exported procedure, no module row, key not migrated, an `ON CONFLICT` warning in the log. On the new one: address resolved, row written, key migrated, no warnings.
+- **Locally:** both services run the new build, all 51 watched folders reached ready, and queries against a real 1C:EDT dump answer — object profile, 30 modules, data links.
+- **Federation:** the node was rebuilt on this build (the binary inside the container matches the built one by checksum) and remote repositories answer — procedure body and data links.
+
 ## [1.0.4] — 2026-09-10
 
 **Editing a file in a 1C:EDT dump no longer breaks the incremental extension update: the call graph and data links now keep up with the base index.**
