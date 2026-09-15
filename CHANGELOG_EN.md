@@ -5,6 +5,34 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.2.0] — 2026-09-15
+
+**`get_callers` in 1C configurations finds calls written with a module name or through an object: `ЗначениеРеквизитаОбъекта` in a standard trade configuration has 4560 callers instead of 11. Single-repository `serve` mode gets the 1C tools and bindings on a par with federation.**
+
+### Added
+
+- **Qualified calls in `get_callers`.** The 1C parser stores the called name together with its receiver (`CommonModule.Method`, `Catalogs.Object.Method`), while `get_callers` looked for an exact match with the bare name and did not see such calls — so calls to common module and manager module procedures were not found at all. Now the exact spellings derived from where the procedure is declared are added to the callers: `Module.Method` for an exported common module procedure, `Collection.Object.Method` for a manager module in both forms of the collection name (`Справочники` and `Catalogs`). Spellings are built only from real declarations, so a same-named method of an unrelated object does not get into the result; repeats are dropped.
+- **A call from a form module is bound to its object module.** A form can call an object module procedure only through a variable holding the object (`ОбработкаОбъект.Метод()`), and the call graph bound such edges by no rule and then pruned them: `get_callers` and `find_path_bsl` did not see the path from a form to its data processor module. The new rule gives a single-dot call from a form module the address of the exported procedure in the object module of that same form. Supported layouts: Designer (`<Object>/Forms/<Form>/Ext/Form/Module.bsl` → `<Object>/Ext/ObjectModule.bsl`), 1C:EDT (`<Object>/Forms/<Form>/Module.bsl` → `<Object>/ObjectModule.bsl`) and external data processors and reports (`Form.obj.bsl` → `ExternalDataProcessor.obj.bsl` or `ExternalReport.obj.bsl`); common forms, common modules and collections are not affected. A standard trade configuration has 501 such calls; for 91 % the object is confirmed by the variable assignment.
+- **`get_callers` takes graph edges by target address** — a new `idx_pcg_callee_key` index. The index is partial (`WHERE callee_proc_key IS NOT NULL`): a full index was also chosen by the planner for the `callee_proc_key IS NULL` condition of the incremental graph update — on the test stand 108–144 ms per query instead of 0.1 ms, and the graph stage of a 10-object batch grew from 0.82–0.90 to 2.3–2.5 s.
+
+### Fixed
+
+- **Single-repository `serve` mode did not attach the language processor to repositories.** In single-repository mode (started with `--path` or without `serve.toml`) repository entries were created without a language, so everything relying on the 1C processor answered incompletely: no qualified calls and no form handler bindings from v0.62.0 (`get_callers` for `ПриСозданииНаСервере` — 19 versus 20 in federation on the same database), and with `--path` the 1C tools were missing from the tool list as well (20 tools instead of 32). Now the language is determined at startup: entries from `[[paths]]` take an explicit `language` or the one detected from the root, entries from `--path` take the detected one, as the `index` command does. Re-reading `daemon.toml` updates the entries' language and processor before the tool list is swapped.
+- **Federation: a `[[paths]]` entry without `language` got the language tools but not the processor.** The language of local entries and the set of active languages are now computed by one function. It did not show in practice: the daemon writes `language` back into `daemon.toml` at startup.
+
+### How to apply
+
+- Calls to common and manager modules, and the single-repository mode fix, work right after the binary is replaced.
+- "Form → object module" edges are built when the 1C extension is built. For changed forms they appear on the next incremental update; for a whole already indexed database run `bsl-indexer index <path>` without `--force` with the daemon stopped: the extension is rebuilt without re-parsing the files.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-targets` — 855 passed, 0 failed; with `--features enrichment` — 864 passed, 0 failed; no compiler warnings. 7 new tests: the target address index is partial; object module candidates for the Designer, 1C:EDT and external data processor layouts; a call from a form is bound to its own object module; the graph after an incremental update matches a full rebuild; qualified calls for a common module, a manager module and a form; the language of a single-repository mode entry; re-reading `daemon.toml` sets the language and processor of a local entry and leaves a remote one untouched.
+- **Test stand — a copy of a standard trade configuration (57 thousand files), compared with 1.1.0 on the same database.** `get_callers`: `ЗначениеРеквизитаОбъекта` 11 → 4560, `СообщитьПользователю` 69 → 8913, `ПриСозданииНаСервере` 20 → 4767, `Записать` 872 → 1064, a data processor module procedure called from its forms 0 → 4; response time 1–77 ms. Full indexing 1:53 → 1:51, graph build 26.2 → 27.1 s; a batch of 100 changed objects 10.5 → 10.6 s, of 10 objects 3.1–3.2 → 2.7–2.8 s. The graph after changing and reverting 100 objects matched a full rebuild (614,131 rows, checksum matched); 100 of 100 new calls from forms were bound to the right procedure.
+- **Test stand, single-repository mode with the daemon running.** The previous build with `--path`: 20 tools, `ЗначениеРеквизитаОбъекта` 11, `ПриСозданииНаСервере` 19. The new one with `--path` and with `--config` without `language` (the language was detected from the root): 32 tools, 4560 and 4767, the path from a form to its data processor module found — exactly as in federation mode of the same build.
+- **Locally:** both services are up on the new build, all 52 tracked directories reached ready; `get_callers` through the working serve answers with the new numbers.
+- **Federation:** the node (Linux, Docker) was rebuilt on this build — the file checksum in the container matched the built one; remote databases answer through the local serve: the trade configuration 4584 callers of `ЗначениеРеквизитаОбъекта`, accounting 5120, ZUP 5082 callers of `СообщитьПользователю`, the data processor procedure called from forms — 4.
+
 ## [1.1.0] — 2026-09-14
 
 **A directory is added to and removed from the index with a single edit to `daemon.toml` and `serve.toml` — without restarting the daemon or serve and without manual commands; clients' open MCP sessions are not dropped.**
