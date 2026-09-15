@@ -1741,13 +1741,29 @@ impl Storage {
     }
 
     /// См. [`CallPathOutcome`]: кроме самого пути возвращает признаки обрыва
-    /// обхода, иначе «пути нет» неотличимо от «не досмотрели».
+    /// обхода, иначе «пути нет» неотличимо от «не досмотрели». Языко-нейтральный
+    /// вариант без привязки вызовов с приёмником — [`Self::find_call_path_with`].
     pub fn find_call_path(
         &self,
         from: &str,
         to: &str,
         max_depth: i64,
         language: Option<&str>,
+    ) -> Result<CallPathOutcome> {
+        self.find_call_path_with(from, to, max_depth, language, &|_, _, _| None)
+    }
+
+    /// То же, что [`Self::find_call_path`], но вызов, записанный с приёмником
+    /// (`ОбработкаОбъект.Метод`), продолжается процедурой, которую вернул `bind`
+    /// по `(file_id источника, процедура-узел, вызов как записан)`. `bind` вернул
+    /// `None` — узел-продолжение остаётся вызовом как записан (прежнее поведение).
+    pub fn find_call_path_with(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: i64,
+        language: Option<&str>,
+        bind: &dyn Fn(i64, &str, &str) -> Option<String>,
     ) -> Result<CallPathOutcome> {
         use std::collections::{HashMap, HashSet, VecDeque};
         let depth_limit = max_depth.clamp(1, 10);
@@ -1779,12 +1795,16 @@ impl Storage {
         let mut stmt = self.conn.prepare(sql)?;
         let mut visited: HashSet<String> = HashSet::new();
         visited.insert(from.to_string());
-        // parent: узел → (предшественник, номер строки ребра, file_id источника)
-        // для реконструкции пути и резолва пути файла.
-        let mut parent: HashMap<String, (String, i64, i64)> = HashMap::new();
+        // parent: узел → (предшественник, номер строки ребра, file_id источника,
+        // вызов как записан) — последнее нужно, чтобы `CallEdge.callee` остался
+        // исходной записью с приёмником, а узел обхода был именем процедуры.
+        let mut parent: HashMap<String, (String, i64, i64, String)> = HashMap::new();
         let mut queue: VecDeque<(String, i64)> = VecDeque::new();
         queue.push_back((from.to_string(), 0));
         let mut found = false;
+        // Узел, на котором нашли цель: при `callee == to` он отличается от `to`
+        // (вызов с приёмником продолжился именем процедуры), и путь собираем от него.
+        let mut hit: Option<String> = None;
         // Признаки обрыва обхода. Без них «пути нет» неотличимо от «не
         // досмотрели»: обход мог упереться в потолок узлов или в глубину.
         let mut nodes_capped = false;
@@ -1806,20 +1826,28 @@ impl Storage {
                 .collect::<rusqlite::Result<Vec<_>>>()?
             };
             for (callee, line, file_id) in rows {
-                if visited.contains(&callee) {
+                // Вызов с приёмником не равен имени процедуры: продолжаем обход
+                // тем, к чему привязал его граф.
+                let next = if callee.contains('.') {
+                    bind(file_id, &node, &callee).unwrap_or_else(|| callee.clone())
+                } else {
+                    callee.clone()
+                };
+                if visited.contains(&next) {
                     continue;
                 }
-                visited.insert(callee.clone());
-                parent.insert(callee.clone(), (node.clone(), line, file_id));
-                if callee == to {
+                visited.insert(next.clone());
+                parent.insert(next.clone(), (node.clone(), line, file_id, callee.clone()));
+                if next == to || callee == to {
                     found = true;
+                    hit = Some(next);
                     break 'bfs;
                 }
                 if visited.len() >= NODE_CAP {
                     nodes_capped = true;
                     break 'bfs;
                 }
-                queue.push_back((callee, d + 1));
+                queue.push_back((next, d + 1));
             }
         }
         if !found {
@@ -1831,12 +1859,12 @@ impl Storage {
         }
         // Реконструкция пути from→to по parent-указателям (обратный проход).
         let mut chain: Vec<CallEdge> = Vec::new();
-        let mut cur = to.to_string();
-        while let Some((prev, line, file_id)) = parent.get(&cur) {
+        let mut cur = hit.unwrap_or_else(|| to.to_string());
+        while let Some((prev, line, file_id, written)) = parent.get(&cur) {
             let path = self.get_path_by_file_id(*file_id).ok().flatten();
             chain.push(CallEdge {
                 caller: prev.clone(),
-                callee: cur.clone(),
+                callee: written.clone(),
                 line: *line,
                 path,
             });
@@ -1938,6 +1966,87 @@ impl Storage {
             })
             .collect();
         Ok((rows, truncated))
+    }
+
+    /// Дерево вызовов для языков, где вызов записан с приёмником (1С): обход по
+    /// уровням с памятью о посещённых именах. Вверх — к `calls.callee = узел`
+    /// добавляются вызовы из `extra_callers(узел)` (с квалификатором); вниз —
+    /// вызов с точкой продолжается процедурой, к которой его привязал `bind`.
+    /// Узлы дерева — имена процедур, поэтому `callee` ребра — имя узла, а не
+    /// запись с приёмником: иначе дерево не связать по уровням.
+    pub fn call_tree_walk(
+        &self,
+        root: &str,
+        down: bool,
+        max_depth: i64,
+        max_nodes: i64,
+        extra_callers: &dyn Fn(&str) -> Vec<CallRecord>,
+        bind: &dyn Fn(i64, &str, &str) -> Option<String>,
+    ) -> Result<(Vec<CallTreeEdge>, bool)> {
+        use std::collections::HashSet;
+        let depth = max_depth.clamp(1, 10);
+        let cap = max_nodes.clamp(1, 5000);
+        let mut frontier: Vec<String> = vec![root.to_string()];
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(root.to_string());
+        let mut edges: Vec<CallTreeEdge> = Vec::new();
+        let mut truncated = false;
+        'levels: for d in 1..=depth {
+            if frontier.is_empty() {
+                break;
+            }
+            // Рёбра уровня: (caller, callee, line, file_id) + имена следующего уровня.
+            let mut level: Vec<(String, String, i64, i64)> = Vec::new();
+            let mut next_names: Vec<String> = Vec::new();
+            for node in &frontier {
+                if down {
+                    for cr in self.get_callees(node, None)? {
+                        let next = if cr.callee.contains('.') {
+                            bind(cr.file_id, node, &cr.callee).unwrap_or_else(|| cr.callee.clone())
+                        } else {
+                            cr.callee.clone()
+                        };
+                        level.push((node.clone(), next.clone(), cr.line as i64, cr.file_id));
+                        next_names.push(next);
+                    }
+                } else {
+                    let mut callers = self.get_callers(node, None)?;
+                    let mut seen_ids: HashSet<i64> =
+                        callers.iter().filter_map(|c| c.id).collect();
+                    for c in extra_callers(node) {
+                        if c.id.map_or(true, |id| seen_ids.insert(id)) {
+                            callers.push(c);
+                        }
+                    }
+                    for cr in callers {
+                        level.push((cr.caller.clone(), node.clone(), cr.line as i64, cr.file_id));
+                        next_names.push(cr.caller.clone());
+                    }
+                }
+            }
+            level.sort();
+            level.dedup();
+            for (caller, callee, line, file_id) in level {
+                // Рёбер больше, чем разрешено, — дальше обход не продолжаем.
+                if edges.len() as i64 == cap {
+                    truncated = true;
+                    break 'levels;
+                }
+                edges.push(CallTreeEdge {
+                    caller,
+                    callee,
+                    line,
+                    depth: d,
+                    path: self.get_path_by_file_id(file_id).ok().flatten(),
+                });
+            }
+            // Дальше идём только по ещё не посещённым именам (циклы не разворачиваем).
+            frontier = next_names
+                .into_iter()
+                .filter(|n| visited.insert(n.clone()))
+                .collect();
+        }
+        Ok((edges, truncated))
     }
 
     /// Объединённый поиск символа по имени (функции + классы + переменные + импорты)
@@ -3815,6 +3924,104 @@ mod tests {
         assert!(storage.find_call_path("A", "B", 3, Some("rust")).unwrap().path.is_none());
         assert!(storage.find_call_path("A", "B", 3, Some("python")).unwrap().path.is_some());
         assert!(storage.find_call_path("X", "Y", 3, Some("rust")).unwrap().path.is_some());
+    }
+
+    #[test]
+    fn find_call_path_with_follows_bound_call() {
+        // Вызов `Объект.Б` из `А` граф привязал к процедуре `Б` в другом файле:
+        // без привязки BFS по точному имени такого пути не видит.
+        let storage = Storage::open_in_memory().unwrap();
+        let fa = storage.upsert_file(&make_file("/a.bsl")).unwrap();
+        let fb = storage.upsert_file(&make_file("/b.bsl")).unwrap();
+        seed_calls(&storage, fa, &[("А", "Объект.Б")]);
+        seed_calls(&storage, fb, &[("Б", "В")]);
+        let bind = |_: i64, caller: &str, callee: &str| {
+            (caller == "А" && callee == "Объект.Б").then(|| "Б".to_string())
+        };
+
+        // `Объект.Б` ≠ `Б` — без привязки пути нет.
+        assert!(storage.find_call_path("А", "Б", 3, None).unwrap().path.is_none());
+
+        let one = storage
+            .find_call_path_with("А", "Б", 3, None, &bind)
+            .unwrap()
+            .path
+            .expect("путь А→Б по привязке");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].caller, "А");
+        assert_eq!(one[0].callee, "Объект.Б", "в ответе — вызов как записан");
+
+        // Дальше от привязанного `Б` обход идёт обычным ребром.
+        let two = storage
+            .find_call_path_with("А", "В", 3, None, &bind)
+            .unwrap()
+            .path
+            .expect("путь А→В через привязанного Б");
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[1].caller, "Б");
+        assert_eq!(two[1].callee, "В");
+    }
+
+    #[test]
+    fn call_tree_walk_up_adds_extra_callers() {
+        // Вверх по дереву: к точному `calls.callee = "Б"` добавляются вызовы с
+        // приёмником (`А → Объект.Б`), которые отдаёт extra_callers.
+        let storage = Storage::open_in_memory().unwrap();
+        let fid = storage.upsert_file(&make_file("/t.py")).unwrap();
+        seed_calls(&storage, fid, &[("Г", "Б")]);
+        let extra = |name: &str| -> Vec<CallRecord> {
+            if name == "Б" {
+                // `id` заведомо не совпадает с rowid вставленных вызовов,
+                // иначе запись отсеялась бы как дубль.
+                vec![CallRecord {
+                    id: Some(999),
+                    file_id: fid,
+                    caller: "А".into(),
+                    callee: "Объект.Б".into(),
+                    line: 9,
+                }]
+            } else {
+                Vec::new()
+            }
+        };
+
+        let (edges, trunc) = storage
+            .call_tree_walk("Б", false, 1, 100, &extra, &|_, _, _| None)
+            .unwrap();
+        assert!(!trunc);
+        assert_eq!(edges.len(), 2, "точный вызыватель + вызов с квалификатором");
+        assert!(edges.iter().any(|e| e.caller == "А" && e.callee == "Б" && e.depth == 1));
+        assert!(edges.iter().any(|e| e.caller == "Г" && e.callee == "Б" && e.depth == 1));
+        assert!(edges.iter().all(|e| e.callee == "Б"), "узлы дерева — имена процедур");
+    }
+
+    #[test]
+    fn call_tree_walk_down_uses_bound_name() {
+        // Вниз вызов с приёмником разворачивается процедурой, к которой его
+        // привязал bind; без привязки узел остаётся записью как есть.
+        let storage = Storage::open_in_memory().unwrap();
+        let fa = storage.upsert_file(&make_file("/a.bsl")).unwrap();
+        let fb = storage.upsert_file(&make_file("/b.bsl")).unwrap();
+        seed_calls(&storage, fa, &[("А", "Объект.Б")]);
+        seed_calls(&storage, fb, &[("Б", "В")]);
+        let bind = |_: i64, caller: &str, callee: &str| {
+            (caller == "А" && callee == "Объект.Б").then(|| "Б".to_string())
+        };
+        let no_extra = |_: &str| -> Vec<CallRecord> { Vec::new() };
+
+        let (edges, _) = storage
+            .call_tree_walk("А", true, 2, 100, &no_extra, &bind)
+            .unwrap();
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|e| e.caller == "А" && e.callee == "Б" && e.depth == 1));
+        assert!(edges.iter().any(|e| e.caller == "Б" && e.callee == "В" && e.depth == 2));
+
+        let (raw, _) = storage
+            .call_tree_walk("А", true, 2, 100, &no_extra, &|_, _, _| None)
+            .unwrap();
+        assert_eq!(raw.len(), 1, "без привязки вызов с приёмником не разворачивается");
+        assert_eq!(raw[0].caller, "А");
+        assert_eq!(raw[0].callee, "Объект.Б");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 // в core (`code_index_core::parser::bsl`); пробрасываем его без изменений
 // — на этапе 3 парсер переедет сюда вместе с XML-парсером метаданных.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -219,6 +220,18 @@ impl LanguageProcessor for BslLanguageProcessor {
     /// `Переменная.Метод` из формы, привязанный графом к модулю объекта.
     fn qualified_callers(&self, storage: &Storage, function_name: &str) -> Vec<CallRecord> {
         crate::qualified_callers::qualified_callers(storage, function_name)
+    }
+
+    /// Все вызовы процедуры, которым граф проставил адрес определения
+    /// (`ОбработкаОбъект.Метод` из формы): вызов как записан →
+    /// `(путь файла, имя процедуры)`.
+    fn bound_callees(
+        &self,
+        storage: &Storage,
+        caller_path: &str,
+        caller: &str,
+    ) -> HashMap<String, (String, String)> {
+        crate::qualified_callers::bound_callees(storage, caller_path, caller)
     }
 }
 

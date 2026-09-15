@@ -4219,6 +4219,40 @@ fn form_call_resolves_to_own_object_module() {
 }
 
 #[test]
+fn bound_callees_form_to_object_module() {
+    // Тот же вызов из формы, что и в form_call_resolves_to_own_object_module:
+    // адрес определения берём не перебором имён, а прямо из графа — сразу все
+    // вызовы процедуры одним запросом.
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut st = fresh_storage(&tmp);
+    {
+        let conn = st.conn();
+        let obj = ensure_file(conn, TEST_OBJ);
+        let form = ensure_file(conn, TEST_FORM);
+        set_func(conn, obj, "Метод", "() Экспорт");
+        set_calls(conn, form, &[("ПриСоздании", "ОбработкаОбъект.Метод")]);
+    }
+    run_index_extras(&repo, &mut st).unwrap();
+
+    let bound = crate::qualified_callers::bound_callees(&st, TEST_FORM, "ПриСоздании");
+    assert_eq!(
+        bound.get("ОбработкаОбъект.Метод"),
+        Some(&(TEST_OBJ.to_string(), "Метод".to_string())),
+        "вызов из формы ведёт в модуль объекта этой формы"
+    );
+    assert!(
+        !bound.contains_key("ОбработкаОбъект.НетТакого"),
+        "вызова нет в графе — привязки нет"
+    );
+    assert!(
+        crate::qualified_callers::bound_callees(&st, TEST_FORM, "НетТакойПроцедуры").is_empty(),
+        "у процедуры без вызовов карта пуста"
+    );
+}
+
+#[test]
 fn form_call_incremental_matches_full_rebuild() {
     let truth_edges: &[(&str, &str)] = &[
         ("ПриСоздании", "ОбработкаОбъект.Метод"),

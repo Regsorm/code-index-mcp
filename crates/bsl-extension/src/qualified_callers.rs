@@ -1,4 +1,5 @@
-//! Вызовы с квалификатором для `get_callers` (1С).
+//! Вызовы с квалификатором для `get_callers` (1С) и адрес их определения для
+//! `get_callees`/`find_path`/`get_call_tree`.
 //!
 //! Разборщик BSL хранит вызываемое имя вместе с приёмником
 //! (`ОбщийМодуль.Метод`, `Справочники.Объект.Метод`, `Переменная.Метод`),
@@ -8,7 +9,7 @@
 //! попадают вызовы через переменную из формы, привязанные к модулю своего
 //! объекта — правило (д) в `index_extras::call_graph`).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use code_index_core::storage::models::CallRecord;
@@ -130,6 +131,58 @@ fn collect(
         }
     }
     Ok(())
+}
+
+/// Все вызовы процедуры `caller` файла `caller_path`, которым граф вызовов
+/// проставил адрес: вызов как записан → `(путь файла определения, имя)`.
+///
+/// Нужно там, где вызов записан с приёмником (`ОбработкаОбъект.Метод`): по
+/// имени целиком его определение не найти, а правило графа адрес проставило.
+/// Забираем сразу ВСЕ вызовы процедуры одним запросом (индекс
+/// `idx_pcg_caller(repo, caller_proc_key)`): обход `find_path` спрашивает
+/// привязки на каждом узле, а вызовов с точкой у процедуры обычно десятки.
+/// Ошибки SQL не пробрасываются: при сбое пишем `tracing::warn!` и отдаём то,
+/// что успели собрать (как в `qualified_callers`).
+pub fn bound_callees(
+    storage: &Storage,
+    caller_path: &str,
+    caller: &str,
+) -> HashMap<String, (String, String)> {
+    let caller_key = format!("{caller_path}::{caller}");
+    let mut out: HashMap<String, (String, String)> = HashMap::new();
+    // Запрос кэшируется: обход `find_path` зовёт его на каждый узел графа, и
+    // подготовка заново на каждом шаге стоила секунды на крупной базе.
+    let rows = match storage
+        .conn()
+        .prepare_cached(
+            "SELECT callee_proc_name, callee_proc_key FROM proc_call_graph \
+             WHERE repo = ?1 AND call_type = 'direct' AND caller_proc_key = ?2 \
+               AND callee_proc_key IS NOT NULL",
+        )
+        .and_then(|mut st| {
+            let v = st
+                .query_map(params![REPO_DEFAULT, caller_key], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(v)
+        }) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("bound_callees({}, {}): {}", caller_path, caller, e);
+            return out;
+        }
+    };
+    for (callee_name, key) in rows {
+        // `callee_proc_key` = `<путь файла>::<имя>` — режем по ПОСЛЕДНЕМУ `::`
+        // (в самом пути разделитель тоже может встретиться).
+        let (path, name) = match key.rsplit_once("::") {
+            Some(v) => v,
+            None => continue,
+        };
+        out.insert(callee_name, (path.to_string(), name.to_string()));
+    }
+    out
 }
 
 /// Прочитать строку `calls` в `CallRecord` (`line` в БД — `INTEGER`).

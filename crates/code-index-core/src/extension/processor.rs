@@ -202,6 +202,19 @@ pub trait LanguageProcessor: Send + Sync {
         Vec::new()
     }
 
+    /// Все вызовы процедуры `caller` файла `caller_path`, которым граф вызовов
+    /// языка проставил адрес: вызов как записан → `(путь файла определения, имя)`.
+    /// Одним запросом на процедуру: обход графа спрашивает это на каждом узле.
+    /// Default — пусто.
+    fn bound_callees(
+        &self,
+        _storage: &Storage,
+        _caller_path: &str,
+        _caller: &str,
+    ) -> std::collections::HashMap<String, (String, String)> {
+        std::collections::HashMap::new()
+    }
+
     /// Сборщик extras для фазы ПАРАЛЛЕЛЬНОГО парсинга (только полный путь
     /// индексации). `None` (по умолчанию) — расширение в парсинге не
     /// участвует, extras целиком делаются в `index_extras` после. bsl-extension

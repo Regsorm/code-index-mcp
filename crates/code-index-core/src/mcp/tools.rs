@@ -491,6 +491,21 @@ pub(crate) fn qualified_callers_of(
     }
 }
 
+/// Все вызовы процедуры `caller` из файла `caller_path` с адресом определения
+/// (`ОбработкаОбъект.Метод`), который знает граф вызовов языка процессора.
+/// Для репо без процессора — пустая карта.
+pub(crate) fn bound_callees_of(
+    entry: &RepoEntry,
+    storage: &crate::storage::Storage,
+    caller_path: &str,
+    caller: &str,
+) -> std::collections::HashMap<String, (String, String)> {
+    match entry.processor.as_ref() {
+        Some(p) => p.bound_callees(storage, caller_path, caller),
+        None => std::collections::HashMap::new(),
+    }
+}
+
 /// Подсказка для поисковых инструментов: найдено одно-два вхождения имени, и
 /// это выглядит как «процедура нигде не используется», хотя у неё есть
 /// декларативная привязка вне кода. Возвращает `None`, если `candidate` — не
@@ -1099,7 +1114,7 @@ pub async fn get_callees(
             if truncated {
                 r.truncate(cap);
             }
-            let deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
+            let mut deps = collect_paths_via(&storage, &r, |cr| cr.file_id);
             // Место ОПРЕДЕЛЕНИЯ вызываемой процедуры. Без него модель добирала
             // его отдельным поиском на каждое имя: в замере 28.08.2026 один
             // вопрос «что вызывает процедура, с файлами» стоил 25+ лишних
@@ -1140,28 +1155,68 @@ pub async fn get_callees(
                 };
                 defs.insert(cr.callee.clone(), found);
             }
+            // Привязки графа спрашиваем ОДИН раз на процедуру-источник: у неё
+            // обычно десятки вызовов с точкой, а отдельный запрос на каждый
+            // вызов стоил тысячи запросов на обходе графа.
+            let mut bound_cache: std::collections::HashMap<
+                (i64, String),
+                std::collections::HashMap<String, (String, String)>,
+            > = std::collections::HashMap::new();
             // Обогащаем каждую запись путём файла-источника (file_id → path).
-            let enriched: Vec<serde_json::Value> = r
-                .iter()
-                .map(|cr| {
-                    let mut rec = serde_json::json!({
-                        "caller": cr.caller,
-                        "callee": cr.callee,
-                        "line": cr.line,
-                        // `file_id` не кладём: общий срез служебных полей
-                        // (strip_plumbing_recursive) всё равно удаляет этот ключ
-                        // перед отдачей — файл-источник несёт `path` (M-9).
-                        "path": lookup_path(&storage, cr.file_id),
-                    });
-                    if let Some(Some((def_path, def_line))) = defs.get(&cr.callee) {
-                        if let Some(obj) = rec.as_object_mut() {
-                            obj.insert("callee_path".into(), serde_json::json!(def_path));
+            let mut enriched: Vec<serde_json::Value> = Vec::with_capacity(r.len());
+            for cr in r.iter() {
+                let mut rec = serde_json::json!({
+                    "caller": cr.caller,
+                    "callee": cr.callee,
+                    "line": cr.line,
+                    // `file_id` не кладём: общий срез служебных полей
+                    // (strip_plumbing_recursive) всё равно удаляет этот ключ
+                    // перед отдачей — файл-источник несёт `path` (M-9).
+                    "path": lookup_path(&storage, cr.file_id),
+                });
+                // Граф точнее эвристики по имени, поэтому спрашиваем первым:
+                // вызов с приёмником (`ОбработкаОбъект.Метод`) он уже привязал
+                // к модулю объекта формы.
+                let bound = bound_cache
+                    .entry((cr.file_id, cr.caller.clone()))
+                    .or_insert_with(|| {
+                        bound_callees_of(
+                            entry,
+                            &storage,
+                            &lookup_path(&storage, cr.file_id),
+                            &cr.caller,
+                        )
+                    })
+                    .get(&cr.callee)
+                    .cloned();
+                if let Some((def_path, def_name)) = bound {
+                    if let Some(obj) = rec.as_object_mut() {
+                        // Строка — из определения этой же процедуры в том
+                        // файле, куда указал граф. Не нашлась — путь всё
+                        // равно ставим, а строку не выдумываем.
+                        let def_line = storage
+                            .get_function_by_name(&def_name)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|f| lookup_path(&storage, f.file_id) == def_path)
+                            .map(|f| f.line_start);
+                        obj.insert("callee_path".into(), serde_json::json!(def_path));
+                        if let Some(def_line) = def_line {
                             obj.insert("callee_line".into(), serde_json::json!(def_line));
                         }
                     }
-                    rec
-                })
-                .collect();
+                    // Строка определения читается из другого файла: без него в
+                    // зависимостях ответ из кэша пережил бы правку этого файла.
+                    deps.push(def_path);
+                } else if let Some(Some((def_path, def_line))) = defs.get(&cr.callee) {
+                    if let Some(obj) = rec.as_object_mut() {
+                        obj.insert("callee_path".into(), serde_json::json!(def_path));
+                        obj.insert("callee_line".into(), serde_json::json!(def_line));
+                    }
+                    deps.push(def_path.clone());
+                }
+                enriched.push(rec);
+            }
             let extra = if truncated {
                 Some(serde_json::json!({
                     "truncated": true, "total": total, "limit": cap,
@@ -1188,7 +1243,37 @@ pub async fn find_path(
     bail_if_not_ready!(entry);
     let depth = max_depth.unwrap_or(5);
     let storage = acquire_storage!(entry);
-    match storage.find_call_path(&from, &to, depth, language.as_deref()) {
+    // Для 1С вызов с приёмником (`ОбработкаОбъект.Метод`) разворачиваем тем, к
+    // чему его привязал граф, — иначе BFS обрывается на точном сравнении имён.
+    // Проверяем именно язык: процессор есть и у других языков.
+    let bsl_bound = entry.language.as_deref() == Some("bsl")
+        && matches!(language.as_deref(), None | Some("bsl"));
+    let outcome = if bsl_bound {
+        // Привязки берём ЦЕЛИКОМ на процедуру и файл — один запрос на узел
+        // обхода вместо запроса на каждый вызов с точкой.
+        let bound: std::cell::RefCell<
+            std::collections::HashMap<(i64, String), std::collections::HashMap<String, String>>,
+        > = Default::default();
+        storage.find_call_path_with(
+            &from,
+            &to,
+            depth,
+            language.as_deref(),
+            &|file_id, caller, callee| {
+                let mut cache = bound.borrow_mut();
+                let map = cache.entry((file_id, caller.to_string())).or_insert_with(|| {
+                    bound_callees_of(entry, &storage, &lookup_path(&storage, file_id), caller)
+                        .into_iter()
+                        .map(|(written, (_, name))| (written, name))
+                        .collect()
+                });
+                map.get(callee).cloned()
+            },
+        )
+    } else {
+        storage.find_call_path(&from, &to, depth, language.as_deref())
+    };
+    match outcome {
         Ok(outcome) => {
             let found = outcome.path.is_some();
             let path = outcome.path.unwrap_or_default();
@@ -1248,7 +1333,37 @@ pub async fn get_call_tree(
     let depth = max_depth.unwrap_or(3);
     let cap = max_nodes.unwrap_or(200);
     let storage = acquire_storage!(entry);
-    match storage.get_call_tree(&root, down, depth, cap, language.as_deref()) {
+    // Для 1С дерево строит обход по уровням: вверх добавляет вызовы с
+    // квалификатором, вниз — разворачивает их по привязке графа. Проверяем
+    // именно язык: процессор есть и у других языков, а их дерево строит CTE.
+    let bsl_bound = entry.language.as_deref() == Some("bsl")
+        && matches!(language.as_deref(), None | Some("bsl"));
+    let tree = if bsl_bound {
+        // Привязки берём целиком на процедуру и файл — см. find_path.
+        let bound: std::cell::RefCell<
+            std::collections::HashMap<(i64, String), std::collections::HashMap<String, String>>,
+        > = Default::default();
+        storage.call_tree_walk(
+            &root,
+            down,
+            depth,
+            cap,
+            &|name| qualified_callers_of(entry, &storage, name),
+            &|file_id, caller, callee| {
+                let mut cache = bound.borrow_mut();
+                let map = cache.entry((file_id, caller.to_string())).or_insert_with(|| {
+                    bound_callees_of(entry, &storage, &lookup_path(&storage, file_id), caller)
+                        .into_iter()
+                        .map(|(written, (_, name))| (written, name))
+                        .collect()
+                });
+                map.get(callee).cloned()
+            },
+        )
+    } else {
+        storage.get_call_tree(&root, down, depth, cap, language.as_deref())
+    };
+    match tree {
         Ok((edges, truncated)) => {
             let tree = build_call_tree_json(&root, down, &edges);
             let empty = edges.is_empty();
