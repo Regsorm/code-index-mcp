@@ -187,7 +187,7 @@ async fn handle_get_call_tree(
         Ok(e) => e,
         Err(r) => return r,
     };
-    ok_json(tools::get_call_tree(&entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language).await)
+    ok_json(tools::get_call_tree(&entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language, p.max_response_bytes, &p.repo).await)
 }
 
 async fn handle_find_symbol(

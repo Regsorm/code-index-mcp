@@ -1326,6 +1326,8 @@ pub async fn get_call_tree(
     max_depth: Option<i64>,
     max_nodes: Option<i64>,
     language: Option<String>,
+    max_response_bytes: Option<usize>,
+    repo: &str,
 ) -> String {
     bail_if_not_ready!(entry);
     // direction: callees|down (что вызывает root, вглубь) | callers|up (кто вызывает root).
@@ -1365,19 +1367,70 @@ pub async fn get_call_tree(
     };
     match tree {
         Ok((edges, truncated)) => {
-            let tree = build_call_tree_json(&root, down, &edges);
+            // Бюджет ответа — своя константа у get_call_tree (см. call_tree_budget),
+            // подсказка бюджет поднять не предлагает. Дальние рёбра, не уместившиеся
+            // в бюджет, отбрасываются; дерево отдаётся только в целом ответе.
+            let budget = call_tree_budget(max_response_bytes);
+            let edges_total = edges.len();
+            // Сколько уровней реально пришло: у горячей процедуры max_nodes
+            // кончается на первом уровне, и совет «меньше уровней» там пуст.
+            let levels = edges.iter().map(|e| e.depth).max().unwrap_or(1);
+            let (edges, tree) = fit_call_tree_to_budget(&root, down, edges, budget);
+            let size_cut = edges.len() < edges_total;
+            // Признак берём до того, как дерево переместится в result: опущенное
+            // дерево отмечаем в ответе, даже если рёбер осталось столько же.
+            let tree_omitted = tree.is_none();
             let empty = edges.is_empty();
             // Зависимые файлы — источники рёбер дерева (M-7), см. find_path.
             let deps: Vec<String> = edges.iter().filter_map(|e| e.path.clone()).collect();
-            let result = serde_json::json!({
+            let mut result = serde_json::json!({
                 "root": root,
                 "direction": if down { "callees" } else { "callers" },
                 "max_depth": depth.clamp(1, 10),
                 "edge_count": edges.len(),
                 "edges": edges,
-                "tree": tree,
             });
-            let extra = if truncated {
+            // В сокращённом ответе дерева нет: оно повторяет рёбра и занимает
+            // около четверти ответа — место отдано рёбрам.
+            if let Some(t) = tree {
+                result["tree"] = t;
+            }
+            let extra = if size_cut {
+                let d = levels.clamp(1, 10);
+                let mut o = serde_json::json!({
+                    "truncated": true,
+                    "edges_total": edges_total,
+                    "edges_shown": edges.len(),
+                    "hint": call_tree_cut_hint(repo, &root, down, d, edges.len(), edges_total),
+                });
+                if truncated {
+                    o["limit"] = serde_json::json!(cap.clamp(1, 5000));
+                    // Иначе «показано N из max_nodes» читается как полный счёт рёбер.
+                    o["hint"] = serde_json::json!(format!(
+                        "Обход остановлен на max_nodes={}: рёбер в графе больше. {}",
+                        cap.clamp(1, 5000),
+                        call_tree_cut_hint(repo, &root, down, d, edges.len(), edges_total)
+                    ));
+                }
+                Some(o)
+            } else if tree_omitted {
+                if truncated {
+                    Some(serde_json::json!({
+                        "truncated": true,
+                        "limit": cap.clamp(1, 5000),
+                        "tree_omitted": true,
+                        "hint": format!(
+                            "Дерево обрезано по max_nodes. Уменьшите max_depth или увеличьте max_nodes. {}",
+                            CALL_TREE_OMITTED_HINT
+                        ),
+                    }))
+                } else {
+                    Some(serde_json::json!({
+                        "tree_omitted": true,
+                        "hint": CALL_TREE_OMITTED_HINT,
+                    }))
+                }
+            } else if truncated {
                 Some(serde_json::json!({
                     "truncated": true,
                     "limit": cap.clamp(1, 5000),
@@ -1394,6 +1447,113 @@ pub async fn get_call_tree(
         }
         Err(e) => format!("{{\"error\": \"get_call_tree: {}\"}}", e),
     }
+}
+
+/// Запас бюджета `get_call_tree` под шапку ответа, служебные поля и подсказку.
+const CALL_TREE_OVERHEAD_BYTES: usize = 2_000;
+
+/// Подсказка `get_call_tree`, когда поле `tree` опущено по размеру ответа.
+const CALL_TREE_OMITTED_HINT: &str = "Поле tree опущено по размеру ответа: все рёбра — в edges, уровень каждого — в depth.";
+
+/// Бюджет ответа `get_call_tree`, когда клиент его не передал. Не больше
+/// серверного бюджета: выключенный конфигом страж (0) остаётся выключенным.
+const CALL_TREE_DEFAULT_BUDGET_BYTES: usize = 48_000;
+
+/// Бюджет одного вызова `get_call_tree` в байтах (0 — не сокращать).
+/// Параметр клиента (кроме 0) разрешается как у остальных инструментов;
+/// без параметра — серверный бюджет, но не больше `CALL_TREE_DEFAULT_BUDGET_BYTES`.
+fn call_tree_budget(requested: Option<usize>) -> usize {
+    let b = crate::mcp::cap::resolve_request_budget(requested);
+    match requested {
+        None | Some(0) => b.applied.min(CALL_TREE_DEFAULT_BUDGET_BYTES),
+        Some(_) => b.applied,
+    }
+}
+
+/// Подсказка сокращённого по размеру ответа `get_call_tree`: как сузить запрос.
+/// Намеренно не предлагает поднять бюджет — это уводит ответ в файл клиента.
+fn call_tree_cut_hint(
+    repo: &str,
+    root: &str,
+    down: bool,
+    depth: i64,
+    shown: usize,
+    total: usize,
+) -> String {
+    let dir = if down { "callees" } else { "callers" };
+    let mut steps: Vec<String> = Vec::new();
+    if depth > 1 {
+        steps.push(format!(
+            "меньше уровней — {}",
+            crate::mcp::cap::next_call_hint(
+                "get_call_tree",
+                &[
+                    ("repo", serde_json::json!(repo)),
+                    ("root", serde_json::json!(root)),
+                    ("direction", serde_json::json!(dir)),
+                    ("max_depth", serde_json::json!(depth - 1)),
+                ],
+            )
+        ));
+    }
+    steps.push("дальние уровни от нужного узла — get_call_tree с root = этот узел из edges".to_string());
+    steps.push("цепочка до конкретной функции — find_path".to_string());
+    steps.push(if down {
+        "все вызываемые одного узла — get_callees с limit".to_string()
+    } else {
+        "все вызывающие одного узла — get_callers с limit".to_string()
+    });
+    format!(
+        "Ответ сокращён по размеру: показано {shown} из {total} рёбер, ближние уровни — первыми; поля tree нет. Сузить запрос: {}.",
+        steps.join("; ")
+    )
+}
+
+/// Уложить рёбра и дерево `get_call_tree` в бюджет `budget` байт.
+///
+/// Уместилось — рёбра, их порядок и дерево не меняются. Не уместилось — рёбра
+/// упорядочиваются по глубине (устойчиво) и берётся наибольшее начало списка,
+/// которое укладывается в бюджет: ближние уровни идут первыми, ребро глубины d+1
+/// не остаётся без рёбер глубины d. Не уместилось вместе с деревом — дерево
+/// опускается, и размер дальше считается по одним рёбрам; если все рёбра без
+/// дерева укладываются, возвращаются все рёбра без дерева. Минимум одно ребро: пустой ответ означал бы «рёбер нет», а не
+/// «не поместилось». `budget == 0` — страж выключен конфигом сервера, ничего не
+/// сокращается.
+fn fit_call_tree_to_budget(
+    root: &str,
+    down: bool,
+    mut edges: Vec<crate::storage::models::CallTreeEdge>,
+    budget: usize,
+) -> (Vec<crate::storage::models::CallTreeEdge>, Option<serde_json::Value>) {
+    let size = |edges: &[crate::storage::models::CallTreeEdge], tree: &serde_json::Value| -> usize {
+        serde_json::to_vec(&serde_json::json!({ "edges": edges, "tree": tree }))
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX)
+    };
+    let tree = build_call_tree_json(root, down, &edges);
+    if budget == 0 || edges.len() <= 1 {
+        return (edges, Some(tree));
+    }
+    let limit = budget.saturating_sub(CALL_TREE_OVERHEAD_BYTES);
+    if size(&edges, &tree) <= limit {
+        return (edges, Some(tree));
+    }
+    edges.sort_by_key(|e| e.depth);
+    let (mut lo, mut hi) = (1usize, edges.len());
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        let fits = serde_json::to_vec(&edges[..mid])
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX)
+            <= limit;
+        if fits {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    edges.truncate(lo);
+    (edges, None)
 }
 
 /// Собрать вложенное дерево `{name, children:[...]}` из плоских рёбер
@@ -2645,5 +2805,140 @@ mod tests {
         let out = compact_listed_files(&files);
         assert_eq!(out[0], serde_json::json!("src/foo.rs | rust | 724 lines | 28504"));
         assert_eq!(out[1], serde_json::json!("bar.md | markdown | 3 lines | ?"));
+    }
+
+    fn tree_edge(caller: &str, callee: &str, depth: i64) -> crate::storage::models::CallTreeEdge {
+        crate::storage::models::CallTreeEdge {
+            caller: caller.to_string(),
+            callee: callee.to_string(),
+            line: 1,
+            depth,
+            path: Some("base/CommonModules/ОбщийМодуль/Ext/Module.bsl".to_string()),
+        }
+    }
+
+    /// Дерево «вниз»: корень → 30 детей → у каждого 30 внуков (930 рёбер).
+    fn wide_tree() -> Vec<crate::storage::models::CallTreeEdge> {
+        let mut v = Vec::new();
+        for i in 0..30 {
+            v.push(tree_edge("Корень", &format!("Ребёнок{i}"), 1));
+        }
+        for i in 0..30 {
+            for j in 0..30 {
+                v.push(tree_edge(&format!("Ребёнок{i}"), &format!("Внук{i}_{j}"), 2));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn call_tree_within_budget_unchanged() {
+        let edges = wide_tree();
+        let before = serde_json::to_string(&edges).unwrap();
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, 10_000_000);
+        assert_eq!(serde_json::to_string(&kept).unwrap(), before, "в бюджете рёбра и порядок не меняются");
+        assert_eq!(tree, Some(build_call_tree_json("Корень", true, &kept)));
+    }
+
+    #[test]
+    fn call_tree_zero_budget_disables_cut() {
+        let edges = wide_tree();
+        let n = edges.len();
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, 0);
+        assert_eq!(kept.len(), n, "бюджет 0 — страж выключен");
+        assert!(tree.is_some(), "целый ответ отдаётся вместе с деревом");
+    }
+
+    #[test]
+    fn call_tree_cut_fits_and_keeps_near_levels() {
+        let edges = wide_tree();
+        let total = edges.len();
+        let budget = 20_000;
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, budget);
+        assert!(kept.len() < total, "ответ сокращён: {} из {}", kept.len(), total);
+        assert!(tree.is_none(), "сокращённый ответ отдаётся без дерева");
+        let size = serde_json::to_vec(&kept).unwrap().len();
+        assert!(size <= budget - CALL_TREE_OVERHEAD_BYTES, "уложилось в бюджет: {size}");
+        let d1 = kept.iter().filter(|e| e.depth == 1).count();
+        assert!(kept.iter().all(|e| e.depth == 1) || d1 == 30, "ребро глубины 2 не остаётся без рёбер глубины 1");
+    }
+
+    #[test]
+    fn call_tree_cut_keeps_at_least_one_edge() {
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, wide_tree(), 100);
+        assert_eq!(kept.len(), 1, "пустой ответ читался бы как «рёбер нет»");
+        assert!(tree.is_none(), "сокращённый ответ отдаётся без дерева");
+    }
+
+    /// Сокращённый ответ без дерева вмещает больше рёбер, чем ответ с деревом
+    /// (ради этого дерево и убрано): сверяем с наибольшим префиксом, который
+    /// уложился бы вместе с деревом.
+    #[test]
+    fn call_tree_cut_without_tree_keeps_more_edges() {
+        let budget = 20_000usize;
+        let mut edges = wide_tree();
+        edges.sort_by_key(|e| e.depth);
+        let mut n_with_tree = 0usize;
+        for k in 1..=edges.len() {
+            let tree = build_call_tree_json("Корень", true, &edges[..k]);
+            let size = serde_json::to_vec(&serde_json::json!({ "edges": &edges[..k], "tree": tree }))
+                .unwrap()
+                .len();
+            if size <= 18_000 {
+                n_with_tree = k;
+            }
+        }
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, budget);
+        assert!(tree.is_none(), "сокращённый ответ отдаётся без дерева");
+        assert!(
+            kept.len() > n_with_tree,
+            "без дерева рёбер помещается больше: {} против {}",
+            kept.len(),
+            n_with_tree
+        );
+    }
+
+    /// Дерево опускается и тогда, когда все рёбра без него уложились целиком:
+    /// рёбра не режутся, но в ответе появляется пометка об опущенном дереве.
+    #[test]
+    fn call_tree_drops_tree_before_edges() {
+        let edges = wide_tree();
+        let edges_only = serde_json::to_vec(&edges).unwrap().len();
+        let with_tree = serde_json::to_vec(&serde_json::json!({
+            "edges": &edges,
+            "tree": build_call_tree_json("Корень", true, &edges),
+        }))
+        .unwrap()
+        .len();
+        let budget = CALL_TREE_OVERHEAD_BYTES + edges_only + (with_tree - edges_only) / 2;
+        assert!(with_tree > edges_only);
+        let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, budget);
+        assert_eq!(kept.len(), 930, "все рёбра без дерева уложились");
+        assert!(tree.is_none(), "дерево опущено по размеру ответа");
+    }
+
+    #[test]
+    fn call_tree_cut_hint_suggests_narrowing() {
+        let s = call_tree_cut_hint("ut", "Корень", false, 3, 10, 200);
+        assert!(s.contains("показано 10 из 200"), "{s}");
+        assert!(s.contains("max_depth"), "{s}");
+        assert!(s.contains("find_path"), "{s}");
+        assert!(s.contains("root = этот узел"), "{s}");
+        assert!(s.contains("get_callers"), "{s}");
+        assert!(!s.contains("max_response_bytes"), "{s}");
+        assert!(!s.contains("192000"), "{s}");
+        let s = call_tree_cut_hint("ut", "Корень", true, 1, 1, 5);
+        assert!(s.contains("get_callees"), "{s}");
+        assert!(!s.contains("get_call_tree("), "{s}");
+    }
+
+    #[test]
+    fn call_tree_budget_default_not_above_constant() {
+        assert!(call_tree_budget(None) <= CALL_TREE_DEFAULT_BUDGET_BYTES);
+        assert_eq!(call_tree_budget(None), call_tree_budget(Some(0)));
+        assert_eq!(
+            call_tree_budget(Some(10_000)),
+            crate::mcp::cap::resolve_request_budget(Some(10_000)).applied
+        );
     }
 }

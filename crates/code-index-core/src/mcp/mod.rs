@@ -196,6 +196,10 @@ pub struct CallTreeParams {
     pub max_nodes: Option<i64>,
     /// Опциональный фильтр по языку файла-источника ребра.
     pub language: Option<String>,
+    /// Бюджет размера ответа в байтах; по умолчанию — бюджет сервера.
+    /// Не уместившиеся дальние рёбра отбрасываются — в ответе truncated,
+    /// edges_total, edges_shown и hint.
+    pub max_response_bytes: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -1177,7 +1181,7 @@ impl CodeIndexServer {
         tools::find_path(&entry, p.from, p.to, p.max_depth, p.language).await
     }
 
-    #[tool(description = "Дерево вызовов на НЕСКОЛЬКО уровней за ОДИН вызов. Бери его на вопросы вида «кто вызывает того, кто вызывает X», «цепочка вызовов вверх/вниз», «дерево вызовов на N уровней»: обход по уровням делает сервер. НЕ собирай такое дерево вручную — перебор узлов через get_callers/get_callees/grep_code/find_symbol стоит десятки лишних вызовов и даёт тот же ответ. Параметры: root — имя функции; direction: callers/up (кто вызывает root — для вопросов «кто выше по цепочке») либо callees/down (что вызывает сам root, по умолчанию); max_depth по умолчанию 3, [1..10]; max_nodes cap (default 200). Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}.")]
+    #[tool(description = "Дерево вызовов на НЕСКОЛЬКО уровней за ОДИН вызов. Бери его на вопросы вида «кто вызывает того, кто вызывает X», «цепочка вызовов вверх/вниз», «дерево вызовов на N уровней»: обход по уровням делает сервер. НЕ собирай такое дерево вручную — перебор узлов через get_callers/get_callees/grep_code/find_symbol стоит десятки лишних вызовов и даёт тот же ответ. Параметры: root — имя функции; direction: callers/up (кто вызывает root — для вопросов «кто выше по цепочке») либо callees/down (что вызывает сам root, по умолчанию); max_depth по умолчанию 3, [1..10]; max_nodes cap (default 200). Большой ответ сокращается по размеру: дальние рёбра отбрасываются, поля tree нет, в ответе truncated, edges_total, edges_shown и hint — как сузить запрос. Универсальный, любой язык. Возвращает {root,direction,edges:[{caller,callee,line,depth}],tree:{name,children}}.")]
     async fn get_call_tree(&self, Parameters(p): Parameters<CallTreeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         if !entry.is_local {
@@ -1185,7 +1189,7 @@ impl CodeIndexServer {
                 &self.clients, &entry.ip, entry.port, "get_call_tree", &p,
             ).await;
         }
-        tools::get_call_tree(&entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language).await
+        tools::get_call_tree(&entry, p.root, p.direction, p.max_depth, p.max_nodes, p.language, p.max_response_bytes, &p.repo).await
     }
 
     #[tool(description = "Навигация: ГДЕ определён символ по ТОЧНОМУ имени — локации функций/классов/переменных/импортов БЕЗ тел (как search_*). Тело конкретного — get_function/get_class. Возвращает {functions, classes, variables, imports} (облегчённые: имя/путь/строки/сигнатура). Голым именем зови ТОЛЬКО для уникального имени: если имя — стандартный обработчик объекта/набора записей или просто распространённое, вернутся сотни локаций (truncated) — для таких сразу задавай path_glob (фильтр по пути).")]
