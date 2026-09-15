@@ -5,6 +5,32 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.2.1] — 2026-09-15
+
+**The "call from a form → the form's object module" rule no longer binds calls from client procedures or calls to a common module through a variable: on a standard accounting configuration false rule links 65 → 5, precision 97.6 % → 99.7 %.**
+
+### Fixed
+
+- **A call from a `&НаКлиенте` procedure is not bound to the object module.** The form object exists only on the server, so a variable in a client procedure holds something else — a client module or its context. The 1.2.0 rule did not tell them apart: on a standard accounting configuration 48 false links came from the client procedures of one container form of the electronic document exchange library. The procedure directive is taken from the module parse.
+- **A call through a `Модуль<Name>` variable is not bound if the common module `<Name>` exists.** This is how standard configurations obtain a common module by name (`Модуль = ОбщегоНазначения.ОбщийМодуль("<Name>")`), and the call belongs to that module, not to the form object. The accounting configuration had 8 such false links.
+
+### How to apply
+
+- Rule links are built when the 1C extension layer is built. For an already indexed database run `bsl-indexer index <path>` without `--force` while the daemon is stopped: the extension layer is rebuilt without reparsing files. Changed forms get the fix on the next incremental update.
+
+### Known limitations
+
+- On a standard accounting configuration, of 2770 rule links 2763 are correct, 5 are false, and 2 more have no final verdict. Two of the five false ones are calls to the object of another report created via `Отчеты["<Name>"].Создать()`.
+- Rule precision in external data processors and reports was not measured: a copy of a standard trade configuration has 159 such links.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-targets` — 862 passed, 0 failed; with `--features enrichment` — 871 passed, 0 failed; no compiler warnings. 3 new tests: a call from a client procedure is not bound; a call through a common module variable is not bound; the graph after an incremental update matches a full rebuild. With the rule reverted, the new tests fail.
+- **Standard accounting configuration, two exports of the same database (Designer and 1C:EDT).** Before the fix the rule produced 2830 links, identical sets in both exports; manual review: 2763 correct, 65 false. After recreating the databases — 2770 in both: exactly the 60 links selected in advance as false were removed, no correct link was affected. Extension layer build on the 1C:EDT export — 88.6 → 89.6 s (single runs).
+- **Copy of a standard trade configuration (57 thousand files).** 3 links removed, all false: one call to a common module through a variable and two client calls in an external data processor; the rest of the graph matched a full 1.2.0 build by checksum. Incremental update of a form after an edit and after reverting it — 1.7–1.9 s, 55 form links, the graph matches a full rebuild.
+- **Locally:** both services are up on the new build, all 52 watched folders reached ready.
+- **Federation:** the node (Linux, Docker) was rebuilt on this build — the checksum of the file in the container matched the built one; the extension layer was rebuilt in six databases. In four accounting and payroll databases direct edges dropped by 60–63, bound `КонтекстЭДОКлиент.*` calls — 0 instead of 48–50; form handler, subscription and extension override edges did not change. On five large databases 1.2.0 → 1.2.1 full indexing — from −2.5 to +0.7 %, extension layer build — from −3.2 to +1.6 % (single runs). Through the local serve the remote accounting database answers `bsl_sql` and `get_call_tree`, the call from a form to its data processor module is in place.
+
 ## [1.2.0] — 2026-09-15
 
 **`get_callers` in 1C configurations finds calls written with a module name or through an object: `ЗначениеРеквизитаОбъекта` in a standard trade configuration has 4560 callers instead of 11, and `get_callees`, `find_path` and `get_call_tree` show the same calls consistently. Single-repository `serve` mode gets the 1C tools and bindings on a par with federation.**
