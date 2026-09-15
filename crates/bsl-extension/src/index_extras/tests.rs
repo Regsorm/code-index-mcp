@@ -2216,6 +2216,26 @@ fn set_func(conn: &rusqlite::Connection, file_id: i64, name: &str, args: &str) {
     .unwrap();
 }
 
+fn set_func_doc(conn: &rusqlite::Connection, file_id: i64, name: &str, args: &str, doc: &str) {
+    conn.execute(
+        "INSERT INTO functions (file_id, name, args, docstring) VALUES (?, ?, ?, ?)",
+        params![file_id, name, args, doc],
+    )
+    .unwrap();
+}
+
+/// Сколько рёбер `caller → callee` привязано именно к `target` («путь::имя»).
+fn bound_to(conn: &rusqlite::Connection, caller: &str, callee: &str, target: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM proc_call_graph \
+         WHERE repo = ?1 AND call_type = 'direct' AND caller_proc_key = ?2 \
+           AND callee_proc_name = ?3 AND callee_proc_key = ?4",
+        params![REPO_DEFAULT, caller, callee, target],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
 #[test]
 fn resolves_callee_keys_local_unique_export_and_null() {
     // Этап 4e: проверяем оба tier'а резолвера и честный NULL.
@@ -4311,6 +4331,164 @@ fn form_call_incremental_matches_full_rebuild() {
         Some(format!("{TEST_OBJ}::Метод")),
         "инкремент дал тот же адрес, что и полный пересбор"
     );
+}
+
+#[test]
+fn form_call_not_bound_from_client_procedure() {
+    // Из процедуры `&НаКлиенте` модуль объекта недоступен — вызов не привязывается.
+    // `&НаСервере`, `&НаКлиентеНаСервереБезКонтекста` и процедура без записи в
+    // functions привязываются, как раньше. Обе раскладки: Конфигуратор и EDT.
+    const EDT_OBJ: &str = "src/DataProcessors/Обр2/ObjectModule.bsl";
+    const EDT_FORM: &str = "src/DataProcessors/Обр2/Forms/Форма/Module.bsl";
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut st = fresh_storage(&tmp);
+    {
+        let conn = st.conn();
+        for (obj_path, form_path) in [(TEST_OBJ, TEST_FORM), (EDT_OBJ, EDT_FORM)] {
+            let obj = ensure_file(conn, obj_path);
+            let form = ensure_file(conn, form_path);
+            set_func(conn, obj, "Метод", "() Экспорт");
+            set_func_doc(conn, form, "Клиент", "()", "procedure &НаКлиенте");
+            set_func_doc(conn, form, "Сервер", "()", "procedure &НаСервере");
+            set_func_doc(conn, form, "Везде", "()", "procedure &НаКлиентеНаСервереБезКонтекста");
+            set_calls(
+                conn,
+                form,
+                &[
+                    ("Клиент", "КонтекстКлиент.Метод"),
+                    ("Сервер", "ОбработкаОбъект.Метод"),
+                    ("Везде", "ОбъектОтчета.Метод"),
+                    ("БезЗаписи", "Объект2.Метод"),
+                ],
+            );
+        }
+    }
+    run_index_extras(&repo, &mut st).unwrap();
+
+    for (obj_path, form_path) in [(TEST_OBJ, TEST_FORM), (EDT_OBJ, EDT_FORM)] {
+        let target = format!("{obj_path}::Метод");
+        let b = |proc_name: &str, callee: &str| -> i64 {
+            bound_to(st.conn(), &format!("{form_path}::{proc_name}"), callee, &target)
+        };
+        assert_eq!(b("Клиент", "КонтекстКлиент.Метод"), 0, "{form_path}: вызов из &НаКлиенте не привязан");
+        assert_eq!(b("Сервер", "ОбработкаОбъект.Метод"), 1, "{form_path}: &НаСервере привязан");
+        assert_eq!(b("Везде", "ОбъектОтчета.Метод"), 1, "{form_path}: &НаКлиентеНаСервереБезКонтекста привязан");
+        assert_eq!(b("БезЗаписи", "Объект2.Метод"), 1, "{form_path}: процедура без записи в functions привязана");
+    }
+}
+
+#[test]
+fn form_call_not_bound_for_common_module_variable() {
+    // Переменная `Модуль<Имя>` при существующем общем модуле `<Имя>` — это
+    // `ОбщегоНазначения.ОбщийМодуль("<Имя>")`, а не объект: к модулю объекта не
+    // привязывается. Общего модуля «Обмена» нет — `МодульОбмена` привязывается.
+    const CM_CLIENT: &str = "CommonModules/СообщенияКлиент/Ext/Module.bsl";
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut st = fresh_storage(&tmp);
+    {
+        let conn = st.conn();
+        let obj = ensure_file(conn, TEST_OBJ);
+        let form = ensure_file(conn, TEST_FORM);
+        let cm = ensure_file(conn, CM_CLIENT);
+        set_func(conn, obj, "Отправить", "() Экспорт");
+        set_func(conn, cm, "Отправить", "() Экспорт");
+        set_calls(
+            conn,
+            form,
+            &[
+                ("ПриСоздании", "МодульСообщенияКлиент.Отправить"),
+                ("ПриСоздании", "МодульОбмена.Отправить"),
+            ],
+        );
+    }
+    run_index_extras(&repo, &mut st).unwrap();
+
+    let caller = format!("{TEST_FORM}::ПриСоздании");
+    let target = format!("{TEST_OBJ}::Отправить");
+    assert_eq!(
+        bound_to(st.conn(), &caller, "МодульСообщенияКлиент.Отправить", &target),
+        0,
+        "общий модуль в переменной — не модуль объекта"
+    );
+    assert_eq!(
+        bound_to(st.conn(), &caller, "МодульОбмена.Отправить", &target),
+        1,
+        "общего модуля «Обмена» нет — привязка остаётся"
+    );
+}
+
+#[test]
+fn form_call_filters_incremental_matches_full_rebuild() {
+    // Оба исключения дают после батч-инкремента тот же граф (с адресами), что и
+    // полный пересбор.
+    const CM_CLIENT: &str = "CommonModules/СообщенияКлиент/Ext/Module.bsl";
+    let truth_edges: &[(&str, &str)] = &[
+        ("Клиент", "КонтекстКлиент.Метод"),
+        ("Сервер", "ОбработкаОбъект.Метод"),
+        ("Сервер", "МодульСообщенияКлиент.Метод"),
+        ("Сервер", "МодульОбмена.Метод"),
+    ];
+    let seed = |conn: &rusqlite::Connection, form_edges: &[(&str, &str)]| -> i64 {
+        let obj = ensure_file(conn, TEST_OBJ);
+        let form = ensure_file(conn, TEST_FORM);
+        let cm = ensure_file(conn, CM_CLIENT);
+        set_func(conn, obj, "Метод", "() Экспорт");
+        set_func(conn, cm, "Метод", "() Экспорт");
+        set_func_doc(conn, form, "Клиент", "()", "procedure &НаКлиенте");
+        set_func_doc(conn, form, "Сервер", "()", "procedure &НаСервере");
+        set_calls(conn, form, form_edges);
+        form
+    };
+    let graph = |conn: &rusqlite::Connection| -> Vec<(String, String, String)> {
+        let mut v: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT caller_proc_key, callee_proc_name, IFNULL(callee_proc_key, '') \
+                 FROM proc_call_graph WHERE repo = ?1 AND call_type = 'direct'",
+            )
+            .unwrap()
+            .query_map(params![REPO_DEFAULT], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        v.sort();
+        v
+    };
+
+    // truth: конечное состояние сразу, полный пересбор.
+    let tmp_t = TempDir::new().unwrap();
+    let repo_t = tmp_t.path().join("repo");
+    std::fs::create_dir(&repo_t).unwrap();
+    let mut st_t = fresh_storage(&tmp_t);
+    seed(st_t.conn(), truth_edges);
+    run_index_extras(&repo_t, &mut st_t).unwrap();
+
+    // incr: сперва одно старое ребро и полный пересбор, затем вызовы truth и
+    // батч-инкремент только по модулю формы.
+    let tmp_i = TempDir::new().unwrap();
+    let repo_i = tmp_i.path().join("repo");
+    std::fs::create_dir(&repo_i).unwrap();
+    let mut st_i = fresh_storage(&tmp_i);
+    let form_i = seed(st_i.conn(), &[("Сервер", "ОбработкаОбъект.Старый")]);
+    run_index_extras(&repo_i, &mut st_i).unwrap();
+    set_calls(st_i.conn(), form_i, truth_edges);
+    run_incremental_extras(&repo_i, &mut st_i, &[repo_i.join(TEST_FORM)], &[]).unwrap();
+
+    assert_eq!(
+        graph(st_i.conn()),
+        graph(st_t.conn()),
+        "граф с адресами после батч-инкремента != полному пересбору"
+    );
+    let target = format!("{TEST_OBJ}::Метод");
+    let client = format!("{TEST_FORM}::Клиент");
+    let server = format!("{TEST_FORM}::Сервер");
+    assert_eq!(bound_to(st_i.conn(), &client, "КонтекстКлиент.Метод", &target), 0, "клиентская процедура");
+    assert_eq!(bound_to(st_i.conn(), &server, "МодульСообщенияКлиент.Метод", &target), 0, "общий модуль в переменной");
+    assert_eq!(bound_to(st_i.conn(), &server, "ОбработкаОбъект.Метод", &target), 1, "объект формы");
+    assert_eq!(bound_to(st_i.conn(), &server, "МодульОбмена.Метод", &target), 1, "общего модуля «Обмена» нет");
 }
 
 #[test]

@@ -1057,6 +1057,10 @@ pub(crate) fn form_owner_object_module_candidates(path: &str) -> Vec<String> {
 /// поэтому одноточечный вызов из модуля формы, чьё имя метода экспортно в
 /// модуле объекта этой формы, привязывается туда. Замер на типовой торговой
 /// конфигурации: 501 такой вызов, 91 % подтверждён по присваиванию переменной.
+/// Не привязываются: вызовы из процедур с директивой `&НаКлиенте` и вызовы через
+/// переменную `Модуль<Имя>`, если общий модуль `<Имя>` существует. Замер на
+/// бухгалтерии (выгрузки EDT и Конфигуратора): из 2830 связей правила оба
+/// исключения убирают 60 ложных, верных — ни одной.
 /// Правило идёт после (в) и (г), до отсева. Транзакцией не управляет.
 pub(crate) fn resolve_callee_keys_by_form_owner(
     conn: &rusqlite::Connection,
@@ -1104,6 +1108,22 @@ pub(crate) fn resolve_callee_keys_by_form_owner(
         conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_formobj;")?;
         return Ok(());
     }
+    // Клиентские процедуры форм области. Из процедуры `&НаКлиенте` модуль объекта
+    // недоступен — в переменной там клиентская форма или общий модуль, привязывать
+    // такой вызов к модулю объекта нельзя. Директиву разборщик кладёт в
+    // `functions.docstring` («procedure &НаКлиенте export»); пробелы вокруг образца
+    // отсекают `&НаКлиентеНаСервереБезКонтекста`. Собираем только по формам из
+    // tmp_pcg_formobj: на точечном обновлении это формы пакета.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_formclient;
+         CREATE TEMP TABLE tmp_pcg_formclient(k TEXT PRIMARY KEY);
+         INSERT OR IGNORE INTO tmp_pcg_formclient(k)
+           SELECT m.form_path || '::' || fn.name
+           FROM tmp_pcg_formobj m
+           JOIN files f ON f.path = m.form_path
+           JOIN functions fn ON fn.file_id = f.id
+           WHERE (' ' || IFNULL(fn.docstring, '') || ' ') LIKE '% &НаКлиенте %';",
+    )?;
 
     // Квалификатор вызова не должен быть ни именем общего модуля (его резолвит
     // Tier C), ни коллекцией метаданных (её резолвит Tier D). Имена коллекций —
@@ -1139,10 +1159,12 @@ pub(crate) fn resolve_callee_keys_by_form_owner(
            AND {form_of_caller} IN (SELECT form_path FROM tmp_pcg_formobj) \
            AND {first} NOT IN (SELECT owner FROM exported_procs WHERE repo = ?1 AND kind = 'common' AND owner IS NOT NULL) \
            AND {first} NOT IN ({colls}) \
+           AND {edges}.caller_proc_key NOT IN (SELECT k FROM tmp_pcg_formclient) \
+           AND NOT ({first} LIKE 'Модуль%' AND substr({first}, 7) IN (SELECT owner FROM exported_procs WHERE repo = ?1 AND kind = 'common' AND owner IS NOT NULL)) \
            AND {exists}"
     );
     sql.push_str(scope.clause());
     conn.execute(&sql, params![REPO_DEFAULT])?;
-    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_formobj;")?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_formobj; DROP TABLE IF EXISTS tmp_pcg_formclient;")?;
     Ok(())
 }
