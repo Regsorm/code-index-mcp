@@ -5,6 +5,45 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.2.2] — 2026-09-15
+
+**`get_call_tree` keeps the response size in check: for a frequently called 1C procedure the default tree is 45.6 KB instead of 74.8 KB, with `max_nodes` 5000 — 45.8 KB instead of 1.8 MB. A shortened response says how many edges are shown and suggests how to get the rest.**
+
+### Added
+
+- **Response size limit for `get_call_tree`.** The default budget is 48 KB, but not above the server `[cap].max_response_bytes`. If the response does not fit, edges are ordered by level and the farthest are dropped, and the `tree` field is not returned: it repeats the edges and takes about a quarter of the response. The response carries `truncated`, `edges_total` (how many edges there were), `edges_shown` (how many are shown) and a hint on how to get what is needed: farther levels — `get_call_tree` from a specific node in `edges`; a chain to a specific function — `find_path`; all callers or callees of one node — `get_callers` or `get_callees` with `limit`; fewer levels — a ready call with `max_depth` one less (only if the response has more than one level). If the traversal also hit `max_nodes`, the hint says the graph has more edges than the shown number.
+- **`tree_omitted` marker.** When all edges fit only without the tree, all edges are returned, the `tree` field is omitted, and the response carries `tree_omitted` and a hint.
+- **The `max_response_bytes` parameter** sets the budget for one call; it is not raised above the server cap `[cap].max_response_bytes_hard`. Neither the tool description nor the hint names budget numbers or suggests raising it: in a draft the hint offered to repeat the call with the cap, the test agent did exactly that, the 186 KB response went to a file, and token usage on the question grew by 37 % (single run).
+
+### How to apply
+
+- Works right after replacing the binary, no reindexing needed.
+
+### Known limitations
+
+- The default budget was chosen without a comparative agent run — 48 KB, as for the other size-limited tools.
+- Within one level edges keep the traversal order: shortening drops the end of the level, not the least important edges.
+- The file path is repeated in every edge and takes 41–44 % of edge bytes on 1C. Moving paths into a separate list was not done: it changes the edge shape for all clients.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace --all-targets` — 870 passed, 0 failed; with `--features enrichment` — 879 passed, 0 failed; no compiler warnings. 8 new tests: a response within budget is unchanged and returned with the tree; a zero budget shortens nothing; a shortened response fits the budget, keeps the near levels and comes without the tree; at least one edge; without the tree more edges fit than with it; the tree is dropped before edges; the hint suggests narrowing the request and does not name the budget; the default budget is not above the constant.
+- **Locally, a copy of a standard trade configuration (57 thousand files) and a 1C:EDT export of an accounting configuration, compared with 1.2.1 on the same requests:**
+
+  | Request | 1.2.1 | 1.2.2 |
+  |---|---:|---:|
+  | callers of `ЗначениеРеквизитаОбъекта`, default | 74.8 KB, 200 edges | 45.6 KB, 162 edges, no `tree` |
+  | same, 3 levels, `max_nodes` 5000 | 1.8 MB, 5000 edges | 45.8 KB, 162 edges |
+  | same on accounting, 1 level, `max_nodes` 5000 | 1.7 MB, 4914 edges | 45.4 KB, 175 edges |
+  | 1 level, `max_nodes` 150 | 56.6 KB, 150 edges | 42.2 KB, all 150 edges, `tree_omitted` |
+  | `max_response_bytes` 100,000 | 74.8 KB | 74.8 KB, with the tree — byte-identical |
+  | `max_response_bytes` 900,000, `max_nodes` 5000 | 1.8 MB | clamped to 192,000 — 186.4 KB, 691 edges |
+
+  Responses that fit the budget matched 1.2.1 byte for byte: a downward tree on a Rust database (28.9 KB, 200 edges), small two-level 1C trees, an empty tree. The `get_callers`, `get_callees` and `find_path` descriptions did not change.
+- **Live development sessions (June–September 2026):** of 18 `get_call_tree` calls 16 were 0.6–13.6 KB — the limit does not affect them; one call with `max_nodes` 5000 returned 1.24 million characters and was dumped to a file by the client.
+- **Locally:** both services are up on the new build, all 52 watched folders reached ready.
+- **Federation:** the node (Linux, Docker) was rebuilt on this build — the checksum of the file in both containers matched the built one. The remote accounting database through the local serve: callers of `ЗначениеРеквизитаОбъекта` — 70.6 KB, 200 edges → 45.5 KB, 172 edges with the same hint; a small tree matched 1.2.1 byte for byte.
+
 ## [1.2.1] — 2026-09-15
 
 **The "call from a form → the form's object module" rule no longer binds calls from client procedures or calls to a common module through a variable: on a standard accounting configuration false rule links 65 → 5, precision 97.6 % → 99.7 %.**
