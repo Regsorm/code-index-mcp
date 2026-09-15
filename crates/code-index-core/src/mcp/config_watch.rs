@@ -15,7 +15,7 @@
 // этапа 1.8 (auto-detect при старте). MCP-сервер же без notify зависел
 // бы от ручного рестарта, поэтому именно тут file-watch критичен.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -226,7 +226,11 @@ async fn reload_from_disk(server: &CodeIndexServer, daemon_toml_path: &Path) -> 
     }
     let cfg = config::load_from(daemon_toml_path)?;
 
-    let active = active_languages(&cfg);
+    let languages = path_languages(&cfg);
+    // Язык и процессор записей — до подмены инструментов: инструмент языка,
+    // вызванный сразу после перечитки, должен застать привязанный процессор.
+    server.apply_repo_languages(&languages);
+    let active: BTreeSet<String> = languages.into_values().collect();
 
     tracing::info!(
         "config_watch: перечитан {}, активные языки: {:?}",
@@ -237,20 +241,21 @@ async fn reload_from_disk(server: &CodeIndexServer, daemon_toml_path: &Path) -> 
     Ok(())
 }
 
-/// Собрать множество активных языков тем же способом для mono-watch и
-/// федеративного перечитывателя.
-pub(crate) fn active_languages(cfg: &config::DaemonFileConfig) -> BTreeSet<String> {
-    // Собираем множество активных языков. У записи без `language` язык
+/// Язык каждой записи `[[paths]]` по её алиасу (`effective_alias`): явный
+/// `language` или автоопределение по корню — тем же способом, каким поле
+/// заполняет демон. Записи, язык которых не определился, в карту не входят.
+pub(crate) fn path_languages(cfg: &config::DaemonFileConfig) -> BTreeMap<String, String> {
+    // Собираем язык каждой записи. У записи без `language` язык
     // определяем сами — тем же способом, каким его заполняет демон при
     // старте. Раньше такие записи просто пропускались, и получалось так:
     // конфигурация 1С подключена, а одиннадцать инструментов 1С в перечне
     // отсутствуют, потому что демон на этом файле ещё не отработал и поле
     // не дописал. Со стороны это выглядит как «инструментов нет вовсе».
-    let mut active = BTreeSet::new();
+    let mut languages = BTreeMap::new();
     for entry in &cfg.paths {
         match &entry.language {
             Some(lang) => {
-                active.insert(lang.clone());
+                languages.insert(entry.effective_alias(), lang.clone());
             }
             None => {
                 let root = entry
@@ -263,13 +268,19 @@ pub(crate) fn active_languages(cfg: &config::DaemonFileConfig) -> BTreeSet<Strin
                         entry.path.display(),
                         lang
                     );
-                    active.insert(lang.to_string());
+                    languages.insert(entry.effective_alias(), lang.to_string());
                 }
             }
         }
     }
 
-    active
+    languages
+}
+
+/// Множество активных языков для федеративного перечитывателя — те же
+/// языки, что у записей в [`path_languages`].
+pub(crate) fn active_languages(cfg: &config::DaemonFileConfig) -> BTreeSet<String> {
+    path_languages(cfg).into_values().collect()
 }
 
 #[cfg(test)]
@@ -369,6 +380,63 @@ mod tests {
             1,
             "инструменты языка должны появиться и без явной настройки"
         );
+    }
+
+    /// Перечитка `daemon.toml` проставляет язык И процессор записи, у которой
+    /// `language` не задан явно, — иначе инструменты языка, взятые из
+    /// перечня, работали бы без привязок. Remote-записи не трогаются.
+    #[tokio::test]
+    async fn перечитка_проставляет_язык_и_процессор_локальной_записи() {
+        let tmp = TempDir::new().unwrap();
+
+        // «Репозиторий» с признаком языка в корне.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::File::create(repo.join("Configuration.xml")).unwrap();
+
+        // Конфигурация без `language` — язык должен определиться сам.
+        let cfg_path = tmp.path().join("daemon.toml");
+        let mut f = std::fs::File::create(&cfg_path).unwrap();
+        write!(
+            f,
+            "[[paths]]\npath = '{}'\nalias = 'stand'\n",
+            repo.canonicalize().unwrap().display()
+        )
+        .unwrap();
+        drop(f);
+
+        let mut repos = BTreeMap::new();
+        repos.insert(
+            "stand".to_string(),
+            RepoEntry {
+                root_path: Some(repo),
+                storage: None,
+                ip: LEGACY_OWN_IP.to_string(),
+                port: crate::federation::client::DEFAULT_REMOTE_PORT,
+                is_local: true,
+                language: None,
+                processor: None,
+            },
+        );
+        repos.insert("remote".to_string(), dummy_repo());
+        let mut registry = ProcessorRegistry::new();
+        registry.register(StdArc::new(FakeBslProcessor));
+        let server = CodeIndexServer::with_repos_and_registry(repos, registry);
+
+        assert!(
+            server.repos.load().get("stand").unwrap().processor.is_none(),
+            "до перечитки процессор ещё не привязан"
+        );
+
+        reload_from_disk(&server, &cfg_path).await.unwrap();
+
+        let stand = server.repos.load().get("stand").cloned().unwrap();
+        assert_eq!(stand.language, Some("bsl".to_string()));
+        assert_eq!(stand.processor.as_ref().map(|p| p.name()), Some("bsl"));
+
+        let remote = server.repos.load().get("remote").cloned().unwrap();
+        assert!(remote.language.is_none());
+        assert!(remote.processor.is_none());
     }
 
     /// Событие «файл открыли/закрыли на чтение» не должно считаться

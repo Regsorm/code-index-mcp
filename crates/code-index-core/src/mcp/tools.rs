@@ -12,7 +12,7 @@
 use super::{CodeIndexServer, RepoEntry};
 use crate::daemon_core::client;
 use crate::daemon_core::ipc::{PathStatus, ToolUnavailable};
-use crate::storage::models::{ClassRecord, FunctionRecord};
+use crate::storage::models::{CallRecord, ClassRecord, FunctionRecord};
 
 /// Soft-cap: число строк в одном `read_file` (по умолчанию).
 pub(crate) const READ_FILE_SOFT_CAP_LINES: usize = 5_000;
@@ -475,6 +475,18 @@ pub(crate) fn declarative_callers_of(
 ) -> Vec<serde_json::Value> {
     match entry.processor.as_ref() {
         Some(p) => p.declarative_callers(storage, function_name),
+        None => Vec::new(),
+    }
+}
+
+/// Вызовы с квалификатором от процессора репо (1С). Для репо без процессора — пусто.
+pub(crate) fn qualified_callers_of(
+    entry: &RepoEntry,
+    storage: &crate::storage::Storage,
+    function_name: &str,
+) -> Vec<CallRecord> {
+    match entry.processor.as_ref() {
+        Some(p) => p.qualified_callers(storage, function_name),
         None => Vec::new(),
     }
 }
@@ -998,6 +1010,18 @@ pub async fn get_callers(
     let storage = acquire_storage!(entry);
     match storage.get_callers(&function_name, language.as_deref()) {
         Ok(mut r) => {
+            // Вызовы с квалификатором (1С: `Модуль.Метод`, `Справочники.X.Метод`,
+            // `ОбработкаОбъект.Метод` из формы): точный поиск по голому имени их не
+            // видит. Дубли по id отбрасываем, порядок — сначала точные совпадения.
+            if language.as_deref().map_or(true, |l| l == "bsl") {
+                let mut seen: std::collections::HashSet<i64> =
+                    r.iter().filter_map(|c| c.id).collect();
+                for c in qualified_callers_of(entry, &storage, &function_name) {
+                    if c.id.map_or(true, |id| seen.insert(id)) {
+                        r.push(c);
+                    }
+                }
+            }
             let cap = limit.unwrap_or(CALL_GRAPH_DEFAULT_LIMIT);
             let total = r.len();
             let truncated = total > cap;

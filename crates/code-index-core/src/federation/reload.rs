@@ -11,7 +11,7 @@ use arc_swap::ArcSwap;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::daemon_core::config::{self as daemon_config, DaemonFileConfig};
+use crate::daemon_core::config as daemon_config;
 use crate::mcp::{build_federated_repo_map, CodeIndexServer, RepoEntry};
 use crate::storage::PoolConfig;
 
@@ -138,7 +138,7 @@ impl ServeConfigReloader {
                 return self.failed(result, error.to_string());
             }
         };
-        let local_languages = local_languages(&daemon_cfg);
+        let local_languages = crate::mcp::config_watch::path_languages(&daemon_cfg);
         let old = self.server.repos.load_full();
         let new_map = match build_federated_repo_map(
             merged,
@@ -236,18 +236,6 @@ impl ServeConfigReloader {
             .config_reload
             .store(Some(Arc::new(result.clone())));
     }
-}
-
-fn local_languages(cfg: &DaemonFileConfig) -> BTreeMap<String, String> {
-    cfg.paths
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .language
-                .as_ref()
-                .map(|language| (entry.effective_alias(), language.clone()))
-        })
-        .collect()
 }
 
 fn pool_differs(left: PoolConfig, right: PoolConfig) -> bool {
@@ -361,7 +349,7 @@ mod tests {
             merged,
             serve_cfg.me.ip.clone(),
             None,
-            local_languages(&daemon_cfg),
+            crate::mcp::config_watch::path_languages(&daemon_cfg),
             serve_cfg.pool.resolve(),
         )
         .unwrap();

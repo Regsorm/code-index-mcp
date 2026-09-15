@@ -251,6 +251,7 @@ const GRAPH_INDEX_NAMES: &[&str] = &[
     "idx_pcg_caller",
     "idx_pcg_callee_name",
     "idx_pcg_call_type",
+    "idx_pcg_callee_key",
     "idx_def_source",
 ];
 
@@ -259,6 +260,8 @@ const GRAPH_INDEX_DDL: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_pcg_caller ON proc_call_graph(repo, caller_proc_key);",
     "CREATE INDEX IF NOT EXISTS idx_pcg_callee_name ON proc_call_graph(repo, callee_proc_name);",
     "CREATE INDEX IF NOT EXISTS idx_pcg_call_type ON proc_call_graph(repo, call_type);",
+    // Частичный — см. комментарий в schema.rs: полный планировщик брал для `IS NULL`.
+    "CREATE INDEX IF NOT EXISTS idx_pcg_callee_key ON proc_call_graph(repo, callee_proc_key) WHERE callee_proc_key IS NOT NULL;",
     "CREATE INDEX IF NOT EXISTS idx_def_source ON direct_edge_files(repo, source_file);",
 ];
 
@@ -527,6 +530,9 @@ pub(crate) fn resolve_and_prune_direct_edges(
     let t = std::time::Instant::now();
     resolve_callee_keys_by_manager(conn, scope, edges)?;
     tracing::debug!("резолв: адреса через менеджеры — {} мс", t.elapsed().as_millis());
+    let t = std::time::Instant::now();
+    resolve_callee_keys_by_form_owner(conn, scope, edges)?;
+    tracing::debug!("резолв: вызовы из форм в модуль своего объекта — {} мс", t.elapsed().as_millis());
     let t = std::time::Instant::now();
     prune_platform_balast(conn, scope, edges)?;
     tracing::debug!("отсев: платформенный балласт — {} мс", t.elapsed().as_millis());
@@ -993,5 +999,150 @@ pub(crate) fn resolve_callee_keys_by_manager(
     sql.push_str(scope.clause());
     conn.execute(&sql, params![REPO_DEFAULT])?;
     conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_mmeth; DROP TABLE IF EXISTS tmp_pcg_coll;")?;
+    Ok(())
+}
+
+
+/// Кандидаты в модуль объекта, которому принадлежит модуль формы `path`.
+/// Пустой вектор — `path` не модуль формы объекта.
+///
+/// Раскладка Конфигуратора — `<X>/Forms/<Форма>/Ext/Form/Module.bsl` → модуль
+/// объекта `<X>/Ext/ObjectModule.bsl`; 1C:EDT — `<X>/Forms/<Форма>/Module.bsl`
+/// → `<X>/ObjectModule.bsl`; внешняя обработка/отчёт —
+/// `<X>/Form/<Форма>/Form.obj.bsl` → `<X>/ExternalDataProcessor.obj.bsl`, затем
+/// `<X>/ExternalReport.obj.bsl`. Имя формы — ровно один сегмент без `/`.
+/// Раскладка Конфигуратора проверяется раньше EDT: её хвост тоже оканчивается
+/// на `/Module.bsl`, но у EDT между `/Forms/<Форма>/` и `Module.bsl` ничего нет.
+/// Всё прочее (в том числе `.../CommonForms/<Ф>/Ext/Form/Module.bsl` — там нет
+/// сегмента `/Forms/`) → пустой вектор.
+pub(crate) fn form_owner_object_module_candidates(path: &str) -> Vec<String> {
+    if let Some(idx) = path.rfind("/Forms/") {
+        let head = &path[..idx];
+        let form = &path[idx + "/Forms/".len()..];
+        if !head.is_empty() {
+            if let Some(name) = form.strip_suffix("/Ext/Form/Module.bsl") {
+                if !name.is_empty() && !name.contains('/') {
+                    return vec![format!("{head}/Ext/ObjectModule.bsl")];
+                }
+            }
+            if let Some(name) = form.strip_suffix("/Module.bsl") {
+                if !name.is_empty() && !name.contains('/') {
+                    return vec![format!("{head}/ObjectModule.bsl")];
+                }
+            }
+        }
+    }
+    if let Some(idx) = path.rfind("/Form/") {
+        let head = &path[..idx];
+        let form = &path[idx + "/Form/".len()..];
+        if !head.is_empty() {
+            if let Some(name) = form.strip_suffix("/Form.obj.bsl") {
+                if !name.is_empty() && !name.contains('/') {
+                    return vec![
+                        format!("{head}/ExternalDataProcessor.obj.bsl"),
+                        format!("{head}/ExternalReport.obj.bsl"),
+                    ];
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+
+/// Правило (д): вызов из модуля формы → модуль объекта этой формы.
+///
+/// В 1С из формы нельзя вызвать процедуру модуля объекта иначе как через
+/// переменную с объектом (`РеквизитФормыВЗначение("Объект")`, `ЭтотОбъект()`),
+/// поэтому одноточечный вызов из модуля формы, чьё имя метода экспортно в
+/// модуле объекта этой формы, привязывается туда. Замер на типовой торговой
+/// конфигурации: 501 такой вызов, 91 % подтверждён по присваиванию переменной.
+/// Правило идёт после (в) и (г), до отсева. Транзакцией не управляет.
+pub(crate) fn resolve_callee_keys_by_form_owner(
+    conn: &rusqlite::Connection,
+    scope: EdgeScope,
+    edges: &str,
+) -> Result<()> {
+    // Пары «модуль формы → модуль объекта» области резолва. Пути читаем в Vec
+    // до вставок: открытый SELECT во время INSERT'ов держать не нужно.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_formobj;
+         CREATE TEMP TABLE tmp_pcg_formobj(form_path TEXT PRIMARY KEY, obj_path TEXT NOT NULL);",
+    )?;
+    let form_paths: Vec<String> = {
+        let sql = match scope {
+            EdgeScope::All => {
+                "SELECT path FROM files WHERE path LIKE '%/Forms/%' OR path LIKE '%/Form/%'"
+            }
+            EdgeScope::Batch => "SELECT path FROM tmp_pcg_scope",
+        };
+        let mut st = conn.prepare(sql)?;
+        let v = st
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        v
+    };
+    {
+        let mut known =
+            conn.prepare("SELECT 1 FROM exported_procs WHERE repo = ?1 AND path = ?2 LIMIT 1")?;
+        let mut ins = conn.prepare(
+            "INSERT OR IGNORE INTO tmp_pcg_formobj(form_path, obj_path) VALUES (?1, ?2)",
+        )?;
+        for path in &form_paths {
+            // Первый кандидат, для которого модуль объекта реально есть в
+            // справочнике (у внешних обработки/отчёта кандидатов два).
+            let obj = form_owner_object_module_candidates(path)
+                .into_iter()
+                .find(|c| known.query_row(params![REPO_DEFAULT, c], |_| Ok(())).is_ok());
+            if let Some(obj) = obj {
+                ins.execute(params![path, obj])?;
+            }
+        }
+    }
+    let found: i64 = conn.query_row("SELECT COUNT(*) FROM tmp_pcg_formobj", [], |r| r.get(0))?;
+    if found == 0 {
+        conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_formobj;")?;
+        return Ok(());
+    }
+
+    // Квалификатор вызова не должен быть ни именем общего модуля (его резолвит
+    // Tier C), ни коллекцией метаданных (её резолвит Tier D). Имена коллекций —
+    // статические, инлайн безопасен (так же сделано для PLATFORM_BALAST).
+    let colls = METADATA_COLLECTIONS
+        .iter()
+        .map(|c| format!("'{}'", c))
+        .collect::<Vec<_>>()
+        .join(",");
+    let form_of_caller =
+        format!("substr({edges}.caller_proc_key, 1, instr({edges}.caller_proc_key, '::') - 1)");
+    let method =
+        format!("substr({edges}.callee_proc_name, instr({edges}.callee_proc_name, '.') + 1)");
+    let first =
+        format!("substr({edges}.callee_proc_name, 1, instr({edges}.callee_proc_name, '.') - 1)");
+    let single_dot = format!(
+        "instr(substr({edges}.callee_proc_name, instr({edges}.callee_proc_name, '.') + 1), '.') = 0"
+    );
+    let exists = format!(
+        "EXISTS ( \
+           SELECT 1 FROM tmp_pcg_formobj m JOIN exported_procs e ON e.repo = ?1 AND e.path = m.obj_path \
+           WHERE m.form_path = {form_of_caller} AND e.name = {method})"
+    );
+    let mut sql = format!(
+        "UPDATE {edges} \
+         SET callee_proc_key = ( \
+             SELECT MIN(e.path || '::' || e.name) \
+             FROM tmp_pcg_formobj m JOIN exported_procs e ON e.repo = ?1 AND e.path = m.obj_path \
+             WHERE m.form_path = {form_of_caller} AND e.name = {method}) \
+         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
+           AND instr({edges}.callee_proc_name, '.') > 0 \
+           AND {single_dot} \
+           AND {form_of_caller} IN (SELECT form_path FROM tmp_pcg_formobj) \
+           AND {first} NOT IN (SELECT owner FROM exported_procs WHERE repo = ?1 AND kind = 'common' AND owner IS NOT NULL) \
+           AND {first} NOT IN ({colls}) \
+           AND {exists}"
+    );
+    sql.push_str(scope.clause());
+    conn.execute(&sql, params![REPO_DEFAULT])?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_formobj;")?;
     Ok(())
 }

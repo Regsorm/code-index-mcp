@@ -402,6 +402,20 @@ fn build_repo_entries(
     Ok(entries)
 }
 
+/// Язык записи одиночного режима. Записи взяты из `[[paths]]` конфигурации —
+/// язык оттуда (явный или автоопределённый, см. `path_languages`); записи
+/// из `--path` — автоопределение по корню, как у команды `index`.
+fn mono_repo_language(
+    alias: &str,
+    root: &Path,
+    config_languages: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<String> {
+    match config_languages {
+        Some(map) => map.get(alias).cloned(),
+        None => crate::daemon_core::language_detect::detect_language(root).map(str::to_string),
+    }
+}
+
 /// Запуск MCP-сервера по HTTP (Streamable HTTP) на `host:port`.
 ///
 /// Роут `/mcp` — точка подключения MCP-клиента (url из `.mcp.json`).
@@ -860,19 +874,14 @@ async fn cmd_serve(
         // чтобы extension-tools (`get_object_structure` и др.)
         // регистрировались в `tools/list` сразу при старте,
         // а не только после первого file-watch-события.
+        // Язык берётся явный из `[[paths]]` или автоопределённый по корню
+        // (см. `path_languages`): запись без `language` тоже получает
+        // инструменты языка и привязанный процессор.
         // remote-репо приходят без языка — для них tools
         // зарегистрированы только если такой же язык уже активен
         // у local-репо на этой ноде (что естественно для
         // 1С-конфигураций, где BSL-репо есть и тут, и там).
-        let local_languages: std::collections::BTreeMap<String, String> = daemon_cfg
-            .paths
-            .iter()
-            .filter_map(|p| {
-                p.language
-                    .as_ref()
-                    .map(|lang| (p.effective_alias(), lang.clone()))
-            })
-            .collect();
+        let local_languages = crate::mcp::config_watch::path_languages(&daemon_cfg);
         // Whitelist tools из daemon.toml [tools].enabled применяется
         // прямо в chain'е после конструктора. Логи и warning о
         // неизвестных именах — внутри `apply_tools_whitelist`.
@@ -940,42 +949,13 @@ async fn cmd_serve(
     }
 
     // Моно-режим (rc5-совместимый): нет serve.toml или явно указан --path.
+    // Источник записей запоминаем до вызова: `path` перемещается в
+    // `build_repo_entries`.
+    let entries_from_config = path.is_empty();
     let entries = build_repo_entries(path, config.as_deref())?;
     let aliases: Vec<&str> = entries.iter().map(|(a, _, _)| a.as_str()).collect();
     tracing::info!("MCP read-only ({}), репо: {:?}", transport, aliases);
 
-    // Если передан реестр — собираем сервер сразу с ним. Если конфига
-    // нет (`--path`-режим), language ещё не известен — extension_tools
-    // окажутся пусты, file-watch их не активирует (нечему watch'ить),
-    // но это разумно: в `--path`-режиме оператор обычно знает что
-    // подключает (моно-репо без 1С-специфики).
-    // Если конфиг есть — daemon уже отработал auto-detect и записал
-    // language обратно в TOML; build_repo_entries прочитал свежий
-    // TOML, передал repos с пустым `language` (моно-конструктор не
-    // подцепляет language из конфига), но file-watch в spawn_watch
-    // ниже подхватит и сделает первый rebuild.
-    let server = match registry {
-        Some(reg) => {
-            let mut map = std::collections::BTreeMap::new();
-            for (alias, root_path, db_path) in entries {
-                let storage = crate::storage::StoragePool::open_file_readonly(
-                    &db_path,
-                    crate::storage::PoolConfig::default(),
-                )?;
-                map.insert(alias, crate::mcp::RepoEntry {
-                    root_path: Some(root_path),
-                    storage: Some(storage),
-                    ip: "127.0.0.1".to_string(),
-                    port: crate::federation::client::DEFAULT_REMOTE_PORT,
-                    is_local: true,
-                    language: None,
-                    processor: None,
-                });
-            }
-            CodeIndexServer::with_repos_and_registry(map, reg)
-        }
-        None => CodeIndexServer::open_readonly_multi(entries)?,
-    };
     // Настройки из daemon.toml: перечень разрешённых инструментов, массовый
     // режим, отсев повторной выдачи и четыре параметра стража размера ответа.
     //
@@ -992,6 +972,40 @@ async fn cmd_serve(
                 .map_err(|e| anyhow::anyhow!("чтение конфигурации {}: {}", p.display(), e))?,
         ),
         None => None,
+    };
+    // Записи из `[[paths]]` получают язык оттуда; записи из `--path` —
+    // автоопределением по корню (см. `mono_repo_language`).
+    let config_languages = match (&daemon_cfg, entries_from_config) {
+        (Some(cfg), true) => Some(crate::mcp::config_watch::path_languages(cfg)),
+        _ => None,
+    };
+    // Язык каждой записи определяется сразу. Без него к записи не
+    // привязывается процессор языка, и инструменты, которым он нужен
+    // (привязки форм, вызовы с квалификатором в `get_callers`),
+    // в одиночном режиме отдают неполный ответ.
+    let server = match registry {
+        Some(reg) => {
+            let mut map = std::collections::BTreeMap::new();
+            for (alias, root_path, db_path) in entries {
+                let language =
+                    mono_repo_language(&alias, &root_path, config_languages.as_ref());
+                let storage = crate::storage::StoragePool::open_file_readonly(
+                    &db_path,
+                    crate::storage::PoolConfig::default(),
+                )?;
+                map.insert(alias, crate::mcp::RepoEntry {
+                    root_path: Some(root_path),
+                    storage: Some(storage),
+                    ip: "127.0.0.1".to_string(),
+                    port: crate::federation::client::DEFAULT_REMOTE_PORT,
+                    is_local: true,
+                    language,
+                    processor: None,
+                });
+            }
+            CodeIndexServer::with_repos_and_registry(map, reg)
+        }
+        None => CodeIndexServer::open_readonly_multi(entries)?,
     };
     let server = match &daemon_cfg {
         Some(cfg) => server
@@ -1626,5 +1640,36 @@ fn print_status_text(h: &crate::daemon_core::ipc::HealthResponse) {
         };
         let err_s = p.error.as_ref().map(|e| format!(" err: {}", e)).unwrap_or_default();
         println!("    - [{}] {}{}{}", status_s, p.path.display(), progress_s, err_s);
+    }
+}
+
+#[cfg(test)]
+mod mono_language_tests {
+    use super::*;
+
+    /// Язык записи одиночного режима: из конфигурации (если она есть) либо
+    /// автоопределением по корню, как у команды `index`.
+    #[test]
+    fn язык_записи_одиночного_режима() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::File::create(root.join("Configuration.xml")).unwrap();
+
+        assert_eq!(
+            mono_repo_language("a", &root, None),
+            Some("bsl".to_string())
+        );
+
+        // Язык из конфигурации важнее признаков корня.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("a".to_string(), "python".to_string());
+        assert_eq!(
+            mono_repo_language("a", &root, Some(&map)),
+            Some("python".to_string())
+        );
+
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(mono_repo_language("a", &root, Some(&empty)), None);
     }
 }

@@ -805,6 +805,30 @@ impl CodeIndexServer {
         }
     }
 
+    /// Проставить local-записям язык из `languages` (алиас → язык) и заново
+    /// привязать процессоры. Remote-записи и записи, чьего алиаса нет в карте,
+    /// остаются как были. Карта подменяется атомарно и только при изменении.
+    pub(crate) fn apply_repo_languages(&self, languages: &BTreeMap<String, String>) {
+        let old = self.repos.load_full();
+        let mut map = (*old).clone();
+        let mut changed = false;
+        for (alias, entry) in map.iter_mut() {
+            if !entry.is_local {
+                continue;
+            }
+            if let Some(lang) = languages.get(alias) {
+                if entry.language.as_deref() != Some(lang.as_str()) {
+                    entry.language = Some(lang.clone());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            attach_processors(&mut map, self.registry.as_ref().as_ref());
+            self.repos.store(Arc::new(map));
+        }
+    }
+
     /// Отправить `notifications/tools/list_changed` по сохранённому peer.
     /// Если peer не сохранён (клиент ещё не подключился или сессия
     /// уже завершилась) — просто пишем info в лог. Ошибки отправки

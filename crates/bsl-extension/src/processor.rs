@@ -12,6 +12,7 @@ use code_index_core::extension::{
 };
 use code_index_core::parser::{bsl::BslParser, LanguageParser};
 use code_index_core::storage::Storage;
+use code_index_core::storage::models::CallRecord;
 
 /// Процессор языка 1С BSL. Реализует `LanguageProcessor` для регистрации
 /// в `bsl-indexer`. На этапе 2 минимален — без специфичных SQL-схем и
@@ -212,6 +213,12 @@ impl LanguageProcessor for BslLanguageProcessor {
         function_name: &str,
     ) -> Vec<serde_json::Value> {
         crate::form_bindings::form_bindings(storage, function_name)
+    }
+
+    /// Вызовы с квалификатором: `ОбщийМодуль.Метод`, `Справочники.X.Метод` и
+    /// `Переменная.Метод` из формы, привязанный графом к модулю объекта.
+    fn qualified_callers(&self, storage: &Storage, function_name: &str) -> Vec<CallRecord> {
+        crate::qualified_callers::qualified_callers(storage, function_name)
     }
 }
 

@@ -4084,3 +4084,253 @@ fn edt_incremental_migrates_old_unique_key() {
         .unwrap();
     assert_eq!(modules, 1, "строка модуля обязана записаться после переноса ключа");
 }
+
+// ── Вызовы с квалификатором и привязка вызовов из формы ────────────────
+
+/// Пути, общие для тестов этого блока.
+const TEST_OBJ: &str = "DataProcessors/Обр/Ext/ObjectModule.bsl";
+const TEST_FORM: &str = "DataProcessors/Обр/Forms/Форма/Ext/Form/Module.bsl";
+const TEST_CM: &str = "CommonModules/Общий/Ext/Module.bsl";
+const TEST_MGR: &str = "Catalogs/Товары/Ext/ManagerModule.bsl";
+const TEST_OTHER: &str = "CommonModules/Другой/Ext/Module.bsl";
+
+#[test]
+fn callee_key_index_is_partial() {
+    // Индекс по адресу цели не должен содержать рёбер с пустым адресом: иначе
+    // планировщик берёт его для `callee_proc_key IS NULL` точечного обновления.
+    // Проверяем оба места, где индекс создаётся: расширение схемы и пересбор графа.
+    let sql = |st: &Storage| -> String {
+        st.conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'idx_pcg_callee_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut st = fresh_storage(&tmp);
+    assert!(sql(&st).contains("WHERE callee_proc_key IS NOT NULL"), "схема");
+    run_index_extras(&repo, &mut st).unwrap();
+    assert!(sql(&st).contains("WHERE callee_proc_key IS NOT NULL"), "пересбор графа");
+}
+
+#[test]
+fn form_owner_candidates_layouts() {
+    // Конфигуратор.
+    assert_eq!(
+        form_owner_object_module_candidates(TEST_FORM),
+        vec![TEST_OBJ.to_string()]
+    );
+    // 1C:EDT — между `/Forms/<Форма>/` и `Module.bsl` ничего нет.
+    assert_eq!(
+        form_owner_object_module_candidates("src/DataProcessors/Обр/Forms/Форма/Module.bsl"),
+        vec!["src/DataProcessors/Обр/ObjectModule.bsl".to_string()]
+    );
+    // Внешняя обработка/отчёт — два кандидата, модуль объекта уточняется по
+    // справочнику уже в правиле.
+    assert_eq!(
+        form_owner_object_module_candidates("external/Обр/Form/Форма/Form.obj.bsl"),
+        vec![
+            "external/Обр/ExternalDataProcessor.obj.bsl".to_string(),
+            "external/Обр/ExternalReport.obj.bsl".to_string(),
+        ]
+    );
+    // Не модуль формы объекта — кандидатов нет.
+    assert!(form_owner_object_module_candidates("CommonForms/Ф/Ext/Form/Module.bsl").is_empty());
+    assert!(form_owner_object_module_candidates(TEST_OBJ).is_empty());
+    assert!(form_owner_object_module_candidates(TEST_CM).is_empty());
+}
+
+#[test]
+fn form_call_resolves_to_own_object_module() {
+    // Полный пересбор: вызов `ОбработкаОбъект.Метод` из модуля формы обязан
+    // привязаться к модулю объекта этой формы, а неэкспортное имя и
+    // платформенный метод — отсеяться.
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut st = fresh_storage(&tmp);
+    {
+        let conn = st.conn();
+        let obj = ensure_file(conn, TEST_OBJ);
+        let form = ensure_file(conn, TEST_FORM);
+        let cm = ensure_file(conn, TEST_CM);
+        set_func(conn, obj, "Метод", "() Экспорт");
+        set_func(conn, obj, "Локальный", "()");
+        set_func(conn, cm, "Метод", "() Экспорт");
+        set_calls(
+            conn,
+            form,
+            &[
+                ("ПриСоздании", "ОбработкаОбъект.Метод"),
+                ("ПриСоздании", "ОбработкаОбъект.Локальный"),
+                ("ПриСоздании", "Запрос.Выполнить"),
+                ("ПриСоздании", "Общий.Метод"),
+            ],
+        );
+    }
+    run_index_extras(&repo, &mut st).unwrap();
+
+    let caller = format!("{TEST_FORM}::ПриСоздании");
+    let rows = |callee: &str| -> i64 {
+        st.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM proc_call_graph \
+                 WHERE repo = ?1 AND call_type = 'direct' AND caller_proc_key = ?2 \
+                   AND callee_proc_name = ?3",
+                params![REPO_DEFAULT, &caller, callee],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let key = |callee: &str| -> Option<String> {
+        st.conn()
+            .query_row(
+                "SELECT callee_proc_key FROM proc_call_graph \
+                 WHERE repo = ?1 AND call_type = 'direct' AND caller_proc_key = ?2 \
+                   AND callee_proc_name = ?3",
+                params![REPO_DEFAULT, &caller, callee],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+    };
+
+    assert_eq!(rows("ОбработкаОбъект.Метод"), 1, "вызов из формы привязан");
+    assert_eq!(
+        key("ОбработкаОбъект.Метод"),
+        Some(format!("{TEST_OBJ}::Метод")),
+        "вызов из формы ведёт в модуль объекта этой формы"
+    );
+    assert_eq!(rows("Общий.Метод"), 1);
+    assert_eq!(
+        key("Общий.Метод"),
+        Some(format!("{TEST_CM}::Метод")),
+        "правило общего модуля (в), не модуль объекта"
+    );
+    assert_eq!(
+        rows("ОбработкаОбъект.Локальный"),
+        0,
+        "неэкспортный метод модуля объекта отсеян"
+    );
+    assert_eq!(rows("Запрос.Выполнить"), 0, "платформенный метод отсеян");
+}
+
+#[test]
+fn form_call_incremental_matches_full_rebuild() {
+    let truth_edges: &[(&str, &str)] = &[
+        ("ПриСоздании", "ОбработкаОбъект.Метод"),
+        ("ПриСоздании", "ОбработкаОбъект.Локальный"),
+        ("ПриСоздании", "Запрос.Выполнить"),
+        ("ПриСоздании", "Общий.Метод"),
+    ];
+    // Начальное состояние репо (модули и функции) — одинаковое в обоих прогонах.
+    let seed = |conn: &rusqlite::Connection, form_edges: &[(&str, &str)]| -> i64 {
+        let obj = ensure_file(conn, TEST_OBJ);
+        let form = ensure_file(conn, TEST_FORM);
+        let cm = ensure_file(conn, TEST_CM);
+        set_func(conn, obj, "Метод", "() Экспорт");
+        set_func(conn, obj, "Локальный", "()");
+        set_func(conn, cm, "Метод", "() Экспорт");
+        set_calls(conn, form, form_edges);
+        form
+    };
+
+    // truth: конечное состояние сразу, полный пересбор.
+    let tmp_t = TempDir::new().unwrap();
+    let repo_t = tmp_t.path().join("repo");
+    std::fs::create_dir(&repo_t).unwrap();
+    let mut st_t = fresh_storage(&tmp_t);
+    seed(st_t.conn(), truth_edges);
+    run_index_extras(&repo_t, &mut st_t).unwrap();
+
+    // incr: сперва одно старое ребро, полный пересбор; затем вызовы truth и
+    // батч-инкремент только по модулю формы.
+    let tmp_i = TempDir::new().unwrap();
+    let repo_i = tmp_i.path().join("repo");
+    std::fs::create_dir(&repo_i).unwrap();
+    let mut st_i = fresh_storage(&tmp_i);
+    let form_i = seed(st_i.conn(), &[("ПриСоздании", "ОбработкаОбъект.Старый")]);
+    run_index_extras(&repo_i, &mut st_i).unwrap();
+    set_calls(st_i.conn(), form_i, truth_edges);
+    run_incremental_extras(&repo_i, &mut st_i, &[repo_i.join(TEST_FORM)], &[]).unwrap();
+
+    assert_eq!(
+        snapshot_pcg(st_i.conn()),
+        snapshot_pcg(st_t.conn()),
+        "proc_call_graph после батч-инкремента != полному пересбору (вызов из формы)"
+    );
+
+    let key = |conn: &rusqlite::Connection| -> Option<String> {
+        conn.query_row(
+            "SELECT callee_proc_key FROM proc_call_graph \
+             WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_name = ?2",
+            params![REPO_DEFAULT, "ОбработкаОбъект.Метод"],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        key(st_i.conn()),
+        Some(format!("{TEST_OBJ}::Метод")),
+        "инкремент дал тот же адрес, что и полный пересбор"
+    );
+}
+
+#[test]
+fn qualified_callers_common_manager_and_form() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut st = fresh_storage(&tmp);
+    {
+        let conn = st.conn();
+        let cm = ensure_file(conn, TEST_CM);
+        let mgr = ensure_file(conn, TEST_MGR);
+        let obj = ensure_file(conn, TEST_OBJ);
+        let form = ensure_file(conn, TEST_FORM);
+        let other = ensure_file(conn, TEST_OTHER);
+        set_func(conn, cm, "Проц", "() Экспорт");
+        set_func(conn, mgr, "Проц", "() Экспорт");
+        set_func(conn, obj, "Проц", "() Экспорт");
+        set_calls(conn, form, &[("ПриСоздании", "ОбработкаОбъект.Проц")]);
+        set_calls(
+            conn,
+            other,
+            &[
+                ("А", "Общий.Проц"),
+                ("Б", "Справочники.Товары.Проц"),
+                ("В", "Catalogs.Товары.Проц"),
+                ("Г", "Проц"),
+                ("Д", "Запрос.Проц"),
+            ],
+        );
+    }
+    run_index_extras(&repo, &mut st).unwrap();
+
+    let got = crate::qualified_callers::qualified_callers(&st, "Проц");
+    let mut names: Vec<&str> = got.iter().map(|c| c.callee.as_str()).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(
+        names,
+        vec![
+            "Catalogs.Товары.Проц",
+            "ОбработкаОбъект.Проц",
+            "Общий.Проц",
+            "Справочники.Товары.Проц",
+        ],
+        "ровно вызовы с квалификатором: без голого имени и платформенного метода"
+    );
+
+    let mut ids: Vec<i64> = got.iter().filter_map(|c| c.id).collect();
+    ids.sort();
+    let total_ids = ids.len();
+    ids.dedup();
+    assert_eq!(ids.len(), total_ids, "дублей по id нет");
+
+    assert!(crate::qualified_callers::qualified_callers(&st, "").is_empty());
+    assert!(crate::qualified_callers::qualified_callers(&st, "Общий.Проц").is_empty());
+}

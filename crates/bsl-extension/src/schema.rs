@@ -218,6 +218,11 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_pcg_caller ON proc_call_graph(repo, caller_proc_key);",
     "CREATE INDEX IF NOT EXISTS idx_pcg_callee_name ON proc_call_graph(repo, callee_proc_name);",
     "CREATE INDEX IF NOT EXISTS idx_pcg_call_type ON proc_call_graph(repo, call_type);",
+    // Индекс по адресу цели — частичный: рёбер с пустым адресом в типовой
+    // торговой конфигурации ~112 тыс. при статистике «5 строк на значение», и
+    // полный индекс планировщик брал для условия `callee_proc_key IS NULL`
+    // точечного обновления — 108–144 мс на запрос вместо 0,1 мс.
+    "CREATE INDEX IF NOT EXISTS idx_pcg_callee_key ON proc_call_graph(repo, callee_proc_key) WHERE callee_proc_key IS NOT NULL;",
 
     // ── metadata_modules ──────────────────────────────────────────────────
     // Модули BSL (`Module.bsl`, `ManagerModule.bsl`, `ObjectModule.bsl`,

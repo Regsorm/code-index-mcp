@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::parser::types::ParseResult;
 use crate::parser::LanguageParser;
+use crate::storage::models::CallRecord;
 use crate::storage::Storage;
 
 use super::tool::IndexTool;
@@ -188,6 +189,16 @@ pub trait LanguageProcessor: Send + Sync {
         _storage: &Storage,
         _function_name: &str,
     ) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+
+    /// Вызовы процедуры, записанные в коде с квалификатором, которых точный
+    /// поиск `get_callers` по голому имени не находит: разборщик хранит
+    /// вызываемое имя вместе с приёмником (`ОбщийМодуль.Метод`,
+    /// `Справочники.Объект.Метод`, `Переменная.Метод`). Возвращает строки
+    /// таблицы `calls`. Default — пусто: у универсальных языков приёмник в имя
+    /// не попадает.
+    fn qualified_callers(&self, _storage: &Storage, _function_name: &str) -> Vec<CallRecord> {
         Vec::new()
     }
 

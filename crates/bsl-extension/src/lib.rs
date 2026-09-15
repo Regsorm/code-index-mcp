@@ -20,6 +20,7 @@ pub mod index_extras;
 pub mod module_constants;
 pub mod parse_collector;
 pub mod processor;
+pub mod qualified_callers;
 pub mod schema;
 pub mod terms;
 pub mod tools;
