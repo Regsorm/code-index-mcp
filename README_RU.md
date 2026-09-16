@@ -135,7 +135,13 @@ npm install -g @regsorm/code-index-mcp
 npx @regsorm/code-index-mcp serve --path /путь/к/репозиторию
 ```
 
-Опубликован также в [официальном MCP-реестре](https://registry.modelcontextprotocol.io/) как `io.github.Regsorm/code-index`. Обёртка содержит только публичный бинарник `code-index` (без поддержки 1С); для `bsl-indexer` собирайте из исходников.
+Опубликован также в [официальном MCP-реестре](https://registry.modelcontextprotocol.io/) как `io.github.Regsorm/code-index`. Обёртка содержит только публичный бинарник `code-index` (без поддержки 1С); `bsl-indexer` берите из архива выпуска на GitHub или собирайте из исходников.
+
+`serve` только читает индекс — строит его фоновый демон. Без запущенного демона (`npx @regsorm/code-index-mcp daemon run`) и переменной `CODE_INDEX_HOME` инструменты отвечают `daemon_offline`; настройка — в разделе [«Настройка фонового демона»](#настройка-фонового-демона-v05).
+
+### Установка вручную, по шагам (Windows)
+
+Без npm и скриптов: скачать архив выпуска, положить файл в папку, создать `daemon.toml`, запустить, подключить клиента, настроить автозапуск — [docs/manual-install.md](docs/manual-install.md).
 
 ### Сборка из исходников
 
@@ -228,7 +234,7 @@ cargo build --release -p bsl-indexer --features enrichment   # дополнит�
    code-index daemon stop
    ```
 
-`CODE_INDEX_HOME` **обязателен** — fallback'а нет. Если переменная не задана, и `daemon`, и `serve` завершатся с ошибкой, объясняющей, как её задать.
+`CODE_INDEX_HOME` **обязателен** — fallback'а нет. Если переменная не задана, `daemon run` завершается с ошибкой и примером, как её задать. `serve` при этом запускается, но на каждый вызов инструмента отвечает `daemon_offline` с тем же объяснением.
 
 > **Решение проблемы — «демон не запущен / runtime-info отсутствует», хотя демон РАБОТАЕТ.**
 >
@@ -245,6 +251,8 @@ code-index index /path/to/project
 code-index stats --path /path/to/project --json
 ```
 
+Готовый индекс читают команды CLI. MCP-серверу (`serve`) демон нужен и в этом случае: без него инструменты отвечают `daemon_offline`, даже когда `.code-index/index.db` уже построен.
+
 ### Запуск MCP-сервера (read-only)
 
 ```bash
@@ -255,7 +263,7 @@ code-index serve --path /path/to/project
 
 ### Транспорты (stdio и HTTP)
 
-`serve` поддерживает два транспорта:
+`serve` поддерживает два транспорта. В обоих индекс строит демон — он должен быть запущен. HTTP-сервер встроен в сам бинарник: отдельный веб-сервер не нужен, по умолчанию привязка к `127.0.0.1`.
 
 | Транспорт | Модель процесса | Когда использовать |
 |-----------|-----------------|-------------------|
@@ -272,22 +280,27 @@ code-index serve --transport http --port 8011 --config /etc/code-index/daemon.to
 
 `--path` принимает форму `alias=dir` и может повторяться (мульти-репо режим). Каждый tool-call получает параметр `repo` для выбора репозитория. Без `=` — старый одиночный контракт под `alias=default`.
 
+Для stdio папка из `--path` должна быть перечислена в `daemon.toml` (регистр букв в пути не важен), иначе ответ — `not_started` с просьбой добавить путь и вызвать `daemon reload`. Алиас при этом берётся из `--path`, а не из `daemon.toml`; запрос с алиасом, которого нет среди доступных серверу, получает `unknown_repo` со списком доступных.
+
 В HTTP-режиме при указании `--config` алиасы берутся из `[[paths]]` файла `daemon.toml`: явный `alias = "..."` либо вычисляется из последнего сегмента пути (нижний регистр, пробелы → `_`). CLI-аргумент `--path` имеет приоритет над конфигом.
 
 ## Подключение к Claude Code
 
-Добавьте в `.mcp.json` вашего проекта. Для `stdio`:
+Добавьте в `.mcp.json` вашего проекта. Для `stdio` (демон запущен, папка проекта есть в `daemon.toml`):
 
 ```json
 {
   "mcpServers": {
     "code-index": {
       "command": "npx",
-      "args": ["-y", "@regsorm/code-index-mcp", "serve", "--path", "."]
+      "args": ["-y", "@regsorm/code-index-mcp", "serve", "--path", "."],
+      "env": { "CODE_INDEX_HOME": "C:\\tools\\code-index" }
     }
   }
 }
 ```
+
+`CODE_INDEX_HOME` в `env` — тот же абсолютный путь, что у демона: клиент может не видеть переменную из системы.
 
 Для общего HTTP-процесса:
 
@@ -522,7 +535,7 @@ code-index get-file-summary "src/auth/login.py" --path /my/project
 
 ### MCP-серверы (сколько угодно read-only читателей)
 
-`code-index serve --path <project>` открывает `.code-index/index.db` в режиме `SQLITE_OPEN_READ_ONLY` и предоставляет MCP-инструменты через stdio. Несколько экземпляров MCP на одном проекте работают параллельно без взаимных блокировок.
+`code-index serve` открывает `.code-index/index.db` в режиме `SQLITE_OPEN_READ_ONLY` и предоставляет MCP-инструменты через stdio или HTTP. Несколько экземпляров MCP на одном проекте работают параллельно без взаимных блокировок. Сам `serve` не индексирует и без демона не отвечает на запросы, даже если индекс уже построен.
 
 Перед каждым tool-call MCP опрашивает у демона статус папки. Если он не `ready` — инструмент возвращает структурированный JSON:
 
@@ -533,8 +546,10 @@ code-index get-file-summary "src/auth/login.py" --path /my/project
 Если демон недоступен:
 
 ```json
-{ "status": "daemon_offline", "message": "Демон code-index не доступен. Запустите 'code-index daemon run' или Scheduled Task." }
+{ "status": "daemon_offline", "message": "Демон code-index не доступен (Демон не найден: отсутствует runtime-info файл C:\\tools\\code-index\\daemon.json. CODE_INDEX_HOME = C:\\tools\\code-index. Проверьте: (1) демон запущен — `code-index daemon run`; (2) демон и этот процесс используют ОДИН CODE_INDEX_HOME. …). Запустите 'code-index daemon run' или Scheduled Task / systemd user unit." }
 ```
+
+Если у процесса `serve` не задана `CODE_INDEX_HOME`, в скобках вместо этого — «переменная окружения CODE_INDEX_HOME не задана для этого процесса» с примером секции `env`.
 
 ### Журнал: что писать в обращение, если индексация встала
 

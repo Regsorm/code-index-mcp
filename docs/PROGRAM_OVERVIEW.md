@@ -99,14 +99,16 @@ XML-файл выгрузки 1С попадает в кодовый индек�
 
 ### Готовые бинарники (GitHub Releases)
 
-На каждый тег публикуются 6 артефактов:
+На каждый тег публикуются 6 архивов, в каждом один исполняемый файл:
 
 ```
-code-index-windows-x64.exe   / code-index-linux-x64 / code-index-macos-arm64
-bsl-indexer-windows-x64.exe  / bsl-indexer-linux-x64 / bsl-indexer-macos-arm64
+code-index-windows-x64.zip   / code-index-linux-x64.tar.gz  / code-index-macos-arm64.tar.gz
+bsl-indexer-windows-x64.zip  / bsl-indexer-linux-x64.tar.gz / bsl-indexer-macos-arm64.tar.gz
 ```
 
 Скачать: https://github.com/Regsorm/code-index-mcp/releases
+
+Пошаговая установка вручную на Windows — [manual-install.md](manual-install.md).
 
 ### Сборка из исходников
 
@@ -152,8 +154,9 @@ cargo build --release -p bsl-indexer --features enrichment
 4. Запустите демон и MCP-сервер:
    ```bash
    code-index daemon run          # в отдельном окне или как фоновый процесс
-   code-index serve --transport http --port 8011
+   code-index serve --transport http --port 8011 --config "C:\tools\code-index\daemon.toml"
    ```
+   Без `--config` (и без `--path`) сервер обслуживает только текущую папку под алиасом `default`, а не папки из `daemon.toml`. HTTP-сервер встроен в бинарник, отдельный веб-сервер не нужен.
 
 5. Добавьте в `.mcp.json` проекта:
    ```json
@@ -649,6 +652,8 @@ Backfill выполняется автоматически при первом �
 Реализован через библиотеку `rmcp 1.3`. Транспорты:
 - `streamable-http` (рекомендуемый): `http://host:port/mcp`.
 - `stdio`: для совместимости с клиентами, поддерживающими только stdio.
+
+В обоих транспортах демон индексации должен быть запущен: без него инструменты отвечают `daemon_offline`.
 
 ### MCP API — обратная совместимость
 

@@ -133,7 +133,13 @@ The `postinstall` step downloads the prebuilt native binary for your platform (W
 npx @regsorm/code-index-mcp serve --path /path/to/your/repo
 ```
 
-Also published to the [official MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.Regsorm/code-index`. This wrapper ships only the public `code-index` binary (no 1C support); for `bsl-indexer` build from source.
+Also published to the [official MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.Regsorm/code-index`. This wrapper ships only the public `code-index` binary (no 1C support); for `bsl-indexer` take the release archive from GitHub or build from source.
+
+`serve` only reads the index — the background daemon builds it. Without a running daemon (`npx @regsorm/code-index-mcp daemon run`) and the `CODE_INDEX_HOME` variable, tools answer `daemon_offline`; see [Set up the background daemon](#set-up-the-background-daemon-v05).
+
+### Manual installation, step by step (Windows)
+
+No npm, no scripts: download the release archive, put the file into a folder, create `daemon.toml`, start, connect a client, set up autostart — [docs/manual-install_EN.md](docs/manual-install_EN.md).
 
 ### Build from source
 
@@ -226,7 +232,7 @@ Portable layout: one folder for everything (binary + config + runtime files). Po
    code-index daemon stop
    ```
 
-`CODE_INDEX_HOME` is **required** — there is no fallback. If it is unset, both `daemon` and `serve` exit with an error explaining how to set it.
+`CODE_INDEX_HOME` is **required** — there is no fallback. If it is unset, `daemon run` exits with an error showing how to set it. `serve` still starts, but answers every tool call with `daemon_offline` carrying the same explanation.
 
 > **Troubleshooting — "daemon not running / runtime-info missing" even though the daemon IS running.**
 >
@@ -243,6 +249,8 @@ code-index index /path/to/project
 code-index stats --path /path/to/project --json
 ```
 
+The CLI commands read the ready index. The MCP server (`serve`) still needs the daemon: without it tools answer `daemon_offline` even when `.code-index/index.db` is already built.
+
 ### Run as MCP server (read-only)
 
 ```bash
@@ -253,7 +261,7 @@ This is a thin read-only client of the daemon. It does not index anything itself
 
 ### Transports (stdio vs HTTP)
 
-`serve` supports two transports:
+`serve` supports two transports. In both, the daemon builds the index and must be running. The HTTP server is built into the binary itself — no separate web server is needed; it binds to `127.0.0.1` by default.
 
 | Transport | Process model | When to use |
 |-----------|---------------|-------------|
@@ -270,22 +278,27 @@ code-index serve --transport http --port 8011 --config /etc/code-index/daemon.to
 
 `--path` can be repeated in `alias=dir` form (multi-repo mode). Each tool call takes a `repo` parameter to select which repository to query. Without `=`, the single path uses `alias=default` (backward-compatible).
 
+For stdio, each folder in `--path` must be listed in `daemon.toml` (path letter case does not matter), otherwise the answer is `not_started` asking to add the path and run `daemon reload`. The alias comes from `--path`, not from `daemon.toml`; a call with an alias the server does not know gets `unknown_repo` with the list of available ones.
+
 In HTTP mode, if `--config` is provided, aliases are taken from `[[paths]]` entries of `daemon.toml`: explicit `alias = "..."`, or derived from the path's last segment (lowercased, spaces → `_`) when not set. CLI `--path` takes precedence over the config file.
 
 ## Connecting to Claude Code
 
-Add to `.mcp.json` in your project root. For `stdio`:
+Add to `.mcp.json` in your project root. For `stdio` (daemon running, project folder listed in `daemon.toml`):
 
 ```json
 {
   "mcpServers": {
     "code-index": {
       "command": "npx",
-      "args": ["-y", "@regsorm/code-index-mcp", "serve", "--path", "."]
+      "args": ["-y", "@regsorm/code-index-mcp", "serve", "--path", "."],
+      "env": { "CODE_INDEX_HOME": "C:\\tools\\code-index" }
     }
   }
 }
 ```
+
+`CODE_INDEX_HOME` in `env` is the same absolute path the daemon uses: the client may not see the system variable.
 
 For a shared HTTP process:
 
@@ -518,7 +531,7 @@ Per-folder lifecycle: `not_started → initial_indexing → ready ⇄ reindexing
 
 ### MCP servers (many read-only readers)
 
-`code-index serve --path <project>` opens `.code-index/index.db` in `SQLITE_OPEN_READ_ONLY` and exposes MCP tools over stdio. Multiple MCP instances on the same project run in parallel without blocking each other.
+`code-index serve` opens `.code-index/index.db` in `SQLITE_OPEN_READ_ONLY` and exposes MCP tools over stdio or HTTP. Multiple MCP instances on the same project run in parallel without blocking each other. `serve` never indexes and does not answer queries without the daemon, even when the index is already built.
 
 Before every tool call the MCP asks the daemon for the per-folder status. If it is not `ready`, the tool returns a structured JSON:
 
@@ -529,8 +542,10 @@ Before every tool call the MCP asks the daemon for the per-folder status. If it 
 If the daemon is offline:
 
 ```json
-{ "status": "daemon_offline", "message": "Демон code-index не доступен. Запустите 'code-index daemon run' или Scheduled Task." }
+{ "status": "daemon_offline", "message": "Демон code-index не доступен (Демон не найден: отсутствует runtime-info файл C:\\tools\\code-index\\daemon.json. CODE_INDEX_HOME = C:\\tools\\code-index. Проверьте: (1) демон запущен — `code-index daemon run`; (2) демон и этот процесс используют ОДИН CODE_INDEX_HOME. …). Запустите 'code-index daemon run' или Scheduled Task / systemd user unit." }
 ```
+
+The message is in Russian. It says the daemon was not found because `daemon.json` is missing, shows the `CODE_INDEX_HOME` in use, and asks to check that the daemon is running and that both processes share one `CODE_INDEX_HOME`. If `serve` has no `CODE_INDEX_HOME` at all, the parenthesis instead says the variable is not set for this process, with an `env` example.
 
 ### Logs: what to attach when indexing appears stuck
 

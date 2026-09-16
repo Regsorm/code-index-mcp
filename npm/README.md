@@ -14,22 +14,42 @@ npm install -g @regsorm/code-index-mcp
 
 Поддерживаемые платформы: Windows x64, Linux x64, macOS arm64.
 
-## Запуск как MCP-сервера
+## Запуск
 
-```bash
-npx @regsorm/code-index-mcp serve --path /path/to/your/repo
-```
+Программа работает двумя процессами: фоновый индексатор строит индекс, MCP-сервер его читает. Без индексатора инструменты отвечают `daemon_offline`.
 
-Транспорт по умолчанию — `stdio`. Для подключения к Claude Code / Cursor добавьте в MCP-конфигурацию:
+1. Задайте переменную `CODE_INDEX_HOME` — папку для настроек и служебных файлов (например `C:\tools\code-index`).
+2. Создайте в ней `daemon.toml` со списком папок:
 
-```json
-{
-  "code-index": {
-    "command": "npx",
-    "args": ["-y", "@regsorm/code-index-mcp", "serve", "--path", "/path/to/your/repo"]
-  }
-}
-```
+   ```toml
+   [daemon]
+   http_host = "127.0.0.1"
+   http_port = 8015
+
+   [[paths]]
+   path = "C:/path/to/your/repo"
+   alias = "main"
+   ```
+
+3. Запустите индексатор:
+
+   ```bash
+   npx @regsorm/code-index-mcp daemon run
+   ```
+
+4. Подключите MCP-сервер. Транспорт по умолчанию — `stdio`; для Claude Code / Cursor добавьте в MCP-конфигурацию:
+
+   ```json
+   {
+     "code-index": {
+       "command": "npx",
+       "args": ["-y", "@regsorm/code-index-mcp", "serve", "--path", "main=C:/path/to/your/repo"],
+       "env": { "CODE_INDEX_HOME": "C:\\tools\\code-index" }
+     }
+   }
+   ```
+
+   Папка в `--path` должна быть перечислена в `daemon.toml`.
 
 ## Документация
 
