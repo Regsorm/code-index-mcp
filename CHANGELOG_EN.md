@@ -5,6 +5,41 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.2.3] — 2026-09-17
+
+**The 1C extension honours `exclude_dirs`: an excluded directory with its own `Configuration.xml` (for example, a copy of the vendor configuration kept for comparison) no longer gets into the metadata tables. On a stand of two copies of one dump, `metadata_modules` had 33 extra rows from the excluded directory; now 0.**
+
+### Fixed
+
+- **The 1C extension walked excluded directories.** The file index honoured `exclude_dirs`, but the extension walked the tree on its own and parsed a `Configuration.xml` found in an excluded directory as one more configuration: its rows appeared in `metadata_modules`, `metadata_objects`, `metadata_forms`, `role_rights`, `data_links`, templates and event subscriptions. Objects with the same name were merged on a first-found basis, so the directory name decided whether `get_object_structure`, `find_references` and `get_role_rights` answered from the customised or the reference configuration. Now every walk of the extension (18 places, including detection of 1C and 1C:EDT dumps) skips directories by the same rule as the file index: the built-in list plus `exclude_dirs` from `.code-index/config.json`.
+- **The daemon ignored `exclude_dirs` when expanding a new folder.** When a folder was created or renamed as a whole, the daemon walked its contents checking only the built-in list. Now a folder that is excluded itself or lies inside an excluded one is not expanded, and user exclusions are skipped during the walk.
+
+### How to apply
+
+- Replace the binary. If an excluded directory already holds a configuration whose rows got into the tables, run `bsl-indexer index --force` on that repository: a full extension pass rebuilds the metadata tables from scratch.
+
+### Known limitations
+
+- `exclude_file_patterns` intentionally does not apply to the extension: it reads `ConfigDumpInfo.xml` itself, and that file is often excluded from the file index.
+- The built-in exclusion list (`build`, `dist`, `env` and others) now applies to the extension too. A 1C object whose directory has such a name drops out of the metadata tables — just as its files already dropped out of the file index.
+- With same-named objects in several non-excluded configurations the choice still depends on the directory walk order.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` with `enrichment` — 883 passed, 0 failed; no compiler warnings. 4 new tests: an excluded configuration does not get into the configuration list, `metadata_objects` or `metadata_modules`; without `config.json` the same configuration gets in (control); the daemon expanding a created excluded folder and a nested excluded folder.
+- **Stand: two copies of an extension dump (321 files) in `cf` and `cf_vendor`, `cf_vendor` in `exclude_dirs`:**
+
+  | Check | 1.2.2 | 1.2.3 |
+  |---|---:|---:|
+  | `bsl-indexer index`, Windows: `metadata_modules` rows with `cf_vendor` | 33 | 0 |
+  | same, Linux build in the node container | — | 0 |
+  | daemon: initial indexing | — | 0 |
+  | daemon: `cf_vendor` deleted and copied back while running — files in the index | — | 0 |
+  | daemon: control non-excluded folder — files in the index | — | 24 |
+
+  Objects, forms and rights on the stand are equal (34 / 1 / 6): the copies are identical and duplicates were merged.
+- **Federation:** queries to remote databases of the standard trade configuration, accounting and payroll answer on the updated node.
+
 ## [1.2.2] — 2026-09-15
 
 **`get_call_tree` keeps the response size in check: for a frequently called 1C procedure the default tree is 45.6 KB instead of 74.8 KB, with `max_nodes` 5000 — 45.8 KB instead of 1.8 MB. A shortened response says how many edges are shown and suggests how to get the rest.**
