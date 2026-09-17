@@ -227,6 +227,7 @@ fn process_batch(
             ctx.index_config.max_file_size,
             ctx.repo_language,
             ctx.extra_text_extensions,
+            &ctx.index_config.exclude_dirs,
         ) {
             ApplyOutcome::Applied => {}
             ApplyOutcome::Failed => {
@@ -1567,6 +1568,7 @@ mod tests {
                 1024, // max_file_size — 1 КБ
                 None,
                 &[],
+                &[],
             );
         }
 
@@ -1577,6 +1579,74 @@ mod tests {
         assert!(
             storage.get_file_by_path("big.json").unwrap().is_none(),
             "файл сверх лимита в индекс попадать не должен"
+        );
+    }
+
+    /// Регресс: раскрытие созданной/переименованной папки пропускало только
+    /// встроенный `EXCLUDE_DIRS`, а пользовательские `exclude_dirs` из
+    /// `.code-index/config.json` игнорировало — и исключённая папка попадала
+    /// в индекс через события демона.
+    #[test]
+    fn раскрытие_созданной_папки_уважает_пользовательские_исключения() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+        std::fs::write(root.join("vendor/mod.py"), "x = 1\n").unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let registry = ParserRegistry::new_all();
+        let exclude_dirs = vec!["vendor".to_string()];
+
+        let outcome = apply_event(
+            &mut storage,
+            &root,
+            &FileEvent::Created(root.join("vendor")),
+            &registry,
+            5 * 1024 * 1024,
+            1024 * 1024,
+            None,
+            &[],
+            &exclude_dirs,
+        );
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert!(
+            storage.get_file_by_path("vendor/mod.py").unwrap().is_none(),
+            "файл из исключённой папки не должен попасть в индекс"
+        );
+    }
+
+    /// Вложенная исключённая папка: событие пришло на `app/`, но `app/vendor`
+    /// тоже пропускается — фильтр проверяет весь путь относительно корня.
+    #[test]
+    fn раскрытие_папки_уважает_вложенные_исключения() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("app/vendor")).unwrap();
+        std::fs::write(root.join("app/main.py"), "y = 2\n").unwrap();
+        std::fs::write(root.join("app/vendor/x.py"), "z = 3\n").unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+        let registry = ParserRegistry::new_all();
+        let exclude_dirs = vec!["vendor".to_string()];
+
+        apply_event(
+            &mut storage,
+            &root,
+            &FileEvent::Created(root.join("app")),
+            &registry,
+            5 * 1024 * 1024,
+            1024 * 1024,
+            None,
+            &[],
+            &exclude_dirs,
+        );
+        assert!(
+            storage.get_file_by_path("app/main.py").unwrap().is_some(),
+            "обычный файл из созданной папки обязан попасть в индекс"
+        );
+        assert!(
+            storage.get_file_by_path("app/vendor/x.py").unwrap().is_none(),
+            "файл из вложенной исключённой папки не должен попасть в индекс"
         );
     }
 
@@ -1948,6 +2018,25 @@ impl ApplyOutcome {
     }
 }
 
+/// Имя каталога исключено из обхода — то же правило, что у обхода дерева в ядре
+/// (`IndexConfig::is_excluded_dir`): встроенный `EXCLUDE_DIRS` плюс
+/// пользовательские `exclude_dirs` из `.code-index/config.json`.
+fn dir_name_excluded(name: &str, exclude_dirs: &[String]) -> bool {
+    crate::indexer::file_types::EXCLUDE_DIRS.contains(&name)
+        || exclude_dirs.iter().any(|d| d == name)
+}
+
+/// Лежит ли каталог внутри исключённого: исключённым считается он сам либо
+/// любой его компонент пути относительно `root`. Нужно для событий на папку —
+/// иначе пользовательский `exclude_dirs` обходился бы через них.
+fn dir_path_excluded(root: &Path, dir: &Path, exclude_dirs: &[String]) -> bool {
+    let rel = dir.strip_prefix(root).unwrap_or(dir);
+    rel.components().any(|c| match c {
+        std::path::Component::Normal(name) => dir_name_excluded(&name.to_string_lossy(), exclude_dirs),
+        _ => false,
+    })
+}
+
 /// Обработать одно событие файловой системы: пересчитать хеш, записать/удалить в БД.
 ///
 /// И `Failed`, и `Busy` означают, что индекс в этом месте остался на прежнем
@@ -1966,6 +2055,7 @@ fn apply_event(
     max_file_size: usize,
     repo_language: Option<&str>,
     extra_text_extensions: &[String],
+    exclude_dirs: &[String],
 ) -> ApplyOutcome {
     match event {
         FileEvent::Modified(abs) | FileEvent::Created(abs) => {
@@ -1973,6 +2063,12 @@ fn apply_event(
             // Файлы внутри своих событий не получили — раскрываем обходом, иначе
             // содержимое новой папки не попадёт в индекс до перезапуска демона.
             if abs.is_dir() {
+                // Папка, которая сама исключена (или лежит внутри исключённой),
+                // не раскрывается: иначе пользовательский `exclude_dirs`
+                // обходился бы событиями демона.
+                if dir_path_excluded(root, abs, exclude_dirs) {
+                    return ApplyOutcome::Applied;
+                }
                 return apply_dir_scan(
                     storage,
                     root,
@@ -1982,6 +2078,7 @@ fn apply_event(
                     max_file_size,
                     repo_language,
                     extra_text_extensions,
+                    exclude_dirs,
                 );
             }
 
@@ -2248,6 +2345,7 @@ fn apply_dir_scan(
     max_file_size: usize,
     repo_language: Option<&str>,
     extra_text_extensions: &[String],
+    exclude_dirs: &[String],
 ) -> ApplyOutcome {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -2270,7 +2368,7 @@ fn apply_dir_scan(
             let excluded = path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| crate::indexer::file_types::EXCLUDE_DIRS.contains(&n))
+                .map(|n| dir_name_excluded(n, exclude_dirs))
                 .unwrap_or(false);
             if excluded {
                 continue;
@@ -2284,6 +2382,7 @@ fn apply_dir_scan(
                 max_file_size,
                 repo_language,
                 extra_text_extensions,
+                exclude_dirs,
             ));
         } else if path.is_file() {
             worst = worst.worse(apply_event(
@@ -2295,6 +2394,7 @@ fn apply_dir_scan(
                 max_file_size,
                 repo_language,
                 extra_text_extensions,
+                exclude_dirs,
             ));
         }
     }

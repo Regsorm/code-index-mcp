@@ -227,13 +227,55 @@ pub(crate) fn rel_path(repo_root: &Path, abs: &Path) -> String {
 }
 
 
+/// Фильтр каталогов при обходе репозитория — то же правило, что у файлового
+/// индекса ядра: встроенный список + `exclude_dirs` из `.code-index/config.json`.
+#[derive(Clone)]
+pub(crate) struct DirFilter {
+    config: code_index_core::indexer::config::IndexConfig,
+}
+
+impl DirFilter {
+    /// Загрузить исключения из `.code-index/config.json` репозитория. Ошибка
+    /// чтения или разбора фильтрацию не отменяет: встроенный список исключений
+    /// действует и на конфиге по умолчанию.
+    pub(crate) fn load(repo_root: &Path) -> Self {
+        match code_index_core::indexer::config::IndexConfig::load(repo_root) {
+            Ok(config) => Self { config },
+            Err(e) => {
+                tracing::warn!(
+                    "{}: не читается .code-index/config.json ({}), беру встроенный список исключений",
+                    repo_root.display(),
+                    e
+                );
+                Self {
+                    config: code_index_core::indexer::config::IndexConfig::default(),
+                }
+            }
+        }
+    }
+
+    /// Оставлять ли запись при обходе. Начальный каталог (depth 0) не
+    /// отбрасывается никогда, файлы фильтр не трогает.
+    pub(crate) fn allows(&self, entry: &walkdir::DirEntry) -> bool {
+        if entry.depth() == 0 || !entry.file_type().is_dir() {
+            return true;
+        }
+        match entry.file_name().to_str() {
+            Some(name) => !self.config.is_excluded_dir(name),
+            None => true,
+        }
+    }
+}
+
+
 /// Корни sub-config'ов репо: каталоги, содержащие `Configuration.xml` на
 /// глубине ≤ 3 (base/ + extensions/<name>/). base-роуты идут ПЕРВЫМИ — их
 /// структура приоритетна при мердже одноимённых реквизитов (см.
 /// `ObjectStructure::merge_from`).
 pub(crate) fn sub_config_roots(repo_root: &Path) -> Vec<std::path::PathBuf> {
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
-    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_map(|e| e.ok()) {
+    let filter = DirFilter::load(repo_root);
+    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
         if entry.file_type().is_file()
             && entry.file_name().to_str() == Some("Configuration.xml")
         {

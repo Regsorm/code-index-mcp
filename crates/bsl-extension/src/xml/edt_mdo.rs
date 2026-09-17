@@ -971,9 +971,11 @@ pub fn parse_mdo_event_subscription(
 /// типов (`src/`, где лежат `Catalogs/`, `Documents/` и т.д.).
 /// Признак EDT: файл `<...>/Configuration/Configuration.mdo`.
 pub fn detect_edt_src(repo_root: &Path) -> Option<PathBuf> {
+    let filter = crate::index_extras::DirFilter::load(repo_root);
     for entry in WalkDir::new(repo_root)
         .max_depth(4)
         .into_iter()
+        .filter_entry(|e| filter.allows(e))
         .filter_map(|e| e.ok())
     {
         if entry.file_type().is_file()

@@ -109,7 +109,8 @@ pub(crate) fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connecti
     // — заимствованные в расширениях объекты с тем же full_name просто
     // пропускаются, в выдаче остаётся base-версия).
     let mut config_paths: Vec<std::path::PathBuf> = Vec::new();
-    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_map(|e| e.ok()) {
+    let filter = DirFilter::load(repo_root);
+    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
         if entry.file_type().is_file()
             && entry.file_name().to_str() == Some("Configuration.xml")
         {
@@ -175,7 +176,7 @@ pub(crate) fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connecti
         if !sub_dir.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&sub_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&sub_dir).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -240,7 +241,8 @@ pub(crate) fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connecti
 pub(crate) fn index_data_links(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
     // Корни sub-config — родители найденных Configuration.xml.
     let mut sub_roots: Vec<std::path::PathBuf> = Vec::new();
-    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_map(|e| e.ok()) {
+    let filter = DirFilter::load(repo_root);
+    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
         if entry.file_type().is_file()
             && entry.file_name().to_str() == Some("Configuration.xml")
         {
@@ -366,13 +368,14 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
     // нужна только если в составе подсистемы встретился идентификатор вместо
     // имени, а это бывает лишь в выгрузках расширений.
     let mut id_map: Option<std::collections::HashMap<String, String>> = None;
+    let filter = DirFilter::load(repo_root);
     for root in &roots {
         // ── Подсистемы: Subsystems/**.xml ──────────────────────────────────
         // Файл-определение подсистемы лежит прямо в папке "Subsystems"
         // (вложенные — в <Parent>/Subsystems/<Child>.xml). Ext/Forms — пропуск.
         let sub_dir = root.join("Subsystems");
         if sub_dir.is_dir() {
-            for entry in WalkDir::new(&sub_dir).into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(&sub_dir).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -433,7 +436,7 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
         // ── Планы обмена: ExchangePlans/<Имя>/Ext/Content.xml ───────────────
         let ep_dir = root.join("ExchangePlans");
         if ep_dir.is_dir() {
-            for entry in WalkDir::new(&ep_dir).into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(&ep_dir).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
                 if !entry.file_type().is_file()
                     || entry.file_name().to_str() != Some("Content.xml")
                 {
@@ -606,12 +609,13 @@ pub(crate) fn index_role_rights(repo_root: &Path, conn: &rusqlite::Connection) -
 
     let mut total: usize = 0;
     let mut roles: usize = 0;
+    let filter = DirFilter::load(repo_root);
     for root in &roots {
         let roles_dir = root.join("Roles");
         if !roles_dir.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&roles_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&roles_dir).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() || entry.file_name().to_str() != Some("Rights.xml") {
                 continue;
             }
@@ -682,7 +686,8 @@ pub(crate) fn index_metadata_code_usages(repo_root: &Path, conn: &rusqlite::Conn
 
     let mut total: usize = 0;
     let mut files: usize = 0;
-    for entry in WalkDir::new(repo_root).into_iter().filter_map(|e| e.ok()) {
+    let filter = DirFilter::load(repo_root);
+    for entry in WalkDir::new(repo_root).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -848,6 +853,7 @@ pub(crate) fn index_object_synonyms(repo_root: &Path, conn: &rusqlite::Connectio
         return Ok(());
     }
     let mut syn: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let filter = DirFilter::load(repo_root);
     for sub_root in &sub_roots {
         let type_dirs = match std::fs::read_dir(sub_root) {
             Ok(r) => r,
@@ -886,7 +892,7 @@ pub(crate) fn index_object_synonyms(repo_root: &Path, conn: &rusqlite::Connectio
         // объектов. Верхнеуровневые повторно не перетираются: `or_insert`.
         let subsystems_dir = sub_root.join("Subsystems");
         if subsystems_dir.is_dir() {
-            for entry in WalkDir::new(&subsystems_dir).into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(&subsystems_dir).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -1143,8 +1149,10 @@ pub(crate) fn index_metadata_forms(repo_root: &Path, conn: &rusqlite::Connection
          VALUES (?, ?, ?, ?)",
     )?;
 
+    let filter = DirFilter::load(repo_root);
     for entry in WalkDir::new(repo_root)
         .into_iter()
+        .filter_entry(|e| filter.allows(e))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
@@ -1208,8 +1216,10 @@ pub(crate) fn index_metadata_forms(repo_root: &Path, conn: &rusqlite::Connection
 /// `index_metadata_objects` — та чистит весь перечень репо целиком.
 pub(crate) fn index_object_templates(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
     let mut rows: Vec<TemplateRow> = Vec::new();
+    let filter = DirFilter::load(repo_root);
     for entry in WalkDir::new(repo_root)
         .into_iter()
+        .filter_entry(|e| filter.allows(e))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
@@ -1414,9 +1424,11 @@ pub(crate) fn index_event_subscriptions(repo_root: &Path, conn: &rusqlite::Conne
          VALUES (?, ?, ?, ?, ?, ?)",
     )?;
 
+    let filter = DirFilter::load(repo_root);
     for entry in WalkDir::new(repo_root)
         .max_depth(4) // root/<sub>/EventSubscriptions/<file>.xml = depth 3, +запас
         .into_iter()
+        .filter_entry(|e| filter.allows(e))
         .filter_map(|e| e.ok())
     {
         let path = entry.path();

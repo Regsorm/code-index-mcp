@@ -78,10 +78,12 @@ impl LanguageProcessor for BslLanguageProcessor {
             return true;
         }
         // Рекурсивный путь — multi-config: base/, extensions/<name>/, ...
+        let filter = crate::index_extras::DirFilter::load(repo_root);
         walkdir::WalkDir::new(repo_root)
             .max_depth(3) // root=0, depth=1=base/, depth=2=extensions/<name>/, depth=3=Configuration.xml
             .min_depth(2)
             .into_iter()
+            .filter_entry(|e| filter.allows(e))
             .filter_map(|e| e.ok())
             .any(|e| {
                 e.file_type().is_file()

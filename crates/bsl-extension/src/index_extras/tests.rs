@@ -275,6 +275,136 @@ fn fills_metadata_objects_from_configuration_xml() {
     assert_eq!(count, 2);
 }
 
+/// Мини-репо из двух sub-config'ов: базовая `cf/` и «вендорская» `cf_vendor/`,
+/// в каждой по объекту с модулем. Имя объекта в `cf_vendor` другое, чтобы его
+/// попадание в индекс было видно.
+fn write_exclude_dirs_fixture(repo: &Path) {
+    write(
+        &repo.join("cf").join("Configuration.xml"),
+        r#"<?xml version="1.0"?><MetaDataObject><Configuration><ChildObjects><Catalog>ОбъектА</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    write(
+        &repo.join("cf").join("Catalogs").join("ОбъектА.xml"),
+        r#"<?xml version="1.0"?><MetaDataObject><Catalog uuid="11111111-1111-1111-1111-111111111111"><Properties><Name>ОбъектА</Name></Properties></Catalog></MetaDataObject>"#,
+    );
+    write(
+        &repo.join("cf")
+            .join("Catalogs")
+            .join("ОбъектА")
+            .join("Ext")
+            .join("ManagerModule.bsl"),
+        "Процедура П() Экспорт\nКонецПроцедуры",
+    );
+
+    write(
+        &repo.join("cf_vendor").join("Configuration.xml"),
+        r#"<?xml version="1.0"?><MetaDataObject><Configuration><ChildObjects><Catalog>ВендорОбъект</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    write(
+        &repo.join("cf_vendor").join("Catalogs").join("ВендорОбъект.xml"),
+        r#"<?xml version="1.0"?><MetaDataObject><Catalog uuid="22222222-2222-2222-2222-222222222222"><Properties><Name>ВендорОбъект</Name></Properties></Catalog></MetaDataObject>"#,
+    );
+    write(
+        &repo.join("cf_vendor")
+            .join("Catalogs")
+            .join("ВендорОбъект")
+            .join("Ext")
+            .join("ManagerModule.bsl"),
+        "Процедура П() Экспорт\nКонецПроцедуры",
+    );
+}
+
+/// Регресс: надстройка обходила дерево своим `WalkDir` без фильтра исключений,
+/// находила `cf_vendor/Configuration.xml` и индексировала исключённую папку как
+/// ещё одну конфигурацию — дубли во всех таблицах слоя. Теперь обход идёт с тем
+/// же правилом, что у файлового индекса ядра (`exclude_dirs` из
+/// `.code-index/config.json`).
+#[test]
+fn exclude_dirs_skips_sub_config() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write_exclude_dirs_fixture(&repo);
+    write(
+        &repo.join(".code-index").join("config.json"),
+        r#"{"exclude_dirs":["cf_vendor"]}"#,
+    );
+
+    let roots = sub_config_roots(&repo);
+    assert!(
+        roots
+            .iter()
+            .all(|r| r.file_name().and_then(|n| n.to_str()) != Some("cf_vendor")),
+        "cf_vendor не должен попасть в корни sub-config: {:?}",
+        roots
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    let conn = storage.conn();
+
+    let count = |sql: &str, arg: &str| -> i64 {
+        conn.query_row(sql, params![REPO_DEFAULT, arg], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM metadata_objects WHERE repo = ?1 AND full_name LIKE ?2",
+            "%Вендор%"
+        ),
+        0,
+        "объект из исключённой папки не должен индексироваться"
+    );
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM metadata_modules WHERE repo = ?1 AND extension_name = ?2",
+            "cf_vendor"
+        ),
+        0,
+        "модули исключённой папки не должны индексироваться"
+    );
+    // Базовая конфигурация обязана остаться на месте — фильтр не глушит обход.
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM metadata_objects WHERE repo = ?1 AND full_name = ?2",
+            "Catalog.ОбъектА"
+        ),
+        1
+    );
+}
+
+/// Контрольный: без `.code-index/config.json` та же папка индексируется как
+/// прежде — значит тест выше ловит именно фильтр.
+#[test]
+fn exclude_dirs_absent_indexes_sub_config() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write_exclude_dirs_fixture(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    let conn = storage.conn();
+
+    let count = |sql: &str, arg: &str| -> i64 {
+        conn.query_row(sql, params![REPO_DEFAULT, arg], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM metadata_objects WHERE repo = ?1 AND full_name LIKE ?2",
+            "%Вендор%"
+        ),
+        1,
+        "без exclude_dirs папка индексируется как обычно"
+    );
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM metadata_modules WHERE repo = ?1 AND extension_name = ?2",
+            "cf_vendor"
+        ),
+        1
+    );
+}
+
 #[test]
 fn nested_subsystem_synonym_filled() {
     // Синонимы собирались обходом ровно на один уровень внутри папки типа, а

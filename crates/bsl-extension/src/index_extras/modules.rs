@@ -67,7 +67,8 @@ pub(crate) fn migrate_metadata_modules_key_tx(conn: &rusqlite::Connection) -> Re
 pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
     // Находим все Configuration.xml — каждая определяет область sub-config.
     let mut sub_configs: Vec<std::path::PathBuf> = Vec::new();
-    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_map(|e| e.ok()) {
+    let filter = DirFilter::load(repo_root);
+    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
         if entry.file_type().is_file()
             && entry.file_name().to_str() == Some("Configuration.xml")
         {
@@ -97,7 +98,7 @@ pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connecti
     > = std::collections::HashMap::new();
 
     for sub_root in &sub_configs {
-        for entry in WalkDir::new(sub_root).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(sub_root).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -270,7 +271,8 @@ pub(crate) fn index_metadata_modules_edt(
         std::collections::HashMap::new();
     let mut total = 0usize;
 
-    for entry in WalkDir::new(src_root).into_iter().filter_map(|e| e.ok()) {
+    let filter = DirFilter::load(repo_root);
+    for entry in WalkDir::new(src_root).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -506,12 +508,13 @@ pub(crate) fn update_metadata_modules_for_object(
          WHERE repo = ? AND (object_name = ? OR object_name LIKE ?)",
         params![REPO_DEFAULT, &object_name, &like],
     )?;
+    let filter = DirFilter::load(repo_root);
     for root in roots {
         let obj_dir = root.join(&folder).join(&stem);
         if !obj_dir.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&obj_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&obj_dir).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
             }
