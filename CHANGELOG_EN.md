@@ -5,7 +5,7 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.2.4] — 2026-09-19
 
 ### Security
 

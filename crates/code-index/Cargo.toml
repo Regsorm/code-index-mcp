@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Ядро — основная зависимость, всё остальное доступно через re-export.
-code-index-core = { path = "../code-index-core", version = "1.2.3" }
+code-index-core = { path = "../code-index-core", version = "1.2.4" }
 
 # CLI и runtime — используются прямо в main.rs.
 clap = { workspace = true }
