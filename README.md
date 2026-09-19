@@ -58,7 +58,7 @@ Expand-Archive "$env:TEMP\code-index.zip" -DestinationPath $dst -Force
 setx CODE_INDEX_HOME $dst
 ```
 
-`bsl-indexer` — сборка с поддержкой 1С (32 инструмента). Нужна работа без 1С —
+`bsl-indexer` — сборка с поддержкой 1С (33 инструмента). Нужна работа без 1С —
 возьмите `code-index-windows-x64.zip` (20 инструментов). Для Linux и macOS в том
 же выпуске лежат `*-linux-x64.tar.gz` и `*-macos-arm64.tar.gz`.
 
