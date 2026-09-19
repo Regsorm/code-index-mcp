@@ -5,6 +5,30 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.3.0] — 2026-09-19
+
+**1C:EDT exports: data composition schemas (`.dcs`) are now searchable as text, and object templates appear in the object registry. Previously the schema never reached the index in this format, and objects had no templates at all. On a typical accounting configuration exported from 1C:EDT: 470 schemas with indexed text and 14,490 template passports — up from 0 and 0.**
+
+> Context. A user compared the analysis of two reports with and without the index: code, registers and call graphs were covered, but "`.dcs` (DCS) is not indexed — query text, fields, resources, parameters, variants" was named the main limitation. In Designer exports the same schema lives in `Templates/<Name>/Ext/Template.xml` and has been indexed for a long time; in 1C:EDT it has its own extension that was missing from the text list, and the template descriptor is not a separate file but `<templates>` elements inside the owner's `.mdo` — the template passport phase (v0.63.0) looked for `Templates/<Name>.xml` and found nothing in EDT.
+
+### Added
+
+- **`.dcs` is a text file of the index.** `grep_text`, `search_text`, `read_file` and `list_files` see data composition schemas of 1C:EDT exports. `Template.dcs` is exempt from the text-file size limit: in this format only a composition schema carries that name, and its size is bounded by the configuration itself (470 files, 48 MB total, the largest 2.55 MB). Without the exemption the main schema of a report at 1,054,441 bytes did not pass the 1 MB limit. Spreadsheet documents `.mxlx` are deliberately not indexed: 11,587 files, 3 GB, the largest 79 MB, and there is nothing to search in cell markup.
+- **Object template passports for 1C:EDT** — the same `<Kind>.<Object>.Template.<Name>` rows in the object registry as for the Designer format: owner, template type, content file with its size, the `content_indexed` flag and the reason when the content is not in the index. Name, synonym and type are read from `<templates>` in the owner's `.mdo`; a missing type means a spreadsheet document (EDT omits default values). A template is found by `get_object_structure`, `find_symbol` and `bsl_sql` like any other object.
+- **Watcher.** Editing a `.mdo` rebuilds the object's template passports (a renamed template disappears, the new one is registered, neighbours are untouched); changing or deleting a template content file updates its passport; deleting an object removes its templates. Verified on a stand copied from a live export across all four scenarios.
+
+### Changed
+
+- For a spreadsheet document (`.mxlx`, `.mxl`) the "content not indexed" reason in the passport names the real cause instead of reporting "binary content".
+
+### Verification
+
+- `cargo test --workspace --all-features`: 890 passed, 0 failed. `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- Forced reindex of a typical accounting configuration in 1C:EDT (47,995 files): 3 min 30 s (core 98 s, extras 94 s). Of 470 composition schemas, 467 are object templates and 3 are common templates (top-level objects); all have `content_indexed = true`. 12,379 spreadsheet documents received a passport with an honest reason.
+- `grep_text` over the main report schema of 1,054,441 bytes finds the query text; a search across all `.dcs` files of the configuration finds references to accounting register virtual tables.
+- Federation on the local build: Designer exports unchanged — 3,916 templates, 3,588 with content; text search over a schema through the node works.
+- **On an existing 1C:EDT database** schemas and passports appear after a one-time `bsl-indexer index <path> --force` — the extras layer is not rebuilt while the data is unchanged (as in v0.63.0). New databases get them immediately.
+
 ## [1.2.4] — 2026-09-19
 
 ### Security
