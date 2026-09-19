@@ -1,13 +1,12 @@
 use anyhow::{anyhow, Result};
 
-use super::types::{
-    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport,
-    ParsedVariable,
-};
-use super::LanguageParser;
 use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 use super::types::PARSE_TIMEOUT_MS;
+use super::types::{
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+};
+use super::LanguageParser;
 
 /// Парсер PHP-файлов на основе tree-sitter.
 ///
@@ -15,6 +14,12 @@ use super::types::PARSE_TIMEOUT_MS;
 /// `?> ... <?php`), а не `LANGUAGE_PHP_ONLY` — потому что шаблоны Битрикса
 /// массово смешивают PHP и HTML в одном файле.
 pub struct PhpParser;
+
+impl Default for PhpParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl PhpParser {
     pub fn new() -> Self {
@@ -42,18 +47,22 @@ fn node_text<'a>(node: tree_sitter::Node<'a>, source: &'a [u8]) -> &'a str {
 }
 
 /// Найти первый дочерний узел с заданным kind
-fn find_child_by_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+fn find_child_by_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
+    let found = node
+        .children(&mut cursor)
+        .find(|&child| child.kind() == kind);
+    found
 }
 
 /// Найти дочерний узел по field name
-fn find_child_by_field<'a>(node: tree_sitter::Node<'a>, field: &str) -> Option<tree_sitter::Node<'a>> {
+fn find_child_by_field<'a>(
+    node: tree_sitter::Node<'a>,
+    field: &str,
+) -> Option<tree_sitter::Node<'a>> {
     node.child_by_field_name(field)
 }
 
@@ -122,7 +131,9 @@ fn visit_node(
         "function_definition" | "method_declaration" => {
             visit_function(node, ctx, class_name);
         }
-        "class_declaration" | "interface_declaration" | "trait_declaration"
+        "class_declaration"
+        | "interface_declaration"
+        | "trait_declaration"
         | "enum_declaration" => {
             visit_class(node, ctx);
         }
@@ -197,7 +208,8 @@ fn visit_function(node: tree_sitter::Node, ctx: &mut VisitContext, class_name: O
         .map(|n| node_text(n, source).to_string());
 
     // Тип возвращаемого значения (после ":")
-    let return_type = find_child_by_field(node, "return_type").map(|n| node_text(n, source).to_string());
+    let return_type =
+        find_child_by_field(node, "return_type").map(|n| node_text(n, source).to_string());
 
     // Тело (compound_statement)
     let body_node = find_child_by_field(node, "body")
@@ -248,8 +260,8 @@ fn visit_class(node: tree_sitter::Node, ctx: &mut VisitContext) {
 
     // Наследование: base_clause (extends) + class_interface_clause (implements)
     let extends = find_child_by_kind(node, "base_clause").map(|n| node_text(n, source).to_string());
-    let implements =
-        find_child_by_kind(node, "class_interface_clause").map(|n| node_text(n, source).to_string());
+    let implements = find_child_by_kind(node, "class_interface_clause")
+        .map(|n| node_text(n, source).to_string());
     let bases = match (extends, implements) {
         (Some(e), Some(i)) => Some(format!("{} {}", e, i)),
         (Some(e), None) => Some(e),
@@ -293,8 +305,8 @@ fn visit_use(node: tree_sitter::Node, ctx: &mut VisitContext) {
                 .or_else(|| find_child_by_kind(child, "name"))
                 .map(|n| node_text(n, source).to_string());
             // Псевдоним (as X) — в грамматике 0.23 это поле `alias` самого clause
-            let alias = find_child_by_field(child, "alias")
-                .map(|n| node_text(n, source).to_string());
+            let alias =
+                find_child_by_field(child, "alias").map(|n| node_text(n, source).to_string());
             ctx.imports.push(ParsedImport {
                 module,
                 name: None,
@@ -351,7 +363,11 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall {
+        caller,
+        callee,
+        line,
+    });
 }
 
 /// Обработать присваивание переменной на уровне модуля (`$x = ...;`)
@@ -499,8 +515,10 @@ use enterego\EnteregoUser;
 use Bitrix\Main\Loader as BxLoader;
 "#;
         let result = parser.parse(source, "test.php").unwrap();
-        assert!(result.imports.iter().any(|i| i.kind == "use"
-            && i.module.as_deref() == Some("enterego\\EnteregoUser")));
+        assert!(result
+            .imports
+            .iter()
+            .any(|i| i.kind == "use" && i.module.as_deref() == Some("enterego\\EnteregoUser")));
         assert!(result
             .imports
             .iter()

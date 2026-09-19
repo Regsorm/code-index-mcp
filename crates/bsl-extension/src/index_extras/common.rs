@@ -1,14 +1,11 @@
 //! Общие части слоя надстройки: состав разбираемых папок, разбор путей
 //! объектов, корни областей выгрузки, обслуживание статистики планировщика.
 
-use std::path::Path;
+use crate::xml::object_attributes::{parse_object_structure_file, ObjectStructure};
 use anyhow::Result;
 use rusqlite::params;
+use std::path::Path;
 use walkdir::WalkDir;
-use crate::xml::object_attributes::{
-    parse_object_structure_file, ObjectStructure,
-};
-
 
 /// Папки выгрузки → singular meta_type. Объектные XML лежат прямо в этих
 /// папках (`Catalogs/<Имя>.xml`). Перечислены типы со ссылочными
@@ -57,7 +54,6 @@ pub(crate) const OBJECT_FOLDERS: &[(&str, &str)] = &[
 /// upsert-ветке перечня/синонима: она должна покрывать те же типы, что попадают
 /// в `metadata_objects` из Configuration.xml (все `KNOWN_META_TYPES`), а не
 /// только объекты со структурой. Полноту стережёт тест
-
 /// `all_object_folders_cover_known_meta_types`.
 pub(crate) const ALL_OBJECT_FOLDERS: &[(&str, &str)] = &[
     ("Subsystems", "Subsystem"),
@@ -105,15 +101,12 @@ pub(crate) const ALL_OBJECT_FOLDERS: &[(&str, &str)] = &[
     ("Sequences", "Sequence"),
     ("Bots", "Bot"),
     ("ExternalDataSources", "ExternalDataSource"),
-
 ];
 
 /// Repo-key для оффлайн-индексации (через `bsl-indexer index .`).
 /// В реальном демоне используется alias из daemon.toml; пока этой
 /// связки нет на стороне индексер — пишем как «default».
 pub(crate) const REPO_DEFAULT: &str = "default";
-
-
 
 /// По пути к корневому XML объекта определить `(meta_type, full_name)`.
 /// Возвращает `None`, если файл не лежит прямо в одной из `OBJECT_FOLDERS`
@@ -131,7 +124,6 @@ pub(crate) fn object_full_name_from_path(xml_path: &Path) -> Option<(&'static st
     }
     None
 }
-
 
 /// Как [`object_full_name_from_path`], но для ВСЕХ типов верхнего уровня
 /// (`ALL_OBJECT_FOLDERS`), а не только объектов со ссылочной структурой.
@@ -151,7 +143,6 @@ pub(crate) fn object_full_name_any(xml_path: &Path) -> Option<(&'static str, Str
     None
 }
 
-
 /// Множественная папка выгрузки по singular meta_type (обратный поиск в
 /// `ALL_OBJECT_FOLDERS`): `Document` → `Documents`, `Report` → `Reports`.
 /// `metadata_forms.owner_full_name` и `metadata_modules.object_name` хранят имя в
@@ -164,14 +155,14 @@ pub(crate) fn plural_folder(meta_type: &str) -> Option<&'static str> {
         .map(|(folder, _mt)| *folder)
 }
 
-
 /// Экранировать спецсимволы LIKE (`\`, `%`, `_`) для поиска по префиксу имени —
 /// в именах 1С встречается `_` (например `ent_ВводНачислений`), без экранирования
 /// он схлопнулся бы в «любой символ».
 pub(crate) fn like_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
-
 
 /// Заполняет `data_links.to_object_key = lower(to_object)` для строк с пустым
 /// ключом. SQLite `lower()` кириллицу не берёт — считаем в Rust. Идемпотентно и
@@ -195,7 +186,6 @@ pub(crate) fn backfill_data_link_keys(conn: &rusqlite::Connection) -> rusqlite::
     Ok(())
 }
 
-
 /// Заполняет `role_rights.object_name_key = lower(object_name)` для строк с
 /// пустым ключом (см. backfill_data_link_keys — та же мотивация по кириллице).
 pub(crate) fn backfill_role_right_keys(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -216,7 +206,6 @@ pub(crate) fn backfill_role_right_keys(conn: &rusqlite::Connection) -> rusqlite:
     Ok(())
 }
 
-
 /// Путь модуля относительно корня репо в формате `files.path`
 /// (forward slash). Совпадает с конвенцией direct_edge_files/code_path.
 pub(crate) fn rel_path(repo_root: &Path, abs: &Path) -> String {
@@ -225,7 +214,6 @@ pub(crate) fn rel_path(repo_root: &Path, abs: &Path) -> String {
         .to_string_lossy()
         .replace('\\', "/")
 }
-
 
 /// Фильтр каталогов при обходе репозитория — то же правило, что у файлового
 /// индекса ядра: встроенный список + `exclude_dirs` из `.code-index/config.json`.
@@ -267,7 +255,6 @@ impl DirFilter {
     }
 }
 
-
 /// Корни sub-config'ов репо: каталоги, содержащие `Configuration.xml` на
 /// глубине ≤ 3 (base/ + extensions/<name>/). base-роуты идут ПЕРВЫМИ — их
 /// структура приоритетна при мердже одноимённых реквизитов (см.
@@ -275,10 +262,13 @@ impl DirFilter {
 pub(crate) fn sub_config_roots(repo_root: &Path) -> Vec<std::path::PathBuf> {
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
     let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
-        if entry.file_type().is_file()
-            && entry.file_name().to_str() == Some("Configuration.xml")
-        {
+    for entry in WalkDir::new(repo_root)
+        .max_depth(3)
+        .into_iter()
+        .filter_entry(|e| filter.allows(e))
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() && entry.file_name().to_str() == Some("Configuration.xml") {
             if let Some(parent) = entry.path().parent() {
                 roots.push(parent.to_path_buf());
             }
@@ -289,7 +279,6 @@ pub(crate) fn sub_config_roots(repo_root: &Path) -> Vec<std::path::PathBuf> {
     roots.sort_by_key(|p| u8::from(p.components().any(|c| c.as_os_str() == "extensions")));
     roots
 }
-
 
 /// Структура объекта, слитая по всем его копиям в sub-config'ах (base +
 /// расширения). Роуты должны быть отсортированы base-first (см.
@@ -314,7 +303,6 @@ pub(crate) fn merged_object_structure(
     }
     acc.filter(|s| !s.is_empty())
 }
-
 
 /// Извлечь (`owner_full_name`, `form_name`) из пути к Form.xml.
 /// Возвращает None, если структура каталогов не похожа на выгрузку 1С.
@@ -351,7 +339,6 @@ pub(crate) fn decode_form_path(repo_root: &Path, form_xml_path: &Path) -> Option
     Some((owner_full, form_name.to_string()))
 }
 
-
 /// Ближайший предок пути (в пределах `repo_root`), содержащий `Configuration.xml`
 /// — sub-config, которому принадлежит файл. Нужен точечным веткам, чтобы взять
 /// `extension_name`/`config_version` без полного обхода репо. `None`, если ни у
@@ -369,7 +356,6 @@ pub(crate) fn sub_root_for_path(repo_root: &Path, path: &Path) -> Option<std::pa
     }
     None
 }
-
 
 /// `extension_name` для записи в `metadata_modules` — относительный путь
 /// от корня репо до sub-config. Пустая строка для случая когда
@@ -392,7 +378,6 @@ pub(crate) fn compute_extension_name(repo_root: &Path, sub_root: &Path) -> Strin
     s
 }
 
-
 /// Число строк в таблице, записанное в `sqlite_stat1` на момент последнего
 /// `ANALYZE` (первый токен колонки `stat`). `None` — статистики нет (таблицу
 /// ни разу не анализировали, либо самой `sqlite_stat1` ещё нет).
@@ -404,9 +389,12 @@ pub(crate) fn analyzed_row_count(conn: &rusqlite::Connection, table: &str) -> Op
             |r| r.get(0),
         )
         .ok();
-    stat.and_then(|s| s.split_whitespace().next().and_then(|t| t.parse::<i64>().ok()))
+    stat.and_then(|s| {
+        s.split_whitespace()
+            .next()
+            .and_then(|t| t.parse::<i64>().ok())
+    })
 }
-
 
 /// Разошлась ли реальная величина таблицы со статистикой настолько, что пора
 /// пересчитать `ANALYZE`. Планировщик SQLite меняет план (seek по индексу ↔
@@ -427,7 +415,6 @@ pub(crate) fn stats_drifted(current: i64, recorded: Option<i64>) -> bool {
         }
     }
 }
-
 
 /// Пересчитать `ANALYZE`, если величина графовых таблиц (`data_links`,
 /// `proc_call_graph`) разошлась со статистикой в ≥1.5× — иначе рекурсивные

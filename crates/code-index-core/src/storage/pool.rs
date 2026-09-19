@@ -263,7 +263,10 @@ mod tests {
         let pool = StoragePool::open_file_readonly(&db_path, PoolConfig::default()).unwrap();
         отравить_замок(&pool);
 
-        let s = pool.get().await.expect("пул обязан работать на отравленном замке");
+        let s = pool
+            .get()
+            .await
+            .expect("пул обязан работать на отравленном замке");
         s.conn().execute_batch("SELECT 1;").unwrap();
     }
 

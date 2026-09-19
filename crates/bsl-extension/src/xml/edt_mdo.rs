@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use super::forms::FormHandler;
+use super::BytesTextExt;
 
 use super::object_attributes::{
     classify_type, pretty_types, DataLinkEdge, ObjectStructure, StructField, StructTabular,
@@ -57,8 +58,7 @@ pub(crate) fn edt_type_to_cfg(t: &str) -> String {
     // Ссылочные и определяемые типы → префикс `cfg:` (classify_type/pretty_one_type
     // ждут именно его). `CatalogRef.X`, `DocumentRef.X`, `EnumRef.X`, `AnyRef`,
     // `DefinedType.X`, обобщённый `CatalogRef` (без имени).
-    if t == "AnyRef" || t.ends_with("Ref") || t.contains("Ref.") || t.starts_with("DefinedType.")
-    {
+    if t == "AnyRef" || t.ends_with("Ref") || t.contains("Ref.") || t.starts_with("DefinedType.") {
         return format!("cfg:{}", t);
     }
     // Прочие платформенные типы (UUID, ValueStorage, ...) — как есть: для
@@ -268,16 +268,26 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                             tt = T::Indexing;
                         }
                     }
-                    "posting" | "realTimePosting" | "registerRecordsDeletion"
+                    "posting"
+                    | "realTimePosting"
+                    | "registerRecordsDeletion"
                     | "registerRecordsWritingOnPost" => {
                         if field.is_none() {
                             cur_posting_prop = Some(cap_first(&local));
                             tt = T::PostingProp;
                         }
                     }
-                    "informationRegisterPeriodicity" | "writeMode" | "registerType"
-                    | "numberType" | "numberLength" | "numberPeriodicity" | "checkUnique"
-                    | "autonumbering" | "hierarchical" | "codeLength" | "descriptionLength" => {
+                    "informationRegisterPeriodicity"
+                    | "writeMode"
+                    | "registerType"
+                    | "numberType"
+                    | "numberLength"
+                    | "numberPeriodicity"
+                    | "checkUnique"
+                    | "autonumbering"
+                    | "hierarchical"
+                    | "codeLength"
+                    | "descriptionLength" => {
                         if field.is_none() {
                             cur_header_prop = Some(cap_first(&local));
                             tt = T::HeaderProp;
@@ -294,8 +304,7 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                     // Регламентное задание: вызываемая процедура и параметры
                     // перезапуска. `predefined` сюда не входит: в EDT это имя
                     // занято блоком предопределённых элементов справочника.
-                    "methodName" | "use" | "restartCountOnFailure"
-                    | "restartIntervalOnFailure" => {
+                    "methodName" | "use" | "restartCountOnFailure" | "restartIntervalOnFailure" => {
                         if field.is_none() && depth == 2 {
                             cur_header_prop = Some(cap_first(&local));
                             tt = T::HeaderProp;
@@ -379,7 +388,8 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                     T::ValueType => {
                         if !txt.is_empty() {
                             let cfg = edt_type_to_cfg(&txt);
-                            out.value_types.push(pretty_types(std::slice::from_ref(&cfg)));
+                            out.value_types
+                                .push(pretty_types(std::slice::from_ref(&cfg)));
                         }
                     }
                     T::HeaderProp => {
@@ -420,7 +430,8 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                                         out.enum_values.push(name);
                                     }
                                     FieldKind::Command => {
-                                        let syn = fb.synonym.filter(|s| !s.is_empty() && s != &name);
+                                        let syn =
+                                            fb.synonym.filter(|s| !s.is_empty() && s != &name);
                                         out.commands.push((name, syn));
                                     }
                                     _ => {
@@ -435,7 +446,9 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                                             FieldKind::Dimension => out.dimensions.push(f),
                                             FieldKind::Resource => out.resources.push(f),
                                             FieldKind::TabAttr => match cur_tab {
-                                                Some(i) => out.tabular_sections[i].attributes.push(f),
+                                                Some(i) => {
+                                                    out.tabular_sections[i].attributes.push(f)
+                                                }
                                                 None => out.attributes.push(f),
                                             },
                                             _ => out.attributes.push(f),
@@ -978,9 +991,7 @@ pub fn detect_edt_src(repo_root: &Path) -> Option<PathBuf> {
         .filter_entry(|e| filter.allows(e))
         .filter_map(|e| e.ok())
     {
-        if entry.file_type().is_file()
-            && entry.file_name().to_str() == Some("Configuration.mdo")
-        {
+        if entry.file_type().is_file() && entry.file_name().to_str() == Some("Configuration.mdo") {
             if let Some(cfg_dir) = entry.path().parent() {
                 if cfg_dir.file_name().and_then(|s| s.to_str()) == Some("Configuration") {
                     if let Some(src) = cfg_dir.parent() {
@@ -1069,9 +1080,13 @@ pub fn parse_mdo_config_refs(
                             Want::SubsystemContent => {
                                 out.push(("subsystem_content", txt, String::new(), false, false))
                             }
-                            Want::ExchangeContent => {
-                                out.push(("exchange_plan_content", txt, String::new(), false, false))
-                            }
+                            Want::ExchangeContent => out.push((
+                                "exchange_plan_content",
+                                txt,
+                                String::new(),
+                                false,
+                                false,
+                            )),
                             Want::FoContent => out.push((
                                 "functional_option_content",
                                 txt,
@@ -1292,7 +1307,9 @@ mod tests {
         assert!(edges
             .iter()
             .all(|e| e.from_path == "Автор" && e.link_kind == "attr" && e.is_composite));
-        assert!(edges.iter().any(|e| e.to_object == "Catalog.ВнешниеПользователи"));
+        assert!(edges
+            .iter()
+            .any(|e| e.to_object == "Catalog.ВнешниеПользователи"));
         assert!(edges.iter().any(|e| e.to_object == "Catalog.Пользователи"));
     }
 
@@ -1320,7 +1337,10 @@ mod tests {
         assert_eq!(s.tabular_sections[0].name, "Товары");
         assert_eq!(s.tabular_sections[0].attributes[0].name, "Номенклатура");
         // Свойства проведения.
-        assert!(s.posting.iter().any(|(k, v)| k == "Posting" && v == "Allow"));
+        assert!(s
+            .posting
+            .iter()
+            .any(|(k, v)| k == "Posting" && v == "Allow"));
         assert!(s
             .posting
             .iter()
@@ -1330,7 +1350,9 @@ mod tests {
         // recorder: 2 регистра; attr: Организация; tabular_attr: Товары.Номенклатура.
         let rec: Vec<_> = edges.iter().filter(|e| e.link_kind == "recorder").collect();
         assert_eq!(rec.len(), 2);
-        assert!(rec.iter().any(|e| e.to_object == "AccumulationRegister.ПрочиеРасчеты"));
+        assert!(rec
+            .iter()
+            .any(|e| e.to_object == "AccumulationRegister.ПрочиеРасчеты"));
         assert!(edges
             .iter()
             .any(|e| e.link_kind == "attr" && e.to_object == "Catalog.Организации"));
@@ -1354,7 +1376,10 @@ mod tests {
         assert_eq!(s.dimensions.len(), 2);
         assert_eq!(s.resources.len(), 1);
         assert_eq!(s.resources[0].type_str, "Число");
-        assert!(s.properties.iter().any(|(k, v)| k == "RegisterType" && v == "Balance"));
+        assert!(s
+            .properties
+            .iter()
+            .any(|(k, v)| k == "RegisterType" && v == "Balance"));
 
         let edges = parse_mdo_datalinks_xml(REGISTER_MDO).unwrap();
         // Оба измерения ссылочные → register_dim; ресурс (Число) — не ссылка.
@@ -1479,8 +1504,14 @@ mod tests {
     fn edt_type_normalization() {
         assert_eq!(edt_type_to_cfg("String"), "xs:string");
         assert_eq!(edt_type_to_cfg("Number"), "xs:decimal");
-        assert_eq!(edt_type_to_cfg("CatalogRef.Товары"), "cfg:CatalogRef.Товары");
-        assert_eq!(edt_type_to_cfg("DefinedType.Сумма"), "cfg:DefinedType.Сумма");
+        assert_eq!(
+            edt_type_to_cfg("CatalogRef.Товары"),
+            "cfg:CatalogRef.Товары"
+        );
+        assert_eq!(
+            edt_type_to_cfg("DefinedType.Сумма"),
+            "cfg:DefinedType.Сумма"
+        );
         assert_eq!(edt_type_to_cfg("AnyRef"), "cfg:AnyRef");
     }
 
@@ -1599,10 +1630,7 @@ mod tests {
             ],
             "строковый тип ребром не становится"
         );
-        assert!(
-            refs.iter().all(|r| r.3),
-            "две цели — составной тип"
-        );
+        assert!(refs.iter().all(|r| r.3), "две цели — составной тип");
 
         // Функциональная опция: расположение (объект + сырое значение) и состав.
         let fo = r#"<?xml version="1.0" encoding="UTF-8"?>

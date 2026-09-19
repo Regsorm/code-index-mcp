@@ -12,6 +12,55 @@ use std::path::Path;
 
 use models::*;
 
+type StatFileRow = (
+    String,
+    String,
+    i64,
+    String,
+    Option<i64>,
+    Option<i64>,
+    String,
+);
+
+pub struct ReadFileOptions {
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub soft_cap_lines: usize,
+    pub soft_cap_bytes: usize,
+    pub hard_cap_bytes: usize,
+    pub size_limit_bytes: Option<i64>,
+}
+
+impl ReadFileOptions {
+    pub fn new(
+        line_start: Option<usize>,
+        line_end: Option<usize>,
+        soft_cap_lines: usize,
+        soft_cap_bytes: usize,
+        hard_cap_bytes: usize,
+        size_limit_bytes: Option<i64>,
+    ) -> Self {
+        Self {
+            line_start,
+            line_end,
+            soft_cap_lines,
+            soft_cap_bytes,
+            hard_cap_bytes,
+            size_limit_bytes,
+        }
+    }
+}
+
+pub struct GrepBodyOptions<'a> {
+    pub pattern: Option<&'a str>,
+    pub regex_pattern: Option<&'a str>,
+    pub language: Option<&'a str>,
+    pub path_glob: Option<&'a str>,
+    pub limit: usize,
+    pub context_lines: usize,
+    pub max_total_bytes: usize,
+}
+
 /// Ёмкость кэша подготовленных запросов соединения. Горячий путь записи —
 /// это ~15 разных INSERT/SELECT, повторяемых на КАЖДЫЙ файл; при дефолтной
 /// ёмкости (16) кэш вытесняется и SQL разбирается заново десятки тысяч раз.
@@ -110,6 +159,7 @@ fn register_unicode_case(conn: &Connection) -> Result<()> {
 
 /// Зарегистрировать все кастомные SQL-функции на соединении: оператор REGEXP
 /// + Unicode-aware `lower()`/`upper()`. Вызывается на каждом открытии БД
+///
 /// (file / readonly / in-memory / auto), чтобы и MCP-tools, и `bsl_sql`
 /// видели одинаковую семантику.
 fn register_sql_functions(conn: &Connection) -> Result<()> {
@@ -156,7 +206,10 @@ impl Storage {
         schema::initialize(&conn).context("Ошибка инициализации схемы БД")?;
         register_sql_functions(&conn)?;
         set_stmt_cache(&conn);
-        Ok(Self { conn, in_memory: false })
+        Ok(Self {
+            conn,
+            in_memory: false,
+        })
     }
 
     /// Собрана ли база в оперативной памяти. `false` — она уже на диске, и
@@ -204,7 +257,10 @@ impl Storage {
         .with_context(|| format!("Не удалось открыть БД (readonly): {}", path.display()))?;
         schema::initialize_readonly(&conn).context("Ошибка инициализации readonly-схемы")?;
         register_sql_functions(&conn)?;
-        Ok(Self { conn, in_memory: false })
+        Ok(Self {
+            conn,
+            in_memory: false,
+        })
     }
 
     /// Открыть базу данных в памяти (используется в тестах)
@@ -213,7 +269,10 @@ impl Storage {
         schema::initialize(&conn).context("Ошибка инициализации схемы in-memory БД")?;
         register_sql_functions(&conn)?;
         set_stmt_cache(&conn);
-        Ok(Self { conn, in_memory: true })
+        Ok(Self {
+            conn,
+            in_memory: true,
+        })
     }
 
     /// Открыть хранилище с автоопределением режима (in-memory или disk).
@@ -230,10 +289,11 @@ impl Storage {
 
                 if db_path.exists() {
                     // Загрузить данные с диска в память через backup API
-                    let disk_conn = Connection::open(db_path)
-                        .with_context(|| format!("Не удалось открыть файл БД: {}", db_path.display()))?;
-                    let mut memory_conn = Connection::open_in_memory()
-                        .context("Не удалось создать in-memory БД")?;
+                    let disk_conn = Connection::open(db_path).with_context(|| {
+                        format!("Не удалось открыть файл БД: {}", db_path.display())
+                    })?;
+                    let mut memory_conn =
+                        Connection::open_in_memory().context("Не удалось создать in-memory БД")?;
 
                     // Копируем disk → memory (Backup::new(src, &mut dst))
                     {
@@ -262,7 +322,10 @@ impl Storage {
                     schema::apply_all_migrations(&memory_conn)
                         .context("Ошибка применения миграций (in-memory)")?;
                     register_sql_functions(&memory_conn)?;
-                    Ok(Self { conn: memory_conn, in_memory: true })
+                    Ok(Self {
+                        conn: memory_conn,
+                        in_memory: true,
+                    })
                 } else {
                     // Новая БД — чистая in-memory со схемой
                     Self::open_in_memory()
@@ -351,11 +414,9 @@ impl Storage {
     pub fn get_path_by_file_id(&self, id: i64) -> Result<Option<String>> {
         let r: Option<String> = self
             .conn
-            .query_row(
-                "SELECT path FROM files WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT path FROM files WHERE id = ?1", params![id], |row| {
+                row.get(0)
+            })
             .optional()
             .context("get_path_by_file_id")?;
         Ok(r)
@@ -651,8 +712,8 @@ impl Storage {
     /// (rowid = file_id). Идемпотентно: если запись уже была — старый токен
     /// указателя снимается, чтобы не задвоить.
     pub fn insert_text_file(&self, record: &TextFileRecord) -> Result<()> {
-        let blob = Self::compress_content(&record.content)
-            .context("insert_text_file: zstd encode")?;
+        let blob =
+            Self::compress_content(&record.content).context("insert_text_file: zstd encode")?;
         self.insert_text_file_blob(record.file_id, &blob, &record.content)
     }
 
@@ -682,7 +743,10 @@ impl Storage {
     pub fn delete_text_file_by_file(&self, file_id: i64) -> Result<()> {
         self.fts_text_delete(file_id)?;
         self.conn
-            .execute("DELETE FROM text_contents WHERE file_id = ?1", params![file_id])
+            .execute(
+                "DELETE FROM text_contents WHERE file_id = ?1",
+                params![file_id],
+            )
             .context("delete_text_file_by_file")?;
         Ok(())
     }
@@ -723,7 +787,9 @@ impl Storage {
         // take(limit + 1) — читаем на 1 байт больше, чтобы отличить
         // «разжалось ровно в limit» (валидно) от «разжалось больше limit»
         // (zstd-bomb: данные ещё были, но мы остановились).
-        let read = (&mut decoder).take(limit + 1).read_to_end(&mut out)
+        let read = (&mut decoder)
+            .take(limit + 1)
+            .read_to_end(&mut out)
             .context("decode_zstd_safe: чтение разжатого потока")?;
         if read as u64 > limit {
             anyhow::bail!(
@@ -801,11 +867,9 @@ impl Storage {
     /// когда нужен только PK (например, в backfill `file_contents`).
     pub fn get_file_id_by_path(&self, path: &str) -> Result<Option<i64>> {
         self.conn
-            .query_row(
-                "SELECT id FROM files WHERE path = ?1",
-                params![path],
-                |r| r.get::<_, i64>(0),
-            )
+            .query_row("SELECT id FROM files WHERE path = ?1", params![path], |r| {
+                r.get::<_, i64>(0)
+            })
             .optional()
             .context("get_file_id_by_path")
     }
@@ -823,9 +887,7 @@ impl Storage {
                AND fi.id NOT IN (SELECT file_id FROM text_contents)
              ORDER BY fi.path",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
@@ -848,7 +910,10 @@ impl Storage {
     /// только для явного контроля.
     pub fn delete_file_content(&self, file_id: i64) -> Result<()> {
         self.conn
-            .execute("DELETE FROM file_contents WHERE file_id = ?1", params![file_id])
+            .execute(
+                "DELETE FROM file_contents WHERE file_id = ?1",
+                params![file_id],
+            )
             .context("delete_file_content")?;
         Ok(())
     }
@@ -889,10 +954,10 @@ impl Storage {
         let content_opt = match blob_opt {
             None => None, // oversize-запись или повреждённая (oversize=0, blob=NULL — не должно случаться)
             Some(blob) => {
-                let bytes = Self::decode_zstd_safe(&blob)
-                    .context("read_file_content: zstd decode")?;
-                let text = String::from_utf8(bytes)
-                    .context("read_file_content: UTF-8 из zstd-blob")?;
+                let bytes =
+                    Self::decode_zstd_safe(&blob).context("read_file_content: zstd decode")?;
+                let text =
+                    String::from_utf8(bytes).context("read_file_content: UTF-8 из zstd-blob")?;
                 Some(text)
             }
         };
@@ -915,8 +980,7 @@ impl Storage {
         match blob {
             None | Some(None) => Ok(None),
             Some(Some(b)) => {
-                let bytes =
-                    Self::decode_zstd_safe(&b).context("read_text_content: zstd decode")?;
+                let bytes = Self::decode_zstd_safe(&b).context("read_text_content: zstd decode")?;
                 let text = String::from_utf8(bytes).context("read_text_content: UTF-8")?;
                 Ok(Some(text))
             }
@@ -1180,8 +1244,10 @@ impl Storage {
             conds.join(" AND ")
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_dyn
+            .iter()
+            .map(|b| &**b as &dyn rusqlite::ToSql)
+            .collect();
         let rows = stmt.query_map(params_refs.as_slice(), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
         })?;
@@ -1199,7 +1265,12 @@ impl Storage {
     /// тех важнее docstring, тех важнее тела. Так точные совпадения по имени
     /// всплывают наверх, а функции, где слова лишь в теле/комментариях, идут
     /// ниже, но не теряются (раньше неявный AND давал пусто).
-    pub fn search_functions(&self, query: &str, limit: usize, language: Option<&str>) -> Result<Vec<FunctionRecord>> {
+    pub fn search_functions(
+        &self,
+        query: &str,
+        limit: usize,
+        language: Option<&str>,
+    ) -> Result<Vec<FunctionRecord>> {
         let safe_query = build_fts_or_query(query);
         match language {
             Some(lang) => {
@@ -1213,7 +1284,8 @@ impl Storage {
                      ORDER BY bm25(fts_functions, 10.0, 5.0, 2.0, 1.0)
                      LIMIT ?3",
                 )?;
-                let rows = stmt.query_map(params![safe_query, lang, limit as i64], row_to_function)?;
+                let rows =
+                    stmt.query_map(params![safe_query, lang, limit as i64], row_to_function)?;
                 rows.map(|r| r.map_err(Into::into)).collect()
             }
             None => {
@@ -1234,7 +1306,12 @@ impl Storage {
 
     /// Полнотекстовый поиск классов через FTS5. См. [`search_functions`] —
     /// та же OR-семантика и bm25-ранжирование (столбцы: имя, docstring, тело).
-    pub fn search_classes(&self, query: &str, limit: usize, language: Option<&str>) -> Result<Vec<ClassRecord>> {
+    pub fn search_classes(
+        &self,
+        query: &str,
+        limit: usize,
+        language: Option<&str>,
+    ) -> Result<Vec<ClassRecord>> {
         let safe_query = build_fts_or_query(query);
         match language {
             Some(lang) => {
@@ -1312,7 +1389,12 @@ impl Storage {
     /// Указатель `fts_text_files` теперь contentless → `snippet()` недоступен:
     /// берём rowid (=file_id) + путь по rank, затем строим вырезку в Rust из
     /// разжатого `text_contents`.
-    pub fn search_text(&self, query: &str, limit: usize, language: Option<&str>) -> Result<Vec<(String, String)>> {
+    pub fn search_text(
+        &self,
+        query: &str,
+        limit: usize,
+        language: Option<&str>,
+    ) -> Result<Vec<(String, String)>> {
         let safe_query = build_fts_or_query(query);
         let hits: Vec<(i64, String)> = match language {
             Some(lang) => {
@@ -1327,7 +1409,8 @@ impl Storage {
                 let rows = stmt.query_map(params![safe_query, lang, limit as i64], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?;
-                rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                rows.map(|r| r.map_err(Into::into))
+                    .collect::<Result<Vec<_>>>()?
             }
             None => {
                 let mut stmt = self.conn.prepare(
@@ -1341,7 +1424,8 @@ impl Storage {
                 let rows = stmt.query_map(params![safe_query, limit as i64], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?;
-                rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                rows.map(|r| r.map_err(Into::into))
+                    .collect::<Result<Vec<_>>>()?
             }
         };
         let mut out: Vec<(String, String)> = Vec::with_capacity(hits.len());
@@ -1429,17 +1513,19 @@ impl Storage {
         let raw_results: Vec<GrepBodyRaw> = match language {
             Some(lang) => {
                 let rows = stmt.query_map(params![body_param, lang, limit as i64], row_mapper)?;
-                rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                rows.map(|r| r.map_err(Into::into))
+                    .collect::<Result<Vec<_>>>()?
             }
             None => {
                 let rows = stmt.query_map(params![body_param, limit as i64], row_mapper)?;
-                rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                rows.map(|r| r.map_err(Into::into))
+                    .collect::<Result<Vec<_>>>()?
             }
         };
 
         // Компилируем regex один раз (если задан)
         let compiled_re = regex_pattern
-            .map(|r| regex::Regex::new(r))
+            .map(regex::Regex::new)
             .transpose()
             .context("grep_body: невалидный regex")?;
 
@@ -1564,7 +1650,10 @@ impl Storage {
     /// вариантах: как есть, нижний, с заглавной первой буквой.
     fn names_by_prefix(&self, table: &str, name: &str) -> Result<Vec<String>> {
         let chars: Vec<char> = name.chars().collect();
-        let sql = format!("SELECT DISTINCT name FROM {} WHERE name LIKE ?1 LIMIT 50", table);
+        let sql = format!(
+            "SELECT DISTINCT name FROM {} WHERE name LIKE ?1 LIMIT 50",
+            table
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut out: Vec<String> = Vec::new();
         let mut probed: Vec<String> = Vec::new();
@@ -1651,7 +1740,11 @@ impl Storage {
     }
 
     /// Найти все вызовы, где данная функция является caller
-    pub fn get_callees(&self, function_name: &str, language: Option<&str>) -> Result<Vec<CallRecord>> {
+    pub fn get_callees(
+        &self,
+        function_name: &str,
+        language: Option<&str>,
+    ) -> Result<Vec<CallRecord>> {
         match language {
             Some(lang) => {
                 let mut stmt = self.conn.prepare(
@@ -1673,7 +1766,11 @@ impl Storage {
     }
 
     /// Найти все вызовы, где данная функция является callee
-    pub fn get_callers(&self, function_name: &str, language: Option<&str>) -> Result<Vec<CallRecord>> {
+    pub fn get_callers(
+        &self,
+        function_name: &str,
+        language: Option<&str>,
+    ) -> Result<Vec<CallRecord>> {
         match language {
             Some(lang) => {
                 let mut stmt = self.conn.prepare(
@@ -1816,12 +1913,20 @@ impl Storage {
             }
             let rows: Vec<(String, i64, i64)> = if let Some(lang) = language {
                 stmt.query_map(params![node, lang], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
             } else {
                 stmt.query_map(params![node], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
             };
@@ -1905,7 +2010,11 @@ impl Storage {
         // join зависят от `down`.
         let node_recur = if down { "c.callee" } else { "c.caller" };
         let start_col = if down { "caller" } else { "callee" };
-        let join_recur = if down { "c.caller = t.node" } else { "c.callee = t.node" };
+        let join_recur = if down {
+            "c.caller = t.node"
+        } else {
+            "c.callee = t.node"
+        };
         let (anchor_join, lang_filter, recur_join) = if language.is_some() {
             (
                 " JOIN files fi ON fi.id = c.file_id",
@@ -2011,10 +2120,9 @@ impl Storage {
                     }
                 } else {
                     let mut callers = self.get_callers(node, None)?;
-                    let mut seen_ids: HashSet<i64> =
-                        callers.iter().filter_map(|c| c.id).collect();
+                    let mut seen_ids: HashSet<i64> = callers.iter().filter_map(|c| c.id).collect();
                     for c in extra_callers(node) {
-                        if c.id.map_or(true, |id| seen_ids.insert(id)) {
+                        if c.id.is_none_or(|id| seen_ids.insert(id)) {
                             callers.push(c);
                         }
                     }
@@ -2062,7 +2170,8 @@ impl Storage {
                          WHERE (f.name = ?1 OR f.qualified_name = ?1) AND fi.language = ?2",
                     )?;
                     let rows = stmt.query_map(params![name, lang], row_to_function)?;
-                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                    rows.map(|r| r.map_err(Into::into))
+                        .collect::<Result<Vec<_>>>()?
                 }
                 None => {
                     let mut stmt = self.conn.prepare(
@@ -2071,7 +2180,8 @@ impl Storage {
                          FROM functions WHERE name = ?1 OR qualified_name = ?1",
                     )?;
                     let rows = stmt.query_map(params![name], row_to_function)?;
-                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                    rows.map(|r| r.map_err(Into::into))
+                        .collect::<Result<Vec<_>>>()?
                 }
             }
         };
@@ -2086,7 +2196,8 @@ impl Storage {
                          WHERE c.name = ?1 AND fi.language = ?2",
                     )?;
                     let rows = stmt.query_map(params![name, lang], row_to_class)?;
-                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                    rows.map(|r| r.map_err(Into::into))
+                        .collect::<Result<Vec<_>>>()?
                 }
                 None => {
                     let mut stmt = self.conn.prepare(
@@ -2095,15 +2206,16 @@ impl Storage {
                          FROM classes WHERE name = ?1",
                     )?;
                     let rows = stmt.query_map(params![name], row_to_class)?;
-                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                    rows.map(|r| r.map_err(Into::into))
+                        .collect::<Result<Vec<_>>>()?
                 }
             }
         };
         // Переменные (фильтр language не применяется — variables не имеют прямой связи с language)
         let variables = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, file_id, name, value, line FROM variables WHERE name = ?1",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, file_id, name, value, line FROM variables WHERE name = ?1")?;
             let rows = stmt.query_map(params![name], row_to_variable)?;
             rows.map(|r| r.map_err(Into::into))
                 .collect::<Result<Vec<_>>>()?
@@ -2118,7 +2230,8 @@ impl Storage {
                          WHERE (i.name = ?1 OR i.alias = ?1) AND fi.language = ?2",
                     )?;
                     let rows = stmt.query_map(params![name, lang], row_to_import)?;
-                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                    rows.map(|r| r.map_err(Into::into))
+                        .collect::<Result<Vec<_>>>()?
                 }
                 None => {
                     let mut stmt = self.conn.prepare(
@@ -2126,12 +2239,18 @@ impl Storage {
                          FROM imports WHERE name = ?1 OR alias = ?1",
                     )?;
                     let rows = stmt.query_map(params![name], row_to_import)?;
-                    rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
+                    rows.map(|r| r.map_err(Into::into))
+                        .collect::<Result<Vec<_>>>()?
                 }
             }
         };
 
-        Ok(SymbolSearchResult { functions, classes, variables, imports })
+        Ok(SymbolSearchResult {
+            functions,
+            classes,
+            variables,
+            imports,
+        })
     }
 
     /// Получить все импорты файла
@@ -2145,7 +2264,11 @@ impl Storage {
     }
 
     /// Найти все импорты указанного модуля
-    pub fn get_imports_by_module(&self, module: &str, language: Option<&str>) -> Result<Vec<ImportRecord>> {
+    pub fn get_imports_by_module(
+        &self,
+        module: &str,
+        language: Option<&str>,
+    ) -> Result<Vec<ImportRecord>> {
         match language {
             Some(lang) => {
                 let mut stmt = self.conn.prepare(
@@ -2210,26 +2333,32 @@ impl Storage {
                 .collect::<Result<Vec<_>>>()?
         };
 
-        Ok(Some(FileSummary { file, functions, classes, imports, variables }))
+        Ok(Some(FileSummary {
+            file,
+            functions,
+            classes,
+            imports,
+            variables,
+        }))
     }
 
     /// Статистика базы данных
     pub fn get_stats(&self) -> Result<DbStats> {
         let count = |table: &str| -> Result<usize> {
-            let n: i64 = self.conn.query_row(
-                &format!("SELECT COUNT(*) FROM {table}"),
-                [],
-                |row| row.get(0),
-            )?;
+            let n: i64 =
+                self.conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
             Ok(n as usize)
         };
         Ok(DbStats {
-            total_files:      count("files")?,
-            total_functions:  count("functions")?,
-            total_classes:    count("classes")?,
-            total_imports:    count("imports")?,
-            total_calls:      count("calls")?,
-            total_variables:  count("variables")?,
+            total_files: count("files")?,
+            total_functions: count("functions")?,
+            total_classes: count("classes")?,
+            total_imports: count("imports")?,
+            total_calls: count("calls")?,
+            total_variables: count("variables")?,
             total_text_files: count("text_contents")?,
             indexing_status: None,
         })
@@ -2250,7 +2379,7 @@ impl Storage {
     /// stat_file: метаданные одного файла из таблицы `files`.
     /// Возвращает `exists=false` если файл не индексирован.
     pub fn stat_file_meta(&self, path: &str) -> Result<StatFileResult> {
-        let row: Option<(String, String, i64, String, Option<i64>, Option<i64>, String)> = self
+        let row: Option<StatFileRow> = self
             .conn
             .query_row(
                 "SELECT language, content_hash, lines_total, indexed_at, mtime, file_size, path
@@ -2258,13 +2387,13 @@ impl Storage {
                 params![path],
                 |r| {
                     Ok((
-                        r.get::<_, String>(0)?,        // language
-                        r.get::<_, String>(1)?,        // content_hash
-                        r.get::<_, i64>(2)?,           // lines_total
-                        r.get::<_, String>(3)?,        // indexed_at
-                        r.get::<_, Option<i64>>(4)?,   // mtime
-                        r.get::<_, Option<i64>>(5)?,   // file_size
-                        r.get::<_, String>(6)?,        // path
+                        r.get::<_, String>(0)?,      // language
+                        r.get::<_, String>(1)?,      // content_hash
+                        r.get::<_, i64>(2)?,         // lines_total
+                        r.get::<_, String>(3)?,      // indexed_at
+                        r.get::<_, Option<i64>>(4)?, // mtime
+                        r.get::<_, Option<i64>>(5)?, // file_size
+                        r.get::<_, String>(6)?,      // path
                     ))
                 },
             )
@@ -2369,7 +2498,10 @@ impl Storage {
             // буквально стоит, — совпадений не бывает никогда, отказ молчаливый
             // (H-5). До правки экранирование не помогало, а само создавало дефект.
             conds.push("path LIKE ? ESCAPE '\\'".to_string());
-            let escaped = p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            let escaped = p
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
             params_dyn.push(Box::new(format!("{}%", escaped)));
         }
         if let Some(l) = language {
@@ -2397,8 +2529,10 @@ impl Storage {
     ) -> Result<usize> {
         let (where_clause, params_dyn) = Self::files_filter_clause(pattern, path_prefix, language);
         let sql = format!("SELECT COUNT(*) FROM files {}", where_clause);
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_dyn
+            .iter()
+            .map(|b| &**b as &dyn rusqlite::ToSql)
+            .collect();
         let total: i64 = self
             .conn
             .query_row(&sql, params_refs.as_slice(), |row| row.get(0))?;
@@ -2426,8 +2560,10 @@ impl Storage {
             where_clause
         );
         params_dyn.push(Box::new(limit as i64));
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_dyn
+            .iter()
+            .map(|b| &**b as &dyn rusqlite::ToSql)
+            .collect();
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_refs.as_slice(), |row| {
@@ -2452,16 +2588,17 @@ impl Storage {
     pub fn read_file_text(
         &self,
         path: &str,
-        line_start: Option<usize>,
-        line_end: Option<usize>,
-        soft_cap_lines: usize,
-        soft_cap_bytes: usize,
-        hard_cap_bytes: usize,
-        // Эффективный лимит размера code-файла для этого репо (per-path > [indexer] > 5 МБ).
-        // Используется только для заполнения `size_limit` и `hint` в oversize-ответе.
-        // None — поля останутся пустыми (например, в тестах или для text-файлов).
-        size_limit_bytes: Option<i64>,
+        options: ReadFileOptions,
     ) -> Result<Option<ReadFileResult>> {
+        let ReadFileOptions {
+            line_start,
+            line_end,
+            soft_cap_lines,
+            soft_cap_bytes,
+            hard_cap_bytes,
+            // Эффективный лимит размера code-файла для этого репо.
+            size_limit_bytes,
+        } = options;
         // Сначала ищем файл в files (берём id, lines_total, indexed_at, file_size)
         let meta: Option<(i64, i64, String, Option<i64>)> = self
             .conn
@@ -2659,8 +2796,10 @@ impl Storage {
             conds.join(" AND ")
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_dyn.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_dyn
+            .iter()
+            .map(|b| &**b as &dyn rusqlite::ToSql)
+            .collect();
         let rows = stmt.query_map(params_refs.as_slice(), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
         })?;
@@ -2673,14 +2812,17 @@ impl Storage {
     /// первой партии совпадений (до 3, как у `match_lines`).
     pub fn grep_body_with_options(
         &self,
-        pattern: Option<&str>,
-        regex_pattern: Option<&str>,
-        language: Option<&str>,
-        path_glob: Option<&str>,
-        limit: usize,
-        context_lines: usize,
-        max_total_bytes: usize,
+        options: GrepBodyOptions<'_>,
     ) -> Result<(Vec<GrepBodyMatch>, bool)> {
+        let GrepBodyOptions {
+            pattern,
+            regex_pattern,
+            language,
+            path_glob,
+            limit,
+            context_lines,
+            max_total_bytes,
+        } = options;
         // Базовое условие body (см. `body_substring_param` о подстроке)
         let (body_condition, body_param) = match (pattern, regex_pattern) {
             (Some(p), _) => ("body REGEXP ?".to_string(), body_substring_param(p)),
@@ -2691,7 +2833,12 @@ impl Storage {
         // Доп. условия для общей секции (применяются и к functions, и к classes)
         // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
         let glob_variants: Vec<String> = path_glob
-            .map(|g| expand_glob_variants(g).iter().map(|v| normalize_glob(v)).collect())
+            .map(|g| {
+                expand_glob_variants(g)
+                    .iter()
+                    .map(|v| normalize_glob(v))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut extra_conds: Vec<String> = Vec::new();
         if language.is_some() {
@@ -2739,8 +2886,10 @@ impl Storage {
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            full_params.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> = full_params
+            .iter()
+            .map(|b| &**b as &dyn rusqlite::ToSql)
+            .collect();
         let raw: Vec<(String, String, String, i64, i64, String)> = stmt
             .query_map(params_refs.as_slice(), |r| {
                 Ok((
@@ -2779,11 +2928,8 @@ impl Storage {
                 }
             }
             let total = all_matches.len();
-            let match_lines: Vec<usize> = all_matches
-                .iter()
-                .take(3)
-                .map(|i| line_start + i)
-                .collect();
+            let match_lines: Vec<usize> =
+                all_matches.iter().take(3).map(|i| line_start + i).collect();
             let match_count = if total > 3 { Some(total) } else { None };
             // Контекст: первые до 3 матчей, по context_lines строк до/после;
             // строки склеиваются в общий список без дублей.
@@ -2898,7 +3044,10 @@ impl Storage {
                     .join(",");
                 for table in TABLES {
                     self.conn
-                        .execute(&format!("DELETE FROM {table} WHERE file_id IN ({list})"), [])
+                        .execute(
+                            &format!("DELETE FROM {table} WHERE file_id IN ({list})"),
+                            [],
+                        )
                         .with_context(|| format!("delete_file_data_bulk: DELETE FROM {table}"))?;
                 }
             }
@@ -2974,7 +3123,10 @@ impl Storage {
     where
         F: FnOnce(&rusqlite::Transaction) -> Result<T>,
     {
-        let tx = self.conn.transaction().context("Не удалось начать транзакцию")?;
+        let tx = self
+            .conn
+            .transaction()
+            .context("Не удалось начать транзакцию")?;
         let result = f(&tx)?;
         tx.commit().context("Не удалось закоммитить транзакцию")?;
         Ok(result)
@@ -3213,10 +3365,7 @@ pub(crate) fn slice_with_caps(
         (None, None) => (0, total),
         (Some(s), None) => (s.saturating_sub(1).min(total), total),
         (None, Some(e)) => (0, e.min(total)),
-        (Some(s), Some(e)) => (
-            s.saturating_sub(1).min(total),
-            e.min(total),
-        ),
+        (Some(s), Some(e)) => (s.saturating_sub(1).min(total), e.min(total)),
     };
     if start_idx > end_idx {
         // Пустой диапазон — возвращаем пусто без ошибки.
@@ -3278,81 +3427,81 @@ pub(crate) fn slice_with_caps(
 
 fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
     Ok(FileRecord {
-        id:           Some(row.get(0)?),
-        path:         row.get(1)?,
+        id: Some(row.get(0)?),
+        path: row.get(1)?,
         content_hash: row.get(2)?,
-        language:     row.get(3)?,
-        lines_total:  row.get::<_, i64>(4)? as usize,
-        indexed_at:   row.get(5)?,
-        mtime:        row.get(6)?,
-        file_size:    row.get(7)?,
+        language: row.get(3)?,
+        lines_total: row.get::<_, i64>(4)? as usize,
+        indexed_at: row.get(5)?,
+        mtime: row.get(6)?,
+        file_size: row.get(7)?,
     })
 }
 
 fn row_to_function(row: &rusqlite::Row<'_>) -> rusqlite::Result<FunctionRecord> {
     Ok(FunctionRecord {
-        id:              Some(row.get(0)?),
-        file_id:         row.get(1)?,
-        name:            row.get(2)?,
-        qualified_name:  row.get(3)?,
-        line_start:      row.get::<_, i64>(4)? as usize,
-        line_end:        row.get::<_, i64>(5)? as usize,
-        args:            row.get(6)?,
-        return_type:     row.get(7)?,
-        docstring:       row.get(8)?,
-        body:            row.get(9)?,
-        is_async:        row.get::<_, i32>(10)? != 0,
-        node_hash:       row.get(11)?,
+        id: Some(row.get(0)?),
+        file_id: row.get(1)?,
+        name: row.get(2)?,
+        qualified_name: row.get(3)?,
+        line_start: row.get::<_, i64>(4)? as usize,
+        line_end: row.get::<_, i64>(5)? as usize,
+        args: row.get(6)?,
+        return_type: row.get(7)?,
+        docstring: row.get(8)?,
+        body: row.get(9)?,
+        is_async: row.get::<_, i32>(10)? != 0,
+        node_hash: row.get(11)?,
         // Колонки 12 и 13 появились в миграции v2 — читаем через try_get,
         // чтобы не ломаться на старых индексах без этих колонок
-        override_type:   row.get(12).ok(),
+        override_type: row.get(12).ok(),
         override_target: row.get(13).ok(),
     })
 }
 
 fn row_to_class(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClassRecord> {
     Ok(ClassRecord {
-        id:        Some(row.get(0)?),
-        file_id:   row.get(1)?,
-        name:      row.get(2)?,
+        id: Some(row.get(0)?),
+        file_id: row.get(1)?,
+        name: row.get(2)?,
         line_start: row.get::<_, i64>(3)? as usize,
-        line_end:   row.get::<_, i64>(4)? as usize,
-        bases:     row.get(5)?,
+        line_end: row.get::<_, i64>(4)? as usize,
+        bases: row.get(5)?,
         docstring: row.get(6)?,
-        body:      row.get(7)?,
+        body: row.get(7)?,
         node_hash: row.get(8)?,
     })
 }
 
 fn row_to_import(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRecord> {
     Ok(ImportRecord {
-        id:      Some(row.get(0)?),
+        id: Some(row.get(0)?),
         file_id: row.get(1)?,
-        module:  row.get(2)?,
-        name:    row.get(3)?,
-        alias:   row.get(4)?,
-        line:    row.get::<_, i64>(5)? as usize,
-        kind:    row.get(6)?,
+        module: row.get(2)?,
+        name: row.get(3)?,
+        alias: row.get(4)?,
+        line: row.get::<_, i64>(5)? as usize,
+        kind: row.get(6)?,
     })
 }
 
 fn row_to_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
     Ok(CallRecord {
-        id:      Some(row.get(0)?),
+        id: Some(row.get(0)?),
         file_id: row.get(1)?,
-        caller:  row.get(2)?,
-        callee:  row.get(3)?,
-        line:    row.get::<_, i64>(4)? as usize,
+        caller: row.get(2)?,
+        callee: row.get(3)?,
+        line: row.get::<_, i64>(4)? as usize,
     })
 }
 
 fn row_to_variable(row: &rusqlite::Row<'_>) -> rusqlite::Result<VariableRecord> {
     Ok(VariableRecord {
-        id:      Some(row.get(0)?),
+        id: Some(row.get(0)?),
         file_id: row.get(1)?,
-        name:    row.get(2)?,
-        value:   row.get(3)?,
-        line:    row.get::<_, i64>(4)? as usize,
+        name: row.get(2)?,
+        value: row.get(3)?,
+        line: row.get::<_, i64>(4)? as usize,
     })
 }
 
@@ -3384,7 +3533,9 @@ mod tests {
         let st = Storage::open_in_memory().unwrap();
         let conn = st.conn();
 
-        let lo: String = conn.query_row("SELECT lower('ЭДО')", [], |r| r.get(0)).unwrap();
+        let lo: String = conn
+            .query_row("SELECT lower('ЭДО')", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(lo, "эдо");
 
         let up: String = conn
@@ -3455,7 +3606,8 @@ mod tests {
         let id = storage.upsert_file(&rec).expect("upsert_file");
         assert!(id > 0, "id должен быть положительным");
 
-        let found = storage.get_file_by_path("/src/main.py")
+        let found = storage
+            .get_file_by_path("/src/main.py")
             .expect("get_file_by_path")
             .expect("файл должен существовать");
         assert_eq!(found.path, "/src/main.py");
@@ -3477,8 +3629,7 @@ mod tests {
         let id2 = storage.upsert_file(&rec2).expect("второй upsert");
 
         assert_eq!(id1, id2, "id не должен меняться при обновлении");
-        let found = storage.get_file_by_path("/src/utils.py")
-            .unwrap().unwrap();
+        let found = storage.get_file_by_path("/src/utils.py").unwrap().unwrap();
         assert_eq!(found.content_hash, "newHash");
         assert_eq!(found.lines_total, 200);
     }
@@ -3495,12 +3646,16 @@ mod tests {
         storage.insert_functions(&funcs).expect("insert_functions");
 
         // Поиск по точному имени
-        let found = storage.get_function_by_name("add").expect("get_function_by_name");
+        let found = storage
+            .get_function_by_name("add")
+            .expect("get_function_by_name");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "add");
 
         // Удаление
-        storage.delete_functions_by_file(file_id).expect("delete_functions_by_file");
+        storage
+            .delete_functions_by_file(file_id)
+            .expect("delete_functions_by_file");
         let empty = storage.get_function_by_name("add").unwrap();
         assert!(empty.is_empty(), "после удаления функций не должно быть");
     }
@@ -3545,7 +3700,9 @@ mod tests {
         storage.insert_functions(&funcs).unwrap();
 
         // FTS-поиск по слову в имени
-        let results = storage.search_functions("binary_search", 10, None).expect("search_functions");
+        let results = storage
+            .search_functions("binary_search", 10, None)
+            .expect("search_functions");
         assert_eq!(results.len(), 1, "должна найтись ровно одна функция");
         assert_eq!(results[0].name, "binary_search");
     }
@@ -3563,25 +3720,38 @@ mod tests {
 
         // Точное совпадение по регистру — работает как прежде.
         assert_eq!(
-            storage.get_function_by_name("ЗаполнитьЖурналОперацийМаксимо").unwrap().len(),
+            storage
+                .get_function_by_name("ЗаполнитьЖурналОперацийМаксимо")
+                .unwrap()
+                .len(),
             1,
         );
         // Другой регистр кириллицы → точный (побайтовый) поиск пуст.
         assert!(
-            storage.get_function_by_name("заполнитьжурналоперациймаксимо").unwrap().is_empty(),
+            storage
+                .get_function_by_name("заполнитьжурналоперациймаксимо")
+                .unwrap()
+                .is_empty(),
             "точный поиск обязан быть регистрозависимым (fast-path без изменений)",
         );
         // ci-fallback находит по имени независимо от регистра.
-        let ci = storage.get_function_by_name_ci("заполнитьжурналоперациймаксимо").unwrap();
+        let ci = storage
+            .get_function_by_name_ci("заполнитьжурналоперациймаксимо")
+            .unwrap();
         assert_eq!(ci.len(), 1, "ci-fallback должен найти функцию");
         assert_eq!(ci[0].name, "ЗаполнитьЖурналОперацийМаксимо");
         // Имя службы с подчёркиваниями (unicode61 бьёт по '_') — тоже находится.
-        let ci2 = storage.get_function_by_name_ci("получитьоперацииws_ibs_matrectrans").unwrap();
+        let ci2 = storage
+            .get_function_by_name_ci("получитьоперацииws_ibs_matrectrans")
+            .unwrap();
         assert_eq!(ci2.len(), 1, "имя с подчёркиваниями должно находиться ci");
         assert_eq!(ci2[0].name, "ПолучитьОперацииWS_IBS_MATRECTRANS");
         // Несуществующее имя — пусто (не ложное срабатывание по подстроке).
         assert!(
-            storage.get_function_by_name_ci("несуществующаяфункция").unwrap().is_empty(),
+            storage
+                .get_function_by_name_ci("несуществующаяфункция")
+                .unwrap()
+                .is_empty(),
             "ci-fallback не должен возвращать посторонние функции",
         );
     }
@@ -3605,7 +3775,10 @@ mod tests {
             .unwrap();
 
         assert!(
-            storage.get_class_by_name("описаниеоперации").unwrap().is_empty(),
+            storage
+                .get_class_by_name("описаниеоперации")
+                .unwrap()
+                .is_empty(),
             "точный поиск класса регистрозависим",
         );
         let ci = storage.get_class_by_name_ci("описаниеоперации").unwrap();
@@ -3626,7 +3799,9 @@ mod tests {
 
         // Опечатка в хвосте слова (…Операции вместо …Операций…): FTS-токен
         // целиком не совпадает, спасает префикс-LIKE.
-        let sugg = storage.suggest_function_names("ЗаполнитьЖурналОперации", 5).unwrap();
+        let sugg = storage
+            .suggest_function_names("ЗаполнитьЖурналОперации", 5)
+            .unwrap();
         assert!(
             sugg.contains(&"ЗаполнитьЖурналОперацийМаксимо".to_string()),
             "did_you_mean должен предложить настоящее имя, получили: {:?}",
@@ -3639,15 +3814,23 @@ mod tests {
         );
         // Запрос в нижнем регистре с опечаткой — ловится регистровым
         // вариантом префикса (LIKE кириллицу не фолдит).
-        let sugg_lower = storage.suggest_function_names("заполнитьжурналоперации", 5).unwrap();
+        let sugg_lower = storage
+            .suggest_function_names("заполнитьжурналоперации", 5)
+            .unwrap();
         assert!(
             sugg_lower.contains(&"ЗаполнитьЖурналОперацийМаксимо".to_string()),
             "lowercase-запрос с опечаткой должен давать подсказку: {:?}",
             sugg_lower,
         );
         // Мусорный запрос — без подсказок.
-        let none = storage.suggest_function_names("qqqzzzневедомое", 5).unwrap();
-        assert!(none.is_empty(), "мусорный запрос не должен давать подсказок: {:?}", none);
+        let none = storage
+            .suggest_function_names("qqqzzzневедомое", 5)
+            .unwrap();
+        assert!(
+            none.is_empty(),
+            "мусорный запрос не должен давать подсказок: {:?}",
+            none
+        );
     }
 
     #[test]
@@ -3681,12 +3864,22 @@ mod tests {
         let storage = Storage::open_in_memory().expect("Ошибка создания БД");
 
         let file_id = storage.upsert_file(&make_file("/src/cascade.py")).unwrap();
-        storage.insert_functions(&[make_function(file_id, "foo")]).unwrap();
-        storage.insert_classes(&[ClassRecord {
-            id: None, file_id, name: "Bar".into(),
-            line_start: 1, line_end: 5, bases: None, docstring: None,
-            body: "class Bar: pass".into(), node_hash: "h".into(),
-        }]).unwrap();
+        storage
+            .insert_functions(&[make_function(file_id, "foo")])
+            .unwrap();
+        storage
+            .insert_classes(&[ClassRecord {
+                id: None,
+                file_id,
+                name: "Bar".into(),
+                line_start: 1,
+                line_end: 5,
+                bases: None,
+                docstring: None,
+                body: "class Bar: pass".into(),
+                node_hash: "h".into(),
+            }])
+            .unwrap();
 
         // Удаляем файл — ожидаем каскадное удаление
         storage.delete_file(file_id).unwrap();
@@ -3715,7 +3908,10 @@ mod tests {
         }
 
         let removed = storage.delete_files_under_prefix("src/dirA").unwrap();
-        assert_eq!(removed, 2, "каталог src/dirA удаляется целиком, включая вложенный");
+        assert_eq!(
+            removed, 2,
+            "каталог src/dirA удаляется целиком, включая вложенный"
+        );
 
         let left: Vec<String> = storage
             .get_all_files()
@@ -3766,11 +3962,18 @@ mod tests {
         let storage = Storage::open_in_memory().expect("Ошибка создания БД");
 
         let file_id = storage.upsert_file(&make_file("/src/symbols.py")).unwrap();
-        storage.insert_functions(&[make_function(file_id, "compute")]).unwrap();
-        storage.insert_variables(&[VariableRecord {
-            id: None, file_id, name: "compute".into(),
-            value: Some("42".into()), line: 5,
-        }]).unwrap();
+        storage
+            .insert_functions(&[make_function(file_id, "compute")])
+            .unwrap();
+        storage
+            .insert_variables(&[VariableRecord {
+                id: None,
+                file_id,
+                name: "compute".into(),
+                value: Some("42".into()),
+                line: 5,
+            }])
+            .unwrap();
 
         let result = storage.find_symbol("compute", None).expect("find_symbol");
         assert_eq!(result.functions.len(), 1, "должна найтись 1 функция");
@@ -3788,13 +3991,18 @@ mod tests {
         assert_eq!(stats.total_files, 0);
 
         let file_id = storage.upsert_file(&make_file("/src/stats.py")).unwrap();
-        storage.insert_functions(&[
-            make_function(file_id, "f1"),
-            make_function(file_id, "f2"),
-        ]).unwrap();
-        storage.insert_calls(&[CallRecord {
-            id: None, file_id, caller: "f1".into(), callee: "f2".into(), line: 5,
-        }]).unwrap();
+        storage
+            .insert_functions(&[make_function(file_id, "f1"), make_function(file_id, "f2")])
+            .unwrap();
+        storage
+            .insert_calls(&[CallRecord {
+                id: None,
+                file_id,
+                caller: "f1".into(),
+                callee: "f2".into(),
+                line: 5,
+            }])
+            .unwrap();
 
         let stats = storage.get_stats().expect("get_stats после вставки");
         assert_eq!(stats.total_files, 1);
@@ -3827,13 +4035,21 @@ mod tests {
         seed_calls(&storage, fid, &[("A", "B"), ("B", "C")]);
 
         // Прямое ребро A→B.
-        let direct = storage.find_call_path("A", "B", 3, None).unwrap().path.expect("путь A→B");
+        let direct = storage
+            .find_call_path("A", "B", 3, None)
+            .unwrap()
+            .path
+            .expect("путь A→B");
         assert_eq!(direct.len(), 1);
         assert_eq!(direct[0].caller, "A");
         assert_eq!(direct[0].callee, "B");
 
         // Два прыжка A→B→C.
-        let two = storage.find_call_path("A", "C", 3, None).unwrap().path.expect("путь A→C");
+        let two = storage
+            .find_call_path("A", "C", 3, None)
+            .unwrap()
+            .path
+            .expect("путь A→C");
         assert_eq!(two.len(), 2);
         assert_eq!(two[1].callee, "C");
     }
@@ -3849,7 +4065,10 @@ mod tests {
 
         let shallow = storage.find_call_path("A", "C", 1, None).unwrap();
         assert!(shallow.path.is_none());
-        assert!(shallow.depth_exhausted, "обход остановился на границе глубины");
+        assert!(
+            shallow.depth_exhausted,
+            "обход остановился на границе глубины"
+        );
         assert!(!shallow.nodes_capped);
 
         // Глубины хватило — путь найден, признака нехватки нет.
@@ -3860,7 +4079,10 @@ mod tests {
         // Достижимый подграф исчерпан целиком: цели нет и обход не обрывался.
         let absent = storage.find_call_path("A", "НетТакого", 5, None).unwrap();
         assert!(absent.path.is_none());
-        assert!(!absent.depth_exhausted, "все узлы развёрнуты в пределах глубины");
+        assert!(
+            !absent.depth_exhausted,
+            "все узлы развёрнуты в пределах глубины"
+        );
         assert!(!absent.nodes_capped);
     }
 
@@ -3868,15 +4090,31 @@ mod tests {
     fn find_call_path_none_and_respects_depth() {
         let storage = Storage::open_in_memory().unwrap();
         // Пустая база — пути нет.
-        assert!(storage.find_call_path("A", "B", 5, None).unwrap().path.is_none());
+        assert!(storage
+            .find_call_path("A", "B", 5, None)
+            .unwrap()
+            .path
+            .is_none());
 
         let fid = storage.upsert_file(&make_file("/g.py")).unwrap();
         seed_calls(&storage, fid, &[("A", "B"), ("B", "C"), ("C", "D")]);
 
         // A→D длиной 3: при max_depth=2 не должен найтись.
-        assert!(storage.find_call_path("A", "D", 2, None).unwrap().path.is_none());
+        assert!(storage
+            .find_call_path("A", "D", 2, None)
+            .unwrap()
+            .path
+            .is_none());
         // При max_depth=3 — путь из 3 рёбер.
-        assert_eq!(storage.find_call_path("A", "D", 3, None).unwrap().path.unwrap().len(), 3);
+        assert_eq!(
+            storage
+                .find_call_path("A", "D", 3, None)
+                .unwrap()
+                .path
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]
@@ -3892,11 +4130,19 @@ mod tests {
             "A вызывает B, путь A→A — найден и пуст"
         );
         // Вызываемый символ тоже считается известным
-        assert!(storage.find_call_path("B", "B", 5, None).unwrap().path.is_some());
+        assert!(storage
+            .find_call_path("B", "B", 5, None)
+            .unwrap()
+            .path
+            .is_some());
 
         // Выдуманного символа в репозитории нет — пути быть не может
         assert!(
-            storage.find_call_path("НетТакого", "НетТакого", 5, None).unwrap().path.is_none(),
+            storage
+                .find_call_path("НетТакого", "НетТакого", 5, None)
+                .unwrap()
+                .path
+                .is_none(),
             "find_path не должен подтверждать путь для несуществующего символа"
         );
     }
@@ -3907,23 +4153,45 @@ mod tests {
         let py = storage.upsert_file(&make_file("/a.py")).unwrap();
         seed_calls(&storage, py, &[("A", "B")]);
 
-        assert!(storage.find_call_path("A", "A", 5, Some("python")).unwrap().path.is_some());
+        assert!(storage
+            .find_call_path("A", "A", 5, Some("python"))
+            .unwrap()
+            .path
+            .is_some());
         // Того же символа в rust-файлах нет — путь к самому себе не подтверждаем
-        assert!(storage.find_call_path("A", "A", 5, Some("rust")).unwrap().path.is_none());
+        assert!(storage
+            .find_call_path("A", "A", 5, Some("rust"))
+            .unwrap()
+            .path
+            .is_none());
     }
 
     #[test]
     fn find_call_path_language_filter() {
         let storage = Storage::open_in_memory().unwrap();
         let py = storage.upsert_file(&make_file("/a.py")).unwrap();
-        let rs = storage.upsert_file(&make_file_full("/a.rs", "rust", 10)).unwrap();
+        let rs = storage
+            .upsert_file(&make_file_full("/a.rs", "rust", 10))
+            .unwrap();
         seed_calls(&storage, py, &[("A", "B")]);
         seed_calls(&storage, rs, &[("X", "Y")]);
 
         // Python-ребро A→B отфильтровано при language=rust.
-        assert!(storage.find_call_path("A", "B", 3, Some("rust")).unwrap().path.is_none());
-        assert!(storage.find_call_path("A", "B", 3, Some("python")).unwrap().path.is_some());
-        assert!(storage.find_call_path("X", "Y", 3, Some("rust")).unwrap().path.is_some());
+        assert!(storage
+            .find_call_path("A", "B", 3, Some("rust"))
+            .unwrap()
+            .path
+            .is_none());
+        assert!(storage
+            .find_call_path("A", "B", 3, Some("python"))
+            .unwrap()
+            .path
+            .is_some());
+        assert!(storage
+            .find_call_path("X", "Y", 3, Some("rust"))
+            .unwrap()
+            .path
+            .is_some());
     }
 
     #[test]
@@ -3940,7 +4208,11 @@ mod tests {
         };
 
         // `Объект.Б` ≠ `Б` — без привязки пути нет.
-        assert!(storage.find_call_path("А", "Б", 3, None).unwrap().path.is_none());
+        assert!(storage
+            .find_call_path("А", "Б", 3, None)
+            .unwrap()
+            .path
+            .is_none());
 
         let one = storage
             .find_call_path_with("А", "Б", 3, None, &bind)
@@ -3990,9 +4262,16 @@ mod tests {
             .unwrap();
         assert!(!trunc);
         assert_eq!(edges.len(), 2, "точный вызыватель + вызов с квалификатором");
-        assert!(edges.iter().any(|e| e.caller == "А" && e.callee == "Б" && e.depth == 1));
-        assert!(edges.iter().any(|e| e.caller == "Г" && e.callee == "Б" && e.depth == 1));
-        assert!(edges.iter().all(|e| e.callee == "Б"), "узлы дерева — имена процедур");
+        assert!(edges
+            .iter()
+            .any(|e| e.caller == "А" && e.callee == "Б" && e.depth == 1));
+        assert!(edges
+            .iter()
+            .any(|e| e.caller == "Г" && e.callee == "Б" && e.depth == 1));
+        assert!(
+            edges.iter().all(|e| e.callee == "Б"),
+            "узлы дерева — имена процедур"
+        );
     }
 
     #[test]
@@ -4013,13 +4292,21 @@ mod tests {
             .call_tree_walk("А", true, 2, 100, &no_extra, &bind)
             .unwrap();
         assert_eq!(edges.len(), 2);
-        assert!(edges.iter().any(|e| e.caller == "А" && e.callee == "Б" && e.depth == 1));
-        assert!(edges.iter().any(|e| e.caller == "Б" && e.callee == "В" && e.depth == 2));
+        assert!(edges
+            .iter()
+            .any(|e| e.caller == "А" && e.callee == "Б" && e.depth == 1));
+        assert!(edges
+            .iter()
+            .any(|e| e.caller == "Б" && e.callee == "В" && e.depth == 2));
 
         let (raw, _) = storage
             .call_tree_walk("А", true, 2, 100, &no_extra, &|_, _, _| None)
             .unwrap();
-        assert_eq!(raw.len(), 1, "без привязки вызов с приёмником не разворачивается");
+        assert_eq!(
+            raw.len(),
+            1,
+            "без привязки вызов с приёмником не разворачивается"
+        );
         assert_eq!(raw[0].caller, "А");
         assert_eq!(raw[0].callee, "Объект.Б");
     }
@@ -4034,9 +4321,15 @@ mod tests {
         let (edges, trunc) = storage.get_call_tree("A", true, 3, 100, None).unwrap();
         assert!(!trunc);
         assert_eq!(edges.len(), 3);
-        let ab = edges.iter().find(|e| e.caller == "A" && e.callee == "B").unwrap();
+        let ab = edges
+            .iter()
+            .find(|e| e.caller == "A" && e.callee == "B")
+            .unwrap();
         assert_eq!(ab.depth, 1);
-        let bd = edges.iter().find(|e| e.caller == "B" && e.callee == "D").unwrap();
+        let bd = edges
+            .iter()
+            .find(|e| e.caller == "B" && e.callee == "D")
+            .unwrap();
         assert_eq!(bd.depth, 2);
     }
 
@@ -4048,17 +4341,30 @@ mod tests {
         seed_calls(&storage, fid, &[("A", "B"), ("B", "D")]);
 
         let (edges, _) = storage.get_call_tree("D", false, 3, 100, None).unwrap();
-        assert!(edges.iter().any(|e| e.caller == "B" && e.callee == "D" && e.depth == 1));
-        assert!(edges.iter().any(|e| e.caller == "A" && e.callee == "B" && e.depth == 2));
+        assert!(edges
+            .iter()
+            .any(|e| e.caller == "B" && e.callee == "D" && e.depth == 1));
+        assert!(edges
+            .iter()
+            .any(|e| e.caller == "A" && e.callee == "B" && e.depth == 2));
     }
 
     #[test]
     fn get_call_tree_truncates_at_max_nodes() {
         let storage = Storage::open_in_memory().unwrap();
         let fid = storage.upsert_file(&make_file("/t.py")).unwrap();
-        let edges_in: Vec<(&str, &str)> =
-            vec![("A", "B0"), ("A", "B1"), ("A", "B2"), ("A", "B3"), ("A", "B4"),
-                 ("A", "B5"), ("A", "B6"), ("A", "B7"), ("A", "B8"), ("A", "B9")];
+        let edges_in: Vec<(&str, &str)> = vec![
+            ("A", "B0"),
+            ("A", "B1"),
+            ("A", "B2"),
+            ("A", "B3"),
+            ("A", "B4"),
+            ("A", "B5"),
+            ("A", "B6"),
+            ("A", "B7"),
+            ("A", "B8"),
+            ("A", "B9"),
+        ];
         seed_calls(&storage, fid, &edges_in);
 
         let (edges, trunc) = storage.get_call_tree("A", true, 2, 5, None).unwrap();
@@ -4086,20 +4392,30 @@ mod tests {
         let rs_id = storage.upsert_file(&rs_rec).unwrap();
 
         // Вставляем функции в оба файла
-        storage.insert_functions(&[make_function(py_id, "py_func")]).unwrap();
-        storage.insert_functions(&[make_function(rs_id, "rs_func")]).unwrap();
+        storage
+            .insert_functions(&[make_function(py_id, "py_func")])
+            .unwrap();
+        storage
+            .insert_functions(&[make_function(rs_id, "rs_func")])
+            .unwrap();
 
         // Без фильтра — обе функции
-        let all = storage.search_functions("func", 10, None).expect("поиск без фильтра");
+        let all = storage
+            .search_functions("func", 10, None)
+            .expect("поиск без фильтра");
         assert_eq!(all.len(), 2, "без фильтра должны найтись обе функции");
 
         // Только Python
-        let py_only = storage.search_functions("func", 10, Some("python")).expect("поиск python");
+        let py_only = storage
+            .search_functions("func", 10, Some("python"))
+            .expect("поиск python");
         assert_eq!(py_only.len(), 1, "с фильтром python — только одна функция");
         assert_eq!(py_only[0].name, "py_func");
 
         // Только Rust
-        let rs_only = storage.search_functions("func", 10, Some("rust")).expect("поиск rust");
+        let rs_only = storage
+            .search_functions("func", 10, Some("rust"))
+            .expect("поиск rust");
         assert_eq!(rs_only.len(), 1, "с фильтром rust — только одна функция");
         assert_eq!(rs_only[0].name, "rs_func");
     }
@@ -4127,9 +4443,14 @@ mod tests {
         storage.insert_functions(&[func]).unwrap();
 
         // Поиск с дефисом не должен вернуть ошибку FTS5
-        let results = storage.search_functions("tree-sitter-python", 10, None)
+        let results = storage
+            .search_functions("tree-sitter-python", 10, None)
             .expect("поиск с дефисом не должен падать");
-        assert_eq!(results.len(), 1, "должна найтись функция с дефисом в docstring");
+        assert_eq!(
+            results.len(),
+            1,
+            "должна найтись функция с дефисом в docstring"
+        );
     }
 
     #[test]
@@ -4137,7 +4458,10 @@ mod tests {
         // Один токен — префиксный терм.
         assert_eq!(build_fts_or_query("один"), "\"один\"*");
         // Многословный — OR между префиксными термами.
-        assert_eq!(build_fts_or_query("цены продажи"), "\"цены\"* OR \"продажи\"*");
+        assert_eq!(
+            build_fts_or_query("цены продажи"),
+            "\"цены\"* OR \"продажи\"*"
+        );
         // Разделители (дефис, скобки) → отдельные токены, не ломают FTS.
         assert_eq!(build_fts_or_query("a-b c"), "\"a\"* OR \"b\"* OR \"c\"*");
         // Мусор без алфанумерики → откат на sanitize_fts_query (старое поведение).
@@ -4164,7 +4488,8 @@ mod tests {
                 args: None,
                 return_type: None,
                 docstring: Some("Расчёт цены продажи для реализации товаров".to_string()),
-                body: "// цены продажи\nПроцедура РассчитатьЦенуПродажи() КонецПроцедуры".to_string(),
+                body: "// цены продажи\nПроцедура РассчитатьЦенуПродажи() КонецПроцедуры"
+                    .to_string(),
                 is_async: false,
                 node_hash: "mw1".to_string(),
                 ..Default::default()
@@ -4242,8 +4567,8 @@ mod tests {
             expected_bytes: 0,
         };
 
-        let storage = Storage::open_auto(&db_path, &config)
-            .expect("open_auto должен работать для новой БД");
+        let storage =
+            Storage::open_auto(&db_path, &config).expect("open_auto должен работать для новой БД");
 
         // Проверяем что БД работает — вставляем файл
         storage.upsert_file(&make_file("/hello.py")).unwrap();
@@ -4262,10 +4587,12 @@ mod tests {
             expected_bytes: 0,
         };
 
-        let storage = Storage::open_auto(&db_path, &config)
-            .expect("open_auto disk режим");
+        let storage = Storage::open_auto(&db_path, &config).expect("open_auto disk режим");
         storage.upsert_file(&make_file("/hello.rs")).unwrap();
-        assert!(db_path.exists(), "файл БД должен существовать в disk-режиме");
+        assert!(
+            db_path.exists(),
+            "файл БД должен существовать в disk-режиме"
+        );
     }
 
     #[test]
@@ -4288,7 +4615,10 @@ mod tests {
         };
         let storage = Storage::open_auto(&db_path, &config).unwrap();
         let found = storage.get_file_by_path("/existing.py").unwrap();
-        assert!(found.is_some(), "данные из файла должны быть доступны в in-memory БД");
+        assert!(
+            found.is_some(),
+            "данные из файла должны быть доступны в in-memory БД"
+        );
     }
 
     /// H-1: база от старого бинарника (без таблиц содержимого) при открытии в
@@ -4337,14 +4667,20 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(restored, 2, "миграции v4 и v5 должны примениться при открытии в память");
+        assert_eq!(
+            restored, 2,
+            "миграции v4 и v5 должны примениться при открытии в память"
+        );
 
         // Настройки соединения на этом пути тоже выставляются (H-1).
         let fk: i64 = storage
             .conn
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(fk, 1, "внешние ключи включены явно, а не по умолчанию сборки");
+        assert_eq!(
+            fk, 1,
+            "внешние ключи включены явно, а не по умолчанию сборки"
+        );
     }
 
     // ── Phase 1 (v0.7.0) тесты ─────────────────────────────────────────────
@@ -4412,10 +4748,7 @@ mod tests {
         // безразличен, поэтому сравниваем как множество.
         let mut two = expand_doublestar("**/a/**/b.rs");
         two.sort();
-        assert_eq!(
-            two,
-            vec!["*/a/*/b.rs", "*/a/b.rs", "a/*/b.rs", "a/b.rs"]
-        );
+        assert_eq!(two, vec!["*/a/*/b.rs", "*/a/b.rs", "a/*/b.rs", "a/b.rs"]);
     }
 
     /// M-6: полное раскрытие — сначала скобки, затем `**/`; файл в корне
@@ -4448,7 +4781,8 @@ mod tests {
     #[test]
     fn test_slice_with_caps_range() {
         let content = "a\nb\nc\nd\ne";
-        let (body, n, truncated) = slice_with_caps(content, Some(2), Some(4), 100, 1000, 10_000).unwrap();
+        let (body, n, truncated) =
+            slice_with_caps(content, Some(2), Some(4), 100, 1000, 10_000).unwrap();
         assert_eq!(n, 3);
         assert!(!truncated);
         assert_eq!(body, "b\nc\nd");
@@ -4456,7 +4790,10 @@ mod tests {
 
     #[test]
     fn test_slice_with_caps_soft_cap_lines() {
-        let content = (1..=10).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let content = (1..=10)
+            .map(|i| format!("line{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let (body, n, truncated) = slice_with_caps(&content, None, None, 3, 1000, 10_000).unwrap();
         assert_eq!(n, 3);
         assert!(truncated);
@@ -4492,23 +4829,36 @@ mod tests {
         // Многобайтные символы: обрезка идёт по границе символа, не по байту.
         let wide: String = "я".repeat(2000);
         let (body3, _, _) = slice_with_caps(&wide, None, None, 10_000, 1001, 100_000).unwrap();
-        assert!(body3.chars().all(|c| c == 'я'), "строка не разрезана посреди символа");
-        assert_eq!(body3.len(), 1000, "1001 байт не делится на символы по 2 байта");
+        assert!(
+            body3.chars().all(|c| c == 'я'),
+            "строка не разрезана посреди символа"
+        );
+        assert_eq!(
+            body3.len(),
+            1000,
+            "1001 байт не делится на символы по 2 байта"
+        );
     }
 
     #[test]
     fn test_stat_file_meta_existing_text() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/cfg.yaml", "yaml", 50)).unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/cfg.yaml", "yaml", 50))
+            .unwrap();
         // upsert_file пишет mtime/file_size из FileRecord; здесь дополнительно
         // фиксируем точные значения через update_file_metadata (те же).
-        storage.update_file_metadata("/cfg.yaml", 1714305600, 2500).unwrap();
+        storage
+            .update_file_metadata("/cfg.yaml", 1714305600, 2500)
+            .unwrap();
         // Помечаем как text-файл (есть запись в text_files).
-        storage.insert_text_file(&TextFileRecord {
-            id: None,
-            file_id: id,
-            content: "key: value\n".repeat(50),
-        }).unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id: id,
+                content: "key: value\n".repeat(50),
+            })
+            .unwrap();
 
         let r = storage.stat_file_meta("/cfg.yaml").unwrap();
         assert!(r.exists);
@@ -4527,14 +4877,24 @@ mod tests {
     fn test_upsert_file_persists_mtime_and_size() {
         let storage = Storage::open_in_memory().unwrap();
         // make_file_full: mtime=Some(1714305600), file_size=Some(50*50)
-        storage.upsert_file(&make_file_full("/new.bsl", "bsl", 50)).unwrap();
+        storage
+            .upsert_file(&make_file_full("/new.bsl", "bsl", 50))
+            .unwrap();
 
         let rec = storage
             .get_file_by_path("/new.bsl")
             .unwrap()
             .expect("файл должен быть в индексе");
-        assert_eq!(rec.mtime, Some(1714305600), "mtime должен записаться через upsert_file");
-        assert_eq!(rec.file_size, Some(2500), "file_size должен записаться через upsert_file");
+        assert_eq!(
+            rec.mtime,
+            Some(1714305600),
+            "mtime должен записаться через upsert_file"
+        );
+        assert_eq!(
+            rec.file_size,
+            Some(2500),
+            "file_size должен записаться через upsert_file"
+        );
 
         // Повторный upsert с None в mtime/file_size не должен затирать уже записанные
         // значения (COALESCE на пути ON CONFLICT DO UPDATE).
@@ -4544,15 +4904,25 @@ mod tests {
         storage.upsert_file(&updated).unwrap();
 
         let rec2 = storage.get_file_by_path("/new.bsl").unwrap().unwrap();
-        assert_eq!(rec2.mtime, Some(1714305600), "None не должен затирать существующий mtime");
-        assert_eq!(rec2.file_size, Some(2500), "None не должен затирать существующий file_size");
+        assert_eq!(
+            rec2.mtime,
+            Some(1714305600),
+            "None не должен затирать существующий mtime"
+        );
+        assert_eq!(
+            rec2.file_size,
+            Some(2500),
+            "None не должен затирать существующий file_size"
+        );
         assert_eq!(rec2.lines_total, 60, "прочие поля при этом обновляются");
     }
 
     #[test]
     fn test_stat_file_meta_existing_code() {
         let storage = Storage::open_in_memory().unwrap();
-        storage.upsert_file(&make_file_full("/lib.py", "python", 30)).unwrap();
+        storage
+            .upsert_file(&make_file_full("/lib.py", "python", 30))
+            .unwrap();
         // Без insert_text_file — это code-файл
         let r = storage.stat_file_meta("/lib.py").unwrap();
         assert!(r.exists);
@@ -4570,15 +4940,27 @@ mod tests {
     #[test]
     fn test_list_files_pattern_glob() {
         let storage = Storage::open_in_memory().unwrap();
-        storage.upsert_file(&make_file_full("/src/auth/login.py", "python", 10)).unwrap();
-        storage.upsert_file(&make_file_full("/src/utils/helpers.py", "python", 20)).unwrap();
-        storage.upsert_file(&make_file_full("/docs/readme.md", "markdown", 30)).unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/auth/login.py", "python", 10))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/utils/helpers.py", "python", 20))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/docs/readme.md", "markdown", 30))
+            .unwrap();
 
-        let py = storage.list_files_filtered(Some("**/*.py"), None, None, 100).unwrap();
+        let py = storage
+            .list_files_filtered(Some("**/*.py"), None, None, 100)
+            .unwrap();
         assert_eq!(py.len(), 2);
-        for f in &py { assert!(f.path.ends_with(".py")); }
+        for f in &py {
+            assert!(f.path.ends_with(".py"));
+        }
 
-        let auth = storage.list_files_filtered(Some("/src/auth/*"), None, None, 100).unwrap();
+        let auth = storage
+            .list_files_filtered(Some("/src/auth/*"), None, None, 100)
+            .unwrap();
         assert_eq!(auth.len(), 1);
         assert_eq!(auth[0].path, "/src/auth/login.py");
     }
@@ -4588,35 +4970,75 @@ mod tests {
     #[test]
     fn test_count_files_matches_list_filters() {
         let storage = Storage::open_in_memory().unwrap();
-        storage.upsert_file(&make_file_full("/src/auth/login.py", "python", 10)).unwrap();
-        storage.upsert_file(&make_file_full("/src/utils/helpers.py", "python", 20)).unwrap();
-        storage.upsert_file(&make_file_full("/src/utils/extra.py", "python", 20)).unwrap();
-        storage.upsert_file(&make_file_full("/docs/readme.md", "markdown", 30)).unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/auth/login.py", "python", 10))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/utils/helpers.py", "python", 20))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/utils/extra.py", "python", 20))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/docs/readme.md", "markdown", 30))
+            .unwrap();
 
         // Потолок выборки урезает список, счётчик — нет.
-        let shown = storage.list_files_filtered(Some("**/*.py"), None, None, 2).unwrap();
+        let shown = storage
+            .list_files_filtered(Some("**/*.py"), None, None, 2)
+            .unwrap();
         assert_eq!(shown.len(), 2, "выборка упёрлась в потолок");
-        assert_eq!(storage.count_files_filtered(Some("**/*.py"), None, None).unwrap(), 3);
+        assert_eq!(
+            storage
+                .count_files_filtered(Some("**/*.py"), None, None)
+                .unwrap(),
+            3
+        );
 
         // Те же фильтры, что у выборки: префикс пути и язык.
-        assert_eq!(storage.count_files_filtered(None, Some("/src/"), None).unwrap(), 3);
-        assert_eq!(storage.count_files_filtered(None, None, Some("markdown")).unwrap(), 1);
+        assert_eq!(
+            storage
+                .count_files_filtered(None, Some("/src/"), None)
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            storage
+                .count_files_filtered(None, None, Some("markdown"))
+                .unwrap(),
+            1
+        );
 
         // Без фильтров — все файлы; ничего не подошло — ноль.
         assert_eq!(storage.count_files_filtered(None, None, None).unwrap(), 4);
-        assert_eq!(storage.count_files_filtered(Some("**/*.rs"), None, None).unwrap(), 0);
+        assert_eq!(
+            storage
+                .count_files_filtered(Some("**/*.rs"), None, None)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
     fn test_list_files_path_prefix() {
         let storage = Storage::open_in_memory().unwrap();
-        storage.upsert_file(&make_file_full("/src/a.py", "python", 1)).unwrap();
-        storage.upsert_file(&make_file_full("/src/b.py", "python", 1)).unwrap();
-        storage.upsert_file(&make_file_full("/test/c.py", "python", 1)).unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/a.py", "python", 1))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/b.py", "python", 1))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/test/c.py", "python", 1))
+            .unwrap();
 
-        let r = storage.list_files_filtered(None, Some("/src/"), None, 100).unwrap();
+        let r = storage
+            .list_files_filtered(None, Some("/src/"), None, 100)
+            .unwrap();
         assert_eq!(r.len(), 2);
-        for f in &r { assert!(f.path.starts_with("/src/")); }
+        for f in &r {
+            assert!(f.path.starts_with("/src/"));
+        }
     }
 
     /// H-5: префикс с подчёркиванием. Спецсимволы LIKE экранируются обратным
@@ -4625,32 +5047,56 @@ mod tests {
     #[test]
     fn test_list_files_path_prefix_with_underscore() {
         let storage = Storage::open_in_memory().unwrap();
-        storage.upsert_file(&make_file_full("/src/daemon_core/worker.rs", "rust", 1)).unwrap();
-        storage.upsert_file(&make_file_full("/src/daemon_core/runner.rs", "rust", 1)).unwrap();
-        storage.upsert_file(&make_file_full("/src/storage/mod.rs", "rust", 1)).unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/daemon_core/worker.rs", "rust", 1))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/daemon_core/runner.rs", "rust", 1))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/storage/mod.rs", "rust", 1))
+            .unwrap();
 
-        let r = storage.list_files_filtered(None, Some("/src/daemon_core/"), None, 100).unwrap();
+        let r = storage
+            .list_files_filtered(None, Some("/src/daemon_core/"), None, 100)
+            .unwrap();
         assert_eq!(r.len(), 2, "путь с подчёркиванием обязан находиться");
 
         // Подчёркивание — не «любой символ»: соседний каталог не подхватывается.
-        storage.upsert_file(&make_file_full("/src/daemonXcore/other.rs", "rust", 1)).unwrap();
-        let r2 = storage.list_files_filtered(None, Some("/src/daemon_core/"), None, 100).unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/daemonXcore/other.rs", "rust", 1))
+            .unwrap();
+        let r2 = storage
+            .list_files_filtered(None, Some("/src/daemon_core/"), None, 100)
+            .unwrap();
         assert_eq!(r2.len(), 2, "подчёркивание не должно работать как шаблон");
 
         // Процент в имени каталога — тот же класс.
-        storage.upsert_file(&make_file_full("/src/100%done/x.rs", "rust", 1)).unwrap();
-        let r3 = storage.list_files_filtered(None, Some("/src/100%done/"), None, 100).unwrap();
+        storage
+            .upsert_file(&make_file_full("/src/100%done/x.rs", "rust", 1))
+            .unwrap();
+        let r3 = storage
+            .list_files_filtered(None, Some("/src/100%done/"), None, 100)
+            .unwrap();
         assert_eq!(r3.len(), 1, "путь с процентом обязан находиться");
     }
 
     #[test]
     fn test_list_files_language_filter() {
         let storage = Storage::open_in_memory().unwrap();
-        storage.upsert_file(&make_file_full("/a.py", "python", 1)).unwrap();
-        storage.upsert_file(&make_file_full("/b.rs", "rust", 1)).unwrap();
-        storage.upsert_file(&make_file_full("/c.py", "python", 1)).unwrap();
+        storage
+            .upsert_file(&make_file_full("/a.py", "python", 1))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/b.rs", "rust", 1))
+            .unwrap();
+        storage
+            .upsert_file(&make_file_full("/c.py", "python", 1))
+            .unwrap();
 
-        let r = storage.list_files_filtered(None, None, Some("rust"), 100).unwrap();
+        let r = storage
+            .list_files_filtered(None, None, Some("rust"), 100)
+            .unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].language, "rust");
     }
@@ -4658,13 +5104,23 @@ mod tests {
     #[test]
     fn test_read_file_text_full() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/r.txt", "text", 3)).unwrap();
-        storage.insert_text_file(&TextFileRecord {
-            id: None,
-            file_id: id,
-            content: "alpha\nbeta\ngamma".to_string(),
-        }).unwrap();
-        let r = storage.read_file_text("/r.txt", None, None, 100, 10_000, 100_000, None).unwrap().unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/r.txt", "text", 3))
+            .unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id: id,
+                content: "alpha\nbeta\ngamma".to_string(),
+            })
+            .unwrap();
+        let r = storage
+            .read_file_text(
+                "/r.txt",
+                ReadFileOptions::new(None, None, 100, 10_000, 100_000, None),
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(r.category, "text");
         assert_eq!(r.lines_returned, 3);
         assert_eq!(r.lines_total, 3);
@@ -4675,14 +5131,23 @@ mod tests {
     #[test]
     fn test_read_file_text_range() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/r.txt", "text", 5)).unwrap();
-        storage.insert_text_file(&TextFileRecord {
-            id: None,
-            file_id: id,
-            content: "1\n2\n3\n4\n5".to_string(),
-        }).unwrap();
-        let r = storage.read_file_text("/r.txt", Some(2), Some(4), 100, 10_000, 100_000, None)
-            .unwrap().unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/r.txt", "text", 5))
+            .unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id: id,
+                content: "1\n2\n3\n4\n5".to_string(),
+            })
+            .unwrap();
+        let r = storage
+            .read_file_text(
+                "/r.txt",
+                ReadFileOptions::new(Some(2), Some(4), 100, 10_000, 100_000, None),
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(r.lines_returned, 3);
         assert_eq!(r.content, "2\n3\n4");
     }
@@ -4690,9 +5155,17 @@ mod tests {
     #[test]
     fn test_read_file_text_code_returns_empty_category_code() {
         let storage = Storage::open_in_memory().unwrap();
-        storage.upsert_file(&make_file_full("/lib.py", "python", 10)).unwrap();
+        storage
+            .upsert_file(&make_file_full("/lib.py", "python", 10))
+            .unwrap();
         // text_files не заполнен — это code-файл
-        let r = storage.read_file_text("/lib.py", None, None, 100, 10_000, 100_000, None).unwrap().unwrap();
+        let r = storage
+            .read_file_text(
+                "/lib.py",
+                ReadFileOptions::new(None, None, 100, 10_000, 100_000, None),
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(r.category, "code");
         assert!(r.content.is_empty());
     }
@@ -4700,20 +5173,31 @@ mod tests {
     #[test]
     fn test_read_file_text_missing() {
         let storage = Storage::open_in_memory().unwrap();
-        let r = storage.read_file_text("/nope", None, None, 100, 10_000, 100_000, None).unwrap();
+        let r = storage
+            .read_file_text(
+                "/nope",
+                ReadFileOptions::new(None, None, 100, 10_000, 100_000, None),
+            )
+            .unwrap();
         assert!(r.is_none());
     }
 
     #[test]
     fn test_grep_text_basic_match() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/cfg.yaml", "yaml", 5)).unwrap();
-        storage.insert_text_file(&TextFileRecord {
-            id: None,
-            file_id: id,
-            content: "host: 10.0.0.1\nport: 8080\nname: example\n".to_string(),
-        }).unwrap();
-        let (m, truncated, _) = storage.grep_text_filtered(r"port:\s*\d+", None, None, 100, 0, 1_000_000).unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/cfg.yaml", "yaml", 5))
+            .unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id: id,
+                content: "host: 10.0.0.1\nport: 8080\nname: example\n".to_string(),
+            })
+            .unwrap();
+        let (m, truncated, _) = storage
+            .grep_text_filtered(r"port:\s*\d+", None, None, 100, 0, 1_000_000)
+            .unwrap();
         assert!(!truncated);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].path, "/cfg.yaml");
@@ -4728,23 +5212,35 @@ mod tests {
     #[test]
     fn test_grep_text_line_anchor_matches_inner_line() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/cfg.yaml", "yaml", 3)).unwrap();
-        storage.insert_text_file(&TextFileRecord {
-            id: None,
-            file_id: id,
-            content: "host: 10.0.0.1\nport: 8080\nname: example\n".to_string(),
-        }).unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/cfg.yaml", "yaml", 3))
+            .unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id: id,
+                content: "host: 10.0.0.1\nport: 8080\nname: example\n".to_string(),
+            })
+            .unwrap();
 
         let (m, _, _) = storage
             .grep_text_filtered(r"^port:", None, None, 100, 0, 1_000_000)
             .unwrap();
-        assert_eq!(m.len(), 1, "^ должен совпадать с началом строки, а не файла");
+        assert_eq!(
+            m.len(),
+            1,
+            "^ должен совпадать с началом строки, а не файла"
+        );
         assert_eq!(m[0].line, 2);
 
         let (m_end, _, _) = storage
             .grep_text_filtered(r"8080$", None, None, 100, 0, 1_000_000)
             .unwrap();
-        assert_eq!(m_end.len(), 1, "$ должен совпадать с концом строки, а не файла");
+        assert_eq!(
+            m_end.len(),
+            1,
+            "$ должен совпадать с концом строки, а не файла"
+        );
         assert_eq!(m_end[0].line, 2);
     }
 
@@ -4754,10 +5250,18 @@ mod tests {
     #[test]
     fn test_grep_code_counts_unreadable_files() {
         let storage = Storage::open_in_memory().unwrap();
-        let good = storage.upsert_file(&make_file_full("/good.py", "python", 2)).unwrap();
-        storage.upsert_file_content(good, "def bar():\n    return 1\n", 4096).unwrap();
-        let bad = storage.upsert_file(&make_file_full("/bad.py", "python", 2)).unwrap();
-        storage.upsert_file_content(bad, "def bar():\n    return 2\n", 4096).unwrap();
+        let good = storage
+            .upsert_file(&make_file_full("/good.py", "python", 2))
+            .unwrap();
+        storage
+            .upsert_file_content(good, "def bar():\n    return 1\n", 4096)
+            .unwrap();
+        let bad = storage
+            .upsert_file(&make_file_full("/bad.py", "python", 2))
+            .unwrap();
+        storage
+            .upsert_file_content(bad, "def bar():\n    return 2\n", 4096)
+            .unwrap();
         // Портим содержимое второго файла: распаковка на нём не пройдёт.
         storage
             .conn()
@@ -4785,7 +5289,9 @@ mod tests {
     #[test]
     fn test_grep_code_line_anchor_matches_inner_line() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/a.py", "python", 4)).unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/a.py", "python", 4))
+            .unwrap();
         storage
             .upsert_file_content(id, "import os\n\ndef bar():\n    return 1\n", 4096)
             .unwrap();
@@ -4793,7 +5299,11 @@ mod tests {
         let (m, _, _) = storage
             .grep_code_filtered(r"^def bar", None, None, 100, 0, 1_000_000)
             .unwrap();
-        assert_eq!(m.len(), 1, "^ должен совпадать с началом строки, а не файла");
+        assert_eq!(
+            m.len(),
+            1,
+            "^ должен совпадать с началом строки, а не файла"
+        );
         assert_eq!(m[0].line, 3);
     }
 
@@ -4804,9 +5314,15 @@ mod tests {
     #[test]
     fn test_grep_code_end_anchor_on_crlf_file() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/crlf.rs", "rust", 4)).unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/crlf.rs", "rust", 4))
+            .unwrap();
         storage
-            .upsert_file_content(id, "use std::sync::Arc;\r\n\r\nfn bar() {\r\n    let x = 1;\r\n}\r\n", 4096)
+            .upsert_file_content(
+                id,
+                "use std::sync::Arc;\r\n\r\nfn bar() {\r\n    let x = 1;\r\n}\r\n",
+                4096,
+            )
             .unwrap();
 
         let (m, _, _) = storage
@@ -4828,8 +5344,12 @@ mod tests {
     #[test]
     fn test_grep_body_line_anchor_matches_inner_line() {
         let storage = Storage::open_in_memory().unwrap();
-        let file_id = storage.upsert_file(&make_file_full("/m.py", "python", 10)).unwrap();
-        storage.insert_functions(&[make_function(file_id, "foo")]).unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/m.py", "python", 10))
+            .unwrap();
+        storage
+            .insert_functions(&[make_function(file_id, "foo")])
+            .unwrap();
 
         // Тело make_function: "def foo(x, y):\n    return x + y"
         let m = storage
@@ -4844,7 +5364,9 @@ mod tests {
     #[test]
     fn test_grep_body_end_anchor_on_crlf_body() {
         let storage = Storage::open_in_memory().unwrap();
-        let file_id = storage.upsert_file(&make_file_full("/m.py", "python", 10)).unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/m.py", "python", 10))
+            .unwrap();
         let mut f = make_function(file_id, "foo");
         f.body = "def foo(x, y):\r\n    return x + y\r\n".to_string();
         storage.insert_functions(&[f]).unwrap();
@@ -4861,7 +5383,9 @@ mod tests {
     #[test]
     fn test_grep_body_pattern_ignores_cyrillic_case() {
         let storage = Storage::open_in_memory().unwrap();
-        let file_id = storage.upsert_file(&make_file_full("/m.bsl", "bsl", 10)).unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/m.bsl", "bsl", 10))
+            .unwrap();
         let mut f = make_function(file_id, "Проверка");
         f.body = "Процедура Проверка()\n    Если ЗначениеЗаполнено(Ссылка) Тогда\n    КонецЕсли;\nКонецПроцедуры".to_string();
         storage.insert_functions(&[f]).unwrap();
@@ -4883,13 +5407,23 @@ mod tests {
     #[test]
     fn test_grep_body_pattern_is_literal() {
         let storage = Storage::open_in_memory().unwrap();
-        let file_id = storage.upsert_file(&make_file_full("/m.bsl", "bsl", 10)).unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/m.bsl", "bsl", 10))
+            .unwrap();
         let mut f = make_function(file_id, "Расчёт");
-        f.body = "Процедура Расчёт()\n    Если Значение(Итого*2) Тогда\n    КонецЕсли;\nКонецПроцедуры".to_string();
+        f.body =
+            "Процедура Расчёт()\n    Если Значение(Итого*2) Тогда\n    КонецЕсли;\nКонецПроцедуры"
+                .to_string();
         storage.insert_functions(&[f]).unwrap();
 
-        let m = storage.grep_body(Some("Значение("), None, None, 100).unwrap();
-        assert_eq!(m.len(), 1, "незакрытая скобка в подстроке не должна ронять поиск");
+        let m = storage
+            .grep_body(Some("Значение("), None, None, 100)
+            .unwrap();
+        assert_eq!(
+            m.len(),
+            1,
+            "незакрытая скобка в подстроке не должна ронять поиск"
+        );
 
         let m = storage.grep_body(Some("Итого*2"), None, None, 100).unwrap();
         assert_eq!(m.len(), 1, "звёздочка в подстроке — обычный символ");
@@ -4898,13 +5432,19 @@ mod tests {
     #[test]
     fn test_grep_text_with_context() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/log.txt", "text", 5)).unwrap();
-        storage.insert_text_file(&TextFileRecord {
-            id: None,
-            file_id: id,
-            content: "a\nb\nFOUND\nd\ne".to_string(),
-        }).unwrap();
-        let (m, _truncated, _) = storage.grep_text_filtered(r"FOUND", None, None, 100, 1, 1_000_000).unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/log.txt", "text", 5))
+            .unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id: id,
+                content: "a\nb\nFOUND\nd\ne".to_string(),
+            })
+            .unwrap();
+        let (m, _truncated, _) = storage
+            .grep_text_filtered(r"FOUND", None, None, 100, 1, 1_000_000)
+            .unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].context.len(), 3); // строки 2, 3, 4
         assert_eq!(m[0].context[0].line, 2);
@@ -4916,11 +5456,29 @@ mod tests {
     #[test]
     fn test_grep_text_path_glob_filters() {
         let storage = Storage::open_in_memory().unwrap();
-        let id1 = storage.upsert_file(&make_file_full("/a.yaml", "yaml", 1)).unwrap();
-        let id2 = storage.upsert_file(&make_file_full("/b.json", "json", 1)).unwrap();
-        storage.insert_text_file(&TextFileRecord { id: None, file_id: id1, content: "key: 42".into() }).unwrap();
-        storage.insert_text_file(&TextFileRecord { id: None, file_id: id2, content: "{\"key\": 42}".into() }).unwrap();
-        let (m, _truncated, _) = storage.grep_text_filtered(r"42", Some("*.yaml"), None, 100, 0, 1_000_000).unwrap();
+        let id1 = storage
+            .upsert_file(&make_file_full("/a.yaml", "yaml", 1))
+            .unwrap();
+        let id2 = storage
+            .upsert_file(&make_file_full("/b.json", "json", 1))
+            .unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id: id1,
+                content: "key: 42".into(),
+            })
+            .unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id: id2,
+                content: "{\"key\": 42}".into(),
+            })
+            .unwrap();
+        let (m, _truncated, _) = storage
+            .grep_text_filtered(r"42", Some("*.yaml"), None, 100, 0, 1_000_000)
+            .unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].path, "/a.yaml");
     }
@@ -4928,14 +5486,20 @@ mod tests {
     #[test]
     fn test_grep_text_truncated_flag() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/many.txt", "text", 5)).unwrap();
-        storage.insert_text_file(&TextFileRecord {
-            id: None,
-            file_id: id,
-            content: "x\nx\nx\nx\nx".to_string(),
-        }).unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/many.txt", "text", 5))
+            .unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id: id,
+                content: "x\nx\nx\nx\nx".to_string(),
+            })
+            .unwrap();
         // limit=2 при 5 совпадениях → результат обрезан, truncated=true
-        let (m, truncated, _) = storage.grep_text_filtered(r"x", None, None, 2, 0, 1_000_000).unwrap();
+        let (m, truncated, _) = storage
+            .grep_text_filtered(r"x", None, None, 2, 0, 1_000_000)
+            .unwrap();
         assert_eq!(m.len(), 2);
         assert!(truncated);
     }
@@ -4943,26 +5507,41 @@ mod tests {
     #[test]
     fn test_grep_body_with_options_context() {
         let storage = Storage::open_in_memory().unwrap();
-        let file_id = storage.upsert_file(&make_file_full("/code.py", "python", 30)).unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/code.py", "python", 30))
+            .unwrap();
         let mut fr = make_function(file_id, "do_thing");
         fr.line_start = 10;
         fr.line_end = 14;
         fr.body = "def do_thing():\n    target = 1\n    other = 2\n    return target".to_string();
         storage.insert_functions(&[fr]).unwrap();
 
-        let (m, _truncated) = storage.grep_body_with_options(
-            Some("target"), None, None, None, 50, 1, 1_000_000,
-        ).unwrap();
+        let (m, _truncated) = storage
+            .grep_body_with_options(GrepBodyOptions {
+                pattern: Some("target"),
+                regex_pattern: None,
+                language: None,
+                path_glob: None,
+                limit: 50,
+                context_lines: 1,
+                max_total_bytes: 1_000_000,
+            })
+            .unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "do_thing");
         assert!(!m[0].match_lines.is_empty());
-        assert!(!m[0].context.is_empty(), "context_lines=1 должен дать контекст");
+        assert!(
+            !m[0].context.is_empty(),
+            "context_lines=1 должен дать контекст"
+        );
     }
 
     #[test]
     fn test_get_path_by_file_id() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/some/path.py", "python", 1)).unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/some/path.py", "python", 1))
+            .unwrap();
         let p = storage.get_path_by_file_id(id).unwrap();
         assert_eq!(p, Some("/some/path.py".to_string()));
         let none = storage.get_path_by_file_id(99999).unwrap();
@@ -4978,9 +5557,13 @@ mod tests {
     #[test]
     fn test_upsert_file_content_round_trip() {
         let storage = Storage::open_in_memory().unwrap();
-        let file_id = storage.upsert_file(&make_file_full("/src/app.py", "python", 5)).unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/src/app.py", "python", 5))
+            .unwrap();
 
-        storage.upsert_file_content(file_id, "hello world", 1024).unwrap();
+        storage
+            .upsert_file_content(file_id, "hello world", 1024)
+            .unwrap();
 
         let result = storage.read_file_content(file_id).unwrap();
         assert_eq!(
@@ -4998,11 +5581,15 @@ mod tests {
     #[test]
     fn test_upsert_file_content_oversize() {
         let storage = Storage::open_in_memory().unwrap();
-        let file_id = storage.upsert_file(&make_file_full("/big.py", "python", 1000)).unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/big.py", "python", 1000))
+            .unwrap();
 
         // 100 байт > 50 байт лимита → oversize
         let big_content: String = "x".repeat(100);
-        storage.upsert_file_content(file_id, &big_content, 50).unwrap();
+        storage
+            .upsert_file_content(file_id, &big_content, 50)
+            .unwrap();
 
         let result = storage.read_file_content(file_id).unwrap();
         assert_eq!(
@@ -5021,10 +5608,16 @@ mod tests {
     #[test]
     fn test_upsert_file_content_idempotent_replace() {
         let storage = Storage::open_in_memory().unwrap();
-        let file_id = storage.upsert_file(&make_file_full("/mod.py", "python", 10)).unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/mod.py", "python", 10))
+            .unwrap();
 
-        storage.upsert_file_content(file_id, "first content", 4096).unwrap();
-        storage.upsert_file_content(file_id, "second content", 4096).unwrap();
+        storage
+            .upsert_file_content(file_id, "first content", 4096)
+            .unwrap();
+        storage
+            .upsert_file_content(file_id, "second content", 4096)
+            .unwrap();
 
         let result = storage.read_file_content(file_id).unwrap();
         assert_eq!(
@@ -5039,7 +5632,9 @@ mod tests {
     #[test]
     fn test_read_file_content_missing_returns_none() {
         let storage = Storage::open_in_memory().unwrap();
-        let file_id = storage.upsert_file(&make_file_full("/norecord.py", "python", 5)).unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/norecord.py", "python", 5))
+            .unwrap();
 
         // Запись в files есть, но file_contents — нет
         let result = storage.read_file_content(file_id).unwrap();
@@ -5057,8 +5652,12 @@ mod tests {
     #[test]
     fn test_delete_file_content_removes_entry() {
         let storage = Storage::open_in_memory().unwrap();
-        let file_id = storage.upsert_file(&make_file_full("/del.py", "python", 3)).unwrap();
-        storage.upsert_file_content(file_id, "some code", 4096).unwrap();
+        let file_id = storage
+            .upsert_file(&make_file_full("/del.py", "python", 3))
+            .unwrap();
+        storage
+            .upsert_file_content(file_id, "some code", 4096)
+            .unwrap();
         assert!(storage.has_file_content(file_id).unwrap());
 
         storage.delete_file_content(file_id).unwrap();
@@ -5079,7 +5678,9 @@ mod tests {
     #[test]
     fn test_get_file_id_by_path_found_and_missing() {
         let storage = Storage::open_in_memory().unwrap();
-        let id = storage.upsert_file(&make_file_full("/exists.py", "python", 1)).unwrap();
+        let id = storage
+            .upsert_file(&make_file_full("/exists.py", "python", 1))
+            .unwrap();
 
         let found = storage.get_file_id_by_path("/exists.py").unwrap();
         assert_eq!(found, Some(id), "путь есть — должен вернуть правильный id");
@@ -5094,14 +5695,20 @@ mod tests {
     #[test]
     fn test_has_text_file_true_for_text_files() {
         let storage = Storage::open_in_memory().unwrap();
-        let text_id = storage.upsert_file(&make_file_full("/readme.md", "markdown", 10)).unwrap();
-        let code_id = storage.upsert_file(&make_file_full("/lib.rs", "rust", 20)).unwrap();
+        let text_id = storage
+            .upsert_file(&make_file_full("/readme.md", "markdown", 10))
+            .unwrap();
+        let code_id = storage
+            .upsert_file(&make_file_full("/lib.rs", "rust", 20))
+            .unwrap();
 
-        storage.insert_text_file(&TextFileRecord {
-            id: None,
-            file_id: text_id,
-            content: "# README\n".to_string(),
-        }).unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id: text_id,
+                content: "# README\n".to_string(),
+            })
+            .unwrap();
 
         assert!(
             storage.has_text_file(text_id).unwrap(),
@@ -5207,7 +5814,10 @@ mod tests {
         storage.upsert_file_content(file_id, source, 4096).unwrap();
 
         let r = storage
-            .read_file_text("/src/utils.py", None, None, 1000, 1_000_000, 10_000_000, None)
+            .read_file_text(
+                "/src/utils.py",
+                ReadFileOptions::new(None, None, 1000, 1_000_000, 10_000_000, None),
+            )
             .unwrap()
             .expect("файл должен существовать");
 
@@ -5226,7 +5836,9 @@ mod tests {
             .upsert_file(&make_file_full("/huge.bsl", "bsl", 500))
             .unwrap();
         // Устанавливаем file_size = 200 через update_file_metadata, чтобы hint мог показать размер
-        storage.update_file_metadata("/huge.bsl", 1714305600, 200).unwrap();
+        storage
+            .update_file_metadata("/huge.bsl", 1714305600, 200)
+            .unwrap();
 
         // content 100 байт > лимит 50
         let big: String = "a".repeat(100);
@@ -5234,7 +5846,10 @@ mod tests {
 
         // С явным size_limit_bytes — hint должен содержать оба числа
         let r = storage
-            .read_file_text("/huge.bsl", None, None, 1000, 1_000_000, 10_000_000, Some(50))
+            .read_file_text(
+                "/huge.bsl",
+                ReadFileOptions::new(None, None, 1000, 1_000_000, 10_000_000, Some(50)),
+            )
             .unwrap()
             .expect("файл должен существовать");
 
@@ -5249,7 +5864,10 @@ mod tests {
 
         // Без size_limit_bytes — hint всё равно Some (общая формулировка)
         let r2 = storage
-            .read_file_text("/huge.bsl", None, None, 1000, 1_000_000, 10_000_000, None)
+            .read_file_text(
+                "/huge.bsl",
+                ReadFileOptions::new(None, None, 1000, 1_000_000, 10_000_000, None),
+            )
             .unwrap()
             .expect("файл должен существовать");
         assert!(r2.oversize);
@@ -5268,7 +5886,10 @@ mod tests {
             .unwrap();
 
         let r = storage
-            .read_file_text("/old.py", None, None, 1000, 1_000_000, 10_000_000, None)
+            .read_file_text(
+                "/old.py",
+                ReadFileOptions::new(None, None, 1000, 1_000_000, 10_000_000, None),
+            )
             .unwrap()
             .expect("файл должен существовать");
 
@@ -5298,7 +5919,11 @@ mod tests {
         let r = storage.stat_file_meta("/heavy.rs").unwrap();
         assert!(r.exists);
         assert_eq!(r.category.as_deref(), Some("code"));
-        assert_eq!(r.oversize, Some(true), "oversize-запись → oversize=Some(true)");
+        assert_eq!(
+            r.oversize,
+            Some(true),
+            "oversize-запись → oversize=Some(true)"
+        );
     }
 
     /// stat_file для обычного code-файла (нормальная запись) → oversize=Some(false).
@@ -5308,12 +5933,18 @@ mod tests {
         let file_id = storage
             .upsert_file(&make_file_full("/small.rs", "rust", 10))
             .unwrap();
-        storage.upsert_file_content(file_id, "fn main() {}", 4096).unwrap();
+        storage
+            .upsert_file_content(file_id, "fn main() {}", 4096)
+            .unwrap();
 
         let r = storage.stat_file_meta("/small.rs").unwrap();
         assert!(r.exists);
         assert_eq!(r.category.as_deref(), Some("code"));
-        assert_eq!(r.oversize, Some(false), "нормальная запись → oversize=Some(false)");
+        assert_eq!(
+            r.oversize,
+            Some(false),
+            "нормальная запись → oversize=Some(false)"
+        );
     }
 
     /// stat_file для text-файла → category="text", oversize=None (поле не заполняется).
@@ -5323,11 +5954,13 @@ mod tests {
         let file_id = storage
             .upsert_file(&make_file_full("/config.yaml", "yaml", 20))
             .unwrap();
-        storage.insert_text_file(&TextFileRecord {
-            id: None,
-            file_id,
-            content: "key: value\n".to_string(),
-        }).unwrap();
+        storage
+            .insert_text_file(&TextFileRecord {
+                id: None,
+                file_id,
+                content: "key: value\n".to_string(),
+            })
+            .unwrap();
 
         let r = storage.stat_file_meta("/config.yaml").unwrap();
         assert!(r.exists);
@@ -5437,7 +6070,11 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].line, 3, "MATCH на строке 3");
         // context_lines=1: строки 2, 3, 4
-        assert_eq!(m[0].context.len(), 3, "должно быть 3 строки контекста (до, матч, после)");
+        assert_eq!(
+            m[0].context.len(),
+            3,
+            "должно быть 3 строки контекста (до, матч, после)"
+        );
         let lines: Vec<usize> = m[0].context.iter().map(|c| c.line).collect();
         assert!(lines.contains(&2), "должна быть строка 2");
         assert!(lines.contains(&3), "должна быть строка 3");
@@ -5463,7 +6100,10 @@ mod tests {
             .grep_code_filtered("COMMON_PATTERN", None, None, 2, 0, 1_000_000)
             .unwrap();
         assert_eq!(m.len(), 2, "limit=2 должен вернуть ровно 2 результата");
-        assert!(truncated, "при достижении лимита truncated должен быть true");
+        assert!(
+            truncated,
+            "при достижении лимита truncated должен быть true"
+        );
     }
 
     // ── migrate_v4 идемпотентность ────────────────────────────────────────────
@@ -5486,14 +6126,18 @@ mod tests {
         conn.execute(
             "INSERT INTO files (path, content_hash, language) VALUES ('/t.py', 'h', 'python')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let file_id: i64 = conn
-            .query_row("SELECT id FROM files WHERE path = '/t.py'", [], |r| r.get(0))
+            .query_row("SELECT id FROM files WHERE path = '/t.py'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         conn.execute(
             "INSERT INTO file_contents (file_id, content_blob, oversize) VALUES (?1, NULL, 1)",
             rusqlite::params![file_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         let oversize: i64 = conn
             .query_row(
@@ -5502,6 +6146,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(oversize, 1, "после идемпотентных вызовов таблица должна работать");
+        assert_eq!(
+            oversize, 1,
+            "после идемпотентных вызовов таблица должна работать"
+        );
     }
 }

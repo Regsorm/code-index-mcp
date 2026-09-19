@@ -230,11 +230,7 @@ fn collect_candidates(
     let rows: Vec<ProcedureRow> = if reenrich {
         stmt.query_map([], |r| {
             Ok(ProcedureRow {
-                proc_key: format!(
-                    "{}::{}",
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?
-                ),
+                proc_key: format!("{}::{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?),
                 name: r.get::<_, String>(1)?,
                 body: r.get::<_, String>(2)?,
             })
@@ -243,11 +239,7 @@ fn collect_candidates(
     } else {
         stmt.query_map(params![REPO_DEFAULT], |r| {
             Ok(ProcedureRow {
-                proc_key: format!(
-                    "{}::{}",
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?
-                ),
+                proc_key: format!("{}::{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?),
                 name: r.get::<_, String>(1)?,
                 body: r.get::<_, String>(2)?,
             })
@@ -258,12 +250,7 @@ fn collect_candidates(
 }
 
 /// UPSERT terms+signature для одной процедуры.
-fn upsert_terms(
-    storage: &mut Storage,
-    proc_key: &str,
-    terms: &str,
-    signature: &str,
-) -> Result<()> {
+fn upsert_terms(storage: &mut Storage, proc_key: &str, terms: &str, signature: &str) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -287,10 +274,17 @@ mod tests {
     use code_index_core::storage::Storage;
     use tempfile::TempDir;
 
-    fn open_storage_with_bsl_function(tmp: &TempDir, file_path: &str, name: &str, body: &str) -> Storage {
+    fn open_storage_with_bsl_function(
+        tmp: &TempDir,
+        file_path: &str,
+        name: &str,
+        body: &str,
+    ) -> Storage {
         let db_path = tmp.path().join("index.db");
         let storage = Storage::open_file(&db_path).unwrap();
-        storage.apply_schema_extensions(crate::schema::SCHEMA_EXTENSIONS).unwrap();
+        storage
+            .apply_schema_extensions(crate::schema::SCHEMA_EXTENSIONS)
+            .unwrap();
 
         let conn = storage.conn();
         conn.execute(
@@ -299,9 +293,11 @@ mod tests {
         )
         .unwrap();
         let file_id: i64 = conn
-            .query_row("SELECT id FROM files WHERE path = ?", params![file_path], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT id FROM files WHERE path = ?",
+                params![file_path],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO functions (file_id, name, body, node_hash) VALUES (?, ?, ?, ?)",
@@ -322,7 +318,7 @@ mod tests {
         );
 
         let client = Arc::new(MockChatClient::with_responses([Ok(
-            "1. товары\n2. склад\n3. проведение".to_string()
+            "1. товары\n2. склад\n3. проведение".to_string(),
         )]));
         let opts = RunOptions {
             prompt_template: "sys".to_string(),
@@ -386,7 +382,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut storage = open_storage_with_bsl_function(&tmp, "A.bsl", "П", "// тело");
 
-        let client = Arc::new(MockChatClient::with_responses([Err(anyhow::anyhow!("сеть"))]));
+        let client = Arc::new(MockChatClient::with_responses([Err(anyhow::anyhow!(
+            "сеть"
+        ))]));
         let opts = RunOptions {
             prompt_template: "sys".to_string(),
             signature: "новая-модель".to_string(),
@@ -430,7 +428,10 @@ mod tests {
 
         // С полным переобогащением — подпись обновляется.
         let client = Arc::new(MockChatClient::with_responses([Ok("термы".to_string())]));
-        let opts = RunOptions { reenrich: true, ..opts };
+        let opts = RunOptions {
+            reenrich: true,
+            ..opts
+        };
         run(&mut storage, client, &opts).await.unwrap();
         assert_eq!(
             super::super::signature::read_signature(storage.conn())
@@ -443,12 +444,7 @@ mod tests {
     #[tokio::test]
     async fn run_skips_already_enriched_unless_reenrich() {
         let tmp = TempDir::new().unwrap();
-        let mut storage = open_storage_with_bsl_function(
-            &tmp,
-            "X.bsl",
-            "P",
-            "// b",
-        );
+        let mut storage = open_storage_with_bsl_function(&tmp, "X.bsl", "P", "// b");
         // Уже есть запись с непустыми terms.
         storage
             .conn()
@@ -529,7 +525,9 @@ mod tests {
         // Добавим вторую процедуру для того же файла.
         let conn = storage.conn();
         let file_id: i64 = conn
-            .query_row("SELECT id FROM files WHERE path = 'A.bsl'", [], |r| r.get(0))
+            .query_row("SELECT id FROM files WHERE path = 'A.bsl'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         conn.execute(
             "INSERT INTO functions (file_id, name, body, node_hash) VALUES (?, ?, ?, ?)",
@@ -584,7 +582,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut storage = open_storage_with_bsl_function(&tmp, "F.bsl", "P", "//b");
 
-        let client = Arc::new(MockChatClient::with_responses([Err(anyhow::anyhow!("boom"))]));
+        let client = Arc::new(MockChatClient::with_responses([Err(anyhow::anyhow!(
+            "boom"
+        ))]));
         let opts = RunOptions {
             prompt_template: "sys".to_string(),
             signature: "sig".to_string(),

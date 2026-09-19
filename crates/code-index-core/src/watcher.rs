@@ -15,7 +15,9 @@ pub(crate) fn is_config_change(
     targets: &[PathBuf],
 ) -> bool {
     !matches!(kind, notify::EventKind::Access(_))
-        && paths.iter().any(|path| targets.iter().any(|target| path == target))
+        && paths
+            .iter()
+            .any(|path| targets.iter().any(|target| path == target))
 }
 
 /// Событие файловой системы
@@ -205,8 +207,7 @@ pub fn create_watcher(
                     let is_excluded = rel.components().any(|c| {
                         let s = c.as_os_str().to_string_lossy();
                         exclude_dirs.contains(&s.to_string())
-                            || crate::indexer::file_types::EXCLUDE_DIRS
-                                .contains(&s.as_ref())
+                            || crate::indexer::file_types::EXCLUDE_DIRS.contains(&s.as_ref())
                     });
                     if is_excluded {
                         continue;
@@ -458,10 +459,7 @@ mod tests {
     fn test_is_real_deletion_only_on_not_found() {
         use std::io::{Error, ErrorKind};
 
-        assert!(
-            !is_real_deletion(None),
-            "путь на месте — это не удаление"
-        );
+        assert!(!is_real_deletion(None), "путь на месте — это не удаление");
         assert!(
             is_real_deletion(Some(&Error::new(ErrorKind::NotFound, "нет такого файла"))),
             "явное отсутствие — удаление"

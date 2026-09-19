@@ -7,6 +7,7 @@ fn main() {
         res.set("LegalCopyright", "Copyright (C) 2026 Regsorm");
         res.set("OriginalFilename", "code-index.exe");
         res.set("InternalName", "code-index.exe");
-        res.compile().expect("failed to embed Windows resources for code-index");
+        res.compile()
+            .expect("failed to embed Windows resources for code-index");
     }
 }

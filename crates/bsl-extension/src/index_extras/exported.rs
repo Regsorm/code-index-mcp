@@ -51,7 +51,11 @@ pub(crate) fn classify_module(path: &str) -> (&'static str, Option<String>, Opti
     if let Some(prefix) = manager {
         let mut segs = prefix.rsplit('/');
         if let (Some(object), Some(folder)) = (segs.next(), segs.next()) {
-            return ("manager", Some(object.to_string()), Some(folder.to_string()));
+            return (
+                "manager",
+                Some(object.to_string()),
+                Some(folder.to_string()),
+            );
         }
     }
     ("other", None, None)

@@ -276,7 +276,10 @@ impl IndexTool for BslSqlTool {
                             if err.code == ErrorCode::OperationInterrupted
                     );
                     let msg = if interrupted {
-                        format!("query timed out after {}s and was interrupted", QUERY_TIMEOUT_SECS)
+                        format!(
+                            "query timed out after {}s and was interrupted",
+                            QUERY_TIMEOUT_SECS
+                        )
                     } else {
                         format!("SQL execution error: {}", e)
                     };
@@ -295,9 +298,17 @@ impl IndexTool for BslSqlTool {
 fn starts_with_select_or_with(sql: &str) -> bool {
     let rest = skip_leading_comments(sql);
     let upper = rest.trim_start();
-    let head: String = upper.chars().take(6).collect::<String>().to_ascii_uppercase();
-    head.starts_with("SELECT") || head.starts_with("WITH ") || head.starts_with("WITH\t")
-        || head.starts_with("WITH\n") || head == "WITH" || head.starts_with("WITH(")
+    let head: String = upper
+        .chars()
+        .take(6)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    head.starts_with("SELECT")
+        || head.starts_with("WITH ")
+        || head.starts_with("WITH\t")
+        || head.starts_with("WITH\n")
+        || head == "WITH"
+        || head.starts_with("WITH(")
 }
 
 /// Срезать ведущие пробелы и SQL-комментарии, вернуть остаток.
@@ -441,8 +452,11 @@ fn terms_fallback_for_sql(
     if words.is_empty() {
         return None;
     }
-    let fts_query =
-        words.iter().map(|w| format!("\"{}\"", w)).collect::<Vec<_>>().join(" OR ");
+    let fts_query = words
+        .iter()
+        .map(|w| format!("\"{}\"", w))
+        .collect::<Vec<_>>()
+        .join(" OR ");
     let mut stmt = conn
         .prepare(
             "SELECT pe.proc_key, pe.signature, fts.rank
@@ -524,8 +538,10 @@ fn tables_in_query(sql: &str) -> Vec<String> {
     for w in toks.windows(2) {
         let kw = w[0].to_ascii_lowercase();
         if kw == "from" || kw == "join" {
-            let ident: String =
-                w[1].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            let ident: String = w[1]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
             if !ident.is_empty() && !out.contains(&ident) {
                 out.push(ident);
             }
@@ -575,8 +591,10 @@ fn enrich_prepare_error(conn: &rusqlite::Connection, sql: &str, err: &str) -> Va
 
     if err.contains("no such table") {
         // Подсказка по таблицам: ближайшие имена из всей БД.
-        let mut cand: Vec<(usize, &String)> =
-            all_tables.iter().map(|t| (levenshtein(&missing, t), t)).collect();
+        let mut cand: Vec<(usize, &String)> = all_tables
+            .iter()
+            .map(|t| (levenshtein(&missing, t), t))
+            .collect();
         cand.sort();
         let dym: Vec<&String> = cand.iter().take(3).map(|(_, t)| *t).collect();
         return json!({ "error": base, "did_you_mean": dym, "tables": all_tables });
@@ -598,10 +616,17 @@ fn enrich_prepare_error(conn: &rusqlite::Connection, sql: &str, err: &str) -> Va
         .collect();
     candidates.sort();
     candidates.dedup();
-    let mut cand: Vec<(usize, &String)> =
-        candidates.iter().map(|c| (levenshtein(&missing, c), c)).collect();
+    let mut cand: Vec<(usize, &String)> = candidates
+        .iter()
+        .map(|c| (levenshtein(&missing, c), c))
+        .collect();
     cand.sort();
-    let dym: Vec<&String> = cand.iter().filter(|(d, _)| *d <= 6).take(3).map(|(_, c)| *c).collect();
+    let dym: Vec<&String> = cand
+        .iter()
+        .filter(|(d, _)| *d <= 6)
+        .take(3)
+        .map(|(_, c)| *c)
+        .collect();
     json!({
         "error": base,
         "did_you_mean": dym,
@@ -685,7 +710,9 @@ mod tests {
     fn prefix_guard_accepts_select_and_with() {
         assert!(starts_with_select_or_with("SELECT 1"));
         assert!(starts_with_select_or_with("  select * from x"));
-        assert!(starts_with_select_or_with("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+        assert!(starts_with_select_or_with(
+            "WITH cte AS (SELECT 1) SELECT * FROM cte"
+        ));
         assert!(starts_with_select_or_with("with(1)")); // редкий, но валидный синтаксис
     }
 
@@ -693,7 +720,9 @@ mod tests {
     fn prefix_guard_skips_leading_comments() {
         assert!(starts_with_select_or_with("-- комментарий\nSELECT 1"));
         assert!(starts_with_select_or_with("/* блок */ SELECT 1"));
-        assert!(starts_with_select_or_with("/* a */ -- b\n  WITH cte AS (SELECT 1) SELECT 1"));
+        assert!(starts_with_select_or_with(
+            "/* a */ -- b\n  WITH cte AS (SELECT 1) SELECT 1"
+        ));
     }
 
     #[test]
@@ -711,7 +740,10 @@ mod tests {
         let conn = mem_db();
         let sql = "WITH c AS (SELECT id FROM metadata_objects) DELETE FROM metadata_objects WHERE id IN (SELECT id FROM c)";
         let stmt = conn.prepare(sql).unwrap();
-        assert!(!stmt.readonly(), "WITH ... DELETE не должен считаться read-only");
+        assert!(
+            !stmt.readonly(),
+            "WITH ... DELETE не должен считаться read-only"
+        );
     }
 
     #[test]
@@ -721,8 +753,12 @@ mod tests {
         let sql = "SELECT mm.meta_type FROM metadata_modules mm";
         let err = conn.prepare(sql).unwrap_err().to_string();
         let v = enrich_prepare_error(&conn, sql, &err);
-        let dym: Vec<&str> =
-            v["did_you_mean"].as_array().unwrap().iter().filter_map(|x| x.as_str()).collect();
+        let dym: Vec<&str> = v["did_you_mean"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
         assert!(dym.contains(&"module_type"), "did_you_mean: {dym:?}");
         // Колонка meta_type реально живёт в metadata_objects.
         let hosts: Vec<&str> = v["column_exists_in_tables"]
@@ -739,8 +775,12 @@ mod tests {
         let sql2 = "SELECT * FROM metadata_object";
         let err2 = conn.prepare(sql2).unwrap_err().to_string();
         let v2 = enrich_prepare_error(&conn, sql2, &err2);
-        let dym2: Vec<&str> =
-            v2["did_you_mean"].as_array().unwrap().iter().filter_map(|x| x.as_str()).collect();
+        let dym2: Vec<&str> = v2["did_you_mean"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
         assert!(dym2.contains(&"metadata_objects"), "did_you_mean: {dym2:?}");
     }
 
@@ -763,10 +803,15 @@ mod tests {
     #[test]
     fn collect_rows_enforces_limit_and_sets_truncated() {
         let conn = mem_db();
-        let mut stmt = conn.prepare("SELECT full_name FROM metadata_objects").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT full_name FROM metadata_objects")
+            .unwrap();
         let (_, rows, truncated) = collect_rows(&mut stmt, Vec::new(), 1).unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(truncated, "при лимите 1 и двух строках должно быть truncated=true");
+        assert!(
+            truncated,
+            "при лимите 1 и двух строках должно быть truncated=true"
+        );
     }
 
     #[test]
@@ -790,8 +835,14 @@ mod tests {
             "SELECT terms FROM procedure_enrichment WHERE proc_key='y'",
         ] {
             let h = empty_result_hint(q);
-            assert!(h.contains("search_terms"), "proc-запрос должен звать в search_terms");
-            assert!(h.contains("триграмм"), "должна быть триграммная аргументация (выгода)");
+            assert!(
+                h.contains("search_terms"),
+                "proc-запрос должен звать в search_terms"
+            );
+            assert!(
+                h.contains("триграмм"),
+                "должна быть триграммная аргументация (выгода)"
+            );
         }
         // Запрос к метаданным/связям → общий hint (тоже упоминает search_terms,
         // но как «если искали процедуру», а не как основной совет).
@@ -805,7 +856,10 @@ mod tests {
         // W5: простые формы.
         assert_eq!(sql_limit_value("SELECT 1 FROM t LIMIT 30"), Some(30));
         assert_eq!(sql_limit_value("select 1 from t limit 30;"), Some(30));
-        assert_eq!(sql_limit_value("SELECT 1 FROM t LIMIT 10 OFFSET 5"), Some(10));
+        assert_eq!(
+            sql_limit_value("SELECT 1 FROM t LIMIT 10 OFFSET 5"),
+            Some(10)
+        );
         // Подзапрос: берём последний LIMIT (внешний).
         assert_eq!(
             sql_limit_value("SELECT * FROM (SELECT 1 FROM t LIMIT 100) LIMIT 7"),
@@ -850,9 +904,13 @@ mod tests {
 
     #[test]
     fn searched_proc_tables_detects_procedure_queries() {
-        assert!(searched_proc_tables("SELECT * FROM functions WHERE name LIKE '%X%'"));
+        assert!(searched_proc_tables(
+            "SELECT * FROM functions WHERE name LIKE '%X%'"
+        ));
         assert!(searched_proc_tables("select count(*) from PROC_CALL_GRAPH"));
-        assert!(searched_proc_tables("SELECT terms FROM procedure_enrichment"));
+        assert!(searched_proc_tables(
+            "SELECT terms FROM procedure_enrichment"
+        ));
         assert!(!searched_proc_tables("SELECT * FROM metadata_objects"));
         assert!(!searched_proc_tables("SELECT * FROM data_links"));
     }
@@ -876,7 +934,10 @@ mod tests {
         .expect("fallback должен вернуть выдачу");
         let results = fb["results"].as_array().unwrap();
         assert!(!results.is_empty());
-        assert!(results[0]["proc_key"].as_str().unwrap().contains("НайтиПоШтрихкоду"));
+        assert!(results[0]["proc_key"]
+            .as_str()
+            .unwrap()
+            .contains("НайтиПоШтрихкоду"));
         // Текстовые params тоже участвуют в термах.
         let fb2 = terms_fallback_for_sql(
             &conn,
@@ -897,7 +958,8 @@ mod tests {
         )
         .is_none());
         // Слов ≥3 символов не нашлось → None ещё до запроса.
-        assert!(terms_fallback_for_sql(&conn, "SELECT name FROM functions WHERE id = 5", &[])
-            .is_none());
+        assert!(
+            terms_fallback_for_sql(&conn, "SELECT name FROM functions WHERE id = 5", &[]).is_none()
+        );
     }
 }

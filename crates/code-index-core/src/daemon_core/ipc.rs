@@ -157,10 +157,7 @@ pub struct StopResponse {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ToolUnavailable {
     /// Первичная или массовая переиндексация в процессе.
-    Indexing {
-        progress: Progress,
-        message: String,
-    },
+    Indexing { progress: Progress, message: String },
     /// Запрошенная папка не в конфиге демона.
     NotStarted { message: String },
     /// Алиаса репозитория не существует — опечатка в имени.
@@ -205,8 +202,16 @@ mod tests {
         })
         .unwrap();
 
-        assert!(unknown.contains("\"status\":\"unknown_repo\""), "{}", unknown);
-        assert!(not_started.contains("\"status\":\"not_started\""), "{}", not_started);
+        assert!(
+            unknown.contains("\"status\":\"unknown_repo\""),
+            "{}",
+            unknown
+        );
+        assert!(
+            not_started.contains("\"status\":\"not_started\""),
+            "{}",
+            not_started
+        );
     }
 
     #[test]

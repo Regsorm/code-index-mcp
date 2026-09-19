@@ -325,7 +325,10 @@ mod tests {
 
     #[test]
     fn source_filter_matches_all_accepted_forms() {
-        let sources = json!(["cfg:DocumentObject.ЗаказКлиента", "cfg:CatalogObject.Контрагенты"]);
+        let sources = json!([
+            "cfg:DocumentObject.ЗаказКлиента",
+            "cfg:CatalogObject.Контрагенты"
+        ]);
         // Singular-тип, тип с суффиксом Object, короткое имя, cfg-префикс, регистр.
         assert!(source_matches(&sources, "Document.ЗаказКлиента"));
         assert!(source_matches(&sources, "DocumentObject.ЗаказКлиента"));

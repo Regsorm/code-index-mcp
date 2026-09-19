@@ -125,7 +125,9 @@ impl IndexTool for FindDataPathTool {
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    return crate::tools::wrap_error(json!({ "error": format!("database error: {}", e) }));
+                    return crate::tools::wrap_error(
+                        json!({ "error": format!("database error: {}", e) }),
+                    );
                 }
             };
 
@@ -182,7 +184,9 @@ impl IndexTool for FindDataPathTool {
             }
 
             if let Some(err) = db_err {
-                return crate::tools::wrap_error(json!({ "error": format!("database error: {}", err) }));
+                return crate::tools::wrap_error(
+                    json!({ "error": format!("database error: {}", err) }),
+                );
             }
 
             let result_value = if reached {

@@ -1,6 +1,6 @@
+use std::path::Path;
 /// Логика выбора режима хранения: in-memory vs disk
 use sysinfo::System;
-use std::path::Path;
 
 /// Режим хранения SQLite
 #[derive(Debug, Clone, PartialEq)]
@@ -76,8 +76,8 @@ pub fn available_ram() -> u64 {
 pub fn determine_storage_mode(config: &StorageConfig, db_path: &Path) -> StorageMode {
     match config.mode.as_str() {
         "memory" => StorageMode::InMemory,
-        "disk"   => StorageMode::Disk,
-        _        => auto_detect(config, db_path),
+        "disk" => StorageMode::Disk,
+        _ => auto_detect(config, db_path),
     }
 }
 
@@ -91,9 +91,7 @@ fn auto_detect(config: &StorageConfig, db_path: &Path) -> StorageMode {
     };
 
     // Порог: memory_max_percent % свободной RAM
-    let threshold = available_ram()
-        .saturating_mul(config.memory_max_percent as u64)
-        / 100;
+    let threshold = available_ram().saturating_mul(config.memory_max_percent as u64) / 100;
 
     // Во что обойдётся работа в памяти. У существующей базы это её размер на
     // диске, у новой — оценка по весу исходников: ноль байт файла ничего не

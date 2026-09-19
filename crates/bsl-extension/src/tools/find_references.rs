@@ -469,9 +469,17 @@ mod tests {
 
         // Вызов с lowercase-ключом (как делает execute: object.to_lowercase()).
         let dr = query_data_refs(&conn, "document.заказклиента", 20).unwrap();
-        assert_eq!(dr["total"], json!(1), "data_refs должен найти по lower-ключу");
+        assert_eq!(
+            dr["total"],
+            json!(1),
+            "data_refs должен найти по lower-ключу"
+        );
         let rr = query_role_rights(&conn, "document.заказклиента", 20).unwrap();
-        assert_eq!(rr["total"], json!(1), "role_rights должен найти по lower-ключу");
+        assert_eq!(
+            rr["total"],
+            json!(1),
+            "role_rights должен найти по lower-ключу"
+        );
 
         // Несуществующий ключ — пусто (sanity).
         let none = query_data_refs(&conn, "document.нетакого", 20).unwrap();
@@ -492,10 +500,9 @@ mod tests {
         }
 
         // Первая страница ограничена бюджетом, но знает полный размер набора.
-        let (items, page) =
-            query_section_page(&conn, "catalog.организации", "data_refs", 0, 4_000)
-                .unwrap()
-                .expect("секция известна");
+        let (items, page) = query_section_page(&conn, "catalog.организации", "data_refs", 0, 4_000)
+            .unwrap()
+            .expect("секция известна");
         let shown = page.shown;
         assert!(shown > 0 && shown < 120, "страница по бюджету: {shown}");
         assert_eq!(page.total, 120);
@@ -521,8 +528,10 @@ mod tests {
         assert_eq!(offset, 120, "обход собрал весь набор");
 
         // Неизвестная секция — понятный отказ, а не паника.
-        assert!(query_section_page(&conn, "catalog.организации", "нет", 0, 4_000)
-            .unwrap()
-            .is_none());
+        assert!(
+            query_section_page(&conn, "catalog.организации", "нет", 0, 4_000)
+                .unwrap()
+                .is_none()
+        );
     }
 }

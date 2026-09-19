@@ -11,10 +11,10 @@ use anyhow::Result;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use crate::parser::types::ParseResult;
-use crate::parser::ParserRegistry;
-use crate::parser::LanguageParser;
 use crate::parser::text::TextParser;
+use crate::parser::types::ParseResult;
+use crate::parser::LanguageParser;
+use crate::parser::ParserRegistry;
 use crate::storage::models::*;
 use crate::storage::Storage;
 use config::IndexConfig;
@@ -170,10 +170,7 @@ pub enum ParsedFile {
         file_size: i64,
     },
     /// Ошибка парсинга
-    Error {
-        rel_path: String,
-        error: String,
-    },
+    Error { rel_path: String, error: String },
 }
 
 /// Что писать в `file_contents` для очередного файла.
@@ -186,6 +183,29 @@ pub enum ContentInput<'a> {
     Oversize,
     /// Содержимое не сохранять.
     None,
+}
+
+pub struct CodeWriteParams<'a> {
+    pub rel_path: &'a str,
+    pub content_hash: &'a str,
+    pub language: &'a str,
+    pub lines_total: usize,
+    pub parse_result: &'a ParseResult,
+    pub skip_delete: bool,
+    pub mtime: Option<i64>,
+    pub file_size: Option<i64>,
+    pub text_for_fts: Option<&'a str>,
+    pub content: ContentInput<'a>,
+}
+
+pub struct TextWriteParams<'a> {
+    pub rel_path: &'a str,
+    pub content_hash: &'a str,
+    pub lines_total: usize,
+    pub content: &'a str,
+    pub skip_delete: bool,
+    pub mtime: Option<i64>,
+    pub file_size: Option<i64>,
 }
 
 /// Индексатор файловой системы
@@ -267,12 +287,17 @@ impl<'a> Indexer<'a> {
 
         // ── Этап 0: загрузка состояния БД ─────────────────────────────────────
         // Тип: path → (id, content_hash, mtime, file_size)
-        let existing_files: HashMap<String, (i64, String, Option<i64>, Option<i64>)> = self
+        let existing_files: ExistingFiles = self
             .storage
             .get_all_files()?
             .into_iter()
             .filter_map(|f| {
-                f.id.map(|id| (f.path.clone(), (id, f.content_hash.clone(), f.mtime, f.file_size)))
+                f.id.map(|id| {
+                    (
+                        f.path.clone(),
+                        (id, f.content_hash.clone(), f.mtime, f.file_size),
+                    )
+                })
             })
             .collect();
 
@@ -299,7 +324,11 @@ impl<'a> Indexer<'a> {
         // — extras-слои пересобирает index_extras как раньше (с диска). Сюда же
         // попадает продолжение прерванной загрузки: разбирается только остаток
         // файлов, и слой, собранный по нему одному, был бы неполным.
-        let collector = if force || is_fresh_db { collector } else { None };
+        let collector = if force || is_fresh_db {
+            collector
+        } else {
+            None
+        };
 
         // ── Этап 1: обход дерева (без чтения содержимого) ────────────────────
         // О начале каждого тяжёлого этапа сообщаем ДО его выполнения: если
@@ -325,7 +354,8 @@ impl<'a> Indexer<'a> {
             result.elapsed_ms = start.elapsed().as_millis() as u64;
             return Ok(result);
         }
-        let entries_to_read = self.filter_entries_by_mtime(&entries, force, &existing_files, &mut result);
+        let entries_to_read =
+            self.filter_entries_by_mtime(&entries, force, &existing_files, &mut result);
         let candidates_dur = candidates_start.elapsed();
         tracing::info!(
             "обход дерева закончен за {} мс: просмотрено {} файлов, к чтению {}",
@@ -502,7 +532,11 @@ impl<'a> Indexer<'a> {
                             ChunkPolicy {
                                 skip_delete,
                                 existing_files: None,
-                                label: if total > 1 { Some((i + 1, total)) } else { None },
+                                label: if total > 1 {
+                                    Some((i + 1, total))
+                                } else {
+                                    None
+                                },
                             },
                             &mut result,
                             stop,
@@ -513,7 +547,11 @@ impl<'a> Indexer<'a> {
                         candidates,
                         &registry,
                         collector,
-                        ChunkPolicy { skip_delete, existing_files: None, label: None },
+                        ChunkPolicy {
+                            skip_delete,
+                            existing_files: None,
+                            label: None,
+                        },
                         &mut result,
                         stop,
                     )?;
@@ -568,7 +606,11 @@ impl<'a> Indexer<'a> {
                                 // удаления не было, а часть файлов в базе уже есть:
                                 // такие чистят свои прежние строки сами.
                                 existing_files: if resume { Some(&existing_files) } else { None },
-                                label: if total > 1 { Some((i + 1, total)) } else { None },
+                                label: if total > 1 {
+                                    Some((i + 1, total))
+                                } else {
+                                    None
+                                },
                             },
                             &mut result,
                             stop,
@@ -657,7 +699,11 @@ impl<'a> Indexer<'a> {
         let cleanup_dur = cleanup_start.elapsed();
         let cleanup_ms = cleanup_dur.as_millis();
         if result.files_deleted > 0 {
-            tracing::info!("[этап 5] удаление исчезнувших файлов: {} мс ({} файлов)", cleanup_ms, result.files_deleted);
+            tracing::info!(
+                "[этап 5] удаление исчезнувших файлов: {} мс ({} файлов)",
+                cleanup_ms,
+                result.files_deleted
+            );
             crate::logging::stage_detail(format!(
                 "{} удалено",
                 crate::logging::plural(result.files_deleted as u64, "файл", "файла", "файлов")
@@ -732,7 +778,6 @@ impl<'a> Indexer<'a> {
         Ok(result)
     }
 
-
     /// Разобрать, сжать и записать одну порцию файлов.
     ///
     /// Всё, что порция занимает в памяти — содержимое, разбор, сжатые копии —
@@ -760,7 +805,11 @@ impl<'a> Indexer<'a> {
         // ── Этап 2: параллельный парсинг (CPU-bound) ─────────────────────────
         // tree-sitter парсинг выполняется в нескольких потоках через rayon.
         // Чтение файлов уже выполнено в read_entries — здесь только AST.
-        tracing::info!("{}разбираю {} изменившихся файлов в несколько потоков", tag, candidates.len());
+        tracing::info!(
+            "{}разбираю {} изменившихся файлов в несколько потоков",
+            tag,
+            candidates.len()
+        );
         let parse_start = std::time::Instant::now();
         // Лимит для `file_contents` — копия в замыкание: сжатие идёт здесь же,
         // в rayon-потоках, а не в единственном потоке-писателе (v0.47.0).
@@ -783,30 +832,29 @@ impl<'a> Indexer<'a> {
                             .to_lowercase();
 
                         match registry.get_parser(&ext) {
-                            Some(parser) => {
-                                match parser.parse_guarded(&content, &rel_path) {
-                                    Ok(pr) => ParsedFile::Code {
-                                        content_hash: hash,
-                                        lines_total: pr.lines_total,
-                                        parse_result: pr,
-                                        mtime,
-                                        file_size,
-                                        text_for_fts: if file_types::is_dual_indexed_language(&language) {
-                                            Some(content.clone())
-                                        } else {
-                                            None
-                                        },
-                                        language,
-                                        rel_path,
-                                        raw_content: content,
-                                        content_blob: None,
+                            Some(parser) => match parser.parse_guarded(&content, &rel_path) {
+                                Ok(pr) => ParsedFile::Code {
+                                    content_hash: hash,
+                                    lines_total: pr.lines_total,
+                                    parse_result: pr,
+                                    mtime,
+                                    file_size,
+                                    text_for_fts: if file_types::is_dual_indexed_language(&language)
+                                    {
+                                        Some(content.clone())
+                                    } else {
+                                        None
                                     },
-                                    Err(e) => ParsedFile::Error {
-                                        rel_path,
-                                        error: e.to_string(),
-                                    },
-                                }
-                            }
+                                    language,
+                                    rel_path,
+                                    raw_content: content,
+                                    content_blob: None,
+                                },
+                                Err(e) => ParsedFile::Error {
+                                    rel_path,
+                                    error: e.to_string(),
+                                },
+                            },
                             None => ParsedFile::Error {
                                 rel_path,
                                 error: format!("Нет парсера для расширения: {}", ext),
@@ -858,7 +906,12 @@ impl<'a> Indexer<'a> {
             })
             .collect();
         let parse_dur = parse_start.elapsed();
-        tracing::info!("{}разбор закончен за {} мс ({} файлов)", tag, parse_dur.as_millis(), parse_results.len());
+        tracing::info!(
+            "{}разбор закончен за {} мс ({} файлов)",
+            tag,
+            parse_dur.as_millis(),
+            parse_results.len()
+        );
         crate::logging::stage_detail(format!(
             "{} разобрано",
             crate::logging::plural(parse_results.len() as u64, "файл", "файла", "файлов")
@@ -877,7 +930,13 @@ impl<'a> Indexer<'a> {
         if let Some(collector) = collector {
             use crate::extension::ParsedFileCtx;
             parse_results.par_iter().for_each(|pf| match pf {
-                ParsedFile::Code { rel_path, language, parse_result, raw_content, .. } => {
+                ParsedFile::Code {
+                    rel_path,
+                    language,
+                    parse_result,
+                    raw_content,
+                    ..
+                } => {
                     collector.on_parsed(ParsedFileCtx {
                         rel_path,
                         language,
@@ -885,7 +944,9 @@ impl<'a> Indexer<'a> {
                         parse_result: Some(parse_result),
                     });
                 }
-                ParsedFile::Text { rel_path, content, .. } => {
+                ParsedFile::Text {
+                    rel_path, content, ..
+                } => {
                     collector.on_parsed(ParsedFileCtx {
                         rel_path,
                         language: "text",
@@ -911,7 +972,12 @@ impl<'a> Indexer<'a> {
         parse_results.par_iter_mut().for_each_init(
             || zstd::bulk::Compressor::new(Storage::FILE_CONTENTS_ZSTD_LEVEL).ok(),
             |compressor, pf| {
-                if let ParsedFile::Code { raw_content, content_blob, .. } = pf {
+                if let ParsedFile::Code {
+                    raw_content,
+                    content_blob,
+                    ..
+                } = pf
+                {
                     *content_blob = if raw_content.len() > max_code_size {
                         None
                     } else {
@@ -926,7 +992,11 @@ impl<'a> Indexer<'a> {
             },
         );
         let compress_dur = compress_start.elapsed();
-        tracing::info!("{}содержимое файлов сжато за {} мс", tag, compress_dur.as_millis());
+        tracing::info!(
+            "{}содержимое файлов сжато за {} мс",
+            tag,
+            compress_dur.as_millis()
+        );
         crate::logging::stage_done("сжатие содержимого", compress_dur);
 
         // ── Этап 3: последовательная запись в SQLite ──────────────────────────
@@ -968,21 +1038,21 @@ impl<'a> Indexer<'a> {
                     content_blob,
                     raw_content: _,
                 } => {
-                    match self.write_code_to_db(
+                    match self.write_code_to_db(CodeWriteParams {
                         rel_path,
                         content_hash,
                         language,
-                        *lines_total,
+                        lines_total: *lines_total,
                         parse_result,
-                        policy.skip_delete_for(rel_path),
-                        Some(*mtime),
-                        Some(*file_size),
-                        text_for_fts.as_deref(),
-                        match content_blob {
+                        skip_delete: policy.skip_delete_for(rel_path),
+                        mtime: Some(*mtime),
+                        file_size: Some(*file_size),
+                        text_for_fts: text_for_fts.as_deref(),
+                        content: match content_blob {
                             Some(b) => ContentInput::Blob(b),
                             None => ContentInput::Oversize,
                         },
-                    ) {
+                    }) {
                         Ok(_) => {
                             result.files_indexed += 1;
                             result.note_changed(rel_path);
@@ -1001,7 +1071,15 @@ impl<'a> Indexer<'a> {
                     mtime,
                     file_size,
                 } => {
-                    match self.write_text_to_db(rel_path, content_hash, *lines_total, content, policy.skip_delete_for(rel_path), Some(*mtime), Some(*file_size)) {
+                    match self.write_text_to_db(TextWriteParams {
+                        rel_path,
+                        content_hash,
+                        lines_total: *lines_total,
+                        content,
+                        skip_delete: policy.skip_delete_for(rel_path),
+                        mtime: Some(*mtime),
+                        file_size: Some(*file_size),
+                    }) {
                         Ok(_) => {
                             result.files_indexed += 1;
                             result.note_changed(rel_path);
@@ -1058,22 +1136,19 @@ impl<'a> Indexer<'a> {
     /// `Blob` — content уже сжат в фазе параллельного парсинга (v0.47.0),
     /// `Oversize` — файл крупнее `config.max_code_file_size_bytes`,
     /// `None` — не сохранять содержимое (тесты и места, где content недоступен).
-    pub fn write_code_to_db(
-        &self,
-        rel_path: &str,
-        content_hash: &str,
-        language: &str,
-        lines_total: usize,
-        parse_result: &ParseResult,
-        skip_delete: bool,
-        mtime: Option<i64>,
-        file_size: Option<i64>,
-        // Для языков с двойной индексацией (html в v0.7.1) — raw-content,
-        // который дополнительно записывается в text_files. Для остальных — None.
-        text_for_fts: Option<&str>,
-        // Phase 2: content для записи в `file_contents` (см. `ContentInput`).
-        content: ContentInput<'_>,
-    ) -> Result<()> {
+    pub fn write_code_to_db(&self, params: CodeWriteParams<'_>) -> Result<()> {
+        let CodeWriteParams {
+            rel_path,
+            content_hash,
+            language,
+            lines_total,
+            parse_result,
+            skip_delete,
+            mtime,
+            file_size,
+            text_for_fts,
+            content,
+        } = params;
         // Сохраняем запись о файле
         let file_record = FileRecord {
             id: None,
@@ -1081,9 +1156,7 @@ impl<'a> Indexer<'a> {
             content_hash: content_hash.to_string(),
             language: language.to_string(),
             lines_total,
-            indexed_at: chrono::Utc::now()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
+            indexed_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             mtime,
             file_size,
         };
@@ -1198,12 +1271,16 @@ impl<'a> Indexer<'a> {
         // таблицы (v0.47.0; до этого один и тот же текст жался дважды).
         if let Some(fts_text) = text_for_fts {
             match content {
-                ContentInput::Blob(b) => self.storage.insert_text_file_blob(file_id, b, fts_text)?,
-                _ => self.storage.insert_text_file(&crate::storage::models::TextFileRecord {
-                    id: None,
-                    file_id,
-                    content: fts_text.to_string(),
-                })?,
+                ContentInput::Blob(b) => {
+                    self.storage.insert_text_file_blob(file_id, b, fts_text)?
+                }
+                _ => self
+                    .storage
+                    .insert_text_file(&crate::storage::models::TextFileRecord {
+                        id: None,
+                        file_id,
+                        content: fts_text.to_string(),
+                    })?,
             }
         }
 
@@ -1224,25 +1301,23 @@ impl<'a> Indexer<'a> {
     }
 
     /// Записать текстовый файл в БД: метаданные + полное содержимое для FTS
-    pub fn write_text_to_db(
-        &self,
-        rel_path: &str,
-        content_hash: &str,
-        lines_total: usize,
-        content: &str,
-        skip_delete: bool,
-        mtime: Option<i64>,
-        file_size: Option<i64>,
-    ) -> Result<()> {
+    pub fn write_text_to_db(&self, params: TextWriteParams<'_>) -> Result<()> {
+        let TextWriteParams {
+            rel_path,
+            content_hash,
+            lines_total,
+            content,
+            skip_delete,
+            mtime,
+            file_size,
+        } = params;
         let file_record = FileRecord {
             id: None,
             path: rel_path.to_string(),
             content_hash: content_hash.to_string(),
             language: "text".to_string(),
             lines_total,
-            indexed_at: chrono::Utc::now()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
+            indexed_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             mtime,
             file_size,
         };
@@ -1324,12 +1399,11 @@ impl<'a> Indexer<'a> {
                 }
             }
 
-            let category =
-                file_types::categorize_file_in_repo(
-                    path,
-                    self.config.repo_language.as_deref(),
-                    &self.config.extra_text_extensions,
-                );
+            let category = file_types::categorize_file_in_repo(
+                path,
+                self.config.repo_language.as_deref(),
+                &self.config.extra_text_extensions,
+            );
 
             if matches!(category, FileCategory::Binary) {
                 continue;
@@ -1366,7 +1440,8 @@ impl<'a> Indexer<'a> {
             }
 
             // mtime и file_size для быстрой проверки изменений
-            let mtime = meta.as_ref()
+            let mtime = meta
+                .as_ref()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
@@ -1393,7 +1468,7 @@ impl<'a> Indexer<'a> {
         &self,
         entries: &'e [FileEntry],
         force: bool,
-        existing_files: &HashMap<String, (i64, String, Option<i64>, Option<i64>)>,
+        existing_files: &ExistingFiles,
         result: &mut IndexResult,
     ) -> Vec<&'e FileEntry> {
         if force {
@@ -1424,7 +1499,7 @@ impl<'a> Indexer<'a> {
         &self,
         entries: &[&FileEntry],
         force: bool,
-        existing_files: &HashMap<String, (i64, String, Option<i64>, Option<i64>)>,
+        existing_files: &ExistingFiles,
         result: &mut IndexResult,
         metadata_updates: &mut Vec<(String, i64, i64)>,
         stop: Option<&AtomicBool>,
@@ -1445,7 +1520,14 @@ impl<'a> Indexer<'a> {
                         } else {
                             entry.category.clone()
                         };
-                        Ok((entry.rel_path.clone(), content, hash, category, entry.mtime, entry.file_size))
+                        Ok((
+                            entry.rel_path.clone(),
+                            content,
+                            hash,
+                            category,
+                            entry.mtime,
+                            entry.file_size,
+                        ))
                     }
                     Err(e) => Err((entry.rel_path.clone(), e.to_string())),
                 })
@@ -1498,6 +1580,10 @@ struct FileEntry {
 /// Кандидат на индексацию: путь, содержимое, хеш, категория, время и размер.
 type Candidate = (String, String, String, FileCategory, i64, i64);
 
+/// Снимок уже индексированного файла: id, hash, mtime и размер.
+type ExistingFile = (i64, String, Option<i64>, Option<i64>);
+type ExistingFiles = HashMap<String, ExistingFile>;
+
 /// Как порция пишется в базу — решения, принятые один раз на весь проход.
 struct ChunkPolicy<'p> {
     /// Пропускать построчное удаление прежних строк файла: в пакетном режиме
@@ -1506,7 +1592,7 @@ struct ChunkPolicy<'p> {
     /// Файлы, которые в базе уже есть. Задаётся только при продолжении
     /// прерванной загрузки: пакетного удаления там не было, поэтому те немногие
     /// файлы, что успели записаться до обрыва, чистят свои строки сами.
-    existing_files: Option<&'p HashMap<String, (i64, String, Option<i64>, Option<i64>)>>,
+    existing_files: Option<&'p ExistingFiles>,
     /// Номер порции и общее их число — только для журнала.
     label: Option<(usize, usize)>,
 }
@@ -1600,7 +1686,10 @@ class App:
         let mut indexer = Indexer::new(&mut storage);
         let result = indexer.full_reindex(tmp.path(), false).unwrap();
 
-        assert_eq!(result.files_indexed, 2, "оба файла должны быть проиндексированы");
+        assert_eq!(
+            result.files_indexed, 2,
+            "оба файла должны быть проиндексированы"
+        );
         assert_eq!(result.files_skipped, 0, "пропущенных файлов быть не должно");
         assert_eq!(result.errors.len(), 0, "ошибок быть не должно");
 
@@ -1608,7 +1697,10 @@ class App:
         let stats = storage.get_stats().unwrap();
         assert!(stats.total_functions >= 2, "минимум 2 функции: hello + run");
         assert!(stats.total_classes >= 1, "минимум 1 класс: App");
-        assert!(stats.total_text_files >= 1, "минимум 1 текстовый файл: readme.md");
+        assert!(
+            stats.total_text_files >= 1,
+            "минимум 1 текстовый файл: readme.md"
+        );
     }
 
     #[test]
@@ -1626,7 +1718,6 @@ class App:
         assert_eq!(storage.get_stats().unwrap().total_files, 0);
     }
 
-
     /// Нарезка на порции: файлы копятся, пока не исчерпан бюджет; файл тяжелее
     /// бюджета уходит в порцию один; нулевой бюджет отключает деление.
     #[test]
@@ -1638,17 +1729,28 @@ class App:
             mtime: 0,
             file_size: size,
         };
-        let entries = vec![mk("a", 40), mk("b", 40), mk("c", 40), mk("d", 500)];
+        let entries = [mk("a", 40), mk("b", 40), mk("c", 40), mk("d", 500)];
         let refs: Vec<&FileEntry> = entries.iter().collect();
 
         let chunks = chunk_by_budget(&refs, 100);
         assert_eq!(chunks.len(), 3, "40+40 | 40 | 500 — три порции");
         assert_eq!(chunks[0].len(), 2);
         assert_eq!(chunks[1].len(), 1);
-        assert_eq!(chunks[2].len(), 1, "файл тяжелее бюджета идёт порцией в одиночку");
+        assert_eq!(
+            chunks[2].len(),
+            1,
+            "файл тяжелее бюджета идёт порцией в одиночку"
+        );
 
-        assert_eq!(chunk_by_budget(&refs, 0).len(), 1, "нулевой бюджет — без деления");
-        assert!(chunk_by_budget(&[], 100).is_empty(), "пустой список — ни одной порции");
+        assert_eq!(
+            chunk_by_budget(&refs, 0).len(),
+            1,
+            "нулевой бюджет — без деления"
+        );
+        assert!(
+            chunk_by_budget(&[], 100).is_empty(),
+            "пустой список — ни одной порции"
+        );
     }
 
     /// Порционный разбор даёт ровно тот же результат, что и разбор одним куском:
@@ -1669,7 +1771,10 @@ class App:
         let whole = {
             let mut indexer = Indexer::with_config(
                 &mut whole_storage,
-                IndexConfig { chunk_budget_bytes: 0, ..IndexConfig::default() },
+                IndexConfig {
+                    chunk_budget_bytes: 0,
+                    ..IndexConfig::default()
+                },
             );
             indexer.full_reindex(tmp.path(), false).unwrap()
         };
@@ -1679,13 +1784,19 @@ class App:
         let chunked = {
             let mut indexer = Indexer::with_config(
                 &mut chunked_storage,
-                IndexConfig { chunk_budget_bytes: 30, ..IndexConfig::default() },
+                IndexConfig {
+                    chunk_budget_bytes: 30,
+                    ..IndexConfig::default()
+                },
             );
             indexer.full_reindex(tmp.path(), false).unwrap()
         };
 
         assert_eq!(chunked.errors.len(), 0, "ошибок быть не должно");
-        assert_eq!(chunked.files_indexed, whole.files_indexed, "записано столько же файлов");
+        assert_eq!(
+            chunked.files_indexed, whole.files_indexed,
+            "записано столько же файлов"
+        );
 
         let whole_stats = whole_storage.get_stats().unwrap();
         let chunked_stats = chunked_storage.get_stats().unwrap();
@@ -1694,7 +1805,10 @@ class App:
         assert_eq!(chunked_stats.total_functions, whole_stats.total_functions);
 
         // Пакетный режим отработал до конца: отметка о незавершённой загрузке снята.
-        assert!(!chunked_storage.bulk_in_progress(), "отметка должна быть снята");
+        assert!(
+            !chunked_storage.bulk_in_progress(),
+            "отметка должна быть снята"
+        );
     }
 
     /// Продолжение прерванной загрузки: отметка осталась с прошлого раза, часть
@@ -1780,7 +1894,10 @@ class App:
 
         let stats = storage.get_stats().unwrap();
         assert_eq!(stats.total_files, 1);
-        assert_eq!(stats.total_functions, 1, "прежняя функция не должна остаться рядом с новой");
+        assert_eq!(
+            stats.total_functions, 1,
+            "прежняя функция не должна остаться рядом с новой"
+        );
     }
 
     /// S-6: списки путей нужны старту демона, чтобы звать точечный пересбор
@@ -1800,7 +1917,11 @@ class App:
         assert!(!first.paths_overflow, "два файла в потолок не упираются");
         let mut got: Vec<&str> = first.changed_paths.iter().map(|s| s.as_str()).collect();
         got.sort();
-        assert_eq!(got, vec!["a.py", "b.py"], "оба файла должны попасть в changed_paths");
+        assert_eq!(
+            got,
+            vec!["a.py", "b.py"],
+            "оба файла должны попасть в changed_paths"
+        );
         assert!(first.deleted_paths.is_empty(), "удалять нечего");
 
         // Один файл меняем, другой убираем — второй проход должен показать оба
@@ -1839,7 +1960,10 @@ class App:
 
         r.note_changed("one_more.py");
         assert!(r.paths_overflow, "шаг за потолок взводит признак");
-        assert!(r.changed_paths.is_empty(), "списки очищены, память не копится");
+        assert!(
+            r.changed_paths.is_empty(),
+            "списки очищены, память не копится"
+        );
         assert!(r.deleted_paths.is_empty());
 
         // После переполнения накопление прекращается — иначе память всё равно росла бы.
@@ -1860,15 +1984,24 @@ class App:
         {
             let mut indexer = Indexer::new(&mut storage);
             let r1 = indexer.full_reindex(tmp.path(), false).unwrap();
-            assert_eq!(r1.files_indexed, 1, "первый проход должен проиндексировать файл");
+            assert_eq!(
+                r1.files_indexed, 1,
+                "первый проход должен проиндексировать файл"
+            );
         }
 
         // Второй проход без изменений — файл должен быть пропущен
         {
             let mut indexer = Indexer::new(&mut storage);
             let r2 = indexer.full_reindex(tmp.path(), false).unwrap();
-            assert_eq!(r2.files_indexed, 0, "повторная индексация не должна записывать файл");
-            assert_eq!(r2.files_skipped, 1, "файл должен быть пропущен как неизменённый");
+            assert_eq!(
+                r2.files_indexed, 0,
+                "повторная индексация не должна записывать файл"
+            );
+            assert_eq!(
+                r2.files_skipped, 1,
+                "файл должен быть пропущен как неизменённый"
+            );
         }
     }
 
@@ -1888,8 +2021,14 @@ class App:
         {
             let mut indexer = Indexer::new(&mut storage);
             let r = indexer.full_reindex(tmp.path(), true).unwrap();
-            assert_eq!(r.files_indexed, 1, "force=true должен переиндексировать файл");
-            assert_eq!(r.files_skipped, 0, "при force=true пропущенных быть не должно");
+            assert_eq!(
+                r.files_indexed, 1,
+                "force=true должен переиндексировать файл"
+            );
+            assert_eq!(
+                r.files_skipped, 0,
+                "при force=true пропущенных быть не должно"
+            );
         }
     }
 
@@ -1919,7 +2058,10 @@ class App:
         }
 
         let stats = storage.get_stats().unwrap();
-        assert_eq!(stats.total_files, 0, "БД должна быть пуста после удаления файла");
+        assert_eq!(
+            stats.total_files, 0,
+            "БД должна быть пуста после удаления файла"
+        );
     }
 
     #[test]
@@ -1934,7 +2076,10 @@ class App:
         let r = indexer.full_reindex(tmp.path(), false).unwrap();
 
         // Только Python-файл проиндексирован, PNG пропущен (бинарный)
-        assert_eq!(r.files_scanned, 1, "бинарные файлы не должны попасть в files_scanned");
+        assert_eq!(
+            r.files_scanned, 1,
+            "бинарные файлы не должны попасть в files_scanned"
+        );
         assert_eq!(r.files_indexed, 1);
     }
 
@@ -1950,7 +2095,10 @@ class App:
         let r = indexer.full_reindex(tmp.path(), false).unwrap();
 
         // Файл в target/ должен быть исключён
-        assert_eq!(r.files_indexed, 1, "только main.py должен быть проиндексирован");
+        assert_eq!(
+            r.files_indexed, 1,
+            "только main.py должен быть проиндексирован"
+        );
     }
 
     #[test]
@@ -1981,7 +2129,10 @@ class App:
         let r = indexer.full_reindex(tmp.path(), false).unwrap();
 
         // vendor/ исключён через конфиг — только app.py
-        assert_eq!(r.files_indexed, 1, "vendor должен быть исключён через конфиг");
+        assert_eq!(
+            r.files_indexed, 1,
+            "vendor должен быть исключён через конфиг"
+        );
     }
 
     #[test]
@@ -2011,7 +2162,10 @@ class App:
         {
             let mut indexer = Indexer::with_config(&mut storage, config.clone());
             let result = indexer.full_reindex(tmp.path(), false).unwrap();
-            assert_eq!(result.files_indexed, 15, "все 15 файлов должны быть проиндексированы");
+            assert_eq!(
+                result.files_indexed, 15,
+                "все 15 файлов должны быть проиндексированы"
+            );
             assert_eq!(result.files_skipped, 0, "пропущенных файлов быть не должно");
             assert_eq!(result.errors.len(), 0, "ошибок быть не должно");
         }
@@ -2023,17 +2177,29 @@ class App:
 
         // Проверяем, что FTS работает после rebuild
         let found = storage.search_functions("func_0", 10, None).unwrap();
-        assert!(!found.is_empty(), "FTS должен находить func_0 после bulk-load rebuild");
+        assert!(
+            !found.is_empty(),
+            "FTS должен находить func_0 после bulk-load rebuild"
+        );
 
         let found_5 = storage.search_functions("func_5", 10, None).unwrap();
-        assert!(!found_5.is_empty(), "FTS должен находить func_5 после bulk-load rebuild");
+        assert!(
+            !found_5.is_empty(),
+            "FTS должен находить func_5 после bulk-load rebuild"
+        );
 
         // Второй проход: повторная индексация — все файлы должны быть пропущены
         {
             let mut indexer = Indexer::with_config(&mut storage, config);
             let result2 = indexer.full_reindex(tmp.path(), false).unwrap();
-            assert_eq!(result2.files_skipped, 15, "при повторной индексации все файлы неизменны");
-            assert_eq!(result2.files_indexed, 0, "ни одного файла не должно быть переиндексировано");
+            assert_eq!(
+                result2.files_skipped, 15,
+                "при повторной индексации все файлы неизменны"
+            );
+            assert_eq!(
+                result2.files_indexed, 0,
+                "ни одного файла не должно быть переиндексировано"
+            );
         }
     }
 
@@ -2044,9 +2210,17 @@ class App:
         fs::write(tmp.path().join("small.txt"), "x = 1\n").unwrap();
         // Большой текстовый файл — пропустим (лимит 10 байт)
         // Лимит max_file_size действует только на Text-файлы, код индексируется всегда
-        fs::write(tmp.path().join("big.txt"), "y = 'a very long string that exceeds limit'\n").unwrap();
+        fs::write(
+            tmp.path().join("big.txt"),
+            "y = 'a very long string that exceeds limit'\n",
+        )
+        .unwrap();
         // Большой код-файл — НЕ пропускается (код индексируется независимо от размера)
-        fs::write(tmp.path().join("big.py"), "y = 'a very long string that exceeds limit'\n").unwrap();
+        fs::write(
+            tmp.path().join("big.py"),
+            "y = 'a very long string that exceeds limit'\n",
+        )
+        .unwrap();
 
         let mut storage = Storage::open_in_memory().unwrap();
         let config = IndexConfig {
@@ -2057,7 +2231,10 @@ class App:
         let r = indexer.full_reindex(tmp.path(), false).unwrap();
 
         // big.txt пропущен из-за лимита размера, big.py — нет (код не ограничен)
-        assert_eq!(r.files_indexed, 2, "small.txt + big.py (код не ограничен размером)");
+        assert_eq!(
+            r.files_indexed, 2,
+            "small.txt + big.py (код не ограничен размером)"
+        );
         assert_eq!(
             r.files_not_indexable, 1,
             "big.txt не индексируется по размеру — это отдельный счётчик, не «без изменений»"
@@ -2085,7 +2262,15 @@ class App:
         {
             let indexer = Indexer::with_config(&mut storage, config.clone());
             indexer
-                .write_text_to_db("big.txt", "hash", 1, "y", false, Some(0), Some(4096))
+                .write_text_to_db(TextWriteParams {
+                    rel_path: "big.txt",
+                    content_hash: "hash",
+                    lines_total: 1,
+                    content: "y",
+                    skip_delete: false,
+                    mtime: Some(0),
+                    file_size: Some(4096),
+                })
                 .unwrap();
         }
 
@@ -2165,7 +2350,10 @@ class App:
         };
 
         // Все 20 файлов должны быть успешно проиндексированы
-        assert_eq!(result.files_indexed, 20, "все 20 файлов должны быть проиндексированы");
+        assert_eq!(
+            result.files_indexed, 20,
+            "все 20 файлов должны быть проиндексированы"
+        );
         assert_eq!(result.files_skipped, 0, "пропущенных файлов быть не должно");
         assert_eq!(result.errors.len(), 0, "ошибок быть не должно");
 
@@ -2179,7 +2367,10 @@ class App:
         assert!(!found.is_empty(), "FTS должен находить batch_func_0");
 
         let found_19 = storage.search_functions("batch_func_19", 10, None).unwrap();
-        assert!(!found_19.is_empty(), "FTS должен находить batch_func_19 (последний батч)");
+        assert!(
+            !found_19.is_empty(),
+            "FTS должен находить batch_func_19 (последний батч)"
+        );
     }
 
     #[test]
@@ -2202,9 +2393,16 @@ class App:
         let result = indexer.full_reindex(tmp.path(), false).unwrap();
 
         // Все 30 файлов проиндексированы
-        assert_eq!(result.files_indexed, 30, "все 30 файлов должны быть проиндексированы");
+        assert_eq!(
+            result.files_indexed, 30,
+            "все 30 файлов должны быть проиндексированы"
+        );
         assert_eq!(result.files_skipped, 0, "пропущенных файлов быть не должно");
-        assert_eq!(result.errors.len(), 0, "ошибок при параллельном парсинге быть не должно");
+        assert_eq!(
+            result.errors.len(),
+            0,
+            "ошибок при параллельном парсинге быть не должно"
+        );
 
         // Проверяем что все функции на месте (по 2 на файл = 60 итого)
         let stats = storage.get_stats().unwrap();
@@ -2212,13 +2410,19 @@ class App:
         assert_eq!(stats.total_functions, 60, "по 2 функции на файл = 60 итого");
 
         // FTS находит функции из разных файлов (порядок парсинга не важен)
-        let found_0 = storage.search_functions("parallel_func_0", 10, None).unwrap();
+        let found_0 = storage
+            .search_functions("parallel_func_0", 10, None)
+            .unwrap();
         assert!(!found_0.is_empty(), "FTS должен находить parallel_func_0");
 
-        let found_15 = storage.search_functions("parallel_func_15", 10, None).unwrap();
+        let found_15 = storage
+            .search_functions("parallel_func_15", 10, None)
+            .unwrap();
         assert!(!found_15.is_empty(), "FTS должен находить parallel_func_15");
 
-        let found_29 = storage.search_functions("parallel_func_29", 10, None).unwrap();
+        let found_29 = storage
+            .search_functions("parallel_func_29", 10, None)
+            .unwrap();
         assert!(!found_29.is_empty(), "FTS должен находить parallel_func_29");
 
         // helper-функции тоже проиндексированы
@@ -2261,7 +2465,10 @@ class App:
             indexer.full_reindex(tmp.path(), false).unwrap()
         };
 
-        assert_eq!(result.files_indexed, 20, "все 20 файлов должны быть проиндексированы");
+        assert_eq!(
+            result.files_indexed, 20,
+            "все 20 файлов должны быть проиндексированы"
+        );
         assert_eq!(result.files_skipped, 0, "пропущенных файлов быть не должно");
         assert_eq!(result.errors.len(), 0, "ошибок быть не должно");
 
@@ -2272,10 +2479,16 @@ class App:
 
         // Проверяем FTS-поиск после bulk rebuild
         let found_0 = storage.search_functions("fresh_func_0", 10, None).unwrap();
-        assert!(!found_0.is_empty(), "FTS должен находить fresh_func_0 после bulk-load rebuild");
+        assert!(
+            !found_0.is_empty(),
+            "FTS должен находить fresh_func_0 после bulk-load rebuild"
+        );
 
         let found_19 = storage.search_functions("fresh_func_19", 10, None).unwrap();
-        assert!(!found_19.is_empty(), "FTS должен находить fresh_func_19 после bulk-load rebuild");
+        assert!(
+            !found_19.is_empty(),
+            "FTS должен находить fresh_func_19 после bulk-load rebuild"
+        );
 
         // Повторная индексация (is_fresh_db = false) — все файлы должны быть пропущены
         let result2 = {
@@ -2283,12 +2496,21 @@ class App:
             indexer.full_reindex(tmp.path(), false).unwrap()
         };
 
-        assert_eq!(result2.files_skipped, 20, "при повторной индексации все 20 файлов неизменны");
-        assert_eq!(result2.files_indexed, 0, "ни одного файла не должно быть переиндексировано");
+        assert_eq!(
+            result2.files_skipped, 20,
+            "при повторной индексации все 20 файлов неизменны"
+        );
+        assert_eq!(
+            result2.files_indexed, 0,
+            "ни одного файла не должно быть переиндексировано"
+        );
 
         // FTS по-прежнему работает после повторного прохода
         let found_after = storage.search_functions("fresh_func_10", 10, None).unwrap();
-        assert!(!found_after.is_empty(), "FTS должен работать и после повторной индексации");
+        assert!(
+            !found_after.is_empty(),
+            "FTS должен работать и после повторной индексации"
+        );
     }
 
     /// Тест: bulk-ОБНОВЛЕНИЕ непустой БД — сценарий бага квадратичной деградации.
@@ -2355,34 +2577,64 @@ class App:
             let mut indexer = Indexer::with_config(&mut storage, config);
             indexer.full_reindex(upd_dir.path(), false).unwrap()
         };
-        assert_eq!(result.files_skipped, 0, "все файлы изменены — пропусков нет");
+        assert_eq!(
+            result.files_skipped, 0,
+            "все файлы изменены — пропусков нет"
+        );
         assert_eq!(result.errors.len(), 0, "ошибок быть не должно");
 
         // ── Нет дублей: счётчики строго равны свежей индексации ──────────────
         let after = storage.get_stats().unwrap();
         assert_eq!(after.total_files, baseline.total_files, "files: без дублей");
-        assert_eq!(after.total_functions, baseline.total_functions, "functions: без дублей");
-        assert_eq!(after.total_classes, baseline.total_classes, "classes: без дублей");
-        assert_eq!(after.total_imports, baseline.total_imports, "imports: без дублей");
+        assert_eq!(
+            after.total_functions, baseline.total_functions,
+            "functions: без дублей"
+        );
+        assert_eq!(
+            after.total_classes, baseline.total_classes,
+            "classes: без дублей"
+        );
+        assert_eq!(
+            after.total_imports, baseline.total_imports,
+            "imports: без дублей"
+        );
         assert_eq!(after.total_calls, baseline.total_calls, "calls: без дублей");
-        assert_eq!(after.total_variables, baseline.total_variables, "variables: без дублей");
-        assert_eq!(after.total_text_files, baseline.total_text_files, "text: без дублей");
+        assert_eq!(
+            after.total_variables, baseline.total_variables,
+            "variables: без дублей"
+        );
+        assert_eq!(
+            after.total_text_files, baseline.total_text_files,
+            "text: без дублей"
+        );
 
         // ── FTS: новые символы находятся, старые — нет ───────────────────────
         assert!(
-            !storage.search_functions("upd_func_0", 10, None).unwrap().is_empty(),
+            !storage
+                .search_functions("upd_func_0", 10, None)
+                .unwrap()
+                .is_empty(),
             "FTS должен находить обновлённую функцию после rebuild"
         );
         assert!(
-            storage.search_functions("orig_func_0", 10, None).unwrap().is_empty(),
+            storage
+                .search_functions("orig_func_0", 10, None)
+                .unwrap()
+                .is_empty(),
             "старая функция не должна оставаться в FTS после bulk-обновления"
         );
         assert!(
-            !storage.search_text("zzfreshtoken", 10, None).unwrap().is_empty(),
+            !storage
+                .search_text("zzfreshtoken", 10, None)
+                .unwrap()
+                .is_empty(),
             "текстовый FTS должен находить новый маркер"
         );
         assert!(
-            storage.search_text("zzoldmarker", 10, None).unwrap().is_empty(),
+            storage
+                .search_text("zzoldmarker", 10, None)
+                .unwrap()
+                .is_empty(),
             "старый текстовый маркер не должен оставаться в contentless-указателе"
         );
     }

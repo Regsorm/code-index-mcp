@@ -28,6 +28,8 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::path::Path;
 
+use super::BytesTextExt;
+
 /// Извлечь UUID из XML объекта (Documents/X.xml, Catalogs/X.xml и т.п.).
 /// Возвращает значение атрибута `uuid` первого дочернего элемента
 /// `MetaDataObject`. None если структура нестандартная или uuid отсутствует.
@@ -46,7 +48,7 @@ pub fn extract_object_uuid_from_str(xml: &str) -> Option<String> {
                     for attr in e.attributes().flatten() {
                         if attr.key.as_ref() == b"uuid" {
                             return attr
-                                .unescape_value()
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .ok()
                                 .map(|cow| cow.to_string());
                         }
@@ -99,11 +101,15 @@ pub fn extract_command_uuid_from_str(xml: &str, command_name: &str) -> Option<St
                         .attributes()
                         .flatten()
                         .find(|a| a.key.as_ref() == b"uuid")
-                        .and_then(|a| a.unescape_value().ok().map(|c| c.to_string()));
+                        .and_then(|a| {
+                            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .ok()
+                                .map(|c| c.to_string())
+                        });
                     expect_name = cur_uuid.is_some();
                 } else if expect_name && name == b"Name" {
                     // следующий текстовый узел — имя команды
-                } 
+                }
             }
             Ok(Event::Text(t)) if expect_name => {
                 let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
@@ -147,7 +153,7 @@ pub fn extract_form_uuid_from_str(xml: &str) -> Option<String> {
                 for attr in e.attributes().flatten() {
                     if attr.key.as_ref() == b"uuid" {
                         return attr
-                            .unescape_value()
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                             .ok()
                             .map(|cow| cow.to_string());
                     }
@@ -173,6 +179,7 @@ pub fn extract_form_uuid_from_file(path: &Path) -> Result<Option<String>> {
 ///  * `Forms/<FormName>.xml` (иерархическая выгрузка DumpConfigToFiles) —
 ///    корень `MetaDataObject`, uuid у дочернего `<Form uuid="…">`;
 ///  * `Form.xml` layout-варианта — uuid атрибут корневого `<Form>`.
+///
 /// Порядок важен: object-стиль первым (у layout-корня uuid на дочернем
 /// элементе отсутствует, ветка вернёт None и сработает fallback).
 pub fn extract_form_uuid_any_from_str(xml: &str) -> Option<String> {

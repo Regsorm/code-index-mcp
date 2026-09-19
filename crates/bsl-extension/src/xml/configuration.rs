@@ -31,6 +31,8 @@ use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use super::BytesTextExt;
+
 /// Один объект конфигурации, перечисленный в Configuration.xml/<ChildObjects>.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectRef {
@@ -133,10 +135,7 @@ pub fn parse_configuration_xml(content: &str) -> Result<Vec<ObjectRef>> {
                 }
                 let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
                 if KNOWN_META_TYPES.contains(&parent) {
-                    let name = text
-                        .unescape()
-                        .map(|s| s.into_owned())
-                        .unwrap_or_default();
+                    let name = text.unescape().map(|s| s.into_owned()).unwrap_or_default();
                     let name = name.trim().to_string();
                     if !name.is_empty() {
                         let full_name = format!("{}.{}", parent, name);

@@ -188,7 +188,11 @@ impl IndexTool for GetDataLinksTool {
             let both = direction == "both";
             // При двух направлениях бюджет делится: иначе первое направление
             // съедает его целиком и второе приходит пустым.
-            let share = if both { budget.applied / 2 } else { budget.applied };
+            let share = if both {
+                budget.applied / 2
+            } else {
+                budget.applied
+            };
 
             let mut result = json!({
                 "object": object,
@@ -430,7 +434,9 @@ fn walk_links(
     // там либо собрано всё (обход дошёл до конца), либо число неполное.
     let exact_total = if depth == 1 && (edges_capped || stopped_by_time) {
         let count_sql = match dir {
-            Direction::Out => "SELECT COUNT(*) FROM data_links WHERE repo = ?1 AND from_object = ?2",
+            Direction::Out => {
+                "SELECT COUNT(*) FROM data_links WHERE repo = ?1 AND from_object = ?2"
+            }
             Direction::In => "SELECT COUNT(*) FROM data_links WHERE repo = ?1 AND to_object = ?2",
         };
         let exact: i64 = conn.query_row(count_sql, params!["default", object], |r| r.get(0))?;
@@ -439,7 +445,13 @@ fn walk_links(
         None
     };
 
-    Ok(Walk { edges, by_kind, stopped_by_time, edges_capped, exact_total })
+    Ok(Walk {
+        edges,
+        by_kind,
+        stopped_by_time,
+        edges_capped,
+        exact_total,
+    })
 }
 
 #[cfg(test)]
@@ -491,7 +503,11 @@ mod tests {
         link(&conn, "*CatalogRef", "Хвост", "Catalog.Z", "attr", false);
 
         let w = walk_links(&conn, "Document.X", 3, &Direction::Out, 100, far_deadline()).unwrap();
-        assert_eq!(w.edges.len(), 1, "обобщённая ссылка дальше не разворачивается");
+        assert_eq!(
+            w.edges.len(),
+            1,
+            "обобщённая ссылка дальше не разворачивается"
+        );
     }
 
     #[test]
@@ -510,10 +526,32 @@ mod tests {
     #[test]
     fn incoming_direction_walks_backwards() {
         let conn = mem();
-        link(&conn, "Document.Заказ", "Партнёр", "Catalog.Партнёры", "attr", false);
-        link(&conn, "Document.Счёт", "Партнёр", "Catalog.Партнёры", "attr", false);
+        link(
+            &conn,
+            "Document.Заказ",
+            "Партнёр",
+            "Catalog.Партнёры",
+            "attr",
+            false,
+        );
+        link(
+            &conn,
+            "Document.Счёт",
+            "Партнёр",
+            "Catalog.Партнёры",
+            "attr",
+            false,
+        );
 
-        let w = walk_links(&conn, "Catalog.Партнёры", 1, &Direction::In, 100, far_deadline()).unwrap();
+        let w = walk_links(
+            &conn,
+            "Catalog.Партнёры",
+            1,
+            &Direction::In,
+            100,
+            far_deadline(),
+        )
+        .unwrap();
         assert_eq!(w.edges.len(), 2, "оба ссылающихся документа найдены");
     }
 
@@ -532,10 +570,25 @@ mod tests {
     fn edge_cap_stops_the_walk() {
         let conn = mem();
         for i in 0..50 {
-            link(&conn, "Catalog.Центр", &format!("Реквизит{}", i), &format!("Catalog.Ц{}", i), "attr", false);
+            link(
+                &conn,
+                "Catalog.Центр",
+                &format!("Реквизит{}", i),
+                &format!("Catalog.Ц{}", i),
+                "attr",
+                false,
+            );
         }
         // limit=1 → потолок обхода 10 рёбер (limit × 10).
-        let w = walk_links(&conn, "Catalog.Центр", 1, &Direction::Out, 1, far_deadline()).unwrap();
+        let w = walk_links(
+            &conn,
+            "Catalog.Центр",
+            1,
+            &Direction::Out,
+            1,
+            far_deadline(),
+        )
+        .unwrap();
         assert!(w.edges_capped);
         assert_eq!(w.edges.len(), 10);
         // На глубине 1 полное число известно точно, поэтому «неполным» оно не
@@ -550,14 +603,39 @@ mod tests {
         // Цепочка вширь: на глубине 2 обход упрётся в потолок, а точного числа
         // рёбер окрестности дёшево не получить — значит число неполное.
         for i in 0..30 {
-            link(&conn, "Catalog.Корень", &format!("Р{}", i), &format!("Catalog.У{}", i), "attr", false);
+            link(
+                &conn,
+                "Catalog.Корень",
+                &format!("Р{}", i),
+                &format!("Catalog.У{}", i),
+                "attr",
+                false,
+            );
             for j in 0..5 {
-                link(&conn, &format!("Catalog.У{}", i), &format!("П{}", j), &format!("Catalog.Л{}_{}", i, j), "attr", false);
+                link(
+                    &conn,
+                    &format!("Catalog.У{}", i),
+                    &format!("П{}", j),
+                    &format!("Catalog.Л{}_{}", i, j),
+                    "attr",
+                    false,
+                );
             }
         }
-        let w = walk_links(&conn, "Catalog.Корень", 2, &Direction::Out, 2, far_deadline()).unwrap();
+        let w = walk_links(
+            &conn,
+            "Catalog.Корень",
+            2,
+            &Direction::Out,
+            2,
+            far_deadline(),
+        )
+        .unwrap();
         assert!(w.edges_capped, "потолок обхода сработал");
-        assert!(w.total_is_partial(), "на глубине >1 число рёбер помечается неполным");
+        assert!(
+            w.total_is_partial(),
+            "на глубине >1 число рёбер помечается неполным"
+        );
         assert_eq!(w.total(), w.edges.len());
     }
 }

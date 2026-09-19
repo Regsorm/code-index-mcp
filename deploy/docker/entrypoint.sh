@@ -1,4 +1,5 @@
 #!/bin/bash
+# Git attributes keep this script LF-only so Linux containers also build from Windows checkouts.
 # Запускает bsl-indexer в одном контейнере: демон (писатель) + serve (read-only
 # MCP HTTP). Оба процесса делят loopback и $CODE_INDEX_HOME — serve находит демон
 # через $CODE_INDEX_HOME/daemon.json (см. docs/bsl-indexer.md).

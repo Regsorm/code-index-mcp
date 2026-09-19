@@ -86,9 +86,7 @@ async fn run_watch(server: CodeIndexServer, daemon_toml_path: PathBuf) -> Result
                 // конкретный kind — на Windows write часто приходит как
                 // Modify(Any), на Linux может быть и Create при atomic-rename.
                 if !events.is_empty() {
-                    if let Err(e) =
-                        reload_from_disk(&server, &daemon_toml_path).await
-                    {
+                    if let Err(e) = reload_from_disk(&server, &daemon_toml_path).await {
                         tracing::warn!(
                             "config_watch: не удалось применить изменения {}: {}",
                             daemon_toml_path.display(),
@@ -195,7 +193,13 @@ fn build_debouncer(
     for parent in parents {
         debouncer
             .watch(parent.as_path(), RecursiveMode::NonRecursive)
-            .map_err(|e| anyhow::anyhow!("config_watch: не удалось watch '{}': {}", parent.display(), e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "config_watch: не удалось watch '{}': {}",
+                    parent.display(),
+                    e
+                )
+            })?;
     }
     Ok(debouncer)
 }
@@ -424,7 +428,13 @@ mod tests {
         let server = CodeIndexServer::with_repos_and_registry(repos, registry);
 
         assert!(
-            server.repos.load().get("stand").unwrap().processor.is_none(),
+            server
+                .repos
+                .load()
+                .get("stand")
+                .unwrap()
+                .processor
+                .is_none(),
             "до перечитки процессор ещё не привязан"
         );
 
@@ -445,7 +455,9 @@ mod tests {
     /// и без фильтра получалась бесконечная петля перечитывания.
     #[test]
     fn access_events_do_not_trigger_reload() {
-        use notify_debouncer_full::notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
+        use notify_debouncer_full::notify::event::{
+            AccessKind, AccessMode, CreateKind, ModifyKind,
+        };
         use notify_debouncer_full::notify::EventKind;
 
         let target = PathBuf::from("/cfg/daemon.toml");

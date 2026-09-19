@@ -75,17 +75,28 @@ pub async fn middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, routing::get, Router};
     use crate::federation::config::{MeSection, ServePathEntry};
+    use axum::{body::Body, routing::get, Router};
     use tower::ServiceExt;
 
     #[test]
     fn build_includes_loopback_and_me_and_paths() {
         let cfg = ServeFileConfig {
-            me: MeSection { ip: "192.0.2.10".to_string(), token: None },
+            me: MeSection {
+                ip: "192.0.2.10".to_string(),
+                token: None,
+            },
             paths: vec![
-                ServePathEntry { alias: "ut".to_string(), ip: "192.0.2.50".to_string(), port: None },
-                ServePathEntry { alias: "dev".to_string(), ip: "192.0.2.10".to_string(), port: None },
+                ServePathEntry {
+                    alias: "ut".to_string(),
+                    ip: "192.0.2.50".to_string(),
+                    port: None,
+                },
+                ServePathEntry {
+                    alias: "dev".to_string(),
+                    ip: "192.0.2.10".to_string(),
+                    port: None,
+                },
             ],
             pool: Default::default(),
         };
@@ -103,10 +114,15 @@ mod tests {
         // validate() в config.rs ловит невалидные IP до этого момента —
         // build не должен паниковать на edge-случае.
         let cfg = ServeFileConfig {
-            me: MeSection { ip: "192.0.2.10".to_string(), token: None },
-            paths: vec![
-                ServePathEntry { alias: "ut".to_string(), ip: "not-ip".to_string(), port: None },
-            ],
+            me: MeSection {
+                ip: "192.0.2.10".to_string(),
+                token: None,
+            },
+            paths: vec![ServePathEntry {
+                alias: "ut".to_string(),
+                ip: "not-ip".to_string(),
+                port: None,
+            }],
             pool: Default::default(),
         };
         let set = build(&cfg);
@@ -127,10 +143,7 @@ mod tests {
             ));
 
         let request_from = |peer| {
-            let mut request = Request::builder()
-                .uri("/")
-                .body(Body::empty())
-                .unwrap();
+            let mut request = Request::builder().uri("/").body(Body::empty()).unwrap();
             request
                 .extensions_mut()
                 .insert(ConnectInfo(SocketAddr::new(peer, 12345)));

@@ -64,7 +64,7 @@ pub fn parse_config_dump_info_str(xml: &str) -> Result<HashMap<String, String>> 
                 let name = e.name();
                 let raw = name.as_ref();
                 let tag = std::str::from_utf8(raw).unwrap_or("");
-                let local = tag.split(':').last().unwrap_or(tag);
+                let local = tag.split(':').next_back().unwrap_or(tag);
                 if local != "Metadata" {
                     continue;
                 }
@@ -74,13 +74,13 @@ pub fn parse_config_dump_info_str(xml: &str) -> Result<HashMap<String, String>> 
                     match attr.key.as_ref() {
                         b"id" => {
                             id = attr
-                                .unescape_value()
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .ok()
                                 .map(|cow| cow.to_string());
                         }
                         b"configVersion" => {
                             config_version = attr
-                                .unescape_value()
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .ok()
                                 .map(|cow| cow.to_string());
                         }
@@ -150,7 +150,7 @@ pub fn parse_config_dump_info_rows_str(xml: &str) -> Result<Vec<(String, String)
                 let name = e.name();
                 let raw = name.as_ref();
                 let tag = std::str::from_utf8(raw).unwrap_or("");
-                let local = tag.split(':').last().unwrap_or(tag);
+                let local = tag.split(':').next_back().unwrap_or(tag);
                 if local != "Metadata" {
                     continue;
                 }
@@ -159,10 +159,16 @@ pub fn parse_config_dump_info_rows_str(xml: &str) -> Result<Vec<(String, String)
                 for attr in e.attributes().flatten() {
                     match attr.key.as_ref() {
                         b"name" => {
-                            full_name = attr.unescape_value().ok().map(|cow| cow.to_string());
+                            full_name = attr
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .ok()
+                                .map(|cow| cow.to_string());
                         }
                         b"configVersion" => {
-                            config_version = attr.unescape_value().ok().map(|cow| cow.to_string());
+                            config_version = attr
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .ok()
+                                .map(|cow| cow.to_string());
                         }
                         _ => {}
                     }
@@ -214,7 +220,7 @@ pub fn parse_config_dump_info_id_map_str(xml: &str) -> Result<HashMap<String, St
                 let name = e.name();
                 let raw = name.as_ref();
                 let tag = std::str::from_utf8(raw).unwrap_or("");
-                let local = tag.split(':').last().unwrap_or(tag);
+                let local = tag.split(':').next_back().unwrap_or(tag);
                 if local != "Metadata" {
                     buf.clear();
                     continue;
@@ -223,8 +229,18 @@ pub fn parse_config_dump_info_id_map_str(xml: &str) -> Result<HashMap<String, St
                 let mut full_name: Option<String> = None;
                 for attr in e.attributes().flatten() {
                     match attr.key.as_ref() {
-                        b"id" => id = attr.unescape_value().ok().map(|c| c.to_string()),
-                        b"name" => full_name = attr.unescape_value().ok().map(|c| c.to_string()),
+                        b"id" => {
+                            id = attr
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .ok()
+                                .map(|c| c.to_string())
+                        }
+                        b"name" => {
+                            full_name = attr
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .ok()
+                                .map(|c| c.to_string())
+                        }
                         _ => {}
                     }
                 }
@@ -267,11 +283,13 @@ mod tests {
         // Только два чистых UUID — у каталога и у формы.
         assert_eq!(map.len(), 2);
         assert_eq!(
-            map.get("aaaaaaaa-1111-2222-3333-444444444444").map(String::as_str),
+            map.get("aaaaaaaa-1111-2222-3333-444444444444")
+                .map(String::as_str),
             Some("catver")
         );
         assert_eq!(
-            map.get("bbbbbbbb-5555-6666-7777-888888888888").map(String::as_str),
+            map.get("bbbbbbbb-5555-6666-7777-888888888888")
+                .map(String::as_str),
             Some("formver")
         );
     }
@@ -298,7 +316,8 @@ mod tests {
         let map = parse_config_dump_info_str(xml).unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(
-            map.get("cccccccc-1234-5678-90ab-cdef00112233").map(String::as_str),
+            map.get("cccccccc-1234-5678-90ab-cdef00112233")
+                .map(String::as_str),
             Some("okver")
         );
     }
@@ -346,7 +365,8 @@ mod tests {
         // Суффиксные записи модулей не в счёт.
         assert_eq!(map.len(), 2);
         assert_eq!(
-            map.get("aaaaaaaa-1111-2222-3333-444444444444").map(String::as_str),
+            map.get("aaaaaaaa-1111-2222-3333-444444444444")
+                .map(String::as_str),
             Some("Catalog.Контрагенты")
         );
     }
@@ -372,9 +392,11 @@ mod tests {
 
     #[test]
     fn rows_empty_on_no_metadata() {
-        assert!(parse_config_dump_info_rows_str("<ConfigDumpInfo><Other/></ConfigDumpInfo>")
-            .unwrap()
-            .is_empty());
+        assert!(
+            parse_config_dump_info_rows_str("<ConfigDumpInfo><Other/></ConfigDumpInfo>")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

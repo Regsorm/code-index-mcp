@@ -162,8 +162,6 @@ fn load_enrichment_config(custom: Option<&Path>) -> Result<EnrichmentConfig> {
             .context("чтение daemon.toml по умолчанию")?,
     };
     cfg.enrichment.ok_or_else(|| {
-        anyhow!(
-            "В daemon.toml нет секции [enrichment] — добавьте её и установите enabled=true."
-        )
+        anyhow!("В daemon.toml нет секции [enrichment] — добавьте её и установите enabled=true.")
     })
 }

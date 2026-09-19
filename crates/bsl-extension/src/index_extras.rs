@@ -20,8 +20,6 @@ use anyhow::Result;
 use code_index_core::storage::Storage;
 use rusqlite::params;
 
-
-
 mod call_graph;
 mod common;
 mod exported;
@@ -75,9 +73,11 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     if crate::parse_collector::collector_did(conn, crate::parse_collector::MARK_CODE_USAGES) {
         tracing::info!("metadata_code_usages: наполнено parse-collector'ом, disk-rebuild пропущен");
     } else {
-        phase("использования в коде", "metadata_code_usages", || {
-            index_metadata_code_usages(repo_root, conn)
-        });
+        phase(
+            "использования в коде",
+            "metadata_code_usages",
+            || index_metadata_code_usages(repo_root, conn),
+        );
     }
     // Механические термы процедур (имя + объект + синоним + комментарий) —
     // после синонимов (использует metadata_objects.synonym, заполнен в слое).
@@ -85,9 +85,11 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // bsl-indexer) — строим из него, без повторного чтения .bsl с диска;
     // иначе полный disk-rebuild (инкремент / публичный путь).
     if crate::parse_collector::collector_did(conn, crate::parse_collector::MARK_PROC_TERMS) {
-        phase("термины процедур", "procedure_terms (staging)", || {
-            build_procedure_terms_from_staging(conn)
-        });
+        phase(
+            "термины процедур",
+            "procedure_terms (staging)",
+            || build_procedure_terms_from_staging(conn),
+        );
     } else {
         phase("термины процедур", "procedure_terms", || {
             index_procedure_terms(repo_root, conn)
@@ -95,7 +97,9 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     }
     // Граф вызовов строится ПОСЛЕ заполнения metadata_forms и event_subscriptions
     // (они в XML-слое выше) — он опирается на их содержимое.
-    phase("граф вызовов", "proc_call_graph", || build_call_graph(conn));
+    phase("граф вызовов", "proc_call_graph", || {
+        build_call_graph(conn)
+    });
     // ANALYZE: без статистики SQLite в рекурсивном шаге find_path_bsl/
     // find_data_path использует лишь префикс индекса (repo=) и сканирует
     // все рёбра repo на каждой итерации (depth=3 ~240с на КА1.1). После
@@ -109,7 +113,6 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     });
     Ok(())
 }
-
 
 /// XML-слой обогащения: перечень объектов, связи данных, конфиг-уровневые
 /// рёбра, права ролей, структура объектов (attributes_json), синонимы, формы,
@@ -150,9 +153,11 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
     // Рёбра data_links КОНФИГУРАЦИОННОГО уровня (подсистемы, планы обмена,
     // определяемые типы, расположение ФО). Строго ПОСЛЕ index_data_links —
     // та wipe-ит все рёбра repo и пишет объектные; эта добавляет свои link_kind.
-    phase("связи конфигурации", "data_links(config-level)", || {
-        index_metadata_refs(repo_root, conn)
-    });
+    phase(
+        "связи конфигурации",
+        "data_links(config-level)",
+        || index_metadata_refs(repo_root, conn),
+    );
     // Права ролей → отдельная таблица role_rights.
     phase("права ролей", "role_rights", || {
         index_role_rights(repo_root, conn)
@@ -160,9 +165,11 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
     // Полная структура объектов (реквизиты+типы, ТЧ, измерения, ресурсы)
     // → metadata_objects.attributes_json. Зависит от строк, созданных
     // index_metadata_objects (выше), — делает UPDATE по full_name.
-    phase("структура объектов", "object_attributes", || {
-        index_object_attributes(repo_root, conn)
-    });
+    phase(
+        "структура объектов",
+        "object_attributes",
+        || index_object_attributes(repo_root, conn),
+    );
     // Синонимы (русские представления) ВСЕХ объектов — отдельный лёгкий проход
     // по корневым XML всех папок типов. Покрывает и объекты без структуры
     // реквизитов (CommonModule/Constant/CommonPicture/FunctionalOption/…),
@@ -199,7 +206,6 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
     Ok(())
 }
 
-
 /// EDT-аналог metadata-слоя: обходит `src/<Тип>/<Имя>/<Имя>.mdo` и заполняет
 /// `metadata_objects` (состав + синоним + `attributes_json`) и `data_links`
 /// (ссылочные реквизиты/измерения + движения документов). Один проход по
@@ -215,7 +221,10 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
         "DELETE FROM metadata_objects WHERE repo = ?",
         params![REPO_DEFAULT],
     )?;
-    conn.execute("DELETE FROM data_links WHERE repo = ?", params![REPO_DEFAULT])?;
+    conn.execute(
+        "DELETE FROM data_links WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
     conn.execute(
         "DELETE FROM metadata_forms WHERE repo = ?",
         params![REPO_DEFAULT],
@@ -496,7 +505,10 @@ fn run_edt_role_rights(src_root: &Path, conn: &rusqlite::Connection) -> Result<(
 
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
-    conn.execute("DELETE FROM role_rights WHERE repo = ?", params![REPO_DEFAULT])?;
+    conn.execute(
+        "DELETE FROM role_rights WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
     let mut stmt = conn.prepare(
         "INSERT OR IGNORE INTO role_rights (repo, role_name, object_name, right_name) \
          VALUES (?, ?, ?, ?)",

@@ -31,6 +31,8 @@ use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use super::BytesTextExt;
+
 /// Описание одной подписки на событие.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventSubscription {
@@ -289,19 +291,28 @@ mod tests {
     fn event_to_russian_maps_known_and_keeps_unknown() {
         assert_eq!(event_to_russian("BeforeWrite"), "ПередЗаписью");
         assert_eq!(event_to_russian("Posting"), "ОбработкаПроведения");
-        assert_eq!(event_to_russian("UndoPosting"), "ОбработкаУдаленияПроведения");
+        assert_eq!(
+            event_to_russian("UndoPosting"),
+            "ОбработкаУдаленияПроведения"
+        );
         assert_eq!(event_to_russian("OnSetNewCode"), "ПриУстановкеНовогоКода");
         // уже-русское — без изменений
         assert_eq!(event_to_russian("ПриЗаписи"), "ПриЗаписи");
         // неизвестное — без изменений
-        assert_eq!(event_to_russian("СовсемДругоеСобытие"), "СовсемДругоеСобытие");
+        assert_eq!(
+            event_to_russian("СовсемДругоеСобытие"),
+            "СовсемДругоеСобытие"
+        );
     }
 
     /// События, которые раньше оставались английскими на живых конфигурациях:
     /// в УТ это 22 подписки из 345, и поиск по русскому имени их не находил.
     #[test]
     fn event_to_russian_covers_form_and_exchange_events() {
-        assert_eq!(event_to_russian("FormGetProcessing"), "ОбработкаПолученияФормы");
+        assert_eq!(
+            event_to_russian("FormGetProcessing"),
+            "ОбработкаПолученияФормы"
+        );
         assert_eq!(
             event_to_russian("PresentationGetProcessing"),
             "ОбработкаПолученияПредставления"

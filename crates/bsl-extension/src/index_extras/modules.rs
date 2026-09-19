@@ -1,18 +1,17 @@
 //! Перечень модулей конфигурации: поиск владельца модуля, классификация
 //! типа и ведение строк как полным проходом, так и пофайлово.
 
-use std::path::Path;
-use anyhow::Result;
-use rusqlite::params;
-use walkdir::WalkDir;
 use crate::module_constants::{module_type_by_filename, property_id_by_type};
 use crate::xml::config_dump_info::parse_config_dump_info;
 use crate::xml::object_uuid::{
     extract_command_uuid_from_file, extract_form_uuid_any_from_file, extract_object_uuid_from_file,
 };
+use anyhow::Result;
+use rusqlite::params;
+use std::path::Path;
+use walkdir::WalkDir;
 
 use super::*;
-
 
 /// Миграция: старый ключ UNIQUE(repo, full_name) без extension_name терял
 /// модули расширений-доработок (то же имя, что в base) через INSERT OR IGNORE,
@@ -34,7 +33,9 @@ pub(crate) fn migrate_metadata_modules_key(conn: &rusqlite::Connection) -> Resul
             for idx_ddl in crate::schema::METADATA_MODULES_INDEXES {
                 conn.execute(idx_ddl, [])?;
             }
-            tracing::info!("metadata_modules: миграция схемы — UNIQUE ключ дополнен extension_name");
+            tracing::info!(
+                "metadata_modules: миграция схемы — UNIQUE ключ дополнен extension_name"
+            );
         }
     }
     Ok(())
@@ -68,10 +69,13 @@ pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connecti
     // Находим все Configuration.xml — каждая определяет область sub-config.
     let mut sub_configs: Vec<std::path::PathBuf> = Vec::new();
     let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(repo_root).max_depth(3).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
-        if entry.file_type().is_file()
-            && entry.file_name().to_str() == Some("Configuration.xml")
-        {
+    for entry in WalkDir::new(repo_root)
+        .max_depth(3)
+        .into_iter()
+        .filter_entry(|e| filter.allows(e))
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() && entry.file_name().to_str() == Some("Configuration.xml") {
             if let Some(parent) = entry.path().parent() {
                 sub_configs.push(parent.to_path_buf());
             }
@@ -98,7 +102,11 @@ pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connecti
     > = std::collections::HashMap::new();
 
     for sub_root in &sub_configs {
-        for entry in WalkDir::new(sub_root).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(sub_root)
+            .into_iter()
+            .filter_entry(|e| filter.allows(e))
+            .filter_map(|e| e.ok())
+        {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -136,7 +144,6 @@ pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connecti
     Ok(())
 }
 
-
 /// Данные одной строки `metadata_modules`, собранные из `.bsl`-модуля. Отделены
 /// от вставки, чтобы одну логику (classify/owner/uuid/config_version) использовать
 /// и пофайлово (`update_metadata_module_for_file`), и по-объектно
@@ -151,7 +158,6 @@ pub(crate) struct ModuleRow {
     code_path: String,
     extension_name: String,
 }
-
 
 /// Собрать строку `metadata_modules` из одного `.bsl` (те же хелперы classify/
 /// owner/uuid, что у `index_metadata_modules` → полная эквивалентность). Не
@@ -195,8 +201,12 @@ pub(crate) fn build_module_row(
             };
             let (owner_xml_path, object_name) = owner_info?;
             let uuid = match owner_xml_kind {
-                OwnerKind::Form => extract_form_uuid_any_from_file(&owner_xml_path).ok().flatten(),
-                OwnerKind::Object => extract_object_uuid_from_file(&owner_xml_path).ok().flatten(),
+                OwnerKind::Form => extract_form_uuid_any_from_file(&owner_xml_path)
+                    .ok()
+                    .flatten(),
+                OwnerKind::Object => extract_object_uuid_from_file(&owner_xml_path)
+                    .ok()
+                    .flatten(),
             };
             (object_name, uuid)
         }
@@ -237,9 +247,6 @@ pub(crate) fn build_module_row(
     })
 }
 
-
-
-
 /// Заполнить `metadata_modules` для выгрузки 1C:EDT.
 ///
 /// Раскладка отличается от формата Конфигуратора: каталога `Ext` нет
@@ -272,7 +279,11 @@ pub(crate) fn index_metadata_modules_edt(
     let mut total = 0usize;
 
     let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(src_root).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(src_root)
+        .into_iter()
+        .filter_entry(|e| filter.allows(e))
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -300,7 +311,6 @@ pub(crate) fn index_metadata_modules_edt(
     );
     Ok(())
 }
-
 
 /// Собрать строку `metadata_modules` из одного `.bsl` выгрузки EDT.
 /// Не модуль известного типа / без владельца / без идентификатора → `None`.
@@ -403,7 +413,6 @@ pub(crate) fn build_module_row_edt(
     })
 }
 
-
 /// Вставка/обновление одной строки `metadata_modules`. Транзакцией управляет вызывающий.
 pub(crate) fn insert_module_row(conn: &rusqlite::Connection, row: &ModuleRow) -> Result<()> {
     conn.execute(
@@ -432,7 +441,6 @@ pub(crate) fn insert_module_row(conn: &rusqlite::Connection, row: &ModuleRow) ->
     )?;
     Ok(())
 }
-
 
 /// Per-file точечное обновление `metadata_modules` для одного изменённого `.bsl`.
 /// Закрывает дыру «строка нового модуля не заводится без Configuration.xml в
@@ -468,7 +476,6 @@ pub(crate) fn update_metadata_module_for_file(
     Ok(())
 }
 
-
 /// Per-object пересборка `metadata_modules` объекта: DELETE всех его модулей (по
 /// всем sub-config'ам, ключ `object_name`) + обход каталогов объекта во ВСЕХ
 /// `roots` с повторной вставкой по существующим `.bsl`. Симметрично
@@ -488,7 +495,11 @@ pub(crate) fn update_metadata_modules_for_object(
 ) -> Result<()> {
     // Папка (plural) и имя объекта — из пути корневого XML; `object_name` в
     // metadata_modules хранится как '<PluralFolder>.<Name>'.
-    let folder = match xml_path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) {
+    let folder = match xml_path
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|s| s.to_str())
+    {
         Some(s) => s.to_string(),
         None => return Ok(()),
     };
@@ -514,7 +525,11 @@ pub(crate) fn update_metadata_modules_for_object(
         if !obj_dir.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&obj_dir).into_iter().filter_entry(|e| filter.allows(e)).filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&obj_dir)
+            .into_iter()
+            .filter_entry(|e| filter.allows(e))
+            .filter_map(|e| e.ok())
+        {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -527,7 +542,6 @@ pub(crate) fn update_metadata_modules_for_object(
     Ok(())
 }
 
-
 /// Что искать как XML-владелец .bsl-файла модуля.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum OwnerKind {
@@ -538,11 +552,13 @@ pub(crate) enum OwnerKind {
     Object,
 }
 
-
 /// Уточнить тип модуля и определить как искать владельца.
 /// Особый случай: Module.bsl внутри `Forms/<X>/Ext/Form/Module.bsl` — это
 /// FormModule, а не CommonModule.Module.
-pub(crate) fn classify_module(bsl_path: &Path, raw_type: &'static str) -> (&'static str, OwnerKind) {
+pub(crate) fn classify_module(
+    bsl_path: &Path,
+    raw_type: &'static str,
+) -> (&'static str, OwnerKind) {
     if raw_type == "Module"
         && (path_has_segment(bsl_path, "Forms") || path_has_segment(bsl_path, "CommonForms"))
     {
@@ -555,14 +571,12 @@ pub(crate) fn classify_module(bsl_path: &Path, raw_type: &'static str) -> (&'sta
     (raw_type, OwnerKind::Object)
 }
 
-
 pub(crate) fn path_has_segment(p: &Path, segment: &str) -> bool {
     p.components().any(|c| match c {
         std::path::Component::Normal(s) => s.to_str() == Some(segment),
         _ => false,
     })
 }
-
 
 /// Найти XML-владельца для модуля формы.
 /// Обычные формы: `<...>/<MetaType>/<Owner>/Forms/<FormName>/[Ext/Form/]Module.bsl`;
@@ -587,7 +601,10 @@ pub(crate) fn find_form_owner(bsl_path: &Path) -> Option<(std::path::PathBuf, St
         let form_name = segments[idx + 1];
         let owner_name = segments[idx - 1];
         let meta_type = segments[idx - 2];
-        (form_name, format!("{}.{}.Form.{}", meta_type, owner_name, form_name))
+        (
+            form_name,
+            format!("{}.{}.Form.{}", meta_type, owner_name, form_name),
+        )
     } else if let Some(idx) = segments.iter().rposition(|s| *s == "CommonForms") {
         if idx + 1 >= segments.len() {
             return None;
@@ -621,13 +638,14 @@ pub(crate) fn find_form_owner(bsl_path: &Path) -> Option<(std::path::PathBuf, St
     Some((xml_path, owner_full))
 }
 
-
 /// Найти владельца для модуля команды ОБЪЕКТА:
 /// `<...>/<MetaType>/<OwnerName>/Commands/<CommandName>/[Ext/]CommandModule.bsl`.
 /// Возвращает (путь к XML объекта, `<MetaType>.<OwnerName>.Command.<CommandName>`,
 /// имя команды). Общие команды (`CommonCommands/<Имя>/Ext/CommandModule.bsl`)
 /// сюда не попадают — у них нет сегмента `Commands`, их ведёт общий разбор пути.
-pub(crate) fn find_object_command_owner(bsl_path: &Path) -> Option<(std::path::PathBuf, String, String)> {
+pub(crate) fn find_object_command_owner(
+    bsl_path: &Path,
+) -> Option<(std::path::PathBuf, String, String)> {
     let segments: Vec<&str> = bsl_path
         .components()
         .filter_map(|c| match c {
@@ -658,16 +676,13 @@ pub(crate) fn find_object_command_owner(bsl_path: &Path) -> Option<(std::path::P
         }
         dir = parent.to_path_buf();
     }
-    let owner_xml = dir
-        .parent()?
-        .join(format!("{}.xml", owner_name));
+    let owner_xml = dir.parent()?.join(format!("{}.xml", owner_name));
     if !owner_xml.is_file() {
         return None;
     }
     let full = format!("{}.{}.Command.{}", meta_type, owner_name, command_name);
     Some((owner_xml, full, command_name.to_string()))
 }
-
 
 /// Найти XML-файл владельца для не-form модуля.
 /// Layout: `<...>/<MetaType>/<OwnerName>/[Ext/]<ModuleFile>.bsl`

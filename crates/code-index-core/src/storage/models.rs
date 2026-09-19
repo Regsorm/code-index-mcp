@@ -9,8 +9,8 @@ pub struct FileRecord {
     pub language: String,
     pub lines_total: usize,
     pub indexed_at: String,
-    pub mtime: Option<i64>,      // Unix timestamp секунды (fs::metadata)
-    pub file_size: Option<i64>,  // размер файла в байтах
+    pub mtime: Option<i64>,     // Unix timestamp секунды (fs::metadata)
+    pub file_size: Option<i64>, // размер файла в байтах
 }
 
 /// Запись функции
@@ -206,7 +206,9 @@ pub struct ReadFileResult {
 }
 
 #[inline]
-fn is_false(b: &bool) -> bool { !*b }
+fn is_false(b: &bool) -> bool {
+    !*b
+}
 
 /// Запись из `list_files` — метаданные файла без полей хеша.
 #[derive(Debug, Clone, Serialize, Deserialize)]

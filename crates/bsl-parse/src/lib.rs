@@ -307,7 +307,9 @@ fn find_bare_raise(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
         let maybe_en = b == b'R' || b == b'r';
         if maybe_ru || maybe_en {
             for kw in ["вызватьисключение", "raise"] {
-                let Some(end) = kw_ends_at(bytes, i, kw) else { continue };
+                let Some(end) = kw_ends_at(bytes, i, kw) else {
+                    continue;
+                };
                 if !on_word_boundary(bytes, i, end) {
                     continue;
                 }
@@ -489,7 +491,13 @@ pub fn collect_facts(source: &str) -> AstFacts {
                     .named_children(&mut cursor)
                     .find(|c| matches!(c.kind(), "property" | "method_call"))
                     // У `method_call` именем является его первый ребёнок-identifier.
-                    .and_then(|c| if c.kind() == "method_call" { c.child(0) } else { Some(c) });
+                    .and_then(|c| {
+                        if c.kind() == "method_call" {
+                            c.child(0)
+                        } else {
+                            Some(c)
+                        }
+                    });
                 if let Some(member_node) = member_node {
                     if let Some((head, head_byte)) = simple_head(node.child(0), src) {
                         if let Ok(member) = member_node.utf8_text(src) {
@@ -836,7 +844,10 @@ pub struct MethodScan {
 impl MethodScan {
     /// Разбор не состоялся: методов нет и знать о модуле нечего.
     fn not_parsed() -> Self {
-        Self { methods: Vec::new(), parsed: false }
+        Self {
+            methods: Vec::new(),
+            parsed: false,
+        }
     }
 }
 
@@ -919,7 +930,10 @@ pub fn collect_methods(source: &str) -> MethodScan {
         }
     }
 
-    MethodScan { methods, parsed: true }
+    MethodScan {
+        methods,
+        parsed: true,
+    }
 }
 
 #[cfg(test)]
@@ -954,9 +968,12 @@ mod tests {
 
     #[test]
     fn query_text_cast_is_not_a_call() {
-        let facts =
-            collect_facts("З = Новый Запрос(\"ВЫБРАТЬ ВЫРАЗИТЬ(Т.С КАК ЧИСЛО(15,2))\");");
-        assert!(facts.calls.is_empty(), "ЧИСЛО из текста запроса: {:?}", facts.calls.iter().map(|c| &c.name).collect::<Vec<_>>());
+        let facts = collect_facts("З = Новый Запрос(\"ВЫБРАТЬ ВЫРАЗИТЬ(Т.С КАК ЧИСЛО(15,2))\");");
+        assert!(
+            facts.calls.is_empty(),
+            "ЧИСЛО из текста запроса: {:?}",
+            facts.calls.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
         assert_eq!(facts.news.len(), 1);
         assert_eq!(facts.news[0].type_name, "Запрос");
     }
@@ -1005,7 +1022,11 @@ mod tests {
                 .iter()
                 .any(|d| d.head == "ТЗ" && d.member == "Колонкы"),
             "нет ТЗ.Колонкы: {:?}",
-            facts.dots.iter().map(|d| (&d.head, &d.member)).collect::<Vec<_>>()
+            facts
+                .dots
+                .iter()
+                .map(|d| (&d.head, &d.member))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1021,11 +1042,18 @@ mod tests {
                 .iter()
                 .any(|d| d.head == "Запрос" && d.member == "Выполнть"),
             "нет звена Запрос.Выполнть: {:?}",
-            facts.dots.iter().map(|d| (&d.head, &d.member)).collect::<Vec<_>>()
+            facts
+                .dots
+                .iter()
+                .map(|d| (&d.head, &d.member))
+                .collect::<Vec<_>>()
         );
         // Голова цепочки не должна попасть в голые вызовы.
-        assert!(facts.calls.is_empty(), "цепочка дала голый вызов: {:?}",
-            facts.calls.iter().map(|c| &c.name).collect::<Vec<_>>());
+        assert!(
+            facts.calls.is_empty(),
+            "цепочка дала голый вызов: {:?}",
+            facts.calls.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1061,8 +1089,14 @@ mod tests {
         // и вложенный вызов внутри тернарного оператора становится виден.
         let facts = collect_facts("Кол = ? (Стр.Свойство(\"К\"), СтрокаЧисло(Стр.К), 0);");
         let names: Vec<&str> = facts.calls.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"СтрокаЧисло"), "вызов внутри тернарного не найден: {names:?}");
-        assert!(facts.dots.iter().any(|d| d.head == "Стр" && d.member == "Свойство"));
+        assert!(
+            names.contains(&"СтрокаЧисло"),
+            "вызов внутри тернарного не найден: {names:?}"
+        );
+        assert!(facts
+            .dots
+            .iter()
+            .any(|d| d.head == "Стр" && d.member == "Свойство"));
     }
 
     #[test]
@@ -1073,14 +1107,20 @@ mod tests {
         );
         assert!(facts.declarations.contains("п"));
         let names: Vec<&str> = facts.calls.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"Лог"), "вызов после ВызватьИсключение потерян: {names:?}");
+        assert!(
+            names.contains(&"Лог"),
+            "вызов после ВызватьИсключение потерян: {names:?}"
+        );
     }
 
     #[test]
     fn raise_with_argument_is_untouched() {
         // Форму с аргументом грамматика понимает — нормализация её не трогает.
         let src = "Попытка\n А();\nИсключение\n ВызватьИсключение \"текст\";\nКонецПопытки;";
-        assert!(matches!(normalize_for_parser(src), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(
+            normalize_for_parser(src),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -1108,9 +1148,15 @@ mod tests {
     fn method_of_ternary_result_is_not_a_bare_call() {
         // `?(У, А, Б).ПолучитьИмена()` грамматика рвёт так, что вызов метода
         // становится отдельным оператором. Точка слева спасает от ложной находки.
-        let facts = collect_facts("Процедура П()\n  А = ?(У, Б, В).ПолучитьИмена();\n  Лог(3);\nКонецПроцедуры");
+        let facts = collect_facts(
+            "Процедура П()\n  А = ?(У, Б, В).ПолучитьИмена();\n  Лог(3);\nКонецПроцедуры",
+        );
         let names: Vec<&str> = facts.calls.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["Лог"], "метод результата тернарного принят за голый вызов: {names:?}");
+        assert_eq!(
+            names,
+            vec!["Лог"],
+            "метод результата тернарного принят за голый вызов: {names:?}"
+        );
     }
 
     #[test]
@@ -1129,22 +1175,32 @@ mod tests {
                    КонецПроцедуры";
         let facts = collect_facts(src);
         let calls: Vec<&str> = facts.calls.iter().map(|c| c.name.as_str()).collect();
-        assert!(calls.is_empty(), "конструктор принят за голый вызов: {calls:?}");
+        assert!(
+            calls.is_empty(),
+            "конструктор принят за голый вызов: {calls:?}"
+        );
         assert!(facts.news.iter().any(|n| n.type_name == "ОписаниеТипов"));
     }
 
     #[test]
     fn new_keyword_check_is_case_insensitive_and_word_bounded() {
         // `Обновый` — не `Новый`; регистр значения не имеет.
-        let facts = collect_facts("Процедура П()\n  А = НОВЫЙ Массив();\n  Б = Обновый(1);\nКонецПроцедуры");
+        let facts = collect_facts(
+            "Процедура П()\n  А = НОВЫЙ Массив();\n  Б = Обновый(1);\nКонецПроцедуры",
+        );
         let calls: Vec<&str> = facts.calls.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(calls, vec!["Обновый"], "ожидался только вызов Обновый: {calls:?}");
+        assert_eq!(
+            calls,
+            vec!["Обновый"],
+            "ожидался только вызов Обновый: {calls:?}"
+        );
     }
 
     #[test]
     fn negative_default_keeps_facts() {
         // `Процедура П(А = -1)` — минус в заголовке грамматика не принимает.
-        let src = "Процедура П(Знач А = -1, Б = 2)\n  Сообщить(1);\n  Х = Стр.Поле;\nКонецПроцедуры";
+        let src =
+            "Процедура П(Знач А = -1, Б = 2)\n  Сообщить(1);\n  Х = Стр.Поле;\nКонецПроцедуры";
         assert_eq!(normalize_for_parser(src).len(), src.len());
         let facts = collect_facts(src);
         assert!(facts.declarations.contains("п"));
@@ -1156,7 +1212,10 @@ mod tests {
     fn negative_value_in_body_is_untouched() {
         // Минус в ТЕЛЕ процедуры грамматике понятен — нормализация его не трогает.
         let src = "Процедура П()\n  Х = -1;\n  У = А - Б;\nКонецПроцедуры";
-        assert!(matches!(normalize_for_parser(src), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(
+            normalize_for_parser(src),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -1165,15 +1224,22 @@ mod tests {
         // вызов. В дереве он лежит внутри `access` единственным ребёнком.
         let facts = collect_facts("Х = ПустаяСсылка().Метаданные().ПолноеИмя();");
         let names: Vec<&str> = facts.calls.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["ПустаяСсылка"], "голова цепочки должна быть голым вызовом");
+        assert_eq!(
+            names,
+            vec!["ПустаяСсылка"],
+            "голова цепочки должна быть голым вызовом"
+        );
     }
 
     #[test]
     fn member_call_in_chain_is_not_bare() {
         // А `Запрос.Выполнить()` — метод объекта, голым вызовом быть не должен.
         let facts = collect_facts("Р = Запрос.Выполнить().Выбрать();");
-        assert!(facts.calls.is_empty(), "лишние голые вызовы: {:?}",
-            facts.calls.iter().map(|c| &c.name).collect::<Vec<_>>());
+        assert!(
+            facts.calls.is_empty(),
+            "лишние голые вызовы: {:?}",
+            facts.calls.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1192,7 +1258,11 @@ mod tests {
             facts.declarations
         );
         let names: Vec<&str> = facts.calls.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["ЗаполнённыеДанные"], "имя вызова должно сохранить ё");
+        assert_eq!(
+            names,
+            vec!["ЗаполнённыеДанные"],
+            "имя вызова должно сохранить ё"
+        );
     }
 
     #[test]
@@ -1238,7 +1308,8 @@ mod tests {
 
     #[test]
     fn collect_methods_directive_and_export() {
-        let scan = collect_methods("&НаСервере\nПроцедура Тест(А, Знач Б = 1) Экспорт\nКонецПроцедуры");
+        let scan =
+            collect_methods("&НаСервере\nПроцедура Тест(А, Знач Б = 1) Экспорт\nКонецПроцедуры");
         assert!(scan.parsed);
         let methods = scan.methods;
         assert_eq!(methods.len(), 1);
@@ -1304,7 +1375,10 @@ mod tests {
         let src = "# Удаление\nА = \"обрыв;\n# КонецУдаления\nБ = 2;";
         let stripped = strip_extension_directives(src);
         assert_eq!(stripped.len(), src.len(), "длина сохраняется побайтно");
-        assert!(!stripped.contains("обрыв"), "удаляемый блок затёрт: {stripped}");
+        assert!(
+            !stripped.contains("обрыв"),
+            "удаляемый блок затёрт: {stripped}"
+        );
         assert!(stripped.contains("Б = 2;"), "код после блока цел");
     }
 }

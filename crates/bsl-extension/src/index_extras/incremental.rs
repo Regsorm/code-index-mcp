@@ -1,20 +1,19 @@
 //! Инкрементальное обновление по событиям наблюдателя: пофайловые ветки
 //! и сверка состава области по описи выгрузки.
 
-use std::path::Path;
-use anyhow::Result;
-use code_index_core::storage::Storage;
-use rusqlite::params;
+use crate::code_usages::extract_code_usages;
 use crate::xml::config_dump_info::parse_config_dump_info_rows;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
 use crate::xml::forms::parse_form_file;
-use crate::code_usages::extract_code_usages;
 use crate::xml::object_attributes::{
     parse_object_attributes_file, parse_object_belonging, parse_object_header_xml,
 };
+use anyhow::Result;
+use code_index_core::storage::Storage;
+use rusqlite::params;
+use std::path::Path;
 
 use super::*;
-
 
 /// Per-object обновление `data_links` для одного объекта: удалить его прежние
 /// рёбра (`from_object = X`) и переразобрать только его XML. Покрывает и
@@ -32,7 +31,11 @@ pub(crate) fn update_data_links_for_object(
     // Папка (plural) и имя объекта — из пути; ищем копии объекта во ВСЕХ sub-config
     // и объединяем рёбра (симметрично bulk index_data_links), а не разбираем один
     // пришедший файл. Удалённая/ушедшая копия отсеивается сама (файла нет).
-    let folder = match xml_path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) {
+    let folder = match xml_path
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|s| s.to_str())
+    {
         Some(s) => s.to_string(),
         None => return Ok(()),
     };
@@ -82,7 +85,6 @@ pub(crate) fn update_data_links_for_object(
     Ok(())
 }
 
-
 /// Per-object обновление `metadata_objects.attributes_json` для одного объекта.
 /// Переразбирает структуру по ВСЕМ sub-config'ам этого объекта (base + копии в
 /// расширениях) и пишет СЛИТУЮ структуру (или NULL, если ни в одной sub-config
@@ -102,7 +104,11 @@ pub(crate) fn update_object_attributes_for_object(
     // Папка (plural) и имя объекта — из пути изменённого XML; ищем копии этого
     // объекта во всех sub-config (`roots`, посчитаны один раз на пачку) и мерджим
     // (base-first).
-    let folder = match xml_path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) {
+    let folder = match xml_path
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|s| s.to_str())
+    {
         Some(s) => s.to_string(),
         None => return Ok(()),
     };
@@ -110,15 +116,13 @@ pub(crate) fn update_object_attributes_for_object(
         Some(s) => s.to_string(),
         None => return Ok(()),
     };
-    let json_opt =
-        merged_object_structure(roots, &folder, &stem).map(|s| s.to_json().to_string());
+    let json_opt = merged_object_structure(roots, &folder, &stem).map(|s| s.to_json().to_string());
     conn.execute(
         "UPDATE metadata_objects SET attributes_json = ? WHERE repo = ? AND full_name = ?",
         params![json_opt, REPO_DEFAULT, &owner_full],
     )?;
     Ok(())
 }
-
 
 /// Per-object upsert строки `metadata_objects` (перечень + синоним + владелец
 /// `sub_config`) из шапки объектного XML. В отличие от `index_metadata_objects`
@@ -147,7 +151,11 @@ pub(crate) fn upsert_metadata_object(
         Some(x) => x,
         None => return Ok(()),
     };
-    let folder = match xml_path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) {
+    let folder = match xml_path
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|s| s.to_str())
+    {
         Some(s) => s.to_string(),
         None => return Ok(()),
     };
@@ -214,7 +222,6 @@ pub(crate) fn upsert_metadata_object(
     Ok(())
 }
 
-
 /// Per-file обновление строки `metadata_forms` для одной формы по её Form.xml.
 /// Слой `form_event` графа пересобирается отдельно (после всех форм батча).
 pub(crate) fn update_metadata_forms_for_file(
@@ -242,13 +249,16 @@ pub(crate) fn update_metadata_forms_for_file(
                     params![REPO_DEFAULT, &owner_full, &form_name, &handlers_json],
                 )?;
             }
-            Err(e) => tracing::warn!("update_metadata_forms_for_file {}: {}", form_xml_path.display(), e),
+            Err(e) => tracing::warn!(
+                "update_metadata_forms_for_file {}: {}",
+                form_xml_path.display(),
+                e
+            ),
         }
     }
     conn.execute("COMMIT", [])?;
     Ok(())
 }
-
 
 /// Per-file обновление паспорта макета объекта по его описанию. Файл удалён —
 /// строка просто уходит из перечня.
@@ -292,10 +302,12 @@ pub(crate) fn update_object_template_for_file(
     Ok(())
 }
 
-
 /// Per-file обновление строки `event_subscriptions` по её XML. Слой
 /// `subscription` графа пересобирается отдельно (после всех подписок батча).
-pub(crate) fn update_event_subscription_for_file(conn: &rusqlite::Connection, xml_path: &Path) -> Result<()> {
+pub(crate) fn update_event_subscription_for_file(
+    conn: &rusqlite::Connection,
+    xml_path: &Path,
+) -> Result<()> {
     let in_dir = xml_path
         .parent()
         .and_then(|p| p.file_name())
@@ -329,7 +341,11 @@ pub(crate) fn update_event_subscription_for_file(conn: &rusqlite::Connection, xm
                 )?;
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!("update_event_subscription_for_file {}: {}", xml_path.display(), e),
+            Err(e) => tracing::warn!(
+                "update_event_subscription_for_file {}: {}",
+                xml_path.display(),
+                e
+            ),
         }
     } else {
         // Файл удалён — имя подписки прочитать неоткуда; в выгрузке 1С имя
@@ -345,7 +361,6 @@ pub(crate) fn update_event_subscription_for_file(conn: &rusqlite::Connection, xm
     conn.execute("COMMIT", [])?;
     Ok(())
 }
-
 
 /// Инкрементально обновить extras для файлов одного watcher-батча.
 ///
@@ -403,8 +418,7 @@ pub fn run_incremental_extras(
     for p in changed.iter().chain(deleted.iter()) {
         let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let has_comp =
-            |name: &str| p.components().any(|c| c.as_os_str().to_str() == Some(name));
+        let has_comp = |name: &str| p.components().any(|c| c.as_os_str().to_str() == Some(name));
         if fname == "Rights.xml" && has_comp("Roles") {
             roles_dirty = true;
         }
@@ -431,7 +445,10 @@ pub fn run_incremental_extras(
         } else if fname == "Form.xml" {
             form_xmls.push(p);
         } else if ext == "xml"
-            && p.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) == Some("Templates")
+            && p.parent()
+                .and_then(|d| d.file_name())
+                .and_then(|s| s.to_str())
+                == Some("Templates")
         {
             // Описание макета объекта: паспорт в перечне обновляется точечно.
             template_xmls.push(p);
@@ -473,8 +490,11 @@ pub fn run_incremental_extras(
     // иначе пачка «только .bsl» не платила бы за лишний обход дерева.
     let need_roots =
         !dump_info_areas.is_empty() || !all_object_xmls.is_empty() || !object_xmls.is_empty();
-    let roots: Vec<std::path::PathBuf> =
-        if need_roots { sub_config_roots(repo_root) } else { Vec::new() };
+    let roots: Vec<std::path::PathBuf> = if need_roots {
+        sub_config_roots(repo_root)
+    } else {
+        Vec::new()
+    };
     // Фаза 3: сверка затронутых областей по свежей описи вместо квадратичного
     // полного пересбора метаданного слоя. Каждая область → точечный diff реестра
     // config_manifest; индексные действия — ТОЛЬКО на удалении объектов (каскад
@@ -490,8 +510,12 @@ pub fn run_incremental_extras(
         match reconcile_area(repo_root, conn, &roots, area_root) {
             Ok(s) => tracing::info!(
                 "reconcile_area {}: +{} ~{} -{} (объектов удалено {}, пере-собрано {})",
-                area_root.display(), s.added, s.updated, s.removed,
-                s.deleted_objects, s.remerged_objects,
+                area_root.display(),
+                s.added,
+                s.updated,
+                s.removed,
+                s.deleted_objects,
+                s.remerged_objects,
             ),
             Err(e) => tracing::warn!("reconcile_area {}: {}", area_root.display(), e),
         }
@@ -621,7 +645,12 @@ pub fn run_incremental_extras(
     if !bsl_paths.is_empty() {
         let сколько =
             code_index_core::logging::plural(bsl_paths.len() as u64, "файл", "файла", "файлов");
-        for имя in ["граф вызовов", "использования в коде", "термины процедур", "модули"] {
+        for имя in [
+            "граф вызовов",
+            "использования в коде",
+            "термины процедур",
+            "модули",
+        ] {
             code_index_core::logging::stage_set_detail(имя, сколько.clone());
         }
         tracing::debug!(
@@ -652,8 +681,7 @@ pub fn run_incremental_extras(
         // Область — только файлы пакета: рёбра, которые не удалось адресовать
         // однозначно, остаются с пустым адресом навсегда, и проход «по всем
         // неадресованным» каждый раз перебирал бы весь граф заново.
-        let scope_paths: Vec<String> =
-            bsl_paths.iter().map(|p| rel_path(repo_root, p)).collect();
+        let scope_paths: Vec<String> = bsl_paths.iter().map(|p| rel_path(repo_root, p)).collect();
         create_batch_scope(conn, &scope_paths)?;
         let _ = conn.execute("ROLLBACK", []);
         conn.execute("BEGIN", [])?;
@@ -689,7 +717,8 @@ pub fn run_incremental_extras(
     // Освежить статистику планировщика, если графовые таблицы (data_links /
     // proc_call_graph) разъехались со статистикой в ≥1.5× (например, bulk-залив
     // расширений). Только когда рёбра реально могли измениться в этом батче.
-    if !dump_info_areas.is_empty() || !bsl_paths.is_empty() || !object_xmls.is_empty() || refs_dirty {
+    if !dump_info_areas.is_empty() || !bsl_paths.is_empty() || !object_xmls.is_empty() || refs_dirty
+    {
         let t = std::time::Instant::now();
         if let Err(e) = maybe_analyze_graph_tables(conn) {
             tracing::warn!("maybe_analyze_graph_tables: {}", e);
@@ -698,7 +727,6 @@ pub fn run_incremental_extras(
     }
     Ok(())
 }
-
 
 /// Итог сверки одной области: сколько строк реестра добавлено/обновлено/убрано и
 /// сколько объектов реально удалено каскадом / пере-собрано после ухода
@@ -711,7 +739,6 @@ pub(crate) struct ReconcileStats {
     pub(crate) deleted_objects: usize,
     pub(crate) remerged_objects: usize,
 }
-
 
 /// Метаданные объекта по его singular full_name (`Catalog.X`) из
 /// `metadata_objects`: (meta_type, name-stem, дом = `sub_config`). `None` — если
@@ -740,7 +767,6 @@ pub(crate) fn lookup_object_meta(
     }
 }
 
-
 /// Каскадное удаление объекта — когда его уронила ДОМАШНЯЯ область (реальное
 /// удаление). Сносит: строку объекта, связи данных в обе стороны, формы, модули
 /// и ВСЕ строки объекта (сам + под-элементы) во ВСЕХ областях реестра. Роли и
@@ -762,7 +788,10 @@ pub(crate) fn delete_object_cascade(
     conn.execute(
         "DELETE FROM metadata_objects \
          WHERE repo = ? AND meta_type = 'Template' AND full_name LIKE ? ESCAPE '\\'",
-        params![REPO_DEFAULT, format!("{}.Template.%", like_escape(full_name))],
+        params![
+            REPO_DEFAULT,
+            format!("{}.Template.%", like_escape(full_name))
+        ],
     )?;
     conn.execute(
         "DELETE FROM data_links WHERE repo = ? AND (from_object = ? OR to_object = ?)",
@@ -787,7 +816,6 @@ pub(crate) fn delete_object_cascade(
     conn.execute("COMMIT", [])?;
     Ok(())
 }
-
 
 /// Пере-сборка объекта после ухода ЗАИМСТВОВАТЕЛЯ (дом жив): объект не удаляем,
 /// перечитываем перечень/синоним/владельца и структуру реквизитов по ОСТАВШИМСЯ
@@ -833,7 +861,6 @@ pub(crate) fn remerge_object(
     Ok(())
 }
 
-
 /// Сверка ОДНОЙ области: свежая опись `ConfigDumpInfo.xml` ↔ строки этой области
 /// в реестре. Появились/изменились → правим ТОЛЬКО реестр (объектные файлы
 /// приедут своим ходом через пофайловую обработку). Пропали → приводим реестр к
@@ -852,7 +879,9 @@ pub(crate) fn reconcile_area(
     // пустую: все прежние строки области — пропавшие, объекты чистятся по дому.
     let fresh: std::collections::HashMap<String, String> =
         if area_root.join("ConfigDumpInfo.xml").is_file() {
-            parse_config_dump_info_rows(area_root)?.into_iter().collect()
+            parse_config_dump_info_rows(area_root)?
+                .into_iter()
+                .collect()
         } else {
             std::collections::HashMap::new()
         };
@@ -904,9 +933,8 @@ pub(crate) fn reconcile_area(
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
     {
-        let mut del = conn.prepare(
-            "DELETE FROM config_manifest WHERE repo = ? AND area = ? AND full_name = ?",
-        )?;
+        let mut del = conn
+            .prepare("DELETE FROM config_manifest WHERE repo = ? AND area = ? AND full_name = ?")?;
         for full_name in old.keys() {
             if !fresh.contains_key(full_name) {
                 del.execute(params![REPO_DEFAULT, &area, full_name])?;
@@ -937,7 +965,6 @@ pub(crate) fn reconcile_area(
 
     Ok(stats)
 }
-
 
 /// Per-file обновление `metadata_code_usages` для одного `.bsl`: снести прежние
 /// строки файла и переразобрать (или просто снести, если файл удалён).
@@ -980,7 +1007,6 @@ pub(crate) fn update_code_usages_for_file(
     Ok(())
 }
 
-
 /// Per-file обновление механических термов для одного `.bsl`: снести свои
 /// (`mech:%`) строки файла и пересобрать по текущему состоянию `functions`
 /// (или просто снести, если файл удалён). LLM-строки не трогаются.
@@ -1016,8 +1042,9 @@ pub(crate) fn update_procedure_terms_for_file(
                 "SELECT f.name, COALESCE(f.line_start, 0) FROM functions f \
                  JOIN files fl ON fl.id = f.file_id WHERE fl.path = ?1",
             )?;
-            let rows = stmt
-                .query_map(params![&rel], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            let rows = stmt.query_map(params![&rel], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
             rows.flatten().collect()
         };
         if !procs.is_empty() {
@@ -1129,11 +1156,7 @@ fn edt_role_name(path: &Path) -> Option<String> {
 
 /// Завести/обновить один объект EDT по его `.mdo`: строка перечня, структура,
 /// связи данных (объектные и конфигурационные), подписка на событие.
-fn upsert_edt_object(
-    conn: &rusqlite::Connection,
-    mdo_path: &Path,
-    obj_name: &str,
-) -> Result<()> {
+fn upsert_edt_object(conn: &rusqlite::Connection, mdo_path: &Path, obj_name: &str) -> Result<()> {
     use crate::xml::edt_mdo;
 
     let content = match std::fs::read_to_string(mdo_path) {
@@ -1246,11 +1269,7 @@ fn upsert_edt_object(
 
 /// Убрать объект EDT, чей `.mdo` исчез: строку перечня, его связи, формы,
 /// модули и подписку.
-fn delete_edt_object(
-    conn: &rusqlite::Connection,
-    folder: &str,
-    obj_name: &str,
-) -> Result<()> {
+fn delete_edt_object(conn: &rusqlite::Connection, folder: &str, obj_name: &str) -> Result<()> {
     let meta_type = match edt_meta_type_by_folder(folder) {
         Some(t) => t,
         None => return Ok(()),
@@ -1268,7 +1287,10 @@ fn delete_edt_object(
     conn.execute(
         "DELETE FROM metadata_objects \
          WHERE repo = ? AND meta_type = 'Template' AND full_name LIKE ? ESCAPE '\\'",
-        params![REPO_DEFAULT, format!("{}.Template.%", like_escape(&full_name))],
+        params![
+            REPO_DEFAULT,
+            format!("{}.Template.%", like_escape(&full_name))
+        ],
     )?;
     conn.execute(
         "DELETE FROM data_links WHERE repo = ? AND from_object = ?",
@@ -1491,8 +1513,7 @@ pub(crate) fn run_incremental_extras_edt(
         // Область резолва — файлы пакета, как и в ветке формата Конфигуратора.
         // Без временных таблиц области запрос падал на `tmp_pcg_keys`, и слой
         // extras оставался несобранным до перезапуска демона (issue #8).
-        let scope_paths: Vec<String> =
-            bsl_changed.iter().map(|p| rel_path(repo_root, p)).collect();
+        let scope_paths: Vec<String> = bsl_changed.iter().map(|p| rel_path(repo_root, p)).collect();
         create_batch_scope(conn, &scope_paths)?;
         let _ = conn.execute("ROLLBACK", []);
         conn.execute("BEGIN", [])?;

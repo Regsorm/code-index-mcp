@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use std::path::Path;
 use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Конфигурация индексатора для проекта
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,8 +337,7 @@ impl IndexConfig {
     /// Проверить, нужно ли исключить директорию
     pub fn is_excluded_dir(&self, dir_name: &str) -> bool {
         use crate::indexer::file_types::EXCLUDE_DIRS;
-        EXCLUDE_DIRS.contains(&dir_name)
-            || self.exclude_dirs.iter().any(|d| d == dir_name)
+        EXCLUDE_DIRS.contains(&dir_name) || self.exclude_dirs.iter().any(|d| d == dir_name)
     }
 
     /// Скомпилировать GlobSet из exclude_file_patterns для последующего быстрого матчинга.
@@ -348,9 +347,14 @@ impl IndexConfig {
         let mut builder = GlobSetBuilder::new();
         for pat in &self.exclude_file_patterns {
             match Glob::new(pat) {
-                Ok(g) => { builder.add(g); }
+                Ok(g) => {
+                    builder.add(g);
+                }
                 Err(e) => {
-                    eprintln!("[config] некорректный exclude_file_pattern '{}': {}", pat, e);
+                    eprintln!(
+                        "[config] некорректный exclude_file_pattern '{}': {}",
+                        pat, e
+                    );
                 }
             }
         }

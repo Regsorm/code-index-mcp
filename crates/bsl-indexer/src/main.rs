@@ -63,4 +63,3 @@ async fn main() -> anyhow::Result<()> {
 
     cli::run(build_registry()).await
 }
-

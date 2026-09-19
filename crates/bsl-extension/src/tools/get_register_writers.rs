@@ -124,7 +124,8 @@ impl IndexTool for GetRegisterWritersTool {
             // пересчитывает массив — LLM занижает длину длинных списков (43→40).
             // Считаем ДО перемещения векторов в json!.
             let count_by_type = |v: &[String]| -> serde_json::Map<String, Value> {
-                let mut m: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                let mut m: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
                 for name in v {
                     let t = name.split('.').next().unwrap_or("").to_string();
                     *m.entry(t).or_insert(0) += 1;
@@ -186,7 +187,9 @@ fn query_recorders(
     };
     let mut stmt = conn.prepare(sql)?;
     // CAP+1 — чтобы отличить «ровно CAP» от «есть ещё».
-    let rows = stmt.query_map(params!["default", object, CAP + 1], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map(params!["default", object, CAP + 1], |r| {
+        r.get::<_, String>(0)
+    })?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);

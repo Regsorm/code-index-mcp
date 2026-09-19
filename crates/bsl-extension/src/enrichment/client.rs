@@ -61,7 +61,13 @@ impl ReqwestChatClient {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .context("не удалось собрать reqwest::Client")?;
-        Ok(Self { http, url: url.into(), model: model.into(), api_key, max_retries })
+        Ok(Self {
+            http,
+            url: url.into(),
+            model: model.into(),
+            api_key,
+            max_retries,
+        })
     }
 }
 
@@ -105,7 +111,10 @@ impl ChatClient for ReqwestChatClient {
                 model: &self.model,
                 messages: messages
                     .iter()
-                    .map(|m| RequestMessage { role: m.role, content: &m.content })
+                    .map(|m| RequestMessage {
+                        role: m.role,
+                        content: &m.content,
+                    })
                     .collect(),
                 temperature: 0.2,
             };

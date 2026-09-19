@@ -36,7 +36,10 @@ pub fn build_messages(system_prompt: &str, proc_name: &str, proc_body: &str) -> 
         // ВАЖНО: считаем по char, не по byte — иначе на кириллице можно
         // перерубить multi-byte UTF-8.
         let mut iter = proc_body.char_indices();
-        let cutoff = iter.nth(MAX_BODY_CHARS).map(|(i, _)| i).unwrap_or(proc_body.len());
+        let cutoff = iter
+            .nth(MAX_BODY_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(proc_body.len());
         let mut s = String::with_capacity(cutoff + 32);
         s.push_str(&proc_body[..cutoff]);
         s.push_str("\n…(обрезано)…");
@@ -48,8 +51,14 @@ pub fn build_messages(system_prompt: &str, proc_name: &str, proc_body: &str) -> 
     let user = format!("Процедура `{}`:\n\n{}", proc_name, truncated);
 
     vec![
-        Message { role: "system", content: system_prompt.to_string() },
-        Message { role: "user", content: user },
+        Message {
+            role: "system",
+            content: system_prompt.to_string(),
+        },
+        Message {
+            role: "user",
+            content: user,
+        },
     ]
 }
 
@@ -155,13 +164,17 @@ mod tests {
 
     #[test]
     fn build_messages_truncates_long_body() {
-        let body: String = std::iter::repeat('а').take(MAX_BODY_CHARS + 100).collect();
+        let body: String = std::iter::repeat_n('а', MAX_BODY_CHARS + 100).collect();
         let msgs = build_messages("sys", "p", &body);
         let user = &msgs[1].content;
         assert!(user.contains("…(обрезано)…"));
         // Проверка что char-длина user ограничена ~MAX_BODY_CHARS + заголовок:
         let chars = user.chars().count();
-        assert!(chars < MAX_BODY_CHARS + 200, "user должен быть обрезан, длина={}", chars);
+        assert!(
+            chars < MAX_BODY_CHARS + 200,
+            "user должен быть обрезан, длина={}",
+            chars
+        );
     }
 
     #[test]

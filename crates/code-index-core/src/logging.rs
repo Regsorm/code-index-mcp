@@ -202,7 +202,10 @@ impl<W: Write> Write for StripExtPrefixWriter<W> {
 
 /// `None` — префикса в буфере нет, значит писать можно как есть, без копии.
 fn without_ext_prefix(buf: &[u8]) -> Option<Vec<u8>> {
-    if !buf.windows(WIN_EXT_PREFIX.len()).any(|w| w == WIN_EXT_PREFIX) {
+    if !buf
+        .windows(WIN_EXT_PREFIX.len())
+        .any(|w| w == WIN_EXT_PREFIX)
+    {
         return None;
     }
     let mut out = Vec::with_capacity(buf.len());
@@ -591,7 +594,9 @@ thread_local! {
 /// нельзя. А строку состояния демона печатает отдельная задача, которой нужно
 /// ответить на вопрос «чем занята папка прямо сейчас». Отсюда общий на процесс
 /// реестр: рабочий поток отмечает в нём начатый этап, задача состояния читает.
-fn running_stages() -> &'static Mutex<std::collections::HashMap<std::thread::ThreadId, (String, std::time::Instant)>> {
+fn running_stages(
+) -> &'static Mutex<std::collections::HashMap<std::thread::ThreadId, (String, std::time::Instant)>>
+{
     static RUNNING: std::sync::OnceLock<
         Mutex<std::collections::HashMap<std::thread::ThreadId, (String, std::time::Instant)>>,
     > = std::sync::OnceLock::new();
@@ -619,10 +624,10 @@ pub fn stage_idle() {
 /// Чем занят поток и сколько секунд он этим занят. `None` — между этапами или
 /// когда поток отработал. Для строки состояния демона.
 pub fn stage_running(thread: std::thread::ThreadId) -> Option<(String, u64)> {
-    running_stages()
-        .lock()
-        .ok()
-        .and_then(|map| map.get(&thread).map(|(name, at)| (name.clone(), at.elapsed().as_secs())))
+    running_stages().lock().ok().and_then(|map| {
+        map.get(&thread)
+            .map(|(name, at)| (name.clone(), at.elapsed().as_secs()))
+    })
 }
 
 /// Забыть накопленное — перед началом очередного набора этапов.
@@ -655,7 +660,11 @@ pub fn stage_add(name: &'static str, dur: std::time::Duration) {
         let mut stages = s.borrow_mut();
         match stages.iter_mut().find(|st| st.name == name) {
             Some(st) => st.dur += dur,
-            None => stages.push(Stage { name, dur, detail: None }),
+            None => stages.push(Stage {
+                name,
+                dur,
+                detail: None,
+            }),
         }
     });
 }
@@ -686,7 +695,11 @@ pub fn stages_take() -> Vec<Stage> {
 /// дорогой этап и так виден по столбцу времени. Столбцы выравниваются по
 /// самому длинному значению, иначе числа не сопоставить глазом.
 pub fn stages_block(stages: &[Stage]) -> Vec<String> {
-    let name_w = stages.iter().map(|s| s.name.chars().count()).max().unwrap_or(0);
+    let name_w = stages
+        .iter()
+        .map(|s| s.name.chars().count())
+        .max()
+        .unwrap_or(0);
     let detail_w = stages
         .iter()
         .map(|s| s.detail.as_deref().unwrap_or("").chars().count())
@@ -785,7 +798,10 @@ mod tests {
     #[test]
     fn этапы_копятся_с_итогами_и_печатаются_блоком() {
         stages_reset();
-        assert!(stages_block(&stages_take()).is_empty(), "пусто — печатать нечего");
+        assert!(
+            stages_block(&stages_take()).is_empty(),
+            "пусто — печатать нечего"
+        );
 
         let ms = std::time::Duration::from_millis;
         stage_detail("57072 файла");
@@ -805,7 +821,11 @@ mod tests {
         assert_eq!(block.len(), 3);
         assert!(block[0].starts_with("  этап 1  обход"), "{}", block[0]);
         assert!(block[0].ends_with("57072 файла   5,3 с"), "{}", block[0]);
-        assert!(block[2].starts_with("  этап 3  связи данных"), "{}", block[2]);
+        assert!(
+            block[2].starts_with("  этап 3  связи данных"),
+            "{}",
+            block[2]
+        );
 
         // Забрали — накопитель пуст, следующий набор не смешается с прошлым.
         assert!(stages_take().is_empty());
@@ -842,7 +862,10 @@ mod tests {
         assert_eq!(plural(21, "файл", "файла", "файлов"), "21 файл");
         assert_eq!(plural(57072, "файл", "файла", "файлов"), "57072 файла");
         assert_eq!(plural(23623, "ребро", "ребра", "рёбер"), "23623 ребра");
-        assert_eq!(plural(17869, "объект", "объекта", "объектов"), "17869 объектов");
+        assert_eq!(
+            plural(17869, "объект", "объекта", "объектов"),
+            "17869 объектов"
+        );
     }
 
     #[test]
@@ -859,9 +882,15 @@ mod tests {
 
     #[test]
     fn имя_модуля_печатается_только_при_отладке() {
-        assert!(!level_is_verbose("info"), "на обычной работе адрес в коде не нужен");
+        assert!(
+            !level_is_verbose("info"),
+            "на обычной работе адрес в коде не нужен"
+        );
         assert!(!level_is_verbose("warn"));
-        assert!(level_is_verbose("debug"), "при отладке по нему открывают код");
+        assert!(
+            level_is_verbose("debug"),
+            "при отладке по нему открывают код"
+        );
         assert!(level_is_verbose("trace"));
         // Так уровень приходит из переменной окружения — набором директив.
         assert!(level_is_verbose("warn,code_index_core=debug"));
@@ -872,7 +901,11 @@ mod tests {
         let stamp = local_timestamp();
         // Формат «2026-08-20 13:06:45.902+03:00»: без суффикса Z и без
         // разделителя T — это и отличает местное время от UTC в журнале.
-        assert!(!stamp.ends_with('Z'), "отметка не должна быть в UTC: {}", stamp);
+        assert!(
+            !stamp.ends_with('Z'),
+            "отметка не должна быть в UTC: {}",
+            stamp
+        );
         assert!(!stamp.contains('T'), "разделитель T не нужен: {}", stamp);
 
         // Сверяем с местным временем до и после замера — иначе тест мигал бы
@@ -913,7 +946,10 @@ mod tests {
     #[test]
     fn наши_крейты_на_запрошенном_уровне_чужие_на_warn() {
         let d = filter_directives("debug");
-        assert!(d.starts_with("warn,"), "чужие крейты должны быть на warn: {d}");
+        assert!(
+            d.starts_with("warn,"),
+            "чужие крейты должны быть на warn: {d}"
+        );
         assert!(d.contains("code_index_core=debug"));
         assert!(d.contains("bsl_extension=debug"));
 

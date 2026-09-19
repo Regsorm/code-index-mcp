@@ -1,14 +1,21 @@
 use anyhow::{anyhow, Result};
 
-use super::types::{
-    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
-};
-use super::LanguageParser;
 use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
+use super::types::{
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+    PARSE_TIMEOUT_MS,
+};
+use super::LanguageParser;
 
 /// Парсер Go-файлов на основе tree-sitter
 pub struct GoParser;
+
+impl Default for GoParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl GoParser {
     pub fn new() -> Self {
@@ -62,12 +69,10 @@ fn find_child_by_kind<'a>(
     kind: &str,
 ) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
+    let found = node
+        .children(&mut cursor)
+        .find(|&child| child.kind() == kind);
+    found
 }
 
 /// Контекст обхода AST Go
@@ -146,7 +151,13 @@ fn visit_node(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 // На верхнем уровне оставляем top_level=true для прямых детей source_file
-                visit_node(child, ctx, current_func, top_level && node.kind() == "source_file", depth + 1);
+                visit_node(
+                    child,
+                    ctx,
+                    current_func,
+                    top_level && node.kind() == "source_file",
+                    depth + 1,
+                );
             }
         }
     }
@@ -212,11 +223,7 @@ fn visit_function_decl(
 }
 
 /// Обработать method_declaration → functions с qualified_name ReceiverType.method
-fn visit_method_decl(
-    node: tree_sitter::Node,
-    ctx: &mut VisitContext,
-    _parent_func: Option<&str>,
-) {
+fn visit_method_decl(node: tree_sitter::Node, ctx: &mut VisitContext, _parent_func: Option<&str>) {
     let source = ctx.source;
 
     // Имя метода: поле name (field_identifier или identifier)
@@ -288,20 +295,21 @@ fn extract_receiver_type(method_node: tree_sitter::Node, source: &[u8]) -> Optio
     // В parameter_declaration тип может быть:
     // - pointer_type → type_identifier (для *Server)
     // - type_identifier (для Server)
-    let type_node = param_decl.child_by_field_name("type")
-        .or_else(|| {
-            // Если поле "type" не найдено — ищем среди дочерних
-            let mut cursor = param_decl.walk();
-            let found = param_decl.children(&mut cursor).find(|c| {
-                matches!(c.kind(), "type_identifier" | "pointer_type" | "qualified_type")
-            });
-            found
-        })?;
+    let type_node = param_decl.child_by_field_name("type").or_else(|| {
+        // Если поле "type" не найдено — ищем среди дочерних
+        let mut cursor = param_decl.walk();
+        let found = param_decl.children(&mut cursor).find(|c| {
+            matches!(
+                c.kind(),
+                "type_identifier" | "pointer_type" | "qualified_type"
+            )
+        });
+        found
+    })?;
 
     if type_node.kind() == "pointer_type" {
         // *Server → находим вложенный type_identifier
-        find_child_by_kind(type_node, "type_identifier")
-            .map(|n| node_text(n, source).to_string())
+        find_child_by_kind(type_node, "type_identifier").map(|n| node_text(n, source).to_string())
     } else {
         Some(node_text(type_node, source).to_string())
     }
@@ -504,11 +512,7 @@ fn collect_var_spec(node: tree_sitter::Node, source: &[u8], ctx: &mut VisitConte
 }
 
 /// Обработать call_expression → calls
-fn visit_call_expr(
-    node: tree_sitter::Node,
-    ctx: &mut VisitContext,
-    current_func: Option<&str>,
-) {
+fn visit_call_expr(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Option<&str>) {
     let source = ctx.source;
     let line = node.start_position().row + 1;
 
@@ -522,7 +526,11 @@ fn visit_call_expr(
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall {
+        caller,
+        callee,
+        line,
+    });
 }
 
 /// Главная функция парсинга Go-файла
@@ -543,7 +551,6 @@ fn parse_go(source: &str) -> Result<ParseResult> {
 
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
-
 
     // Количество строк
     let lines_total = source.lines().count();
@@ -638,7 +645,10 @@ type Handler interface {\n\tHandle()\n}\n";
             .find(|c| c.name == "Handler")
             .unwrap_or_else(|| panic!("тип Handler не найден: {:?}", result.classes));
         assert!(
-            t.docstring.as_deref().unwrap_or("").contains("Handler обрабатывает"),
+            t.docstring
+                .as_deref()
+                .unwrap_or("")
+                .contains("Handler обрабатывает"),
             "комментарий типа не извлечён: {:?}",
             t.docstring
         );
@@ -687,8 +697,7 @@ type Handler interface {\n\tHandle()\n}\n";
     #[test]
     fn test_parse_go_calls() {
         let parser = GoParser::new();
-        let source =
-            "package main\n\nfunc main() {\n\tfmt.Println(\"hello\")\n\tprocess()\n}\n";
+        let source = "package main\n\nfunc main() {\n\tfmt.Println(\"hello\")\n\tprocess()\n}\n";
         let result = parser.parse(source, "test.go").unwrap();
         assert!(
             result.calls.len() >= 2,

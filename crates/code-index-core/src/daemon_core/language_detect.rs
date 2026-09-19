@@ -115,8 +115,9 @@ pub fn detect_by_extension_majority(root: &Path) -> Option<&'static str> {
                 // C++, язык проекта по нему не определить. Решают `.c` против
                 // `.cpp`/`.cc`; однозначные C++-заголовки (`.hpp`) — тоже.
                 Some("c") => "c",
-                Some("cpp") | Some("cxx") | Some("cc") | Some("hpp") | Some("hxx")
-                | Some("hh") => "cpp",
+                Some("cpp") | Some("cxx") | Some("cc") | Some("hpp") | Some("hxx") | Some("hh") => {
+                    "cpp"
+                }
                 Some("cs") => "csharp",
                 Some("rb") => "ruby",
                 Some("swift") => "swift",
@@ -185,9 +186,8 @@ pub fn write_language_back(
     }
 
     if updated {
-        fs::write(daemon_toml_path, doc.to_string()).with_context(|| {
-            format!("Не удалось записать {}", daemon_toml_path.display())
-        })?;
+        fs::write(daemon_toml_path, doc.to_string())
+            .with_context(|| format!("Не удалось записать {}", daemon_toml_path.display()))?;
     }
     Ok(updated)
 }
@@ -353,8 +353,7 @@ path = "/srv/repos/foo"
             .write_all(original.as_bytes())
             .unwrap();
 
-        let updated =
-            write_language_back(&toml_path, Path::new("/srv/repos/ut"), "bsl").unwrap();
+        let updated = write_language_back(&toml_path, Path::new("/srv/repos/ut"), "bsl").unwrap();
         assert!(updated);
 
         let new_text = std::fs::read_to_string(&toml_path).unwrap();

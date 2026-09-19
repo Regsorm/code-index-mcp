@@ -38,18 +38,27 @@ pub const BSL_FILE_MODULE_TYPE: &[(&str, &str)] = &[
 /// `setBreakpoint` для указания «в каком именно модуле остановиться».
 /// Без них точка останова не привязывается к строке.
 pub const MODULE_TYPE_PROPERTY_ID: &[(&str, &str)] = &[
-    ("ObjectModule",                "a637f77f-3840-441d-a1c3-699c8c5cb7e0"),
-    ("ManagerModule",               "d1b64a2c-8078-4982-8190-8f81aefda192"),
-    ("FormModule",                  "32e087ab-1491-49b6-aba7-43571b41ac2b"),
-    ("RecordSetModule",             "9f36fd70-4bf4-47f6-b235-935f73aab43f"),
-    ("CommandModule",               "078a6af8-d22c-4248-9c33-7e90075a3d2c"),
-    ("ValueManagerModule",          "3e58c91f-9aaa-4f42-8999-4baf33907b75"),
+    ("ObjectModule", "a637f77f-3840-441d-a1c3-699c8c5cb7e0"),
+    ("ManagerModule", "d1b64a2c-8078-4982-8190-8f81aefda192"),
+    ("FormModule", "32e087ab-1491-49b6-aba7-43571b41ac2b"),
+    ("RecordSetModule", "9f36fd70-4bf4-47f6-b235-935f73aab43f"),
+    ("CommandModule", "078a6af8-d22c-4248-9c33-7e90075a3d2c"),
+    ("ValueManagerModule", "3e58c91f-9aaa-4f42-8999-4baf33907b75"),
     // Module = CommonModule / HTTPService / WebService
-    ("Module",                      "d5963243-262e-4398-b4d7-fb16d06484f6"),
-    ("ManagedApplicationModule",    "d22e852a-cf8a-4f77-8ccb-3548e7792bea"),
-    ("SessionModule",               "9b7bbbae-9771-46f2-9e4d-2489e0ffc702"),
-    ("ExternalConnectionModule",    "a4a9c1e2-1e54-4c7f-af06-4ca341198fac"),
-    ("OrdinaryApplicationModule",   "a78d9ce3-4e0c-48d5-9863-ae7342eedf94"),
+    ("Module", "d5963243-262e-4398-b4d7-fb16d06484f6"),
+    (
+        "ManagedApplicationModule",
+        "d22e852a-cf8a-4f77-8ccb-3548e7792bea",
+    ),
+    ("SessionModule", "9b7bbbae-9771-46f2-9e4d-2489e0ffc702"),
+    (
+        "ExternalConnectionModule",
+        "a4a9c1e2-1e54-4c7f-af06-4ca341198fac",
+    ),
+    (
+        "OrdinaryApplicationModule",
+        "a78d9ce3-4e0c-48d5-9863-ae7342eedf94",
+    ),
 ];
 
 /// Тип модуля по имени `.bsl`-файла. None если имя не из известного
@@ -76,9 +85,15 @@ mod tests {
 
     #[test]
     fn module_type_lookup_works() {
-        assert_eq!(module_type_by_filename("ManagerModule.bsl"), Some("ManagerModule"));
+        assert_eq!(
+            module_type_by_filename("ManagerModule.bsl"),
+            Some("ManagerModule")
+        );
         assert_eq!(module_type_by_filename("Module.bsl"), Some("Module"));
-        assert_eq!(module_type_by_filename("ObjectModule.bsl"), Some("ObjectModule"));
+        assert_eq!(
+            module_type_by_filename("ObjectModule.bsl"),
+            Some("ObjectModule")
+        );
         assert_eq!(module_type_by_filename("Random.bsl"), None);
     }
 

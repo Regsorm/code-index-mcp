@@ -173,7 +173,8 @@ impl SessionDedup {
         if elided == 0 {
             return (payload.to_string(), 0);
         }
-        self.elided_total.fetch_add(elided as u64, Ordering::Relaxed);
+        self.elided_total
+            .fetch_add(elided as u64, Ordering::Relaxed);
         match serde_json::to_string(&outer) {
             Ok(s) => (s, elided),
             Err(_) => (payload.to_string(), 0),
@@ -182,12 +183,7 @@ impl SessionDedup {
 
     /// Первый проход: опустить уже отданные строки и ЗАПОМНИТЬ новые как
     /// отданные. Возвращает (число опущенных, отпечатки опущенных строк).
-    fn dedup_and_record(
-        &self,
-        sid: &str,
-        scope: &str,
-        obj: &mut Value,
-    ) -> (usize, HashSet<u64>) {
+    fn dedup_and_record(&self, sid: &str, scope: &str, obj: &mut Value) -> (usize, HashSet<u64>) {
         let mut elided_fps: HashSet<u64> = HashSet::new();
         let mut guard = lock_w(&self.sessions);
         // Защита от утечки: новая сессия при переполнении карты → полный сброс.
@@ -383,9 +379,10 @@ mod tests {
         assert_eq!(elided, 2); // A,B уже отданы
         let kept = rows_of(&out);
         assert_eq!(kept.len(), 1); // только C
-        // маркер на месте
+                                   // маркер на месте
         let outer: Value = serde_json::from_str(&out).unwrap();
-        let inner: Value = serde_json::from_str(outer["content"][0]["text"].as_str().unwrap()).unwrap();
+        let inner: Value =
+            serde_json::from_str(outer["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(inner["result"]["rows_elided_already_delivered"], json!(2));
     }
 
@@ -484,9 +481,8 @@ mod tests {
     #[test]
     fn foreign_hint_is_kept() {
         let d = SessionDedup::new(true);
-        let inner =
-            json!({ "result": [{"caller": "A"}], "hint": "truncated", "truncated": true })
-                .to_string();
+        let inner = json!({ "result": [{"caller": "A"}], "hint": "truncated", "truncated": true })
+            .to_string();
         let p = json!({ "content": [ { "type": "text", "text": inner } ] }).to_string();
         d.process(Some("s1"), SCOPE, &p);
         let (out, elided) = d.process(Some("s1"), SCOPE, &p);
@@ -514,8 +510,11 @@ mod tests {
             .to_string()
         };
         d.process(Some("s1"), SCOPE, &mk(json!([["A", 1], ["B", 2]])));
-        let (out, elided) =
-            d.process(Some("s1"), SCOPE, &mk(json!([["A", 1], ["B", 2], ["C", 3]])));
+        let (out, elided) = d.process(
+            Some("s1"),
+            SCOPE,
+            &mk(json!([["A", 1], ["B", 2], ["C", 3]])),
+        );
         assert_eq!(elided, 2);
 
         let outer: Value = serde_json::from_str(&out).unwrap();
@@ -545,7 +544,10 @@ mod tests {
         assert_eq!(second, 1, "повтор обязан быть опущен");
         let outer: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
-            outer["structuredContent"]["result"].as_array().unwrap().len(),
+            outer["structuredContent"]["result"]
+                .as_array()
+                .unwrap()
+                .len(),
             0
         );
     }

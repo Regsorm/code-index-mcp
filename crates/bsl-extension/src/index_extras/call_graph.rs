@@ -1,12 +1,11 @@
 //! Граф вызовов процедур 1С: сборка слоёв, резолв адресов вызываемых
 //! процедур и отсев платформенного балласта.
 
-use std::path::Path;
 use anyhow::Result;
 use rusqlite::params;
+use std::path::Path;
 
 use super::*;
-
 
 // ───────────────────────── Инкрементальное обновление ─────────────────────
 //
@@ -25,6 +24,7 @@ use super::*;
 ///   1) прежние рёбра файла, которых больше нет ни в одном файле
 ///      (проверка `calls` — она глобальна и актуальна), удаляем из графа;
 ///   2) текущие рёбра файла доинсертим (существующие отсекает UNIQUE).
+///
 /// Стоимость — O(рёбер одного файла), не зависит от размера графа.
 pub(crate) fn update_call_graph_direct_for_file(
     repo_root: &Path,
@@ -132,7 +132,6 @@ pub(crate) fn update_call_graph_direct_for_file(
     Ok(())
 }
 
-
 /// Пересобрать слой `subscription` графа вызовов из таблицы
 /// `event_subscriptions`. Идентично subscription-части `build_call_graph`.
 pub(crate) fn rebuild_call_graph_subscription(conn: &rusqlite::Connection) -> Result<()> {
@@ -154,7 +153,6 @@ pub(crate) fn rebuild_call_graph_subscription(conn: &rusqlite::Connection) -> Re
     tracing::debug!("proc_call_graph subscription (slice-rebuild): {} рёбер", n);
     Ok(())
 }
-
 
 /// Пересобрать слой `form_event` графа вызовов из таблицы `metadata_forms`.
 /// Идентично form_event-части `build_call_graph`.
@@ -205,10 +203,12 @@ pub(crate) fn rebuild_call_graph_form_event(conn: &rusqlite::Connection) -> Resu
         }
     }
     conn.execute("COMMIT", [])?;
-    tracing::debug!("proc_call_graph form_event (slice-rebuild): {} рёбер", form_count);
+    tracing::debug!(
+        "proc_call_graph form_event (slice-rebuild): {} рёбер",
+        form_count
+    );
     Ok(())
 }
-
 
 /// Построить граф вызовов из заполненных metadata_forms,
 /// event_subscriptions и core-таблицы `calls`. Удаляет старые ребра
@@ -236,7 +236,6 @@ pub(crate) fn rebuild_call_graph_extension_override(conn: &rusqlite::Connection)
     conn.execute("COMMIT", [])?;
     Ok(())
 }
-
 
 /// Вторичные индексы таблиц графа — те же, что заводит расширение схемы.
 ///
@@ -283,7 +282,10 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
         "DELETE FROM proc_call_graph WHERE repo = ?",
         params![REPO_DEFAULT],
     )?;
-    tracing::debug!("удаление прежних рёбер — {} мс", t_step.elapsed().as_millis());
+    tracing::debug!(
+        "удаление прежних рёбер — {} мс",
+        t_step.elapsed().as_millis()
+    );
 
     // ── direct: из core::calls ────────────────────────────────────────
     // Таблица `calls` core содержит ребра «caller имя → callee имя»
@@ -303,7 +305,10 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     // из неё обе таблицы простыми вставками без повторного JOIN/DISTINCT.
     let t_step = std::time::Instant::now();
     conn.execute_batch("DROP TABLE IF EXISTS tmp_direct_raw; CREATE TEMP TABLE tmp_direct_raw AS SELECT DISTINCT f.path AS path, c.caller AS caller, c.callee AS callee FROM calls c JOIN files f ON f.id = c.file_id WHERE c.caller IS NOT NULL AND c.callee IS NOT NULL;")?;
-    tracing::debug!("выборка рёбер из вызовов — {} мс", t_step.elapsed().as_millis());
+    tracing::debug!(
+        "выборка рёбер из вызовов — {} мс",
+        t_step.elapsed().as_millis()
+    );
 
     // Рёбра слоя `direct` собираются во временной таблице и там же проходят
     // резолв и отсев. Прежде они попадали в основную таблицу сразу, целиком: на
@@ -336,7 +341,10 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     // уникальности из четырёх текстовых полей. Порядок вставки задан этим
     // ключом — строки ложатся в его дерево по возрастанию, а не вразнобой.
     let t_step = std::time::Instant::now();
-    conn.execute("DELETE FROM direct_edge_files WHERE repo = ?", params![REPO_DEFAULT])?;
+    conn.execute(
+        "DELETE FROM direct_edge_files WHERE repo = ?",
+        params![REPO_DEFAULT],
+    )?;
     let def_count = conn.execute(
         "INSERT OR IGNORE INTO direct_edge_files (repo, caller, callee, source_file) \
          SELECT ?, caller, callee, path FROM tmp_direct_raw ORDER BY caller, callee, path",
@@ -495,7 +503,6 @@ pub(crate) fn build_call_graph(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
-
 /// Этап 4e (общий для полного пересбора и инкремента): заполнить
 /// `callee_proc_key` всем direct-рёбрам с NULL-адресом и отсеять
 /// платформенный/объектный балласт. Транзакцией управляет вызывающий.
@@ -526,19 +533,34 @@ pub(crate) fn resolve_and_prune_direct_edges(
     // видно, какой именно шаг сколько занял.
     let t = std::time::Instant::now();
     resolve_direct_callee_keys(conn, scope, edges)?;
-    tracing::debug!("резолв: локальные и экспортные адреса — {} мс", t.elapsed().as_millis());
+    tracing::debug!(
+        "резолв: локальные и экспортные адреса — {} мс",
+        t.elapsed().as_millis()
+    );
     let t = std::time::Instant::now();
     resolve_callee_keys_by_manager(conn, scope, edges)?;
-    tracing::debug!("резолв: адреса через менеджеры — {} мс", t.elapsed().as_millis());
+    tracing::debug!(
+        "резолв: адреса через менеджеры — {} мс",
+        t.elapsed().as_millis()
+    );
     let t = std::time::Instant::now();
     resolve_callee_keys_by_form_owner(conn, scope, edges)?;
-    tracing::debug!("резолв: вызовы из форм в модуль своего объекта — {} мс", t.elapsed().as_millis());
+    tracing::debug!(
+        "резолв: вызовы из форм в модуль своего объекта — {} мс",
+        t.elapsed().as_millis()
+    );
     let t = std::time::Instant::now();
     prune_platform_balast(conn, scope, edges)?;
-    tracing::debug!("отсев: платформенный балласт — {} мс", t.elapsed().as_millis());
+    tracing::debug!(
+        "отсев: платформенный балласт — {} мс",
+        t.elapsed().as_millis()
+    );
     let t = std::time::Instant::now();
     prune_object_method_calls(conn, scope, edges)?;
-    tracing::debug!("отсев: вызовы методов объектов — {} мс", t.elapsed().as_millis());
+    tracing::debug!(
+        "отсев: вызовы методов объектов — {} мс",
+        t.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -604,7 +626,6 @@ pub(crate) fn drop_batch_scope(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_scope; DROP TABLE IF EXISTS tmp_pcg_keys;")?;
     Ok(())
 }
-
 
 /// Этап 4e: заполнить `callee_proc_key` для direct-рёбер графа — адрес
 /// вызываемой процедуры в формате `<rel_path>::<name>` (тот же, что у
@@ -715,7 +736,6 @@ pub(crate) fn resolve_direct_callee_keys(
     Ok(())
 }
 
-
 /// Построить temp-таблицу `tmp_pcg_cmeth` экспортных методов общих модулей:
 /// `(mname, method, path)`, где `mname` — имя общего модуля (сегмент пути после
 /// `CommonModules/`). Используется Tier C резолва (`resolve_callee_keys_by_qualifier`)
@@ -732,7 +752,6 @@ pub(crate) fn build_common_module_methods(conn: &rusqlite::Connection) -> Result
     )?;
     Ok(())
 }
-
 
 /// Tier C: резолв `callee_proc_key` по квалификатору общего модуля. callee
 /// хранится склеенным `Модуль.Метод`; берём часть до точки как имя модуля,
@@ -764,7 +783,6 @@ pub(crate) fn resolve_callee_keys_by_qualifier(
     Ok(())
 }
 
-
 /// Имена-«балласт»: методы коллекций/объектов/запросов/выборок и глобальные
 /// функции платформы, чья цель лежит ВНЕ кода конфигурации. Ядро стирает
 /// приёмник вызова (`Коллекция.Добавить` → `Добавить`), поэтому такие рёбра
@@ -776,28 +794,78 @@ pub(crate) fn resolve_callee_keys_by_qualifier(
 /// `prune_platform_balast` удаляются только рёбра с `callee_proc_key IS NULL`.
 pub(crate) const PLATFORM_BALAST: &[&str] = &[
     // методы коллекций / объектов / запросов / выборок (приёмник стёрт ядром)
-    "Вставить", "Добавить", "Количество", "Найти", "Выбрать", "Следующий",
-    "Получить", "Выгрузить", "ВыгрузитьКолонку", "Записать", "НайтиСтроки",
-    "Очистить", "Удалить", "Закрыть", "ПолучитьОбъект", "Прочитать",
-    "Установить", "ПолучитьЭлементы", "НайтиПоИдентификатору", "Свойство",
-    "Метаданные", "ПолноеИмя", "УникальныйИдентификатор", "ПустаяСсылка",
+    "Вставить",
+    "Добавить",
+    "Количество",
+    "Найти",
+    "Выбрать",
+    "Следующий",
+    "Получить",
+    "Выгрузить",
+    "ВыгрузитьКолонку",
+    "Записать",
+    "НайтиСтроки",
+    "Очистить",
+    "Удалить",
+    "Закрыть",
+    "ПолучитьОбъект",
+    "Прочитать",
+    "Установить",
+    "ПолучитьЭлементы",
+    "НайтиПоИдентификатору",
+    "Свойство",
+    "Метаданные",
+    "ПолноеИмя",
+    "УникальныйИдентификатор",
+    "ПустаяСсылка",
     "СоздатьНаборЗаписей",
     // глобальные функции / процедуры платформы
-    "ЗначениеЗаполнено", "НСтр", "Тип", "ТипЗнч", "Выполнить", "СтрЗаменить",
-    "СтрШаблон", "ПодставитьПараметрыВСтроку", "Строка", "СокрЛП",
-    "СтрСоединить", "СтрНайти", "СтрДлина", "Лев", "Сред", "Прав", "Формат",
-    "ТекущаяДатаСеанса", "ПредопределенноеЗначение", "ОткрытьФорму", "Сообщить",
-    "УстановитьПривилегированныйРежим", "ПолучитьФункциональнуюОпцию",
-    "ЗаписьЖурналаРегистрации", "НачатьТранзакцию", "ЗафиксироватьТранзакцию",
-    "ОтменитьТранзакцию", "ОчиститьСообщения", "ИнформацияОбОшибке",
-    "ПодробноеПредставлениеОшибки", "ПоместитьВоВременноеХранилище",
-    "ПолучитьИзВременногоХранилища", "ВыполнитьОбработкуОповещения",
-    "ОбщийМодуль", "ЗаполнитьЗначенияСвойств", "УстановитьПараметр",
-    "ОписаниеОповещения", "ОписаниеТипов", "ПустаяСтрока",
+    "ЗначениеЗаполнено",
+    "НСтр",
+    "Тип",
+    "ТипЗнч",
+    "Выполнить",
+    "СтрЗаменить",
+    "СтрШаблон",
+    "ПодставитьПараметрыВСтроку",
+    "Строка",
+    "СокрЛП",
+    "СтрСоединить",
+    "СтрНайти",
+    "СтрДлина",
+    "Лев",
+    "Сред",
+    "Прав",
+    "Формат",
+    "ТекущаяДатаСеанса",
+    "ПредопределенноеЗначение",
+    "ОткрытьФорму",
+    "Сообщить",
+    "УстановитьПривилегированныйРежим",
+    "ПолучитьФункциональнуюОпцию",
+    "ЗаписьЖурналаРегистрации",
+    "НачатьТранзакцию",
+    "ЗафиксироватьТранзакцию",
+    "ОтменитьТранзакцию",
+    "ОчиститьСообщения",
+    "ИнформацияОбОшибке",
+    "ПодробноеПредставлениеОшибки",
+    "ПоместитьВоВременноеХранилище",
+    "ПолучитьИзВременногоХранилища",
+    "ВыполнитьОбработкуОповещения",
+    "ОбщийМодуль",
+    "ЗаполнитьЗначенияСвойств",
+    "УстановитьПараметр",
+    "ОписаниеОповещения",
+    "ОписаниеТипов",
+    "ПустаяСтрока",
     // конструкторы типов (Новый X — ядро пишет callee = имя типа)
-    "Структура", "Массив", "Запрос", "Соответствие", "ТаблицаЗначений",
+    "Структура",
+    "Массив",
+    "Запрос",
+    "Соответствие",
+    "ТаблицаЗначений",
     "СписокЗначений",
-
 ];
 
 /// Удалить direct-рёбра-балласт (см. [`PLATFORM_BALAST`]). Две защиты от потери
@@ -842,25 +910,50 @@ pub(crate) fn prune_platform_balast(
     Ok(())
 }
 
-
 /// Коллекции метаданных 1С — менеджеры, доступные как `Справочники.X`,
 /// `Документы.X` и т.п. Одноточечный вызов с таким префиксом — обращение к
 /// менеджеру (вызов менеджер-модуля), НЕ метод локального объекта. Прун
 /// объектных вызовов их щадит: резолв менеджер-модулей — отдельный шаг.
 pub(crate) const METADATA_COLLECTIONS: &[&str] = &[
-    "Справочники", "Документы", "ЖурналыДокументов", "Перечисления",
-    "Отчеты", "Обработки", "ПланыВидовХарактеристик", "ПланыСчетов",
-    "ПланыВидовРасчета", "РегистрыСведений", "РегистрыНакопления",
-    "РегистрыБухгалтерии", "РегистрыРасчета", "БизнесПроцессы", "Задачи",
-    "ПланыОбмена", "Константы", "Последовательности", "КритерииОтбора",
+    "Справочники",
+    "Документы",
+    "ЖурналыДокументов",
+    "Перечисления",
+    "Отчеты",
+    "Обработки",
+    "ПланыВидовХарактеристик",
+    "ПланыСчетов",
+    "ПланыВидовРасчета",
+    "РегистрыСведений",
+    "РегистрыНакопления",
+    "РегистрыБухгалтерии",
+    "РегистрыРасчета",
+    "БизнесПроцессы",
+    "Задачи",
+    "ПланыОбмена",
+    "Константы",
+    "Последовательности",
+    "КритерииОтбора",
     "ОпределяемыеТипы",
     // англоязычные эквиваленты (EN-конфигурации)
-    "Catalogs", "Documents", "DocumentJournals", "Enums", "Reports",
-    "DataProcessors", "ChartsOfCharacteristicTypes", "ChartsOfAccounts",
-    "ChartsOfCalculationTypes", "InformationRegisters", "AccumulationRegisters",
-    "AccountingRegisters", "CalculationRegisters", "BusinessProcesses",
-    "Tasks", "ExchangePlans", "Constants", "Sequences",
-
+    "Catalogs",
+    "Documents",
+    "DocumentJournals",
+    "Enums",
+    "Reports",
+    "DataProcessors",
+    "ChartsOfCharacteristicTypes",
+    "ChartsOfAccounts",
+    "ChartsOfCalculationTypes",
+    "InformationRegisters",
+    "AccumulationRegisters",
+    "AccountingRegisters",
+    "CalculationRegisters",
+    "BusinessProcesses",
+    "Tasks",
+    "ExchangePlans",
+    "Constants",
+    "Sequences",
 ];
 
 /// Прун объектных вызовов (CORE B): удалить склеенные ОДНОТОЧЕЧНЫЕ рёбра
@@ -873,6 +966,7 @@ pub(crate) const METADATA_COLLECTIONS: &[&str] = &[
 ///   2) квалификатор НЕ имя общего модуля (его резолвит Tier C);
 ///   3) квалификатор НЕ коллекция метаданных (`Справочники`/`Документы`/… —
 ///      вызовы менеджеров, резолв отложен).
+///
 /// Удаляются только рёбра с `callee_proc_key IS NULL`. `file_scope=Some(rel)` —
 /// в области одного файла (инкремент).
 pub(crate) fn prune_object_method_calls(
@@ -929,7 +1023,6 @@ pub(crate) fn prune_object_method_calls(
     Ok(())
 }
 
-
 /// Построить temp-таблицу `tmp_pcg_mmeth` экспортных методов менеджер-модулей:
 /// `(folder, object, method, path)`. folder/object извлекаем из пути
 /// `<...>/<Folder>/<Object>/[Ext/]ManagerModule.bsl` в Rust (в SQLite нет «последнего
@@ -948,7 +1041,6 @@ pub(crate) fn build_manager_module_methods(conn: &rusqlite::Connection) -> Resul
     Ok(())
 }
 
-
 /// Построить temp-таблицу `tmp_pcg_coll` (форма-обращения → папка метаданных) из
 /// единой таблицы META_FORMS (`code_usages`). RU и EN формы ведут в одну папку.
 pub(crate) fn build_collection_folder_map(conn: &rusqlite::Connection) -> Result<()> {
@@ -964,7 +1056,6 @@ pub(crate) fn build_collection_folder_map(conn: &rusqlite::Connection) -> Result
     conn.execute_batch("CREATE INDEX tmp_pcg_coll_idx ON tmp_pcg_coll(coll);")?;
     Ok(())
 }
-
 
 /// Tier D: резолв менеджер-вызовов `Коллекция.Объект.Метод` (ровно 2 точки).
 /// Коллекцию маппим в папку метаданных, ищем экспортный метод в
@@ -1001,7 +1092,6 @@ pub(crate) fn resolve_callee_keys_by_manager(
     conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_mmeth; DROP TABLE IF EXISTS tmp_pcg_coll;")?;
     Ok(())
 }
-
 
 /// Кандидаты в модуль объекта, которому принадлежит модуль формы `path`.
 /// Пустой вектор — `path` не модуль формы объекта.
@@ -1048,7 +1138,6 @@ pub(crate) fn form_owner_object_module_candidates(path: &str) -> Vec<String> {
     }
     Vec::new()
 }
-
 
 /// Правило (д): вызов из модуля формы → модуль объекта этой формы.
 ///
@@ -1097,7 +1186,11 @@ pub(crate) fn resolve_callee_keys_by_form_owner(
             // справочнике (у внешних обработки/отчёта кандидатов два).
             let obj = form_owner_object_module_candidates(path)
                 .into_iter()
-                .find(|c| known.query_row(params![REPO_DEFAULT, c], |_| Ok(())).is_ok());
+                .find(|c| {
+                    known
+                        .query_row(params![REPO_DEFAULT, c], |_| Ok(()))
+                        .is_ok()
+                });
             if let Some(obj) = obj {
                 ins.execute(params![path, obj])?;
             }
@@ -1165,6 +1258,8 @@ pub(crate) fn resolve_callee_keys_by_form_owner(
     );
     sql.push_str(scope.clause());
     conn.execute(&sql, params![REPO_DEFAULT])?;
-    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcg_formobj; DROP TABLE IF EXISTS tmp_pcg_formclient;")?;
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pcg_formobj; DROP TABLE IF EXISTS tmp_pcg_formclient;",
+    )?;
     Ok(())
 }

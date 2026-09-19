@@ -33,7 +33,11 @@ pub fn home_dir() -> Result<PathBuf> {
              Linux:    export {}=\"$HOME/.local/code-index\"\n\
              macOS:    launchctl setenv {} /Users/you/code-index\n\
              MCP:      \"env\": {{ \"{}\": \"...\" }} в .mcp.json",
-            HOME_ENV, HOME_ENV, HOME_ENV, HOME_ENV, HOME_ENV
+            HOME_ENV,
+            HOME_ENV,
+            HOME_ENV,
+            HOME_ENV,
+            HOME_ENV
         )),
     }
 }

@@ -8,12 +8,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use code_index_core::extension::{
-    IndexTool, LanguageProcessor, ParseExtrasCollector,
-};
+use code_index_core::extension::{IndexTool, LanguageProcessor, ParseExtrasCollector};
 use code_index_core::parser::{bsl::BslParser, LanguageParser};
-use code_index_core::storage::Storage;
 use code_index_core::storage::models::CallRecord;
+use code_index_core::storage::Storage;
 
 /// Процессор языка 1С BSL. Реализует `LanguageProcessor` для регистрации
 /// в `bsl-indexer`. На этапе 2 минимален — без специфичных SQL-схем и
@@ -24,7 +22,9 @@ pub struct BslLanguageProcessor {
 
 impl BslLanguageProcessor {
     pub fn new() -> Self {
-        Self { parser: BslParser::new() }
+        Self {
+            parser: BslParser::new(),
+        }
     }
 }
 
@@ -85,10 +85,7 @@ impl LanguageProcessor for BslLanguageProcessor {
             .into_iter()
             .filter_entry(|e| filter.allows(e))
             .filter_map(|e| e.ok())
-            .any(|e| {
-                e.file_type().is_file()
-                    && e.file_name().to_str() == Some("Configuration.xml")
-            })
+            .any(|e| e.file_type().is_file() && e.file_name().to_str() == Some("Configuration.xml"))
     }
 
     /// SQLite-расширения схемы для конфигураций 1С: `metadata_objects`,
@@ -181,7 +178,6 @@ impl LanguageProcessor for BslLanguageProcessor {
     ) -> anyhow::Result<()> {
         crate::index_extras::run_incremental_extras(repo_root, storage, changed, deleted)
     }
-
 
     /// Extras считаются наполненными, когда непусты ОБЕ ключевые таблицы,
     /// которые гарантированно есть у нормального BSL-репо: `metadata_objects`
@@ -303,7 +299,10 @@ mod tests {
         let cfg = tmp.path().join("src").join("Configuration");
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::File::create(cfg.join("Configuration.mdo")).unwrap();
-        assert!(p.detects(tmp.path()), "src/Configuration/Configuration.mdo — наш");
+        assert!(
+            p.detects(tmp.path()),
+            "src/Configuration/Configuration.mdo — наш"
+        );
     }
 
     #[test]
@@ -316,7 +315,10 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::File::create(deep.join("Configuration.xml")).unwrap();
         let p = BslLanguageProcessor::new();
-        assert!(!p.detects(tmp.path()), "слишком глубоко — не должны срабатывать");
+        assert!(
+            !p.detects(tmp.path()),
+            "слишком глубоко — не должны срабатывать"
+        );
     }
 
     #[test]

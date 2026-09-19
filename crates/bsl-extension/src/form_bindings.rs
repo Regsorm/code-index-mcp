@@ -46,10 +46,7 @@ pub fn form_bindings(storage: &Storage, function_name: &str) -> Vec<Value> {
 /// повторяться (локальная функция с именем процедуры общего модуля). Поэтому
 /// каждый кандидат сверяется с описанием его формы. Обход прекращается на
 /// второй подтверждённой: дальше ответ всё равно один и тот же.
-fn confirmed_bindings(
-    conn: &Connection,
-    function_name: &str,
-) -> Vec<(FormLocation, Vec<Value>)> {
+fn confirmed_bindings(conn: &Connection, function_name: &str) -> Vec<(FormLocation, Vec<Value>)> {
     let sql = "SELECT f.path FROM functions fn \
                JOIN files f ON f.id = fn.file_id \
                WHERE fn.name = ?1 AND f.path LIKE '%/Forms/%' \
@@ -224,9 +221,10 @@ mod tests {
 
     #[test]
     fn configurator_module_path_resolves_to_form_xml() {
-        let loc =
-            FormLocation::from_module_path("base/Catalogs/Контрагенты/Forms/ФормаЭлемента/Ext/Form/Module.bsl")
-                .expect("модуль формы конфигуратора должен разбираться");
+        let loc = FormLocation::from_module_path(
+            "base/Catalogs/Контрагенты/Forms/ФормаЭлемента/Ext/Form/Module.bsl",
+        )
+        .expect("модуль формы конфигуратора должен разбираться");
         assert_eq!(loc.owner_full_name, "Catalogs.Контрагенты");
         assert_eq!(loc.form_name, "ФормаЭлемента");
         assert_eq!(
@@ -237,8 +235,9 @@ mod tests {
 
     #[test]
     fn edt_module_path_resolves_to_form_file() {
-        let loc = FormLocation::from_module_path("src/Documents/Заказ/Forms/ФормаДокумента/Module.bsl")
-            .expect("модуль формы EDT должен разбираться");
+        let loc =
+            FormLocation::from_module_path("src/Documents/Заказ/Forms/ФормаДокумента/Module.bsl")
+                .expect("модуль формы EDT должен разбираться");
         assert_eq!(loc.owner_full_name, "Documents.Заказ");
         assert_eq!(
             loc.descriptor_path,
@@ -249,14 +248,14 @@ mod tests {
     #[test]
     fn non_form_modules_are_rejected() {
         // Модуль объекта, общий модуль и модуль команды формой не являются.
-        assert!(FormLocation::from_module_path(
-            "base/Catalogs/Контрагенты/Ext/ObjectModule.bsl"
-        )
-        .is_none());
         assert!(
-            FormLocation::from_module_path("base/CommonModules/ОбщегоНазначения/Ext/Module.bsl")
+            FormLocation::from_module_path("base/Catalogs/Контрагенты/Ext/ObjectModule.bsl")
                 .is_none()
         );
+        assert!(FormLocation::from_module_path(
+            "base/CommonModules/ОбщегоНазначения/Ext/Module.bsl"
+        )
+        .is_none());
         assert!(FormLocation::from_module_path(
             "base/Catalogs/Контрагенты/Forms/ФормаЭлемента/Ext/Form/Command/Module.bsl"
         )

@@ -15,11 +15,11 @@ pub mod prompt;
 pub mod signature;
 
 #[cfg(feature = "enrichment")]
-pub mod client;
-#[cfg(feature = "enrichment")]
 pub mod batch;
 #[cfg(feature = "enrichment")]
 pub mod cli;
+#[cfg(feature = "enrichment")]
+pub mod client;
 
 #[cfg(feature = "enrichment")]
 pub use cli::run_cli;

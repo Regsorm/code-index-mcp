@@ -130,8 +130,7 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     // Event-based cache invalidation (этап 3, v0.9.1+): создаём один общий
     // CacheClient на все workers, передаём как `Option<Arc<_>>`. Пустой
     // `cache_targets` → None (внутренний путь invalidate отключён).
-    let cache_target_urls: Vec<String> =
-        cfg.cache_targets.iter().map(|t| t.url.clone()).collect();
+    let cache_target_urls: Vec<String> = cfg.cache_targets.iter().map(|t| t.url.clone()).collect();
     let cache_client = if cache_target_urls.is_empty() {
         None
     } else {
@@ -175,7 +174,8 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     // Первый тик — через интервал, а не сразу: на старте все папки ещё «не
     // начаты», и мгновенный пульс дал бы полсотни бессодержательных строк.
     let pulse_period = std::time::Duration::from_secs(PULSE_INTERVAL_SEC);
-    let mut pulse = tokio::time::interval_at(tokio::time::Instant::now() + pulse_period, pulse_period);
+    let mut pulse =
+        tokio::time::interval_at(tokio::time::Instant::now() + pulse_period, pulse_period);
 
     // Основной цикл: команды + Ctrl-C + сторож
     loop {
@@ -242,11 +242,7 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     let _ = shutdown_tx.send(());
     for (path, task) in workers {
         if let Err(e) = task.handle.await {
-            tracing::warn!(
-                "worker {} не завершился корректно: {}",
-                path.display(),
-                e
-            );
+            tracing::warn!("worker {} не завершился корректно: {}", path.display(), e);
         }
     }
     for (path, handle) in stopping_workers {
@@ -400,10 +396,12 @@ fn spawn_worker(
             state,
             shutdown_rx,
             worker_stop,
-            initial_limiter,
-            indexer_section,
-            processor_registry,
-            cache_client,
+            worker::WorkerOptions {
+                initial_limiter,
+                indexer_section,
+                processor_registry,
+                cache_client,
+            },
         );
     });
     WorkerTask { handle, stop }
@@ -415,12 +413,12 @@ fn spawn_worker(
 /// прошло больше `window`. Вынесено чистой функцией ради модульного теста.
 fn allow_respawn(
     tracker: &mut HashMap<PathBuf, (u32, std::time::Instant)>,
-    path: &PathBuf,
+    path: &Path,
     now: std::time::Instant,
     window: std::time::Duration,
     max: u32,
 ) -> bool {
-    let slot = tracker.entry(path.clone()).or_insert((0, now));
+    let slot = tracker.entry(path.to_path_buf()).or_insert((0, now));
     if now.duration_since(slot.1) > window {
         *slot = (0, now);
     }
@@ -642,8 +640,7 @@ async fn handle_reload(
     // использовать свой (захваченный при старте) client, новые получают
     // обновлённый. После полного рестарта demon все workers будут на
     // одной актуальной версии.
-    let cache_target_urls: Vec<String> =
-        cfg.cache_targets.iter().map(|t| t.url.clone()).collect();
+    let cache_target_urls: Vec<String> = cfg.cache_targets.iter().map(|t| t.url.clone()).collect();
     let reload_cache_client = if cache_target_urls.is_empty() {
         None
     } else {
@@ -658,12 +655,8 @@ async fn handle_reload(
             .canonicalize()
             .unwrap_or_else(|_| entry.path.clone());
         if added.contains(&canonical) {
-            if let Err(e) = wait_for_stopping_worker(
-                &canonical,
-                stopping_workers,
-                Duration::from_secs(5),
-            )
-            .await
+            if let Err(e) =
+                wait_for_stopping_worker(&canonical, stopping_workers, Duration::from_secs(5)).await
             {
                 launch_errors.push(e);
                 failed_additions.push(canonical);
@@ -939,7 +932,13 @@ mod migrate_tests {
             }
         });
         let mut workers = WorkerMap::new();
-        workers.insert(path.clone(), WorkerTask { handle, stop: stop.clone() });
+        workers.insert(
+            path.clone(),
+            WorkerTask {
+                handle,
+                stop: stop.clone(),
+            },
+        );
         let mut stopping = StoppingWorkerMap::new();
         let mut entries = HashMap::new();
         entries.insert(path.clone(), test_entry(&path));
@@ -960,7 +959,10 @@ mod migrate_tests {
 
         assert!(response.reloaded);
         assert_eq!(response.removed, vec![path.clone()]);
-        assert!(stop.load(Ordering::Acquire), "worker должен получить собственный сигнал");
+        assert!(
+            stop.load(Ordering::Acquire),
+            "worker должен получить собственный сигнал"
+        );
         assert!(!workers.contains_key(&path));
         assert!(!entries.contains_key(&path));
         assert!(stopping.contains_key(&path));
@@ -988,8 +990,14 @@ mod migrate_tests {
             &None,
         )
         .await;
-        assert!(workers.is_empty(), "сторож не должен перезапускать удалённый путь");
-        assert!(stopping.is_empty(), "завершившаяся задача должна быть убрана");
+        assert!(
+            workers.is_empty(),
+            "сторож не должен перезапускать удалённый путь"
+        );
+        assert!(
+            stopping.is_empty(),
+            "завершившаяся задача должна быть убрана"
+        );
     }
 
     #[tokio::test]
@@ -1030,7 +1038,11 @@ mod migrate_tests {
         assert!(response.reloaded, "{:?}", response.error);
         assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(stopping.is_empty());
-        assert_eq!(workers.len(), 1, "должна быть запущена ровно одна новая задача");
+        assert_eq!(
+            workers.len(),
+            1,
+            "должна быть запущена ровно одна новая задача"
+        );
         assert!(workers.contains_key(&path));
 
         request_worker_stop(&path, &mut workers, &mut stopping, &mut entries);
@@ -1213,10 +1225,18 @@ mod migrate_tests {
             .collect();
 
         let lines = format_pulse(60, "100 МБ", &snapshot);
-        assert_eq!(lines.len(), 1 + 10 + 1, "сводка + 10 папок + остаток: {:?}", lines.len());
-        assert!(lines.last().unwrap().contains("и ещё 15 папок"), "{}", lines.last().unwrap());
+        assert_eq!(
+            lines.len(),
+            1 + 10 + 1,
+            "сводка + 10 папок + остаток: {:?}",
+            lines.len()
+        );
+        assert!(
+            lines.last().unwrap().contains("и ещё 15 папок"),
+            "{}",
+            lines.last().unwrap()
+        );
     }
-
 
     fn make_repo_with_marker(tmp: &TempDir, name: &str, marker: &str) -> std::path::PathBuf {
         let dir = tmp.path().join(name);

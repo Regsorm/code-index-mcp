@@ -172,13 +172,15 @@ impl IndexTool for GetObjectProfileTool {
 
             let result = assemble_profile(
                 conn,
-                &full_name,
-                &meta_type,
-                &name,
-                &sections,
-                expand_handlers,
-                expand_modules,
-                budget.applied,
+                ProfileAssembly {
+                    full_name: &full_name,
+                    meta_type: &meta_type,
+                    name: &name,
+                    sections: &sections,
+                    expand_handlers,
+                    expand_modules,
+                    budget: budget.applied,
+                },
             );
             timer.abort();
 
@@ -340,25 +342,42 @@ impl FoldedForms {
 /// (каждый репо — отдельный файл БД). См. index_extras::REPO_DEFAULT.
 const REPO: &str = "default";
 
+struct ProfileAssembly<'a> {
+    full_name: &'a str,
+    meta_type: &'a str,
+    name: &'a str,
+    sections: &'a [String],
+    expand_handlers: bool,
+    expand_modules: bool,
+    budget: usize,
+}
+
 /// Сборка паспорта объекта одним проходом — под общим interrupt-таймаутом из
 /// execute (все запросы используют один conn, прерываются разом по таймауту).
 fn assemble_profile(
     conn: &rusqlite::Connection,
-    full_name: &str,
-    meta_type: &str,
-    name: &str,
-    sections: &[String],
-    expand_handlers: bool,
-    expand_modules: bool,
-    budget: usize,
+    assembly: ProfileAssembly<'_>,
 ) -> rusqlite::Result<(Value, Option<Folded>)> {
+    let ProfileAssembly {
+        full_name,
+        meta_type,
+        name,
+        sections,
+        expand_handlers,
+        expand_modules,
+        budget,
+    } = assembly;
     let folder = crate::tools::meta_type_to_folder(meta_type);
     // Выбор секций: пустой список → все (обратная совместимость). Иначе — только
     // запрошенные (рычаг удешевления: ['structure'] вернёт лишь реквизиты/ТЧ).
     let all = sections.is_empty();
     let want = |s: &str| all || sections.iter().any(|x| x == s);
-    let (want_structure, want_forms, want_modules, want_links) =
-        (want("structure"), want("forms"), want("modules"), want("data_links"));
+    let (want_structure, want_forms, want_modules, want_links) = (
+        want("structure"),
+        want("forms"),
+        want("modules"),
+        want("data_links"),
+    );
 
     // ── Заголовок + структура (metadata_objects, singular key) ────────────
     let header = conn.query_row(
@@ -386,9 +405,13 @@ fn assemble_profile(
         // Объект может не иметь записи в metadata_objects (тип вне OBJECT_FOLDERS —
         // например DataProcessor/Report), но формы/модули у него есть. Не выходим —
         // отдаём что найдём, found=false.
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            (false, meta_type.to_string(), name.to_string(), None, Value::Null)
-        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => (
+            false,
+            meta_type.to_string(),
+            name.to_string(),
+            None,
+            Value::Null,
+        ),
         Err(e) => return Err(e),
     };
 
@@ -424,7 +447,11 @@ fn assemble_profile(
     let mut modules_by_type = serde_json::Map::new();
     for m in &modules {
         let t = m["module_type"].as_str().unwrap_or("?").to_string();
-        let n = modules_by_type.get(&t).and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+        let n = modules_by_type
+            .get(&t)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            + 1;
         modules_by_type.insert(t, json!(n));
     }
     let modules_map = json!({ "by_type": Value::Object(modules_by_type.clone()) });
@@ -499,9 +526,13 @@ fn assemble_profile(
     // обрывок вместо данных. Не влезли и в потолок — перечень плюс подсказка
     // «берите по частям», а не молчаливая пустая секция.
     let modules_full = json!(&modules);
-    let modules_bytes = serde_json::to_string(&modules_full).map(|s| s.len()).unwrap_or(0);
+    let modules_bytes = serde_json::to_string(&modules_full)
+        .map(|s| s.len())
+        .unwrap_or(0);
     let full = build(forms.clone(), true, modules_full.clone(), true);
-    let forms_bytes = serde_json::to_string(&full["forms"]).map(|s| s.len()).unwrap_or(0);
+    let forms_bytes = serde_json::to_string(&full["forms"])
+        .map(|s| s.len())
+        .unwrap_or(0);
 
     // Первой сворачивается секция, которую НЕ просили подробно: иначе `expand`
     // одной секции поднимает бюджет и заодно разворачивает соседнюю — на
@@ -512,8 +543,7 @@ fn assemble_profile(
         build(forms_map.clone(), false, modules_full, true)
     };
     let effective = effective_budget(budget, expand_handlers, expand_modules);
-    let (value, middle_used) =
-        code_index_core::mcp::cap::fold_to_budget(full, middle, effective);
+    let (value, middle_used) = code_index_core::mcp::cap::fold_to_budget(full, middle, effective);
     let (value, least_used) = code_index_core::mcp::cap::fold_to_budget(
         value,
         build(forms_map, false, modules_map, false),
@@ -531,13 +561,13 @@ fn assemble_profile(
     Ok((
         value,
         Some(Folded {
-            forms: forms_folded.then(|| FoldedForms {
+            forms: forms_folded.then_some(FoldedForms {
                 forms: forms_count,
                 handlers: handlers_total,
                 full_bytes: forms_bytes,
                 top_form,
             }),
-            modules: modules_folded.then(|| FoldedModules {
+            modules: modules_folded.then_some(FoldedModules {
                 total: modules_total,
                 full_bytes: modules_bytes,
             }),
@@ -567,9 +597,15 @@ fn query_forms(conn: &rusqlite::Connection, owner_full_name: &str) -> rusqlite::
 }
 
 /// Модули объекта: тип + UUID (object_id/property_id для dbgs) + путь + расширение.
-fn query_modules(conn: &rusqlite::Connection, full_name_prefix: &str) -> rusqlite::Result<Vec<Value>> {
+fn query_modules(
+    conn: &rusqlite::Connection,
+    full_name_prefix: &str,
+) -> rusqlite::Result<Vec<Value>> {
     // full_name вида 'Documents.X.ManagerModule' — берём по префиксу 'Documents.X.'.
-    let like = format!("{}%", full_name_prefix.replace('%', "\\%").replace('_', "\\_"));
+    let like = format!(
+        "{}%",
+        full_name_prefix.replace('%', "\\%").replace('_', "\\_")
+    );
     let mut stmt = conn.prepare(
         "SELECT module_type, object_id, property_id, config_version, code_path, extension_name \
          FROM metadata_modules WHERE repo = ?1 AND full_name LIKE ?2 ESCAPE '\\' \
@@ -648,7 +684,11 @@ fn query_data_links(conn: &rusqlite::Connection, object: &str) -> rusqlite::Resu
 }
 
 /// Выбрать один текстовый столбец в Vec<String> по запросу с (repo, object).
-fn collect_col(conn: &rusqlite::Connection, sql: &str, object: &str) -> rusqlite::Result<Vec<String>> {
+fn collect_col(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    object: &str,
+) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(params![REPO, object], |r| r.get::<_, String>(0))?;
     let mut out = Vec::new();
@@ -665,7 +705,10 @@ mod tests {
 
     #[test]
     fn folder_mapping_handles_regular_and_irregular() {
-        assert_eq!(meta_type_to_folder("Document").as_deref(), Some("Documents"));
+        assert_eq!(
+            meta_type_to_folder("Document").as_deref(),
+            Some("Documents")
+        );
         assert_eq!(meta_type_to_folder("Catalog").as_deref(), Some("Catalogs"));
         assert_eq!(
             meta_type_to_folder("ChartOfAccounts").as_deref(),
@@ -677,7 +720,10 @@ mod tests {
         );
         // Регулярная эвристика +s для неперечисленного типа.
         assert_eq!(meta_type_to_folder("Report").as_deref(), Some("Reports"));
-        assert_eq!(meta_type_to_folder("SomeNewKind").as_deref(), Some("SomeNewKinds"));
+        assert_eq!(
+            meta_type_to_folder("SomeNewKind").as_deref(),
+            Some("SomeNewKinds")
+        );
         assert_eq!(meta_type_to_folder("").as_deref(), None);
     }
 
@@ -712,12 +758,14 @@ mod tests {
             "INSERT INTO data_links (repo, from_object, from_path, to_object, link_kind) \
              VALUES ('default','Document.Реализация','Контрагент','Catalog.Контрагенты','attr')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO data_links (repo, from_object, from_path, to_object, link_kind) \
              VALUES ('default','Document.Реализация','','AccumulationRegister.Продажи','recorder')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // forms
         let forms = query_forms(&conn, "Documents.Реализация").unwrap();
@@ -734,25 +782,57 @@ mod tests {
         assert_eq!(dl["out_total"], json!(1));
         assert_eq!(dl["out_by_kind"]["attr"], json!(1));
         assert!(dl.get("out").is_none(), "рёбра в паспорте не отдаются");
-        assert_eq!(dl["writes_to_registers"][0], json!("AccumulationRegister.Продажи"));
+        assert_eq!(
+            dl["writes_to_registers"][0],
+            json!("AccumulationRegister.Продажи")
+        );
         assert_eq!(dl["incoming_refs_count"], json!(0));
 
         // sections=['structure'] → только structure, без forms/modules/data_links
-        let (only, _) = assemble_profile(&conn, "Document.Реализация", "Document", "Реализация",
-            &["structure".to_string()], false, false, 48_000).unwrap();
+        let (only, _) = assemble_profile(
+            &conn,
+            ProfileAssembly {
+                full_name: "Document.Реализация",
+                meta_type: "Document",
+                name: "Реализация",
+                sections: &["structure".to_string()],
+                expand_handlers: false,
+                expand_modules: false,
+                budget: 48_000,
+            },
+        )
+        .unwrap();
         let o = only.as_object().unwrap();
         assert!(o.contains_key("structure"), "structure должна быть");
-        assert!(!o.contains_key("forms"), "forms не запрашивалась → ключа нет");
+        assert!(
+            !o.contains_key("forms"),
+            "forms не запрашивалась → ключа нет"
+        );
         assert!(!o.contains_key("modules"));
         assert!(!o.contains_key("data_links"));
         assert_eq!(o["sections_returned"], json!(["structure"]));
 
         // пустой список → все секции, без sections_returned (обратная совместимость)
-        let (full, folded) = assemble_profile(&conn, "Document.Реализация", "Document",
-            "Реализация", &[], false, false, 48_000).unwrap();
+        let (full, folded) = assemble_profile(
+            &conn,
+            ProfileAssembly {
+                full_name: "Document.Реализация",
+                meta_type: "Document",
+                name: "Реализация",
+                sections: &[],
+                expand_handlers: false,
+                expand_modules: false,
+                budget: 48_000,
+            },
+        )
+        .unwrap();
         let f = full.as_object().unwrap();
-        assert!(f.contains_key("structure") && f.contains_key("forms")
-            && f.contains_key("modules") && f.contains_key("data_links"));
+        assert!(
+            f.contains_key("structure")
+                && f.contains_key("forms")
+                && f.contains_key("modules")
+                && f.contains_key("data_links")
+        );
         assert!(!f.contains_key("sections_returned"));
         // Ответ мелкий — обработчики и модули отданы полностью, свёртки нет.
         assert!(folded.is_none());
@@ -761,16 +841,33 @@ mod tests {
         assert_eq!(f["forms_handlers_total"], json!(1));
         assert_eq!(f["modules_listed"], json!(true));
         assert_eq!(f["modules_total"], json!(1));
-        assert_eq!(full["forms"][0]["handlers"][0]["event"], json!("ПриОткрытии"));
+        assert_eq!(
+            full["forms"][0]["handlers"][0]["event"],
+            json!("ПриОткрытии")
+        );
         assert_eq!(full["modules"][0]["object_id"], json!("uuid-obj"));
 
         // Тесный бюджет → формы и модули сворачиваются, а подсказка называет
         // форму и несёт готовые вызовы за содержимым обеих секций.
-        let (small, folded) = assemble_profile(&conn, "Document.Реализация", "Document",
-            "Реализация", &[], false, false, 200).unwrap();
+        let (small, folded) = assemble_profile(
+            &conn,
+            ProfileAssembly {
+                full_name: "Document.Реализация",
+                meta_type: "Document",
+                name: "Реализация",
+                sections: &[],
+                expand_handlers: false,
+                expand_modules: false,
+                budget: 200,
+            },
+        )
+        .unwrap();
         assert_eq!(small["forms_handlers_included"], json!(false));
         assert_eq!(small["forms"][0]["handlers_count"], json!(1));
-        assert!(small["forms"][0].get("handlers").is_none(), "содержимое не отдаётся");
+        assert!(
+            small["forms"][0].get("handlers").is_none(),
+            "содержимое не отдаётся"
+        );
         assert_eq!(small["modules_listed"], json!(false));
         assert_eq!(small["modules"]["by_type"]["ObjectModule"], json!(1));
         let info = folded.expect("свёртка должна быть отмечена");
@@ -779,14 +876,30 @@ mod tests {
         let hint = info.hint("ut", "Document.Реализация");
         assert!(hint.contains("get_form_handlers(repo='ut', owner_full_name='Document.Реализация', form_name='ФормаДокумента')"),
             "подсказка должна нести готовый вызов за обработчиками: {hint}");
-        assert!(hint.contains("expand=[\"modules.list\"]"),
-            "подсказка должна нести вызов за списком модулей: {hint}");
+        assert!(
+            hint.contains("expand=[\"modules.list\"]"),
+            "подсказка должна нести вызов за списком модулей: {hint}"
+        );
 
         // expand → содержимое отдаётся даже при тесном бюджете (просили явно).
-        let (expanded, folded) = assemble_profile(&conn, "Document.Реализация", "Document",
-            "Реализация", &[], true, false, 200).unwrap();
+        let (expanded, folded) = assemble_profile(
+            &conn,
+            ProfileAssembly {
+                full_name: "Document.Реализация",
+                meta_type: "Document",
+                name: "Реализация",
+                sections: &[],
+                expand_handlers: true,
+                expand_modules: false,
+                budget: 200,
+            },
+        )
+        .unwrap();
         assert!(folded.is_none());
         assert_eq!(expanded["forms_handlers_included"], json!(true));
-        assert_eq!(expanded["forms"][0]["handlers"][0]["event"], json!("ПриОткрытии"));
+        assert_eq!(
+            expanded["forms"][0]["handlers"][0]["event"],
+            json!("ПриОткрытии")
+        );
     }
 }

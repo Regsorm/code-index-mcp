@@ -1,13 +1,12 @@
 use anyhow::{anyhow, Result};
 
-use super::types::{
-    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport,
-    ParsedVariable,
-};
-use super::LanguageParser;
 use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 use super::types::PARSE_TIMEOUT_MS;
+use super::types::{
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+};
+use super::LanguageParser;
 
 /// Парсер C#-файлов на основе tree-sitter (грамматика `tree-sitter-c-sharp`).
 ///
@@ -15,6 +14,12 @@ use super::types::PARSE_TIMEOUT_MS;
 /// именованный контейнер с телом. Пространства имён (`namespace`) отдельными
 /// сущностями не записываем, только рекурсивно спускаемся внутрь.
 pub struct CSharpParser;
+
+impl Default for CSharpParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CSharpParser {
     pub fn new() -> Self {
@@ -42,14 +47,15 @@ fn node_text<'a>(node: tree_sitter::Node<'a>, source: &'a [u8]) -> &'a str {
 }
 
 /// Найти первый дочерний узел с заданным kind
-fn find_child_by_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+fn find_child_by_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
+    let found = node
+        .children(&mut cursor)
+        .find(|&child| child.kind() == kind);
+    found
 }
 
 /// Извлечь XML-документацию (`/// ...`), стоящую непосредственно перед объявлением.
@@ -343,7 +349,11 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall {
+        caller,
+        callee,
+        line,
+    });
 }
 
 /// Главная функция парсинга C#-файла
@@ -413,7 +423,11 @@ namespace App.Core
         assert_eq!(result.classes.len(), 1);
         assert_eq!(result.classes[0].name, "OrderService");
         assert!(result.classes[0].docstring.is_some());
-        assert!(result.classes[0].bases.as_deref().unwrap().contains("IOrderService"));
+        assert!(result.classes[0]
+            .bases
+            .as_deref()
+            .unwrap()
+            .contains("IOrderService"));
 
         assert!(result
             .functions
@@ -437,7 +451,10 @@ class C {
 }
 "#;
         let result = parser.parse(source, "test.cs").unwrap();
-        assert!(result.calls.iter().any(|c| c.callee == "Log" && c.caller == "Run"));
+        assert!(result
+            .calls
+            .iter()
+            .any(|c| c.callee == "Log" && c.caller == "Run"));
         assert!(result.calls.iter().any(|c| c.callee == "Process"));
     }
 

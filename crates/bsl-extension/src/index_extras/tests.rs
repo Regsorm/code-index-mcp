@@ -6,7 +6,9 @@ use tempfile::TempDir;
 fn fresh_storage(tmp: &TempDir) -> Storage {
     let db_path = tmp.path().join("index.db");
     let storage = Storage::open_file(&db_path).unwrap();
-    storage.apply_schema_extensions(crate::schema::SCHEMA_EXTENSIONS).unwrap();
+    storage
+        .apply_schema_extensions(crate::schema::SCHEMA_EXTENSIONS)
+        .unwrap();
     storage
 }
 
@@ -85,7 +87,11 @@ fn incremental_config_change_adds_new_object() {
     run_index_extras(&repo, &mut full).unwrap();
 
     assert_eq!(cnt(&storage), 2, "новый объект Склады заведён");
-    assert_eq!(cnt(&storage), cnt(&full), "incremental metadata_objects == full");
+    assert_eq!(
+        cnt(&storage),
+        cnt(&full),
+        "incremental metadata_objects == full"
+    );
 }
 
 // Набор full_name объектов репо (сортированный) — надёжнее COUNT: ловит и
@@ -288,7 +294,8 @@ fn write_exclude_dirs_fixture(repo: &Path) {
         r#"<?xml version="1.0"?><MetaDataObject><Catalog uuid="11111111-1111-1111-1111-111111111111"><Properties><Name>ОбъектА</Name></Properties></Catalog></MetaDataObject>"#,
     );
     write(
-        &repo.join("cf")
+        &repo
+            .join("cf")
             .join("Catalogs")
             .join("ОбъектА")
             .join("Ext")
@@ -301,11 +308,15 @@ fn write_exclude_dirs_fixture(repo: &Path) {
         r#"<?xml version="1.0"?><MetaDataObject><Configuration><ChildObjects><Catalog>ВендорОбъект</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
     );
     write(
-        &repo.join("cf_vendor").join("Catalogs").join("ВендорОбъект.xml"),
+        &repo
+            .join("cf_vendor")
+            .join("Catalogs")
+            .join("ВендорОбъект.xml"),
         r#"<?xml version="1.0"?><MetaDataObject><Catalog uuid="22222222-2222-2222-2222-222222222222"><Properties><Name>ВендорОбъект</Name></Properties></Catalog></MetaDataObject>"#,
     );
     write(
-        &repo.join("cf_vendor")
+        &repo
+            .join("cf_vendor")
             .join("Catalogs")
             .join("ВендорОбъект")
             .join("Ext")
@@ -429,7 +440,11 @@ fn nested_subsystem_synonym_filled() {
 </Properties><ChildObjects/></Subsystem></MetaDataObject>"#,
     );
     write(
-        &repo.join("Subsystems").join("Продажи").join("Subsystems").join("Розница.xml"),
+        &repo
+            .join("Subsystems")
+            .join("Продажи")
+            .join("Subsystems")
+            .join("Розница.xml"),
         r#"<?xml version="1.0"?>
 <MetaDataObject><Subsystem><Properties>
   <Name>Розница</Name>
@@ -450,7 +465,10 @@ fn nested_subsystem_synonym_filled() {
             )
             .unwrap()
     };
-    assert_eq!(syn("Subsystem.Продажи").as_deref(), Some("Продажи и оплаты"));
+    assert_eq!(
+        syn("Subsystem.Продажи").as_deref(),
+        Some("Продажи и оплаты")
+    );
     assert_eq!(
         syn("Subsystem.Розница").as_deref(),
         Some("Розничные продажи"),
@@ -474,9 +492,16 @@ fn incremental_bsl_delete_removes_metadata_module_row() {
         &repo.join("Catalogs").join("Склады.xml"),
         r#"<?xml version="1.0"?><MetaDataObject><Catalog uuid="11111111-1111-1111-1111-111111111111"><Properties><Name>Склады</Name></Properties></Catalog></MetaDataObject>"#,
     );
-    let bsl = repo.join("Catalogs").join("Склады").join("Ext").join("ManagerModule.bsl");
-    write(&bsl, "Процедура П() Экспорт
-КонецПроцедуры");
+    let bsl = repo
+        .join("Catalogs")
+        .join("Склады")
+        .join("Ext")
+        .join("ManagerModule.bsl");
+    write(
+        &bsl,
+        "Процедура П() Экспорт
+КонецПроцедуры",
+    );
 
     let count = |st: &Storage| -> i64 {
         st.conn()
@@ -494,7 +519,7 @@ fn incremental_bsl_delete_removes_metadata_module_row() {
 
     // Модуль удалён с диска, событие пришло как deleted.
     std::fs::remove_file(&bsl).unwrap();
-    run_incremental_extras(&repo, &mut inc, &[], &[bsl.clone()]).unwrap();
+    run_incremental_extras(&repo, &mut inc, &[], std::slice::from_ref(&bsl)).unwrap();
     assert_eq!(count(&inc), 0, "строка удалённого модуля обязана исчезнуть");
 
     // Эталон: полный пересбор на том же дереве строки тоже не заводит.
@@ -555,7 +580,10 @@ fn object_command_module_gets_row_with_command_uuid() {
         )
         .expect("модуль команды объекта обязан попадать в перечень");
     assert_eq!(row.0, "Catalogs.Склады.Command.Инвентаризация");
-    assert_eq!(row.1, "Catalogs.Склады.Command.Инвентаризация.CommandModule");
+    assert_eq!(
+        row.1,
+        "Catalogs.Склады.Command.Инвентаризация.CommandModule"
+    );
     assert_eq!(
         row.2, "dddddddd-6666-7777-8888-999999999999",
         "идентификатор берётся у самой команды, а не у объекта"
@@ -592,15 +620,26 @@ fn upsert_metadata_object_owner_and_synonym_base_first() {
     );
     // Расширение EF_A: Контрагенты заимствован (Adopted) + собственный Native.
     write(
-        &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Configuration.xml"),
         r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog><Catalog>МойОбъект</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
     );
     write(
-        &repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join("Контрагенты.xml"),
         r#"<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core"><Catalog><Properties><Name>Контрагенты</Name><Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Контрагенты расш</v8:content></v8:item></Synonym><ObjectBelonging>Adopted</ObjectBelonging></Properties></Catalog></MetaDataObject>"#,
     );
     write(
-        &repo.join("extensions").join("EF_A").join("Catalogs").join("МойОбъект.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join("МойОбъект.xml"),
         r#"<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core"><Catalog><Properties><Name>МойОбъект</Name><Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Мой</v8:content></v8:item></Synonym><ObjectBelonging>Native</ObjectBelonging></Properties></Catalog></MetaDataObject>"#,
     );
 
@@ -623,7 +662,11 @@ fn upsert_metadata_object_owner_and_synonym_base_first() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(syn.as_deref(), Some("Контрагенты база"), "синоним base-first");
+    assert_eq!(
+        syn.as_deref(),
+        Some("Контрагенты база"),
+        "синоним base-first"
+    );
     assert_eq!(sub, "", "Adopted/base → владелец база ''");
 
     // Собственный объект расширения (Native, только в ext): владелец = путь расширения.
@@ -631,7 +674,11 @@ fn upsert_metadata_object_owner_and_synonym_base_first() {
         &repo,
         conn,
         &sub_config_roots(&repo),
-        &repo.join("extensions").join("EF_A").join("Catalogs").join("МойОбъект.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join("МойОбъект.xml"),
     )
     .unwrap();
     let (syn2, sub2): (Option<String>, String) = conn
@@ -642,7 +689,10 @@ fn upsert_metadata_object_owner_and_synonym_base_first() {
         )
         .unwrap();
     assert_eq!(syn2.as_deref(), Some("Мой"));
-    assert_eq!(sub2, "extensions/EF_A", "Native → владелец = путь расширения");
+    assert_eq!(
+        sub2, "extensions/EF_A",
+        "Native → владелец = путь расширения"
+    );
 }
 
 #[test]
@@ -653,7 +703,10 @@ fn fills_config_manifest_from_all_areas() {
     // под-элемент хранится с пустым config_version.
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().join("repo");
-    write(&repo.join("base").join("Configuration.xml"), "<MetaDataObject/>");
+    write(
+        &repo.join("base").join("Configuration.xml"),
+        "<MetaDataObject/>",
+    );
     write(
         &repo.join("base").join("ConfigDumpInfo.xml"),
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -665,11 +718,17 @@ fn fills_config_manifest_from_all_areas() {
 </ConfigVersions></ConfigDumpInfo>"#,
     );
     write(
-        &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Configuration.xml"),
         "<MetaDataObject/>",
     );
     write(
-        &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("ConfigDumpInfo.xml"),
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <ConfigDumpInfo><ConfigVersions>
   <Metadata name="Catalog.Контрагенты" id="c-uuid" configVersion="cext"/>
@@ -768,10 +827,25 @@ fn reconcile_home_delete_cascades_object() {
     run_index_extras(&repo, &mut storage).unwrap();
     let conn = storage.conn();
     let cnt1 = |c: &rusqlite::Connection, sql: &str, p: &str| -> i64 {
-        c.query_row(sql, params![p], |r| r.get::<_, i64>(0)).unwrap()
+        c.query_row(sql, params![p], |r| r.get::<_, i64>(0))
+            .unwrap()
     };
-    assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM metadata_objects WHERE full_name = ?", "Catalog.Удаляемый"), 1);
-    assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM config_manifest WHERE full_name = ?", "Catalog.Удаляемый"), 1);
+    assert_eq!(
+        cnt1(
+            conn,
+            "SELECT COUNT(*) FROM metadata_objects WHERE full_name = ?",
+            "Catalog.Удаляемый"
+        ),
+        1
+    );
+    assert_eq!(
+        cnt1(
+            conn,
+            "SELECT COUNT(*) FROM config_manifest WHERE full_name = ?",
+            "Catalog.Удаляемый"
+        ),
+        1
+    );
 
     // Удаляемый пропал из свежей описи (Живой остался) — уронила домашняя область.
     write(
@@ -783,9 +857,30 @@ fn reconcile_home_delete_cascades_object() {
     let stats = reconcile_area(&repo, conn, &sub_config_roots(&repo), &repo.join("base")).unwrap();
     assert_eq!(stats.deleted_objects, 1);
 
-    assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM metadata_objects WHERE full_name = ?", "Catalog.Удаляемый"), 0);
-    assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM config_manifest WHERE full_name LIKE ?", "Catalog.Удаляемый%"), 0);
-    assert_eq!(cnt1(conn, "SELECT COUNT(*) FROM metadata_objects WHERE full_name = ?", "Catalog.Живой"), 1);
+    assert_eq!(
+        cnt1(
+            conn,
+            "SELECT COUNT(*) FROM metadata_objects WHERE full_name = ?",
+            "Catalog.Удаляемый"
+        ),
+        0
+    );
+    assert_eq!(
+        cnt1(
+            conn,
+            "SELECT COUNT(*) FROM config_manifest WHERE full_name LIKE ?",
+            "Catalog.Удаляемый%"
+        ),
+        0
+    );
+    assert_eq!(
+        cnt1(
+            conn,
+            "SELECT COUNT(*) FROM metadata_objects WHERE full_name = ?",
+            "Catalog.Живой"
+        ),
+        1
+    );
 }
 
 #[test]
@@ -807,15 +902,25 @@ fn reconcile_borrower_drop_keeps_object() {
     );
     // Расширение EF_A заимствует Общий (Adopted).
     write(
-        &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Configuration.xml"),
         r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Общий</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
     );
     write(
-        &repo.join("extensions").join("EF_A").join("Catalogs").join("Общий.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join("Общий.xml"),
         r#"<MetaDataObject><Catalog><Properties><Name>Общий</Name><ObjectBelonging>Adopted</ObjectBelonging></Properties></Catalog></MetaDataObject>"#,
     );
     write(
-        &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("ConfigDumpInfo.xml"),
         r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Общий" id="o1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
     );
 
@@ -824,27 +929,75 @@ fn reconcile_borrower_drop_keeps_object() {
     let conn = storage.conn();
     // до: объект в реестре в двух областях
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Общий'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Общий'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         2
     );
 
     // EF_A перестало заимствовать: пропал из его описи И его копия XML удалена с диска.
-    std::fs::remove_file(repo.join("extensions").join("EF_A").join("Catalogs").join("Общий.xml")).unwrap();
+    std::fs::remove_file(
+        repo.join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join("Общий.xml"),
+    )
+    .unwrap();
     write(
-        &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("ConfigDumpInfo.xml"),
         r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#,
     );
-    let stats = reconcile_area(&repo, conn, &sub_config_roots(&repo), &repo.join("extensions").join("EF_A")).unwrap();
-    assert_eq!(stats.remerged_objects, 1, "заимствователь уронил — пере-сборка, не удаление");
+    let stats = reconcile_area(
+        &repo,
+        conn,
+        &sub_config_roots(&repo),
+        &repo.join("extensions").join("EF_A"),
+    )
+    .unwrap();
+    assert_eq!(
+        stats.remerged_objects, 1,
+        "заимствователь уронил — пере-сборка, не удаление"
+    );
     assert_eq!(stats.deleted_objects, 0);
 
     let cnt2 = |c: &rusqlite::Connection, sql: &str, a: &str, b: &str| -> i64 {
-        c.query_row(sql, params![a, b], |r| r.get::<_, i64>(0)).unwrap()
+        c.query_row(sql, params![a, b], |r| r.get::<_, i64>(0))
+            .unwrap()
     };
     // объект цел (дом — база); участие EF_A снято, база осталась
-    assert_eq!(cnt2(conn, "SELECT COUNT(*) FROM metadata_objects WHERE full_name=? AND sub_config=?", "Catalog.Общий", ""), 1);
-    assert_eq!(cnt2(conn, "SELECT COUNT(*) FROM config_manifest WHERE full_name=? AND area=?", "Catalog.Общий", ""), 1);
-    assert_eq!(cnt2(conn, "SELECT COUNT(*) FROM config_manifest WHERE full_name=? AND area=?", "Catalog.Общий", "extensions/EF_A"), 0);
+    assert_eq!(
+        cnt2(
+            conn,
+            "SELECT COUNT(*) FROM metadata_objects WHERE full_name=? AND sub_config=?",
+            "Catalog.Общий",
+            ""
+        ),
+        1
+    );
+    assert_eq!(
+        cnt2(
+            conn,
+            "SELECT COUNT(*) FROM config_manifest WHERE full_name=? AND area=?",
+            "Catalog.Общий",
+            ""
+        ),
+        1
+    );
+    assert_eq!(
+        cnt2(
+            conn,
+            "SELECT COUNT(*) FROM config_manifest WHERE full_name=? AND area=?",
+            "Catalog.Общий",
+            "extensions/EF_A"
+        ),
+        0
+    );
 }
 
 #[test]
@@ -872,7 +1025,12 @@ fn reconcile_subelement_disappearance_registry_only() {
     run_index_extras(&repo, &mut storage).unwrap();
     let conn = storage.conn();
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Товар.Attribute.Цвет'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Товар.Attribute.Цвет'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         1
     );
 
@@ -884,19 +1042,37 @@ fn reconcile_subelement_disappearance_registry_only() {
 </ConfigVersions></ConfigDumpInfo>"#,
     );
     let stats = reconcile_area(&repo, conn, &sub_config_roots(&repo), &repo.join("base")).unwrap();
-    assert_eq!(stats.deleted_objects, 0, "реквизит — не удаление объекта (Вариант А)");
+    assert_eq!(
+        stats.deleted_objects, 0,
+        "реквизит — не удаление объекта (Вариант А)"
+    );
     assert_eq!(stats.remerged_objects, 0);
 
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Товар'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Товар'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         1
     );
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Товар.Attribute.Цвет'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Товар.Attribute.Цвет'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         0
     );
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Товар'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM config_manifest WHERE full_name='Catalog.Товар'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         1
     );
 }
@@ -934,7 +1110,12 @@ fn incremental_dumpinfo_change_dispatches_reconcile_cascade() {
     {
         let conn = storage.conn();
         assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Удаляемый'", [], |r| r.get::<_, i64>(0)).unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Удаляемый'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
             1
         );
     }
@@ -954,17 +1135,32 @@ fn incremental_dumpinfo_change_dispatches_reconcile_cascade() {
 
     let conn = storage.conn();
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Удаляемый'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Удаляемый'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         0,
         "объект каскадно удалён через диспетчеризацию в reconcile_area"
     );
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM config_manifest WHERE full_name LIKE 'Catalog.Удаляемый%'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM config_manifest WHERE full_name LIKE 'Catalog.Удаляемый%'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         0,
         "строки реестра удаляемого объекта убраны"
     );
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Живой'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Живой'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         1,
         "живой объект не задет"
     );
@@ -1029,11 +1225,17 @@ fn incremental_bsl_event_upserts_metadata_module_matches_full() {
             params![REPO_DEFAULT],
         )
         .unwrap();
-    assert!(module_row(&inc).is_none(), "строку убрали для чистоты теста");
+    assert!(
+        module_row(&inc).is_none(),
+        "строку убрали для чистоты теста"
+    );
 
-    run_incremental_extras(&repo, &mut inc, &[bsl.clone()], &[]).unwrap();
+    run_incremental_extras(&repo, &mut inc, std::slice::from_ref(&bsl), &[]).unwrap();
     let inc_row = module_row(&inc).expect("точечная ветка восстановила строку");
-    assert_eq!(inc_row, full_row, "инкрементальный upsert модуля == полный пересбор");
+    assert_eq!(
+        inc_row, full_row,
+        "инкрементальный upsert модуля == полный пересбор"
+    );
 }
 
 #[test]
@@ -1045,7 +1247,10 @@ fn stats_drifted_threshold_is_1_5x_with_floor() {
     assert!(stats_drifted(9000, Some(6000)), "1.5× ровно");
     assert!(!stats_drifted(8000, Some(6000)), "1.33× — не дрейф");
     // Срез: до /1.5 — дрейф, 0.75× — нет.
-    assert!(stats_drifted(4000, Some(6000)), "6000/1.5 = 4000 — дрейф вниз");
+    assert!(
+        stats_drifted(4000, Some(6000)),
+        "6000/1.5 = 4000 — дрейф вниз"
+    );
     assert!(!stats_drifted(4500, Some(6000)), "0.75× — не дрейф");
     // Нет статистики, но таблица уже крупная.
     assert!(stats_drifted(5000, None));
@@ -1066,13 +1271,19 @@ fn maybe_analyze_runs_when_graph_grows() {
         )
         .unwrap();
     }
-    assert!(analyzed_row_count(conn, "data_links").is_none(), "до ANALYZE статы нет");
+    assert!(
+        analyzed_row_count(conn, "data_links").is_none(),
+        "до ANALYZE статы нет"
+    );
 
     maybe_analyze_graph_tables(conn).unwrap();
 
     let rec = analyzed_row_count(conn, "data_links");
     assert!(rec.is_some(), "ANALYZE должен был записать sqlite_stat1");
-    assert!(rec.unwrap() >= 1000, "записанное число строк отражает реальный размер");
+    assert!(
+        rec.unwrap() >= 1000,
+        "записанное число строк отражает реальный размер"
+    );
 }
 
 #[test]
@@ -1189,7 +1400,9 @@ fn write_terms_fixture(repo: &Path, storage: &Storage) {
     )
     .unwrap();
     let fid: i64 = conn
-        .query_row("SELECT id FROM files WHERE language='bsl'", [], |r| r.get(0))
+        .query_row("SELECT id FROM files WHERE language='bsl'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     conn.execute(
         "INSERT INTO functions (file_id, name, line_start) \
@@ -1221,9 +1434,18 @@ fn mechanical_terms_include_name_synonym_and_comment() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert!(terms.contains("уточнить данные по штрихкоду"), "слова имени: {terms}");
-    assert!(terms.contains("работа со штрихкодами"), "синоним объекта: {terms}");
-    assert!(terms.contains("уточняет данные номенклатуры"), "комментарий: {terms}");
+    assert!(
+        terms.contains("уточнить данные по штрихкоду"),
+        "слова имени: {terms}"
+    );
+    assert!(
+        terms.contains("работа со штрихкодами"),
+        "синоним объекта: {terms}"
+    );
+    assert!(
+        terms.contains("уточняет данные номенклатуры"),
+        "комментарий: {terms}"
+    );
     assert_eq!(sig, crate::terms::MECH_SIGNATURE);
 
     // FTS (trigram): словоформа и подстрока находят процедуру.
@@ -1274,7 +1496,10 @@ fn mechanical_terms_dont_touch_llm_rows() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(terms, "llm-термины, бережно сохранить", "LLM-строка не перетёрта");
+    assert_eq!(
+        terms, "llm-термины, бережно сохранить",
+        "LLM-строка не перетёрта"
+    );
     assert_eq!(sig, "openai_compatible:m");
 }
 
@@ -1308,7 +1533,9 @@ fn incremental_terms_update_and_cleanup() {
     {
         let conn = storage.conn();
         let fid: i64 = conn
-            .query_row("SELECT id FROM files WHERE language='bsl'", [], |r| r.get(0))
+            .query_row("SELECT id FROM files WHERE language='bsl'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         conn.execute(
             "INSERT INTO functions (file_id, name, line_start) \
@@ -1317,7 +1544,7 @@ fn incremental_terms_update_and_cleanup() {
         )
         .unwrap();
     }
-    run_incremental_extras(&repo, &mut storage, &[bsl_abs.clone()], &[]).unwrap();
+    run_incremental_extras(&repo, &mut storage, std::slice::from_ref(&bsl_abs), &[]).unwrap();
 
     let count: i64 = storage
         .conn()
@@ -1384,7 +1611,10 @@ fn fills_event_subscriptions() {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
-    assert_eq!(row, ("MySub".into(), "МойМодуль".into(), "МойОбработчик".into()));
+    assert_eq!(
+        row,
+        ("MySub".into(), "МойМодуль".into(), "МойОбработчик".into())
+    );
 }
 
 #[test]
@@ -1409,7 +1639,11 @@ fn call_graph_includes_extension_override() {
     )
     .unwrap();
     let fid: i64 = conn
-        .query_row("SELECT id FROM files WHERE path LIKE '%Module.bsl'", [], |r| r.get(0))
+        .query_row(
+            "SELECT id FROM files WHERE path LIKE '%Module.bsl'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     conn.execute(
         "INSERT INTO functions (file_id, name, override_type, override_target) \
@@ -1427,7 +1661,10 @@ fn call_graph_includes_extension_override() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(cnt, 1, "должно появиться ребро перехвата extension_override");
+    assert_eq!(
+        cnt, 1,
+        "должно появиться ребро перехвата extension_override"
+    );
 
     // Инкрементальный rebuild идемпотентен (не дублирует ребро).
     rebuild_call_graph_extension_override(conn).unwrap();
@@ -1487,11 +1724,7 @@ fn call_graph_combines_subscriptions_and_form_events() {
         .collect::<Result<_, _>>()
         .unwrap();
     let map: std::collections::HashMap<String, i64> = by_type.into_iter().collect();
-    assert_eq!(
-        map.get("subscription").copied(),
-        Some(1),
-        "одна подписка"
-    );
+    assert_eq!(map.get("subscription").copied(), Some(1), "одна подписка");
     assert_eq!(
         map.get("form_event").copied(),
         Some(1),
@@ -1572,7 +1805,10 @@ fn object_template_registered_with_passport() {
 </Properties></Template></MetaDataObject>"#,
     );
     write(
-        &template_dir.join("ПечатьКарточки").join("Ext").join("Template.xml"),
+        &template_dir
+            .join("ПечатьКарточки")
+            .join("Ext")
+            .join("Template.xml"),
         "<Document/>",
     );
 
@@ -1592,7 +1828,10 @@ fn object_template_registered_with_passport() {
     assert_eq!(synonym.as_deref(), Some("Печать карточки"));
     let passport: serde_json::Value = serde_json::from_str(&passport).unwrap();
     assert_eq!(passport["owner"].as_str(), Some("Catalog.Контрагенты"));
-    assert_eq!(passport["template_type"].as_str(), Some("SpreadsheetDocument"));
+    assert_eq!(
+        passport["template_type"].as_str(),
+        Some("SpreadsheetDocument")
+    );
     // Сам объект-владелец из перечня никуда не делся.
     let owners: i64 = storage
         .conn()
@@ -1620,7 +1859,10 @@ fn text_template_content_file_found_by_real_extension() {
   <Catalog>Классификаторы</Catalog>
 </ChildObjects></Configuration></MetaDataObject>"#,
     );
-    let templates = repo.join("Catalogs").join("Классификаторы").join("Templates");
+    let templates = repo
+        .join("Catalogs")
+        .join("Классификаторы")
+        .join("Templates");
     write(
         &templates.join("ДанныеКлассификатора.xml"),
         r#"<?xml version="1.0"?>
@@ -1628,7 +1870,10 @@ fn text_template_content_file_found_by_real_extension() {
 <TemplateType>TextDocument</TemplateType></Properties></Template></MetaDataObject>"#,
     );
     write(
-        &templates.join("ДанныеКлассификатора").join("Ext").join("Template.txt"),
+        &templates
+            .join("ДанныеКлассификатора")
+            .join("Ext")
+            .join("Template.txt"),
         "код;наименование\n001;первый\n",
     );
 
@@ -1646,7 +1891,10 @@ fn text_template_content_file_found_by_real_extension() {
         .unwrap();
     let passport: serde_json::Value = serde_json::from_str(&passport).unwrap();
     assert!(
-        passport["content_file"].as_str().unwrap_or_default().ends_with("Template.txt"),
+        passport["content_file"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("Template.txt"),
         "у текстового макета содержимое в .txt: {passport}"
     );
     assert!(
@@ -1677,7 +1925,10 @@ fn binary_template_content_note_names_the_real_reason() {
 <TemplateType>AddIn</TemplateType></Properties></Template></MetaDataObject>"#,
     );
     write(
-        &templates.join("ДрайверУстройства").join("Ext").join("Template.zip"),
+        &templates
+            .join("ДрайверУстройства")
+            .join("Ext")
+            .join("Template.zip"),
         "PK\u{3}\u{4}двоичное",
     );
 
@@ -1696,7 +1947,10 @@ fn binary_template_content_note_names_the_real_reason() {
     let passport: serde_json::Value = serde_json::from_str(&passport).unwrap();
     assert_eq!(passport["content_indexed"].as_bool(), Some(false));
     assert!(
-        passport["content_note"].as_str().unwrap_or_default().contains("двоичное"),
+        passport["content_note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("двоичное"),
         "причина должна называться по факту, а не сваливаться на размер: {passport}"
     );
 }
@@ -1716,7 +1970,11 @@ fn template_without_indexed_content_is_marked() {
 </ChildObjects></Configuration></MetaDataObject>"#,
     );
     write(
-        &repo.join("Documents").join("Реализация").join("Templates").join("Накладная.xml"),
+        &repo
+            .join("Documents")
+            .join("Реализация")
+            .join("Templates")
+            .join("Накладная.xml"),
         r#"<?xml version="1.0"?>
 <MetaDataObject><Template><Properties><Name>Накладная</Name></Properties></Template></MetaDataObject>"#,
     );
@@ -1736,7 +1994,10 @@ fn template_without_indexed_content_is_marked() {
     let passport: serde_json::Value = serde_json::from_str(&passport).unwrap();
     assert_eq!(passport["content_indexed"].as_bool(), Some(false));
     assert!(
-        passport["content_note"].as_str().unwrap_or_default().contains("нет файла содержимого"),
+        passport["content_note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("нет файла содержимого"),
         "у макета без файла содержимого причина должна называться прямо: {passport}"
     );
 }
@@ -1802,7 +2063,10 @@ fn incremental_updates_and_removes_object_template() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(left, 0, "макет удалённого файла не должен оставаться в перечне");
+    assert_eq!(
+        left, 0,
+        "макет удалённого файла не должен оставаться в перечне"
+    );
 }
 
 /// Вложенная подсистема должна попадать в реестр объектов (в
@@ -1870,7 +2134,10 @@ fn nested_subsystem_registered_and_identifier_target_resolved() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(nested, 1, "вложенная подсистема должна быть в реестре объектов");
+    assert_eq!(
+        nested, 1,
+        "вложенная подсистема должна быть в реестре объектов"
+    );
 
     let resolved: String = conn
         .query_row(
@@ -1907,7 +2174,11 @@ fn write_config_level_fixture(repo: &Path) {
     );
     // План обмена: Content.xml.
     write(
-        &repo.join("ExchangePlans").join("Обмен").join("Ext").join("Content.xml"),
+        &repo
+            .join("ExchangePlans")
+            .join("Обмен")
+            .join("Ext")
+            .join("Content.xml"),
         r#"<?xml version="1.0"?>
 <ExchangePlanContent xmlns="z">
   <Item><Metadata>Catalog.Номенклатура</Metadata><AutoRecord>Deny</AutoRecord></Item>
@@ -1935,7 +2206,11 @@ fn write_config_level_fixture(repo: &Path) {
     );
     // Роль: Read=true и Posting=false на документе.
     write(
-        &repo.join("Roles").join("Роль1").join("Ext").join("Rights.xml"),
+        &repo
+            .join("Roles")
+            .join("Роль1")
+            .join("Ext")
+            .join("Rights.xml"),
         r#"<?xml version="1.0"?>
 <Rights xmlns="r"><object>
   <name>Document.РеализацияТоваровУслуг</name>
@@ -2005,7 +2280,9 @@ fn fills_metadata_refs_and_role_rights() {
     // role_rights: только granted (Read), Posting=false отброшен.
     let rr: Vec<(String, String, String)> = {
         let mut s = conn
-            .prepare("SELECT role_name, object_name, right_name FROM role_rights ORDER BY right_name")
+            .prepare(
+                "SELECT role_name, object_name, right_name FROM role_rights ORDER BY right_name",
+            )
             .unwrap();
         let rows = s
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -2032,7 +2309,11 @@ fn fills_metadata_refs_and_role_rights() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(total, 2 + 1 + 2 + 1, "config-level data_links после повтора");
+    assert_eq!(
+        total,
+        2 + 1 + 2 + 1,
+        "config-level data_links после повтора"
+    );
     let rr_total: i64 = conn
         .query_row("SELECT COUNT(*) FROM role_rights", [], |r| r.get(0))
         .unwrap();
@@ -2071,7 +2352,11 @@ fn incremental_rebuilds_metadata_refs_and_role_rights() {
 </Properties><ChildObjects/></Subsystem></MetaDataObject>"#,
     );
     write(
-        &repo.join("Roles").join("Роль1").join("Ext").join("Rights.xml"),
+        &repo
+            .join("Roles")
+            .join("Роль1")
+            .join("Ext")
+            .join("Rights.xml"),
         r#"<?xml version="1.0"?>
 <Rights xmlns="r"><object>
   <name>Document.РеализацияТоваровУслуг</name>
@@ -2082,7 +2367,10 @@ fn incremental_rebuilds_metadata_refs_and_role_rights() {
 
     let changed = vec![
         repo.join("Subsystems").join("Продажи.xml"),
-        repo.join("Roles").join("Роль1").join("Ext").join("Rights.xml"),
+        repo.join("Roles")
+            .join("Роль1")
+            .join("Ext")
+            .join("Rights.xml"),
     ];
     run_incremental_extras(&repo, &mut storage, &changed, &[]).unwrap();
 
@@ -2092,7 +2380,11 @@ fn incremental_rebuilds_metadata_refs_and_role_rights() {
     let mut full = fresh_storage(&tmp2);
     run_index_extras(&repo, &mut full).unwrap();
 
-    assert_eq!(cnt(&mut storage, dl_sql), 3 + 1 + 2 + 1, "data_links после инкремента");
+    assert_eq!(
+        cnt(&mut storage, dl_sql),
+        3 + 1 + 2 + 1,
+        "data_links после инкремента"
+    );
     assert_eq!(cnt(&mut storage, rr_sql), 2, "role_rights после инкремента");
     assert_eq!(
         cnt(&mut storage, dl_sql),
@@ -2136,14 +2428,28 @@ fn fills_metadata_code_usages_from_bsl() {
     assert_eq!(
         rows,
         vec![
-            ("Document.РеализацияТоваровУслуг".to_string(), None, "manager".to_string(), 2),
-            ("Document.Заказ".to_string(), Some("Товары".to_string()), "query".to_string(), 3),
+            (
+                "Document.РеализацияТоваровУслуг".to_string(),
+                None,
+                "manager".to_string(),
+                2
+            ),
+            (
+                "Document.Заказ".to_string(),
+                Some("Товары".to_string()),
+                "query".to_string(),
+                3
+            ),
         ]
     );
 
     // file_path записан относительным с forward slash.
     let fp: String = conn
-        .query_row("SELECT DISTINCT file_path FROM metadata_code_usages", [], |r| r.get(0))
+        .query_row(
+            "SELECT DISTINCT file_path FROM metadata_code_usages",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(fp, "CommonModules/М/Ext/Module.bsl");
 
@@ -2151,7 +2457,9 @@ fn fills_metadata_code_usages_from_bsl() {
     run_index_extras(&repo, &mut storage).unwrap();
     let cnt: i64 = storage
         .conn()
-        .query_row("SELECT COUNT(*) FROM metadata_code_usages", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM metadata_code_usages", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(cnt, 2);
 }
@@ -2201,9 +2509,16 @@ fn fills_data_links_from_object_xml() {
 
     // Контрагент (attr) + Товары.Номенклатура (tabular_attr) = 2 ребра.
     let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM data_links WHERE repo = ?", params![REPO_DEFAULT], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM data_links WHERE repo = ?",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert_eq!(count, 2, "ожидаем 2 ссылочных ребра (примитив Сумма пропущен)");
+    assert_eq!(
+        count, 2,
+        "ожидаем 2 ссылочных ребра (примитив Сумма пропущен)"
+    );
 
     let (from_path, to_object, kind): (String, String, String) = conn
         .query_row(
@@ -2259,7 +2574,11 @@ fn data_links_idempotent() {
 
     let count: i64 = storage
         .conn()
-        .query_row("SELECT COUNT(*) FROM data_links WHERE repo = ?", params![REPO_DEFAULT], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM data_links WHERE repo = ?",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(count, 1, "повторный run не должен плодить дубликаты рёбер");
 }
@@ -2277,7 +2596,9 @@ fn snapshot_pcg(conn: &rusqlite::Connection) -> Vec<(String, String, String)> {
              FROM proc_call_graph WHERE repo = ?",
         )
         .unwrap()
-        .query_map(params![REPO_DEFAULT], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .query_map(params![REPO_DEFAULT], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
@@ -2322,8 +2643,10 @@ fn ensure_file(conn: &rusqlite::Connection, path: &str) -> i64 {
         params![path],
     )
     .unwrap();
-    conn.query_row("SELECT id FROM files WHERE path = ?", params![path], |r| r.get(0))
-        .unwrap()
+    conn.query_row("SELECT id FROM files WHERE path = ?", params![path], |r| {
+        r.get(0)
+    })
+    .unwrap()
 }
 
 fn set_calls(conn: &rusqlite::Connection, file_id: i64, edges: &[(&str, &str)]) {
@@ -2398,7 +2721,7 @@ fn resolves_callee_keys_local_unique_export_and_null() {
         &[
             ("ОбработкаПроведения", "МестныйПомощник"), // локальный → резолв в p1
             ("ОбработкаПроведения", "ОбщийУникальный"), // уникальный экспорт → util
-            ("ОбработкаПроведения", "Дубликат"),       // неоднозначный экспорт → NULL
+            ("ОбработкаПроведения", "Дубликат"),        // неоднозначный экспорт → NULL
             ("ОбработкаПроведения", "ВнешнийНеизвестный"), // не резолвится, не балласт → NULL
         ],
     );
@@ -2438,13 +2761,27 @@ fn resolves_callee_keys_local_unique_export_and_null() {
     };
 
     // 2) Локальный вызов → адрес в файле вызывателя.
-    assert_eq!(key("МестныйПомощник"), Some(format!("{p1}::МестныйПомощник")));
+    assert_eq!(
+        key("МестныйПомощник"),
+        Some(format!("{p1}::МестныйПомощник"))
+    );
     // 3) Уникальный экспорт → адрес единственного носителя.
-    assert_eq!(key("ОбщийУникальный"), Some(format!("{util}::ОбщийУникальный")));
+    assert_eq!(
+        key("ОбщийУникальный"),
+        Some(format!("{util}::ОбщийУникальный"))
+    );
     // 4) Неоднозначный экспорт (2 модуля) → честный NULL.
-    assert_eq!(key("Дубликат"), None, "неоднозначный экспорт не должен привязываться");
+    assert_eq!(
+        key("Дубликат"),
+        None,
+        "неоднозначный экспорт не должен привязываться"
+    );
     // 5) Нерезолвимое имя (нет такой процедуры, не балласт) → NULL, ребро на месте.
-    assert_eq!(key("ВнешнийНеизвестный"), None, "нерезолвимый вызов не привязывается");
+    assert_eq!(
+        key("ВнешнийНеизвестный"),
+        None,
+        "нерезолвимый вызов не привязывается"
+    );
 }
 
 #[test]
@@ -2478,10 +2815,10 @@ fn prunes_platform_balast_keeps_real_and_resolved() {
         conn,
         f1,
         &[
-            ("ОбработкаПроведения", "Добавить"),        // балласт, не экспорт, не резолв → удалить
+            ("ОбработкаПроведения", "Добавить"), // балласт, не экспорт, не резолв → удалить
             ("ОбработкаПроведения", "МестныйПомощник"), // реальное локальное → оставить
-            ("ОбработкаПроведения", "Найти"),           // балластное ИМЯ, но резолвится → оставить
-            ("ОбработкаПроведения", "Записать"),        // балласт + экспорт-коллизия, NULL → оставить
+            ("ОбработкаПроведения", "Найти"),    // балластное ИМЯ, но резолвится → оставить
+            ("ОбработкаПроведения", "Записать"), // балласт + экспорт-коллизия, NULL → оставить
         ],
     );
 
@@ -2497,8 +2834,16 @@ fn prunes_platform_balast_keeps_real_and_resolved() {
         .unwrap()
     };
 
-    assert_eq!(exists("Добавить"), 0, "балластное ребро (не экспорт, не резолв) удаляется");
-    assert_eq!(exists("МестныйПомощник"), 1, "реальное локальное ребро остаётся");
+    assert_eq!(
+        exists("Добавить"),
+        0,
+        "балластное ребро (не экспорт, не резолв) удаляется"
+    );
+    assert_eq!(
+        exists("МестныйПомощник"),
+        1,
+        "реальное локальное ребро остаётся"
+    );
     assert_eq!(
         exists("Найти"),
         1,
@@ -2556,21 +2901,37 @@ fn resolves_callee_key_by_module_qualifier() {
     };
 
     // Коллизия имени разрешена квалификатором — точная привязка к нужному модулю.
-    assert_eq!(key("МодульА.ОбщийМетод"), Some(format!("{mod_a}::ОбщийМетод")));
-    assert_eq!(key("МодульБ.ОбщийМетод"), Some(format!("{mod_b}::ОбщийМетод")));
+    assert_eq!(
+        key("МодульА.ОбщийМетод"),
+        Some(format!("{mod_a}::ОбщийМетод"))
+    );
+    assert_eq!(
+        key("МодульБ.ОбщийМетод"),
+        Some(format!("{mod_b}::ОбщийМетод"))
+    );
     // Метода нет в модуле, но квалификатор = реальный модуль → щадим, NULL.
-    assert_eq!(key("МодульА.НетТакого"), None, "несуществующий метод модуля не привязывается");
+    assert_eq!(
+        key("МодульА.НетТакого"),
+        None,
+        "несуществующий метод модуля не привязывается"
+    );
     // Квалификатор — не общий модуль и не коллекция → трактуется как объектный
     // вызов и отсеивается пруном (строки больше нет).
     let exists_chuzhoy: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM proc_call_graph \
              WHERE call_type='direct' AND caller_proc_key=?1 AND callee_proc_name=?2",
-            params![format!("{caller}::ОбработкаПроведения"), "ЧужойМодуль.Метод"],
+            params![
+                format!("{caller}::ОбработкаПроведения"),
+                "ЧужойМодуль.Метод"
+            ],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(exists_chuzhoy, 0, "вызов с неизвестным квалификатором отсеян пруном объектных вызовов");
+    assert_eq!(
+        exists_chuzhoy, 0,
+        "вызов с неизвестным квалификатором отсеян пруном объектных вызовов"
+    );
 }
 
 #[test]
@@ -2600,7 +2961,10 @@ fn resolves_callee_keys_in_edt_layout() {
         fc,
         &[
             ("ОбработкаПроведения", "МодульА.ОбщийМетод"),
-            ("ОбработкаПроведения", "Справочники.Контрагенты.МетодМенеджера"),
+            (
+                "ОбработкаПроведения",
+                "Справочники.Контрагенты.МетодМенеджера",
+            ),
         ],
     );
 
@@ -2665,7 +3029,11 @@ fn prunes_glued_object_method_but_keeps_resolved_module_call() {
         .unwrap()
     };
 
-    assert_eq!(exists("Объект.Добавить"), 0, "склеенный балласт отсеивается по методу-после-точки");
+    assert_eq!(
+        exists("Объект.Добавить"),
+        0,
+        "склеенный балласт отсеивается по методу-после-точки"
+    );
     assert_eq!(
         exists("ОбщегоНазначения.РеальныйМетод"),
         1,
@@ -2697,13 +3065,19 @@ fn prunes_object_calls_protects_modules_collections_chains() {
         fc,
         &[
             ("ОбработкаПроведения", "Объект.ПроизвольныйМетод"), // объект (1 точка) → удалить
-            ("ОбработкаПроведения", "Запрос.ВыполнитьПакет"),   // объект (1 точка) → удалить
-            ("ОбработкаПроведения", "Запрос.Поле.Значение"),    // объектная цепочка (2 точки) → удалить
+            ("ОбработкаПроведения", "Запрос.ВыполнитьПакет"),    // объект (1 точка) → удалить
+            ("ОбработкаПроведения", "Запрос.Поле.Значение"), // объектная цепочка (2 точки) → удалить
             ("ОбработкаПроведения", "ОбщегоНазначения.РеальныйМетод"), // модуль (Tier C) → оставить
-            ("ОбработкаПроведения", "ОбщегоНазначения.НетТакого"),     // модуль, метод не экспортен → NULL, щадим
+            ("ОбработкаПроведения", "ОбщегоНазначения.НетТакого"), // модуль, метод не экспортен → NULL, щадим
             ("ОбработкаПроведения", "Справочники.НайтиПоНаименованию"), // коллекция (1 точка) → щадим
-            ("ОбработкаПроведения", "Справочники.Контрагенты.СоздатьПоНаименованию"), // менеджер (Tier D) → резолв
-            ("ОбработкаПроведения", "Справочники.Контрагенты.ПустаяСсылка"), // платформенный метод менеджера → удалить
+            (
+                "ОбработкаПроведения",
+                "Справочники.Контрагенты.СоздатьПоНаименованию",
+            ), // менеджер (Tier D) → резолв
+            (
+                "ОбработкаПроведения",
+                "Справочники.Контрагенты.ПустаяСсылка",
+            ), // платформенный метод менеджера → удалить
         ],
     );
 
@@ -2728,18 +3102,46 @@ fn prunes_object_calls_protects_modules_collections_chains() {
         .unwrap()
     };
 
-    assert_eq!(exists("Объект.ПроизвольныйМетод"), 0, "объектный вызов (1 точка) отсеян");
-    assert_eq!(exists("Запрос.ВыполнитьПакет"), 0, "объектный вызов (1 точка) отсеян");
-    assert_eq!(exists("Запрос.Поле.Значение"), 0, "объектная цепочка (2 точки) отсеяна");
-    assert_eq!(exists("ОбщегоНазначения.РеальныйМетод"), 1, "общий модуль (резолв) сохранён");
-    assert_eq!(exists("ОбщегоНазначения.НетТакого"), 1, "имя общего модуля щадим даже при NULL");
-    assert_eq!(exists("Справочники.НайтиПоНаименованию"), 1, "коллекция (1 точка) сохранена");
+    assert_eq!(
+        exists("Объект.ПроизвольныйМетод"),
+        0,
+        "объектный вызов (1 точка) отсеян"
+    );
+    assert_eq!(
+        exists("Запрос.ВыполнитьПакет"),
+        0,
+        "объектный вызов (1 точка) отсеян"
+    );
+    assert_eq!(
+        exists("Запрос.Поле.Значение"),
+        0,
+        "объектная цепочка (2 точки) отсеяна"
+    );
+    assert_eq!(
+        exists("ОбщегоНазначения.РеальныйМетод"),
+        1,
+        "общий модуль (резолв) сохранён"
+    );
+    assert_eq!(
+        exists("ОбщегоНазначения.НетТакого"),
+        1,
+        "имя общего модуля щадим даже при NULL"
+    );
+    assert_eq!(
+        exists("Справочники.НайтиПоНаименованию"),
+        1,
+        "коллекция (1 точка) сохранена"
+    );
     assert_eq!(
         key("Справочники.Контрагенты.СоздатьПоНаименованию"),
         Some(format!("{mgr}::СоздатьПоНаименованию")),
         "менеджер-вызов резолвлен в ManagerModule (Tier D)"
     );
-    assert_eq!(exists("Справочники.Контрагенты.ПустаяСсылка"), 0, "платформенный метод менеджера отсеян");
+    assert_eq!(
+        exists("Справочники.Контрагенты.ПустаяСсылка"),
+        0,
+        "платформенный метод менеджера отсеян"
+    );
 }
 
 #[test]
@@ -2790,7 +3192,7 @@ fn incremental_object_xml_matches_full() {
     let mut st_i = fresh_storage(&tmp_i);
     run_index_extras(&repo_i, &mut st_i).unwrap();
     write(&doc_path, doc_v2);
-    run_incremental_extras(&repo_i, &mut st_i, &[doc_path.clone()], &[]).unwrap();
+    run_incremental_extras(&repo_i, &mut st_i, std::slice::from_ref(&doc_path), &[]).unwrap();
 
     assert_eq!(
         snapshot_dl(st_i.conn()),
@@ -2833,11 +3235,18 @@ fn write_borrow_repo(repo: &Path) {
         r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="k1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
     );
     write(
-        &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Configuration.xml"),
         r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
     );
     write(
-        &repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join("Контрагенты.xml"),
         r#"<MetaDataObject xmlns:v8="http://v8.1c.ru/8.3/data/core">
   <Catalog uuid="root"><Properties><Name>Контрагенты</Name><ObjectBelonging>Adopted</ObjectBelonging></Properties>
 <ChildObjects>
@@ -2849,7 +3258,10 @@ fn write_borrow_repo(repo: &Path) {
 </MetaDataObject>"#,
     );
     write(
-        &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+        &repo
+            .join("extensions")
+            .join("EF_A")
+            .join("ConfigDumpInfo.xml"),
         r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="k1" configVersion="v1"/></ConfigVersions></ConfigDumpInfo>"#,
     );
 }
@@ -2857,10 +3269,20 @@ fn write_borrow_repo(repo: &Path) {
 // Снять заимствование EF_A: удалить его копию объекта с диска, опись — пустая
 // (расширение выжило, но заимствует пусто). Возвращает (путь_описи, путь_копии).
 fn drop_ef_a_borrow(repo: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let copy = repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml");
+    let copy = repo
+        .join("extensions")
+        .join("EF_A")
+        .join("Catalogs")
+        .join("Контрагенты.xml");
     let _ = std::fs::remove_file(&copy);
-    let dump = repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml");
-    write(&dump, r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#);
+    let dump = repo
+        .join("extensions")
+        .join("EF_A")
+        .join("ConfigDumpInfo.xml");
+    write(
+        &dump,
+        r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#,
+    );
     (dump, copy)
 }
 
@@ -2944,7 +3366,12 @@ fn incremental_borrower_drop_rebuilds_metadata_modules() {
             r#"<MetaDataObject><Catalog uuid="cbase"><Properties><Name>Контрагенты</Name></Properties></Catalog></MetaDataObject>"#,
         );
         write(
-            &repo.join("base").join("Catalogs").join("Контрагенты").join("Ext").join("ManagerModule.bsl"),
+            &repo
+                .join("base")
+                .join("Catalogs")
+                .join("Контрагенты")
+                .join("Ext")
+                .join("ManagerModule.bsl"),
             "Процедура П() Экспорт\nКонецПроцедуры",
         );
         write(
@@ -2952,19 +3379,35 @@ fn incremental_borrower_drop_rebuilds_metadata_modules() {
             r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="cbase" configVersion="VER-base"/></ConfigVersions></ConfigDumpInfo>"#,
         );
         write(
-            &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+            &repo
+                .join("extensions")
+                .join("EF_A")
+                .join("Configuration.xml"),
             r#"<MetaDataObject><Configuration><ChildObjects><Catalog>Контрагенты</Catalog></ChildObjects></Configuration></MetaDataObject>"#,
         );
         write(
-            &repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml"),
+            &repo
+                .join("extensions")
+                .join("EF_A")
+                .join("Catalogs")
+                .join("Контрагенты.xml"),
             r#"<MetaDataObject><Catalog uuid="cbase"><Properties><Name>Контрагенты</Name><ObjectBelonging>Adopted</ObjectBelonging></Properties></Catalog></MetaDataObject>"#,
         );
         write(
-            &repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты").join("Ext").join("ManagerModule.bsl"),
+            &repo
+                .join("extensions")
+                .join("EF_A")
+                .join("Catalogs")
+                .join("Контрагенты")
+                .join("Ext")
+                .join("ManagerModule.bsl"),
             "Процедура П() Экспорт\nКонецПроцедуры",
         );
         write(
-            &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+            &repo
+                .join("extensions")
+                .join("EF_A")
+                .join("ConfigDumpInfo.xml"),
             r#"<ConfigDumpInfo><ConfigVersions><Metadata name="Catalog.Контрагенты" id="cbase" configVersion="VER-ext"/></ConfigVersions></ConfigDumpInfo>"#,
         );
     }
@@ -2990,10 +3433,20 @@ fn incremental_borrower_drop_rebuilds_metadata_modules() {
     run_index_extras(&repo, &mut storage).unwrap();
 
     // уход: удалить EF_A-копию объекта + опустошить опись EF_A; .bsl-модуль остаётся
-    let copy = repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml");
+    let copy = repo
+        .join("extensions")
+        .join("EF_A")
+        .join("Catalogs")
+        .join("Контрагенты.xml");
     std::fs::remove_file(&copy).unwrap();
-    let dump = repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml");
-    write(&dump, r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#);
+    let dump = repo
+        .join("extensions")
+        .join("EF_A")
+        .join("ConfigDumpInfo.xml");
+    write(
+        &dump,
+        r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#,
+    );
     run_incremental_extras(&repo, &mut storage, &[dump], &[copy]).unwrap();
 
     // эталон: полный пересбор финального состояния (только база)
@@ -3001,11 +3454,18 @@ fn incremental_borrower_drop_rebuilds_metadata_modules() {
     let repo_t = tmp_t.path().join("repo");
     write_repo(&repo_t);
     std::fs::remove_file(
-        repo_t.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml"),
+        repo_t
+            .join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join("Контрагенты.xml"),
     )
     .unwrap();
     write(
-        &repo_t.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+        &repo_t
+            .join("extensions")
+            .join("EF_A")
+            .join("ConfigDumpInfo.xml"),
         r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#,
     );
     let mut st_t = fresh_storage(&tmp_t);
@@ -3039,7 +3499,11 @@ fn incremental_ext_copy_change_keeps_base_data_links() {
     let mut storage = fresh_storage(&tmp);
     run_index_extras(&repo, &mut storage).unwrap();
 
-    let ef_copy = repo.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml");
+    let ef_copy = repo
+        .join("extensions")
+        .join("EF_A")
+        .join("Catalogs")
+        .join("Контрагенты.xml");
     write(&ef_copy, modified_ef_copy);
     run_incremental_extras(&repo, &mut storage, &[ef_copy], &[]).unwrap();
 
@@ -3047,7 +3511,11 @@ fn incremental_ext_copy_change_keeps_base_data_links() {
     let repo_t = tmp_t.path().join("repo");
     write_borrow_repo(&repo_t);
     write(
-        &repo_t.join("extensions").join("EF_A").join("Catalogs").join("Контрагенты.xml"),
+        &repo_t
+            .join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join("Контрагенты.xml"),
         modified_ef_copy,
     );
     let mut st_t = fresh_storage(&tmp_t);
@@ -3094,7 +3562,10 @@ fn incremental_massive_object_change_matches_full() {
                 "<Metadata name=\"Catalog.Спр{i}\" id=\"c{i}\" configVersion=\"v1\"/>"
             ));
             write(
-                &repo.join("base").join("Catalogs").join(format!("Спр{i}.xml")),
+                &repo
+                    .join("base")
+                    .join("Catalogs")
+                    .join(format!("Спр{i}.xml")),
                 &base_obj_xml(i, (i + ref_shift) % N),
             );
         }
@@ -3130,14 +3601,26 @@ fn incremental_massive_object_change_matches_full() {
                 &repo.join("extensions").join("EF_A").join("Configuration.xml"),
                 &format!("<MetaDataObject><Configuration><ChildObjects>{ef_children}</ChildObjects></Configuration></MetaDataObject>"),
             );
-            write(&repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"), &ef_dump);
+            write(
+                &repo
+                    .join("extensions")
+                    .join("EF_A")
+                    .join("ConfigDumpInfo.xml"),
+                &ef_dump,
+            );
         } else {
             write(
-                &repo.join("extensions").join("EF_A").join("Configuration.xml"),
+                &repo
+                    .join("extensions")
+                    .join("EF_A")
+                    .join("Configuration.xml"),
                 r#"<MetaDataObject><Configuration><ChildObjects></ChildObjects></Configuration></MetaDataObject>"#,
             );
             write(
-                &repo.join("extensions").join("EF_A").join("ConfigDumpInfo.xml"),
+                &repo
+                    .join("extensions")
+                    .join("EF_A")
+                    .join("ConfigDumpInfo.xml"),
                 r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#,
             );
         }
@@ -3160,19 +3643,35 @@ fn incremental_massive_object_change_matches_full() {
     let mut changed: Vec<std::path::PathBuf> = Vec::new();
     let mut deleted: Vec<std::path::PathBuf> = Vec::new();
     for i in 0..N {
-        let p = repo_i.join("base").join("Catalogs").join(format!("Спр{i}.xml"));
+        let p = repo_i
+            .join("base")
+            .join("Catalogs")
+            .join(format!("Спр{i}.xml"));
         write(&p, &base_obj_xml(i, (i + 2) % N)); // база: реф-сдвиг 1→2
         changed.push(p);
-        let c = repo_i.join("extensions").join("EF_A").join("Catalogs").join(format!("Спр{i}.xml"));
+        let c = repo_i
+            .join("extensions")
+            .join("EF_A")
+            .join("Catalogs")
+            .join(format!("Спр{i}.xml"));
         std::fs::remove_file(&c).unwrap(); // снять заимствование: удалить копию
         deleted.push(c);
     }
     write(
-        &repo_i.join("extensions").join("EF_A").join("Configuration.xml"),
+        &repo_i
+            .join("extensions")
+            .join("EF_A")
+            .join("Configuration.xml"),
         r#"<MetaDataObject><Configuration><ChildObjects></ChildObjects></Configuration></MetaDataObject>"#,
     );
-    let ef_dump = repo_i.join("extensions").join("EF_A").join("ConfigDumpInfo.xml");
-    write(&ef_dump, r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#);
+    let ef_dump = repo_i
+        .join("extensions")
+        .join("EF_A")
+        .join("ConfigDumpInfo.xml");
+    write(
+        &ef_dump,
+        r#"<ConfigDumpInfo><ConfigVersions></ConfigVersions></ConfigDumpInfo>"#,
+    );
     changed.push(ef_dump);
 
     run_incremental_extras(&repo_i, &mut st_i, &changed, &deleted).unwrap();
@@ -3232,16 +3731,28 @@ fn incremental_call_graph_direct_matches_full() {
     let tmp_t = TempDir::new().unwrap();
     let (repo_t, mut st_t) = build(&tmp_t);
     let fid_t = ensure_file(st_t.conn(), "Documents/Реализация/Ext/ObjectModule.bsl");
-    set_calls(st_t.conn(), fid_t, &[("ПриЗаписи", "ВыполнитьC"), ("ПриЗаписи", "Общее")]);
+    set_calls(
+        st_t.conn(),
+        fid_t,
+        &[("ПриЗаписи", "ВыполнитьC"), ("ПриЗаписи", "Общее")],
+    );
     run_index_extras(&repo_t, &mut st_t).unwrap();
 
     // incr: calls = v1 → полный пересбор → правка .bsl (calls → v2) → инкремент.
     let tmp_i = TempDir::new().unwrap();
     let (repo_i, mut st_i) = build(&tmp_i);
     let fid_i = ensure_file(st_i.conn(), "Documents/Реализация/Ext/ObjectModule.bsl");
-    set_calls(st_i.conn(), fid_i, &[("ПриЗаписи", "ВыполнитьB"), ("ПриЗаписи", "Общее")]);
+    set_calls(
+        st_i.conn(),
+        fid_i,
+        &[("ПриЗаписи", "ВыполнитьB"), ("ПриЗаписи", "Общее")],
+    );
     run_index_extras(&repo_i, &mut st_i).unwrap();
-    set_calls(st_i.conn(), fid_i, &[("ПриЗаписи", "ВыполнитьC"), ("ПриЗаписи", "Общее")]);
+    set_calls(
+        st_i.conn(),
+        fid_i,
+        &[("ПриЗаписи", "ВыполнитьC"), ("ПриЗаписи", "Общее")],
+    );
     let bsl_path = repo_i
         .join("Documents")
         .join("Реализация")
@@ -3283,7 +3794,11 @@ fn incremental_call_graph_multifile_batch_matches_full() {
     let repo_t = tmp_t.path().join("repo");
     write(&repo_t.join("Configuration.xml"), cfg);
     let mut st_t = fresh_storage(&tmp_t);
-    seed(&st_t, &[("ПроцА", "МодульБ.ПроцБ")], &[("ПроцБ", "МодульА.ПроцА")]);
+    seed(
+        &st_t,
+        &[("ПроцА", "МодульБ.ПроцБ")],
+        &[("ПроцБ", "МодульА.ПроцА")],
+    );
     run_index_extras(&repo_t, &mut st_t).unwrap();
 
     // incr: v1-вызовы → полный пересбор → правка ОБОИХ модулей (v2) → батч-инкремент.
@@ -3301,8 +3816,16 @@ fn incremental_call_graph_multifile_batch_matches_full() {
         set_calls(conn, fa, &[("ПроцА", "МодульБ.ПроцБ")]);
         set_calls(conn, fb, &[("ПроцБ", "МодульА.ПроцА")]);
     }
-    let bsl_a = repo_i.join("CommonModules").join("МодульА").join("Ext").join("Module.bsl");
-    let bsl_b = repo_i.join("CommonModules").join("МодульБ").join("Ext").join("Module.bsl");
+    let bsl_a = repo_i
+        .join("CommonModules")
+        .join("МодульА")
+        .join("Ext")
+        .join("Module.bsl");
+    let bsl_b = repo_i
+        .join("CommonModules")
+        .join("МодульБ")
+        .join("Ext")
+        .join("Module.bsl");
     run_incremental_extras(&repo_i, &mut st_i, &[bsl_a, bsl_b], &[]).unwrap();
 
     assert_eq!(
@@ -3321,8 +3844,16 @@ fn incremental_call_graph_multifile_batch_matches_full() {
             )
             .unwrap()
     };
-    assert_eq!(key("МодульБ.ПроцБ"), Some(format!("{pb}::ПроцБ")), "А→Б резолвнут");
-    assert_eq!(key("МодульА.ПроцА"), Some(format!("{pa}::ПроцА")), "Б→А резолвнут");
+    assert_eq!(
+        key("МодульБ.ПроцБ"),
+        Some(format!("{pb}::ПроцБ")),
+        "А→Б резолвнут"
+    );
+    assert_eq!(
+        key("МодульА.ПроцА"),
+        Some(format!("{pa}::ПроцА")),
+        "Б→А резолвнут"
+    );
 }
 
 #[test]
@@ -3664,8 +4195,16 @@ fn edt_layer_indexes_modules() {
             .map(|(f, t, id, _)| (f.as_str(), t.as_str(), id.as_str()))
             .collect::<Vec<_>>(),
         vec![
-            ("Catalogs.Товары.Command.Печать.CommandModule", "CommandModule", "cmd-uuid"),
-            ("Catalogs.Товары.Form.ФормаСписка.FormModule", "FormModule", "form-uuid"),
+            (
+                "Catalogs.Товары.Command.Печать.CommandModule",
+                "CommandModule",
+                "cmd-uuid"
+            ),
+            (
+                "Catalogs.Товары.Form.ФормаСписка.FormModule",
+                "FormModule",
+                "form-uuid"
+            ),
             ("Catalogs.Товары.ObjectModule", "ObjectModule", "cat-uuid"),
             ("CommonModules.Общий.Module", "Module", "cm-uuid"),
         ],
@@ -3788,14 +4327,18 @@ fn common_form_indexed_in_both_dump_formats() {
     // ── Формат EDT ──────────────────────────────────────────────────────
     let src = tmp.path().join("src");
     write(
-        &src.join("CommonForms").join("ВыборПериода").join("ВыборПериода.mdo"),
+        &src.join("CommonForms")
+            .join("ВыборПериода")
+            .join("ВыборПериода.mdo"),
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <mdclass:CommonForm xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cf-uuid">
   <name>ВыборПериода</name>
 </mdclass:CommonForm>"#,
     );
     write(
-        &src.join("CommonForms").join("ВыборПериода").join("Form.form"),
+        &src.join("CommonForms")
+            .join("ВыборПериода")
+            .join("Form.form"),
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <form:Form xmlns:form="http://g5.1c.ru/v8/dt/form">
   <handlers>
@@ -3828,14 +4371,21 @@ fn common_form_indexed_in_both_dump_formats() {
 #[cfg(test)]
 fn edt_stand(root: &Path) {
     write(
-        &root.join("src").join("Configuration").join("Configuration.mdo"),
+        &root
+            .join("src")
+            .join("Configuration")
+            .join("Configuration.mdo"),
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <mdclass:Configuration xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cfg">
   <name>Конфигурация</name>
 </mdclass:Configuration>"#,
     );
     write(
-        &root.join("src").join("Catalogs").join("Товары").join("Товары.mdo"),
+        &root
+            .join("src")
+            .join("Catalogs")
+            .join("Товары")
+            .join("Товары.mdo"),
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="cat">
   <name>Товары</name>
@@ -3843,7 +4393,11 @@ fn edt_stand(root: &Path) {
 </mdclass:Catalog>"#,
     );
     write(
-        &root.join("src").join("Catalogs").join("Товары").join("ObjectModule.bsl"),
+        &root
+            .join("src")
+            .join("Catalogs")
+            .join("Товары")
+            .join("ObjectModule.bsl"),
         "Процедура ПередЗаписью(Отказ) КонецПроцедуры",
     );
 }
@@ -3871,10 +4425,18 @@ fn edt_incremental_updates_object_form_and_rights() {
             .ok()
             .flatten()
     };
-    assert_eq!(synonym(&storage).as_deref(), Some("Товары"), "исходное состояние");
+    assert_eq!(
+        synonym(&storage).as_deref(),
+        Some("Товары"),
+        "исходное состояние"
+    );
 
     // ── Правка описания объекта ─────────────────────────────────────────
-    let mdo = repo.join("src").join("Catalogs").join("Товары").join("Товары.mdo");
+    let mdo = repo
+        .join("src")
+        .join("Catalogs")
+        .join("Товары")
+        .join("Товары.mdo");
     write(
         &mdo,
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -3883,7 +4445,7 @@ fn edt_incremental_updates_object_form_and_rights() {
   <synonym><key>ru</key><value>Номенклатура</value></synonym>
 </mdclass:Catalog>"#,
     );
-    run_incremental_extras(&repo, &mut storage, &[mdo.clone()], &[]).unwrap();
+    run_incremental_extras(&repo, &mut storage, std::slice::from_ref(&mdo), &[]).unwrap();
     assert_eq!(
         synonym(&storage).as_deref(),
         Some("Номенклатура"),
@@ -3905,7 +4467,7 @@ fn edt_incremental_updates_object_form_and_rights() {
   <handlers><event>OnCreateAtServer</event><name>ПриСозданииНаСервере</name></handlers>
 </form:Form>"#,
     );
-    run_incremental_extras(&repo, &mut storage, &[form.clone()], &[]).unwrap();
+    run_incremental_extras(&repo, &mut storage, std::slice::from_ref(&form), &[]).unwrap();
     let handlers: String = storage
         .conn()
         .query_row(
@@ -3933,7 +4495,7 @@ fn edt_incremental_updates_object_form_and_rights() {
     </object>
 </Rights>"#,
     );
-    run_incremental_extras(&repo, &mut storage, &[rights.clone()], &[]).unwrap();
+    run_incremental_extras(&repo, &mut storage, std::slice::from_ref(&rights), &[]).unwrap();
     let rights_count: i64 = storage
         .conn()
         .query_row(
@@ -3942,7 +4504,10 @@ fn edt_incremental_updates_object_form_and_rights() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(rights_count, 1, "правка прав роли обязана доехать до индекса");
+    assert_eq!(
+        rights_count, 1,
+        "правка прав роли обязана доехать до индекса"
+    );
 }
 
 #[test]
@@ -3956,30 +4521,45 @@ fn edt_incremental_removes_deleted_object() {
     let mut storage = fresh_storage(&tmp);
     run_index_extras(&repo, &mut storage).unwrap();
 
-    let count = |st: &Storage, sql: &str| -> i64 {
-        st.conn().query_row(sql, [], |r| r.get(0)).unwrap()
-    };
+    let count =
+        |st: &Storage, sql: &str| -> i64 { st.conn().query_row(sql, [], |r| r.get(0)).unwrap() };
     assert_eq!(
-        count(&storage, "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Товары'"),
+        count(
+            &storage,
+            "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Товары'"
+        ),
         1
     );
     assert_eq!(
-        count(&storage, "SELECT COUNT(*) FROM metadata_modules WHERE object_name='Catalogs.Товары'"),
+        count(
+            &storage,
+            "SELECT COUNT(*) FROM metadata_modules WHERE object_name='Catalogs.Товары'"
+        ),
         1,
         "модуль объекта заведён полным проходом"
     );
 
-    let mdo = repo.join("src").join("Catalogs").join("Товары").join("Товары.mdo");
+    let mdo = repo
+        .join("src")
+        .join("Catalogs")
+        .join("Товары")
+        .join("Товары.mdo");
     std::fs::remove_file(&mdo).unwrap();
-    run_incremental_extras(&repo, &mut storage, &[], &[mdo.clone()]).unwrap();
+    run_incremental_extras(&repo, &mut storage, &[], std::slice::from_ref(&mdo)).unwrap();
 
     assert_eq!(
-        count(&storage, "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Товары'"),
+        count(
+            &storage,
+            "SELECT COUNT(*) FROM metadata_objects WHERE full_name='Catalog.Товары'"
+        ),
         0,
         "удалённый объект обязан уйти из реестра"
     );
     assert_eq!(
-        count(&storage, "SELECT COUNT(*) FROM metadata_modules WHERE object_name='Catalogs.Товары'"),
+        count(
+            &storage,
+            "SELECT COUNT(*) FROM metadata_modules WHERE object_name='Catalogs.Товары'"
+        ),
         0,
         "модули удалённого объекта тоже убираются"
     );
@@ -4020,7 +4600,11 @@ fn edt_incremental_bsl_change_resolves_call_edges() {
         &caller_path,
         "Процедура Вызывающая() МодульА.ОбщийМетод(); КонецПроцедуры",
     );
-    set_calls(storage.conn(), f_caller, &[("Вызывающая", "МодульА.ОбщийМетод")]);
+    set_calls(
+        storage.conn(),
+        f_caller,
+        &[("Вызывающая", "МодульА.ОбщийМетод")],
+    );
 
     run_incremental_extras(&repo, &mut storage, &[caller_path], &[])
         .expect("точечное обновление надстройки на правке .bsl в EDT обязано проходить");
@@ -4144,7 +4728,10 @@ fn edt_incremental_keeps_exported_procs_registry() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(registered, 1, "новая экспортная процедура обязана попасть в справочник");
+    assert_eq!(
+        registered, 1,
+        "новая экспортная процедура обязана попасть в справочник"
+    );
 
     let key: Option<String> = storage
         .conn()
@@ -4176,7 +4763,10 @@ fn edt_incremental_keeps_exported_procs_registry() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(left, 0, "процедуры удалённого модуля обязаны уйти из справочника");
+    assert_eq!(
+        left, 0,
+        "процедуры удалённого модуля обязаны уйти из справочника"
+    );
 }
 
 #[test]
@@ -4206,7 +4796,10 @@ fn edt_incremental_migrates_old_unique_key() {
 
     let module_rel = "src/Catalogs/Товары/ObjectModule.bsl";
     let module_path = repo.join(module_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-    write(&module_path, "Процедура ПередЗаписью(Отказ) Экспорт КонецПроцедуры");
+    write(
+        &module_path,
+        "Процедура ПередЗаписью(Отказ) Экспорт КонецПроцедуры",
+    );
     let f = ensure_file(storage.conn(), module_rel);
     set_func(storage.conn(), f, "ПередЗаписью", "(Отказ) Экспорт");
 
@@ -4232,7 +4825,10 @@ fn edt_incremental_migrates_old_unique_key() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(modules, 1, "строка модуля обязана записаться после переноса ключа");
+    assert_eq!(
+        modules, 1,
+        "строка модуля обязана записаться после переноса ключа"
+    );
 }
 
 // ── Вызовы с квалификатором и привязка вызовов из формы ────────────────
@@ -4262,9 +4858,15 @@ fn callee_key_index_is_partial() {
     let repo = tmp.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     let mut st = fresh_storage(&tmp);
-    assert!(sql(&st).contains("WHERE callee_proc_key IS NOT NULL"), "схема");
+    assert!(
+        sql(&st).contains("WHERE callee_proc_key IS NOT NULL"),
+        "схема"
+    );
     run_index_extras(&repo, &mut st).unwrap();
-    assert!(sql(&st).contains("WHERE callee_proc_key IS NOT NULL"), "пересбор графа");
+    assert!(
+        sql(&st).contains("WHERE callee_proc_key IS NOT NULL"),
+        "пересбор графа"
+    );
 }
 
 #[test]
@@ -4482,7 +5084,13 @@ fn form_call_not_bound_from_client_procedure() {
             set_func(conn, obj, "Метод", "() Экспорт");
             set_func_doc(conn, form, "Клиент", "()", "procedure &НаКлиенте");
             set_func_doc(conn, form, "Сервер", "()", "procedure &НаСервере");
-            set_func_doc(conn, form, "Везде", "()", "procedure &НаКлиентеНаСервереБезКонтекста");
+            set_func_doc(
+                conn,
+                form,
+                "Везде",
+                "()",
+                "procedure &НаКлиентеНаСервереБезКонтекста",
+            );
             set_calls(
                 conn,
                 form,
@@ -4500,12 +5108,33 @@ fn form_call_not_bound_from_client_procedure() {
     for (obj_path, form_path) in [(TEST_OBJ, TEST_FORM), (EDT_OBJ, EDT_FORM)] {
         let target = format!("{obj_path}::Метод");
         let b = |proc_name: &str, callee: &str| -> i64 {
-            bound_to(st.conn(), &format!("{form_path}::{proc_name}"), callee, &target)
+            bound_to(
+                st.conn(),
+                &format!("{form_path}::{proc_name}"),
+                callee,
+                &target,
+            )
         };
-        assert_eq!(b("Клиент", "КонтекстКлиент.Метод"), 0, "{form_path}: вызов из &НаКлиенте не привязан");
-        assert_eq!(b("Сервер", "ОбработкаОбъект.Метод"), 1, "{form_path}: &НаСервере привязан");
-        assert_eq!(b("Везде", "ОбъектОтчета.Метод"), 1, "{form_path}: &НаКлиентеНаСервереБезКонтекста привязан");
-        assert_eq!(b("БезЗаписи", "Объект2.Метод"), 1, "{form_path}: процедура без записи в functions привязана");
+        assert_eq!(
+            b("Клиент", "КонтекстКлиент.Метод"),
+            0,
+            "{form_path}: вызов из &НаКлиенте не привязан"
+        );
+        assert_eq!(
+            b("Сервер", "ОбработкаОбъект.Метод"),
+            1,
+            "{form_path}: &НаСервере привязан"
+        );
+        assert_eq!(
+            b("Везде", "ОбъектОтчета.Метод"),
+            1,
+            "{form_path}: &НаКлиентеНаСервереБезКонтекста привязан"
+        );
+        assert_eq!(
+            b("БезЗаписи", "Объект2.Метод"),
+            1,
+            "{form_path}: процедура без записи в functions привязана"
+        );
     }
 }
 
@@ -4540,7 +5169,12 @@ fn form_call_not_bound_for_common_module_variable() {
     let caller = format!("{TEST_FORM}::ПриСоздании");
     let target = format!("{TEST_OBJ}::Отправить");
     assert_eq!(
-        bound_to(st.conn(), &caller, "МодульСообщенияКлиент.Отправить", &target),
+        bound_to(
+            st.conn(),
+            &caller,
+            "МодульСообщенияКлиент.Отправить",
+            &target
+        ),
         0,
         "общий модуль в переменной — не модуль объекта"
     );
@@ -4580,7 +5214,9 @@ fn form_call_filters_incremental_matches_full_rebuild() {
                  FROM proc_call_graph WHERE repo = ?1 AND call_type = 'direct'",
             )
             .unwrap()
-            .query_map(params![REPO_DEFAULT], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_map(params![REPO_DEFAULT], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -4615,10 +5251,26 @@ fn form_call_filters_incremental_matches_full_rebuild() {
     let target = format!("{TEST_OBJ}::Метод");
     let client = format!("{TEST_FORM}::Клиент");
     let server = format!("{TEST_FORM}::Сервер");
-    assert_eq!(bound_to(st_i.conn(), &client, "КонтекстКлиент.Метод", &target), 0, "клиентская процедура");
-    assert_eq!(bound_to(st_i.conn(), &server, "МодульСообщенияКлиент.Метод", &target), 0, "общий модуль в переменной");
-    assert_eq!(bound_to(st_i.conn(), &server, "ОбработкаОбъект.Метод", &target), 1, "объект формы");
-    assert_eq!(bound_to(st_i.conn(), &server, "МодульОбмена.Метод", &target), 1, "общего модуля «Обмена» нет");
+    assert_eq!(
+        bound_to(st_i.conn(), &client, "КонтекстКлиент.Метод", &target),
+        0,
+        "клиентская процедура"
+    );
+    assert_eq!(
+        bound_to(st_i.conn(), &server, "МодульСообщенияКлиент.Метод", &target),
+        0,
+        "общий модуль в переменной"
+    );
+    assert_eq!(
+        bound_to(st_i.conn(), &server, "ОбработкаОбъект.Метод", &target),
+        1,
+        "объект формы"
+    );
+    assert_eq!(
+        bound_to(st_i.conn(), &server, "МодульОбмена.Метод", &target),
+        1,
+        "общего модуля «Обмена» нет"
+    );
 }
 
 #[test]

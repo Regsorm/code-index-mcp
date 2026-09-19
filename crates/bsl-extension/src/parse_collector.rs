@@ -15,8 +15,8 @@
 // `index_extras` делает полный disk-rebuild как раньше. Watcher-инкремент
 // (`index_extras_for_files`) сборщик не использует.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use anyhow::Result;
 use rusqlite::params;
@@ -184,12 +184,19 @@ impl ParseExtrasCollector for BslParseCollector {
         {
             let mut stmt = conn.prepare("INSERT INTO _proc_terms_staging (proc_key, proc_name, object_meta_type, object_name, comment) VALUES (?1, ?2, ?3, ?4, ?5)")?;
             for t in terms.iter() {
-                stmt.execute(params![&t.proc_key, &t.proc_name, t.object_meta_type, &t.object_name, &t.comment])?;
+                stmt.execute(params![
+                    &t.proc_key,
+                    &t.proc_name,
+                    t.object_meta_type,
+                    &t.object_name,
+                    &t.comment
+                ])?;
             }
         }
         conn.execute("COMMIT", [])?;
 
-        self.written_usages.fetch_add(usages_written, Ordering::Relaxed);
+        self.written_usages
+            .fetch_add(usages_written, Ordering::Relaxed);
         self.written_files.fetch_add(files.len(), Ordering::Relaxed);
         self.written_terms.fetch_add(terms.len(), Ordering::Relaxed);
         Ok(())

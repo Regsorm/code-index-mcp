@@ -4,7 +4,7 @@
 // indexer и HTTP-сервер видели одни и те же данные.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -74,7 +74,10 @@ pub struct PathPulse {
 impl DaemonState {
     pub fn new() -> Self {
         let now = SystemTime::now();
-        let started_at_unix = now.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let started_at_unix = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let started_at_rfc3339 = chrono::DateTime::<chrono::Utc>::from(now).to_rfc3339();
         Self {
             inner: Arc::new(RwLock::new(DaemonStateInner {
@@ -94,7 +97,10 @@ impl DaemonState {
     /// Зарегистрировать набор путей в состоянии. Новые пути добавляются
     /// со статусом `NotStarted`; убранные — удаляются; существующие не трогаются.
     /// Возвращает `(added, removed, unchanged)`.
-    pub async fn apply_config(&self, paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    pub async fn apply_config(
+        &self,
+        paths: &[PathBuf],
+    ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
         let mut guard = self.inner.write().await;
         let mut added = Vec::new();
         let mut unchanged = Vec::new();
@@ -122,16 +128,16 @@ impl DaemonState {
     /// Запомнить поток, который ведёт эту папку. Вызывается самим рабочим
     /// потоком в начале работы: по этой отметке строка состояния демона
     /// узнаёт, каким этапом папка занята прямо сейчас.
-    pub async fn note_worker_thread(&self, path: &PathBuf) {
+    pub async fn note_worker_thread(&self, path: &Path) {
         let mut guard = self.inner.write().await;
-        let entry = guard.paths.entry(path.clone()).or_default();
+        let entry = guard.paths.entry(path.to_path_buf()).or_default();
         entry.worker_thread = Some(std::thread::current().id());
     }
 
     /// Выставить статус папки. Используется фоновыми задачами демона.
-    pub async fn set_status(&self, path: &PathBuf, status: PathStatus) {
+    pub async fn set_status(&self, path: &Path, status: PathStatus) {
         let mut guard = self.inner.write().await;
-        let entry = guard.paths.entry(path.clone()).or_default();
+        let entry = guard.paths.entry(path.to_path_buf()).or_default();
         entry.status = status;
         entry.error = None;
         entry.changed_at = Instant::now();
@@ -157,9 +163,9 @@ impl DaemonState {
     }
 
     /// Зафиксировать ошибку индексации папки.
-    pub async fn set_error(&self, path: &PathBuf, message: impl Into<String>) {
+    pub async fn set_error(&self, path: &Path, message: impl Into<String>) {
         let mut guard = self.inner.write().await;
-        let entry = guard.paths.entry(path.clone()).or_default();
+        let entry = guard.paths.entry(path.to_path_buf()).or_default();
         entry.status = PathStatus::Error;
         entry.progress = None;
         entry.error = Some(message.into());
@@ -253,7 +259,7 @@ mod tests {
     async fn set_ready_clears_progress() {
         let st = DaemonState::new();
         let path = PathBuf::from("/a");
-        st.apply_config(&[path.clone()]).await;
+        st.apply_config(std::slice::from_ref(&path)).await;
         st.set_status(&path, PathStatus::InitialIndexing).await;
         st.set_progress(&path, Progress::new(10, 100)).await;
 

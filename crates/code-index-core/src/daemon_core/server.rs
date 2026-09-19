@@ -18,9 +18,7 @@ use serde::Deserialize;
 use tokio::sync::oneshot;
 
 use super::commands::{CommandSender, DaemonCommand};
-use super::ipc::{
-    HealthResponse, PathStatus, PathStatusResponse, ReloadResponse, StopResponse,
-};
+use super::ipc::{HealthResponse, PathStatus, PathStatusResponse, ReloadResponse, StopResponse};
 use super::state::DaemonState;
 
 /// Разделяемое состояние, передаваемое в handler'ы axum.
@@ -194,6 +192,11 @@ fn normalize_path_key(input: &str) -> String {
     s.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
+// Возвращает фактически используемые клиентом заголовки для удобного разбора
+// ответа. Отдельно вынесено, чтобы `path_status` мог вернуть IntoResponse.
+#[allow(dead_code)]
+pub(crate) const HEADER_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+
 #[cfg(test)]
 mod normalize_tests {
     use super::normalize_path_key;
@@ -207,11 +210,6 @@ mod normalize_tests {
         assert_eq!(a, r"c:\repo1c-test");
     }
 }
-
-// Возвращает фактически используемые клиентом заголовки для удобного разбора
-// ответа. Отдельно вынесено, чтобы `path_status` мог вернуть IntoResponse.
-#[allow(dead_code)]
-pub(crate) const HEADER_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 // Используются внутри сервера для более точных ответов на OPTIONS/HEAD, но
 // сейчас мы не реализуем CORS — demon слушает только loopback.

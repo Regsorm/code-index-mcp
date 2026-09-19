@@ -5,6 +5,50 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- Updated dependencies containing RustSec fixes: `rmcp` 1.8, `quick-xml` 0.41,
+  `rustls` 0.23.45, `rustls-webpki` 0.103.15 and related transitive packages.
+  The watcher also moved to `notify` 8.2 and `notify-debouncer-full` 0.7,
+  removing the unmaintained `instant` dependency.
+- Added `deny.toml`: CI rejects known vulnerabilities, yanked versions,
+  unknown sources and unapproved licenses. Duplicate transitive versions are
+  currently reported as warnings.
+
+### Changed
+
+- All Rust code now follows one `rustfmt` baseline; strict Clippy passes for
+  every target and feature without exemptions. Long internal signatures were
+  replaced with named parameter structures. Direct `code-index-core` users
+  must use `CodeWriteParams`, `TextWriteParams`, `ReadFileOptions` and
+  `GrepBodyOptions`; the MCP protocol and JSON responses are unchanged.
+- The release profile now uses thin LTO, one codegen unit and symbol stripping.
+  In clean Windows GNU builds both binaries took 4:29 instead of 2:39 to build,
+  while `code-index.exe` shrank from 53.3 to 37.4 MB and `bsl-indexer.exe` from
+  56.0 to 39.3 MB. Median repeated indexing time for a 1,200-file corpus went
+  from 1,895 to 1,874 ms (about 1%).
+- Added a separate CI workflow for regular pushes and pull requests: formatting,
+  Clippy, doc tests, `cargo-deny`, `nextest` on Linux and Windows, and release
+  builds at the end. Tag-based publication workflows are unchanged.
+- Added reproducible `tests/mcp_full_acceptance.py`: it starts isolated daemon
+  and HTTP serve processes on a small 1C fixture, verifies `tools/list`, and
+  calls all 32 advertised MCP tools.
+- The Docker context no longer includes local `.cargo/config.toml`, and shell
+  scripts are forced to LF endings. The Linux image therefore builds and starts
+  consistently from both Linux and Windows checkouts.
+
+### Verification
+
+- `cargo nextest run --workspace --all-features`: 883 passed, 0 failed.
+- `cargo test --workspace --all-features --doc`: passed (one example is marked
+  `ignored`).
+- `cargo clippy --all-targets --all-features -- -D warnings` and
+  `cargo deny check`: passed.
+- Full MCP acceptance of the current release binaries: 32 of 32 tools passed on
+  Windows GNU and 32 of 32 in the Debian container.
+
 ## [1.2.3] — 2026-09-17
 
 **The 1C extension honours `exclude_dirs`: an excluded directory with its own `Configuration.xml` (for example, a copy of the vendor configuration kept for comparison) no longer gets into the metadata tables. On a stand of two copies of one dump, `metadata_modules` had 33 extra rows from the excluded directory; now 0.**

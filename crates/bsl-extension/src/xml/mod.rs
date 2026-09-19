@@ -19,6 +19,24 @@
 //   опций) → доп. рёбра `data_links`; плюс права ролей (Rights.xml) для
 //   отдельной таблицы `role_rights`.
 
+use std::borrow::Cow;
+
+use quick_xml::events::BytesText;
+
+/// Совместимый с прежним quick-xml путь: декодировать XML-текст и раскрыть
+/// стандартные entity (`&amp;`, `&lt;` и т.д.).
+pub(crate) trait BytesTextExt {
+    fn unescape(&self) -> Result<Cow<'_, str>, ()>;
+}
+
+impl BytesTextExt for BytesText<'_> {
+    fn unescape(&self) -> Result<Cow<'_, str>, ()> {
+        let decoded = self.xml10_content().map_err(|_| ())?;
+        let unescaped = quick_xml::escape::unescape(&decoded).map_err(|_| ())?;
+        Ok(Cow::Owned(unescaped.into_owned()))
+    }
+}
+
 pub mod config_dump_info;
 pub mod configuration;
 // `edt_mdo` — формат 1C:EDT (`.mdo`): структура объектов, связи данных,

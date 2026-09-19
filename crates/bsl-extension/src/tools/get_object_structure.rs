@@ -101,10 +101,12 @@ impl IndexTool for GetObjectStructureTool {
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
             // Узкая выборка секций (sections): без параметра — все секции.
-            let sections: Option<Vec<String>> = args
-                .get("sections")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+            let sections: Option<Vec<String>> =
+                args.get("sections").and_then(|v| v.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                });
             // Явный режим «только имена». Отдельный вход, потому что sections=[]
             // означает «все секции» (обратная совместимость, тест
             // apply_sections_filters_top_level_keys) — попросить одни имена
@@ -115,10 +117,7 @@ impl IndexTool for GetObjectStructureTool {
                 .unwrap_or(false);
             // Смещение страницы — работает, когда запрошена ровно одна секция
             // (sections=['enum_values'] и т.п.). Продолжение выдачи, а не выбор.
-            let offset = args
-                .get("offset")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
+            let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             // Бюджет размера этого ответа: клиентский max_response_bytes
             // поверх серверного, но не выше серверного потолка.
             let budget = code_index_core::mcp::cap::resolve_request_budget(
@@ -189,9 +188,17 @@ impl IndexTool for GetObjectStructureTool {
                         full_names,
                         move |st, fqn| {
                             // Страницы (offset/budget) — только для одиночного объекта: в массовом
-// режиме размером управляет shrink_search_results, и постраничная выдача
-// внутри каждого элемента сделала бы ответ невнятным.
-resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only, 0, 0)
+                            // режиме размером управляет shrink_search_results, и постраничная выдача
+                            // внутри каждого элемента сделала бы ответ невнятным.
+                            resolve_one(
+                                st.conn(),
+                                &repo_label,
+                                &fqn,
+                                sections_c.as_deref(),
+                                names_only,
+                                0,
+                                0,
+                            )
                         },
                     )
                     .await;
@@ -204,8 +211,7 @@ resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only, 0, 
                         .collect();
                     json!({ "matched": matched, "truncated": truncated, "results": results })
                 }
-            } else if let Some(arr) = args.get("full_names").and_then(|v| v.as_array())
-            {
+            } else if let Some(arr) = args.get("full_names").and_then(|v| v.as_array()) {
                 // Конкуррентно: каждый элемент берёт своё соединение из пула и
                 // исполняется в spawn_blocking (mass_map). Нестроковые элементы
                 // получают {error} на своей позиции без обращения к пулу.
@@ -232,9 +238,17 @@ resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only, 0, 
                 let rows =
                     code_index_core::mcp::tools::mass_map(ctx.storage, items, move |st, fqn| {
                         // Страницы (offset/budget) — только для одиночного объекта: в массовом
-// режиме размером управляет shrink_search_results, и постраничная выдача
-// внутри каждого элемента сделала бы ответ невнятным.
-resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only, 0, 0)
+                        // режиме размером управляет shrink_search_results, и постраничная выдача
+                        // внутри каждого элемента сделала бы ответ невнятным.
+                        resolve_one(
+                            st.conn(),
+                            &repo_label,
+                            &fqn,
+                            sections_c.as_deref(),
+                            names_only,
+                            0,
+                            0,
+                        )
                     })
                     .await;
                 for (pos, row) in positions.into_iter().zip(rows) {
@@ -283,10 +297,8 @@ resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only, 0, 
             // общий omit выбрасывал его первым же шагом, оставляя клиенту три
             // числа вместо списка найденного. Опознание объектов неприкосновенно.
             if result_value.get("results").is_some() {
-                let (result_value, shrink) = code_index_core::mcp::cap::shrink_search_results(
-                    result_value,
-                    budget.applied,
-                );
+                let (result_value, shrink) =
+                    code_index_core::mcp::cap::shrink_search_results(result_value, budget.applied);
                 // Маркеры ставим свои: общий OMIT_HINT здесь не годится (советует
                 // grep_code/grep_body и не называет ни размера, ни ручки).
                 let mut out =
@@ -318,7 +330,8 @@ resolve_one(st.conn(), &repo_label, &fqn, sections_c.as_deref(), names_only, 0, 
             // проставил omit выше. Нужны, чтобы подсказка называла КОНКРЕТНУЮ
             // секцию и готовый вызов, а не общий совет.
             let omitted_sections = omitted_section_names(&result_value);
-            let mut out = crate::tools::wrap_with_meta_structural(result_value, Vec::new(), omitted);
+            let mut out =
+                crate::tools::wrap_with_meta_structural(result_value, Vec::new(), omitted);
             if let Some(obj) = out.as_object_mut() {
                 // Готовый вызов собираем только для одиночного объекта: в массовом
                 // режиме страницы по секции выключены намеренно.
@@ -534,11 +547,8 @@ fn resolve_one(
             let attrs_value = match (sections, attrs_value) {
                 (Some(secs), Value::Object(mut map)) if secs.len() == 1 => {
                     if let Some(Value::Array(items)) = map.remove(secs[0].as_str()) {
-                        let mut page = code_index_core::mcp::cap::page_by_bytes(
-                            items,
-                            offset,
-                            budget,
-                        );
+                        let mut page =
+                            code_index_core::mcp::cap::page_by_bytes(items, offset, budget);
                         let items = std::mem::take(&mut page.items);
                         map.insert(secs[0].clone(), Value::Array(items));
                         page_meta = Some((secs[0].clone(), page));
@@ -684,16 +694,35 @@ mod tests {
         )
         .unwrap();
 
-        let v = resolve_one(&conn, "ut", "Catalog.СоглашенияСКлиентами", None, true, 0, 0);
+        let v = resolve_one(
+            &conn,
+            "ut",
+            "Catalog.СоглашенияСКлиентами",
+            None,
+            true,
+            0,
+            0,
+        );
         assert_eq!(v["full_name"], json!("Catalog.СоглашенияСКлиентами"));
         assert_eq!(v["meta_type"], json!("Catalog"));
         assert_eq!(v["name"], json!("СоглашенияСКлиентами"));
         assert_eq!(v["synonym"], json!("Соглашения с клиентами"));
-        assert!(v.get("attributes").is_none(), "структура не должна отдаваться");
+        assert!(
+            v.get("attributes").is_none(),
+            "структура не должна отдаваться"
+        );
         assert!(v.get("counts").is_none());
 
         // names_only=false → структура на месте (прежнее поведение).
-        let full = resolve_one(&conn, "ut", "Catalog.СоглашенияСКлиентами", None, false, 0, 0);
+        let full = resolve_one(
+            &conn,
+            "ut",
+            "Catalog.СоглашенияСКлиентами",
+            None,
+            false,
+            0,
+            0,
+        );
         assert_eq!(full["counts"]["attributes"], json!(2));
     }
 
@@ -727,8 +756,14 @@ mod tests {
         // после появления страниц по секции это стало неправдой, и выпущенная
         // возможность оставалась невидимой для модели.
         let hint = code_index_core::mcp::cap::OMIT_HINT;
-        assert!(!hint.contains("недоступен"), "подсказка не должна отрицать доступность: {hint}");
-        assert!(hint.contains("sections=[<секция>]"), "нужен путь к секции: {hint}");
+        assert!(
+            !hint.contains("недоступен"),
+            "подсказка не должна отрицать доступность: {hint}"
+        );
+        assert!(
+            hint.contains("sections=[<секция>]"),
+            "нужен путь к секции: {hint}"
+        );
         assert!(hint.contains("offset="), "нужно упоминание страниц: {hint}");
     }
 
@@ -753,12 +788,26 @@ mod tests {
         .unwrap();
 
         let secs = vec!["enum_values".to_string()];
-        let first = resolve_one(&conn, "ut", "Enum.ХозяйственныеОперации", Some(&secs), false, 0, 3_000);
+        let first = resolve_one(
+            &conn,
+            "ut",
+            "Enum.ХозяйственныеОперации",
+            Some(&secs),
+            false,
+            0,
+            3_000,
+        );
         let shown = first["enum_values_shown"].as_u64().unwrap() as usize;
-        assert!(shown > 0 && shown < 100, "страница набирается по бюджету: {shown}");
+        assert!(
+            shown > 0 && shown < 100,
+            "страница набирается по бюджету: {shown}"
+        );
         assert_eq!(first["enum_values_total"], json!(100));
         assert_eq!(first["enum_values_has_more"], json!(true));
-        assert_eq!(first["attributes"]["enum_values"].as_array().unwrap().len(), shown);
+        assert_eq!(
+            first["attributes"]["enum_values"].as_array().unwrap().len(),
+            shown
+        );
         let hint = first["hint"].as_str().unwrap();
         assert!(
             hint.contains(&format!("offset={}", shown)),
@@ -766,10 +815,21 @@ mod tests {
         );
 
         // Продолжение со смещения доходит до конца набора.
-        let last = resolve_one(&conn, "ut", "Enum.ХозяйственныеОперации", Some(&secs), false, 90, 3_000);
+        let last = resolve_one(
+            &conn,
+            "ut",
+            "Enum.ХозяйственныеОперации",
+            Some(&secs),
+            false,
+            90,
+            3_000,
+        );
         assert_eq!(last["enum_values_offset"], json!(90));
         assert_eq!(last["enum_values_shown"], json!(10));
         assert_eq!(last["enum_values_has_more"], json!(false));
-        assert!(last.get("hint").is_none(), "конец набора — продолжать некуда");
+        assert!(
+            last.get("hint").is_none(),
+            "конец набора — продолжать некуда"
+        );
     }
 }

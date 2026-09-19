@@ -1,12 +1,11 @@
 use anyhow::{anyhow, Result};
 
-use super::types::{
-    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport,
-    ParsedVariable,
-};
-use super::LanguageParser;
 use super::types::MAX_VISIT_DEPTH;
 use super::types::PARSE_TIMEOUT_MS;
+use super::types::{
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+};
+use super::LanguageParser;
 
 /// Парсер Ruby-файлов на основе tree-sitter (грамматика `tree-sitter-ruby`).
 ///
@@ -14,6 +13,12 @@ use super::types::PARSE_TIMEOUT_MS;
 /// Вызовы без скобок (`puts "x"`) в грамматике 0.23 — это тот же узел `call`,
 /// отдельного узла `command` нет.
 pub struct RubyParser;
+
+impl Default for RubyParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RubyParser {
     pub fn new() -> Self {
@@ -147,7 +152,11 @@ fn visit_method(node: tree_sitter::Node, ctx: &mut VisitContext, class_name: Opt
     }
 
     // Идиоматика Ruby: `Класс#метод` для обычных, `Класс.метод` для singleton
-    let separator = if node.kind() == "singleton_method" { "." } else { "#" };
+    let separator = if node.kind() == "singleton_method" {
+        "."
+    } else {
+        "#"
+    };
     let qualified_name = class_name.map(|cn| format!("{}{}{}", cn, separator, name));
 
     let line_start = node.start_position().row + 1;
@@ -267,7 +276,11 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     }
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall {
+        caller,
+        callee,
+        line,
+    });
 }
 
 /// Обработать присваивание на верхнем уровне файла (`X = ...`)
@@ -418,8 +431,7 @@ require_relative "../lib/helper"
         assert!(result
             .imports
             .iter()
-            .any(|i| i.kind == "require_relative"
-                && i.module.as_deref() == Some("../lib/helper")));
+            .any(|i| i.kind == "require_relative" && i.module.as_deref() == Some("../lib/helper")));
         // require не должен попасть в обычные вызовы
         assert!(!result.calls.iter().any(|c| c.callee == "require"));
     }

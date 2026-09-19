@@ -5,6 +5,7 @@ target/
 target2/
 .git/
 .github/
+.cargo/
 .code-index/
 *.db
 *.db-shm

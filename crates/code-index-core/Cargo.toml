@@ -41,7 +41,7 @@ tree-sitter-swift = { workspace = true }
 # Единый слой разбора BSL (нормализация под дефекты грамматики tree-sitter-bsl).
 # Вендоренная копия крейта из репозитория Bsl-context — code-index собирается
 # самодостаточно, без завязки на соседний каталог на диске.
-bsl-parse = { path = "../bsl-parse" }
+bsl-parse = { path = "../bsl-parse", version = "0.8.0" }
 
 # XML-парсинг (для выгрузок 1С — пока в core, на этапе 2 переедет в bsl-extension)
 quick-xml = { workspace = true }

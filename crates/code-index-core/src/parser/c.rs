@@ -1,17 +1,22 @@
 use anyhow::{anyhow, Result};
 
-use super::types::{
-    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport,
-    ParsedVariable,
-};
-use super::LanguageParser;
 use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 use super::types::PARSE_TIMEOUT_MS;
+use super::types::{
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+};
+use super::LanguageParser;
 
 /// Парсер C-файлов на основе tree-sitter.
 /// Функции — `function_definition`; «классы» для C — это `struct`/`union`/`enum`.
 pub struct CParser;
+
+impl Default for CParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CParser {
     pub fn new() -> Self {
@@ -37,14 +42,15 @@ fn node_text<'a>(node: tree_sitter::Node<'a>, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
 }
 
-fn find_child_by_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+fn find_child_by_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
+    let found = node
+        .children(&mut cursor)
+        .find(|&child| child.kind() == kind);
+    found
 }
 
 /// Извлечь комментарий-документацию перед объявлением: подряд идущие узлы
@@ -193,7 +199,9 @@ fn visit_function(node: tree_sitter::Node, ctx: &mut VisitContext, class_name: O
         .and_then(|d| find_descendant_by_kind(d, "parameter_list"))
         .map(|n| node_text(n, source).to_string());
 
-    let return_type = node.child_by_field_name("type").map(|n| node_text(n, source).to_string());
+    let return_type = node
+        .child_by_field_name("type")
+        .map(|n| node_text(n, source).to_string());
 
     let body_node = node.child_by_field_name("body");
     let body = node_text(node, source).to_string();
@@ -278,7 +286,11 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall {
+        caller,
+        callee,
+        line,
+    });
 }
 
 fn visit_include(node: tree_sitter::Node, ctx: &mut VisitContext) {

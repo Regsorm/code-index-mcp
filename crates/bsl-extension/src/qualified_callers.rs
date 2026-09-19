@@ -82,7 +82,7 @@ fn collect(
             .query_map(params![spelling], read_call)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for c in rows {
-            if c.id.map_or(true, |id| seen.insert(id)) {
+            if c.id.is_none_or(|id| seen.insert(id)) {
                 out.push(c);
             }
         }
@@ -125,7 +125,7 @@ fn collect(
             .query_map(params![callee_name, caller, path], read_call)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for c in rows {
-            if c.id.map_or(true, |id| seen.insert(id)) {
+            if c.id.is_none_or(|id| seen.insert(id)) {
                 out.push(c);
             }
         }

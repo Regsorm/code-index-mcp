@@ -225,7 +225,10 @@ mod tests {
     #[test]
     fn yo_folds_to_e_everywhere() {
         // Идентификаторы: «РасчётСебестоимости» нормализуется без ё.
-        assert_eq!(split_identifier("РасчётСебестоимости"), vec!["расчет", "себестоимости"]);
+        assert_eq!(
+            split_identifier("РасчётСебестоимости"),
+            vec!["расчет", "себестоимости"]
+        );
         // Свободный текст (синонимы, комментарии): та же свёртка.
         assert_eq!(fold_text("Учёт партий"), "учет партий");
     }
@@ -246,7 +249,10 @@ mod tests {
             split_identifier("ПолучитьHTTPОтвет"),
             vec!["получить", "http", "ответ"]
         );
-        assert_eq!(split_identifier("Форма2Элемент"), vec!["форма", "2", "элемент"]);
+        assert_eq!(
+            split_identifier("Форма2Элемент"),
+            vec!["форма", "2", "элемент"]
+        );
     }
 
     #[test]
@@ -267,7 +273,10 @@ mod tests {
             object_from_module_path("base/CommonModules/РаботаСоСкидками/Ext/Module.bsl"),
             Some(("CommonModule", "РаботаСоСкидками".to_string()))
         );
-        assert_eq!(object_from_module_path("Configuration/ManagedApplicationModule.bsl"), None);
+        assert_eq!(
+            object_from_module_path("Configuration/ManagedApplicationModule.bsl"),
+            None
+        );
     }
 
     #[test]
@@ -290,11 +299,7 @@ mod tests {
 
     #[test]
     fn comment_stops_at_code() {
-        let lines = vec![
-            "КонецПроцедуры",
-            "",
-            "Процедура Другая()",
-        ];
+        let lines = vec!["КонецПроцедуры", "", "Процедура Другая()"];
         // Пустая строка над процедурой → комментария нет.
         assert_eq!(extract_leading_comment(&lines, 3), None);
     }
@@ -308,7 +313,10 @@ mod tests {
             Some("Уточняет штрихкод товара"),
         );
         // Синоним «Номенклатура» дублирует слова объекта → схлопнут.
-        assert_eq!(t, "уточнить штрихкод, номенклатура, уточняет штрихкод товара");
+        assert_eq!(
+            t,
+            "уточнить штрихкод, номенклатура, уточняет штрихкод товара"
+        );
 
         let t2 = build_terms("RefineBarcode", None, None, None);
         assert_eq!(t2, "refine barcode");

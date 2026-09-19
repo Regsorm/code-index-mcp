@@ -566,12 +566,32 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
 /// `apply_schema_extensions`. Вызывать ДО применения `SCHEMA_EXTENSIONS`.
 /// Безопасно на свежей БД (таблиц ещё нет — ALTER пропускается) и при повторе.
 pub fn migrate_extensions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
-    ensure_column(conn, "data_links", "to_object_key", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(conn, "role_rights", "object_name_key", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        conn,
+        "data_links",
+        "to_object_key",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "role_rights",
+        "object_name_key",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     // Владелец объекта (base '' / Extensions/<EF_X>) для diff-удаления перечня.
-    ensure_column(conn, "metadata_objects", "sub_config", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        conn,
+        "metadata_objects",
+        "sub_config",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     // Ключ имени объекта для регистронезависимого резолва на входе инструментов.
-    ensure_column(conn, "metadata_objects", "full_name_key", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        conn,
+        "metadata_objects",
+        "full_name_key",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     backfill_metadata_object_keys(conn)?;
     ensure_trigram_tokenizer(conn)?;
     Ok(())
@@ -600,9 +620,7 @@ pub fn backfill_metadata_object_keys(conn: &rusqlite::Connection) -> rusqlite::R
             "SELECT id, full_name FROM metadata_objects \
              WHERE full_name_key = '' AND full_name <> ''",
         )?;
-        let rows = sel.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let rows = sel.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     if pending.is_empty() {
@@ -849,7 +867,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(owner, "", "новая строка без sub_config → владелец база ('')");
+        assert_eq!(
+            owner, "",
+            "новая строка без sub_config → владелец база ('')"
+        );
 
         // Идемпотентность: повтор миграции — no-op, не падает.
         super::migrate_extensions(&conn).unwrap();
@@ -874,7 +895,8 @@ mod tests {
         }
         // Идемпотентность — повторный execute не должен валиться.
         for ddl in SCHEMA_EXTENSIONS {
-            conn.execute_batch(ddl).expect("DDL должен быть идемпотентным");
+            conn.execute_batch(ddl)
+                .expect("DDL должен быть идемпотентным");
         }
     }
 
@@ -888,21 +910,36 @@ mod tests {
         conn.execute(
             "INSERT INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) \
              VALUES (?, ?, ?, ?)",
-            rusqlite::params!["ut", "ОбщегоНазначенияСервер.Старт", "Логирование.Записать", "direct"],
+            rusqlite::params![
+                "ut",
+                "ОбщегоНазначенияСервер.Старт",
+                "Логирование.Записать",
+                "direct"
+            ],
         )
         .unwrap();
         // Повтор — должен сломаться по UNIQUE(repo, caller, callee_name, call_type).
         let dup = conn.execute(
             "INSERT INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) \
              VALUES (?, ?, ?, ?)",
-            rusqlite::params!["ut", "ОбщегоНазначенияСервер.Старт", "Логирование.Записать", "direct"],
+            rusqlite::params![
+                "ut",
+                "ОбщегоНазначенияСервер.Старт",
+                "Логирование.Записать",
+                "direct"
+            ],
         );
         assert!(dup.is_err());
         // А вот другой call_type на ту же пару — допустим (нет конфликта).
         conn.execute(
             "INSERT INTO proc_call_graph (repo, caller_proc_key, callee_proc_name, call_type) \
              VALUES (?, ?, ?, ?)",
-            rusqlite::params!["ut", "ОбщегоНазначенияСервер.Старт", "Логирование.Записать", "subscription"],
+            rusqlite::params![
+                "ut",
+                "ОбщегоНазначенияСервер.Старт",
+                "Логирование.Записать",
+                "subscription"
+            ],
         )
         .unwrap();
     }
@@ -937,7 +974,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "FTS должна найти запись после insert через триггер");
+        assert_eq!(
+            count, 1,
+            "FTS должна найти запись после insert через триггер"
+        );
 
         // Совместный JOIN — типичный запрос tool'а search_terms.
         let row: (String, String, String) = conn
@@ -983,7 +1023,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(old_hits, 0, "старое значение FTS должна удалить через триггер update");
+        assert_eq!(
+            old_hits, 0,
+            "старое значение FTS должна удалить через триггер update"
+        );
         let new_hits: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM fts_procedure_enrichment WHERE terms MATCH 'обновлено'",
@@ -1035,7 +1078,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(ddl.contains("trigram"), "после миграции токенайзер trigram: {ddl}");
+        assert!(
+            ddl.contains("trigram"),
+            "после миграции токенайзер trigram: {ddl}"
+        );
         // Substring и словоформа находятся; индекс пересобран из content-таблицы.
         for q in ["трихкод", "штрихкоду", "УТОЧНИТЬ"] {
             let hits: i64 = conn

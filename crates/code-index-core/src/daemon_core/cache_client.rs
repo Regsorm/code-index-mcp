@@ -94,10 +94,7 @@ impl CacheClient {
                         } else {
                             let body_text =
                                 resp.text().await.unwrap_or_else(|_| "<no body>".into());
-                            eprintln!(
-                                "[cache_client] {} non-2xx ({}): {}",
-                                url, status, body_text
-                            );
+                            eprintln!("[cache_client] {} non-2xx ({}): {}", url, status, body_text);
                             false
                         }
                     }
@@ -153,10 +150,7 @@ impl CacheClient {
                             // best-effort, invalidate после commit подстрахует.
                             let body_text =
                                 resp.text().await.unwrap_or_else(|_| "<no body>".into());
-                            eprintln!(
-                                "[cache_client] {} non-2xx ({}): {}",
-                                url, status, body_text
-                            );
+                            eprintln!("[cache_client] {} non-2xx ({}): {}", url, status, body_text);
                             false
                         }
                     }
@@ -213,9 +207,7 @@ mod tests {
     #[tokio::test]
     async fn invalidate_files_noop_on_no_targets() {
         let c = CacheClient::new(Vec::new());
-        let ok = c
-            .invalidate_files("ut", &["src/X.bsl".to_string()])
-            .await;
+        let ok = c.invalidate_files("ut", &["src/X.bsl".to_string()]).await;
         assert_eq!(ok, 0);
     }
 
@@ -224,9 +216,7 @@ mod tests {
         // Несуществующий порт, чтобы получить connection refused / timeout.
         // Главное проверить что вызов НЕ паникует и возвращает 0 успехов.
         let c = CacheClient::new(vec!["http://127.0.0.1:1".into()]);
-        let ok = c
-            .invalidate_files("ut", &["src/X.bsl".to_string()])
-            .await;
+        let ok = c.invalidate_files("ut", &["src/X.bsl".to_string()]).await;
         assert_eq!(ok, 0);
     }
 }

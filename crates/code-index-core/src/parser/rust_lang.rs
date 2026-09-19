@@ -1,14 +1,21 @@
 use anyhow::{anyhow, Result};
 
-use super::types::{
-    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
-};
-use super::LanguageParser;
 use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
+use super::types::{
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+    PARSE_TIMEOUT_MS,
+};
+use super::LanguageParser;
 
 /// Парсер Rust-файлов на основе tree-sitter
 pub struct RustParser;
+
+impl Default for RustParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RustParser {
     pub fn new() -> Self {
@@ -41,12 +48,10 @@ fn find_child_by_kind<'a>(
     kind: &str,
 ) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
+    let found = node
+        .children(&mut cursor)
+        .find(|&child| child.kind() == kind);
+    found
 }
 
 /// Извлечь doc-комментарий, предшествующий узлу: цепочку `line_comment`,
@@ -261,14 +266,7 @@ fn visit_function(
     if let Some(body_node) = node.child_by_field_name("body") {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
-            visit_node(
-                child,
-                ctx,
-                impl_type,
-                Some(&func_name),
-                body_node.kind(),
-                1,
-            );
+            visit_node(child, ctx, impl_type, Some(&func_name), body_node.kind(), 1);
         }
     }
 }
@@ -289,8 +287,7 @@ fn visit_impl(
         .map(|n| node_text(n, source).to_string())
         // Если поле "type" не найдено — ищем первый type_identifier
         .or_else(|| {
-            find_child_by_kind(node, "type_identifier")
-                .map(|n| node_text(n, source).to_string())
+            find_child_by_kind(node, "type_identifier").map(|n| node_text(n, source).to_string())
         })
         .unwrap_or_default();
 
@@ -462,7 +459,8 @@ fn visit_use(node: tree_sitter::Node, ctx: &mut VisitContext) {
     let line = node.start_position().row + 1;
 
     // Ищем use_tree — дочерний узел use_declaration
-    if let Some(use_tree) = node.child_by_field_name("argument")
+    if let Some(use_tree) = node
+        .child_by_field_name("argument")
         .or_else(|| find_child_by_kind(node, "use_tree"))
         .or_else(|| find_child_by_kind(node, "scoped_use_list"))
         .or_else(|| find_child_by_kind(node, "identifier"))
@@ -495,21 +493,22 @@ fn collect_use_tree(
                 .map(|n| node_text(n, source).to_string());
 
             // Путь (поле path или первый scoped_identifier/identifier)
-            let path_node = node.child_by_field_name("path")
+            let path_node = node
+                .child_by_field_name("path")
                 .or_else(|| find_child_by_kind(node, "scoped_identifier"))
                 .or_else(|| find_child_by_kind(node, "identifier"));
 
             // Список вложенных деревьев (группа в {})
-            let list_node = node.child_by_field_name("list")
+            let list_node = node
+                .child_by_field_name("list")
                 .or_else(|| find_child_by_kind(node, "use_tree_list"));
 
             // Звёздочка
-            let has_star = find_child_by_kind(node, "use_wildcard").is_some()
-                || {
-                    let mut cur = node.walk();
-                    let found = node.children(&mut cur).any(|c| node_text(c, source) == "*");
-                    found
-                };
+            let has_star = find_child_by_kind(node, "use_wildcard").is_some() || {
+                let mut cur = node.walk();
+                let found = node.children(&mut cur).any(|c| node_text(c, source) == "*");
+                found
+            };
 
             // Формируем накопленный путь для данного узла
             let current_path = if let Some(pn) = path_node {
@@ -536,7 +535,11 @@ fn collect_use_tree(
                 let (module, name) = split_use_path(&current_path);
                 let _ = name;
                 ctx.imports.push(ParsedImport {
-                    module: if module.is_empty() { None } else { Some(module) },
+                    module: if module.is_empty() {
+                        None
+                    } else {
+                        Some(module)
+                    },
                     name: Some("*".to_string()),
                     alias,
                     line,
@@ -546,7 +549,11 @@ fn collect_use_tree(
                 // Простой путь: use std::path::Path
                 let (module, name) = split_use_path(&current_path);
                 ctx.imports.push(ParsedImport {
-                    module: if module.is_empty() { None } else { Some(module) },
+                    module: if module.is_empty() {
+                        None
+                    } else {
+                        Some(module)
+                    },
                     name: if name.is_empty() { None } else { Some(name) },
                     alias,
                     line,
@@ -564,7 +571,11 @@ fn collect_use_tree(
             };
             let (module, name) = split_use_path(&full_path);
             ctx.imports.push(ParsedImport {
-                module: if module.is_empty() { None } else { Some(module) },
+                module: if module.is_empty() {
+                    None
+                } else {
+                    Some(module)
+                },
                 name: if name.is_empty() { None } else { Some(name) },
                 alias: None,
                 line,
@@ -587,7 +598,10 @@ fn collect_use_tree(
             // Для неожиданных типов — пробуем обработать дочерние
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if matches!(child.kind(), "use_tree" | "scoped_identifier" | "identifier") {
+                if matches!(
+                    child.kind(),
+                    "use_tree" | "scoped_identifier" | "identifier"
+                ) {
                     collect_use_tree(child, source, line, prefix, ctx);
                 }
             }
@@ -607,11 +621,7 @@ fn split_use_path(path: &str) -> (String, String) {
 }
 
 /// Обработать call_expression: func(args)
-fn visit_call_expr(
-    node: tree_sitter::Node,
-    ctx: &mut VisitContext,
-    current_func: Option<&str>,
-) {
+fn visit_call_expr(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Option<&str>) {
     let source = ctx.source;
     let line = node.start_position().row + 1;
 
@@ -625,15 +635,15 @@ fn visit_call_expr(
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall {
+        caller,
+        callee,
+        line,
+    });
 }
 
 /// Обработать method_call_expression: receiver.method(args)
-fn visit_method_call(
-    node: tree_sitter::Node,
-    ctx: &mut VisitContext,
-    current_func: Option<&str>,
-) {
+fn visit_method_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Option<&str>) {
     let source = ctx.source;
     let line = node.start_position().row + 1;
 
@@ -650,7 +660,11 @@ fn visit_method_call(
     let callee = method_name;
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall {
+        caller,
+        callee,
+        line,
+    });
 }
 
 /// Обработать static_item и const_item → variables
@@ -727,7 +741,6 @@ fn parse_rust(source: &str) -> Result<ParseResult> {
 
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
-
 
     // Количество строк
     let lines_total = source.lines().count();
@@ -832,7 +845,9 @@ fn run(&self, x: &str) -> Result<()> {
             assert!(names.contains(&expected), "{expected} не найден: {names:?}");
         }
         assert!(
-            !names.iter().any(|n| n.contains('(') || n.contains('\n') || n.contains("::")),
+            !names
+                .iter()
+                .any(|n| n.contains('(') || n.contains('\n') || n.contains("::")),
             "в callee попал текст выражения: {names:?}"
         );
     }

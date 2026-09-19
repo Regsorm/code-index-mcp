@@ -27,6 +27,8 @@ use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use super::BytesTextExt;
+
 /// Один обработчик события формы.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormHandler {
@@ -209,15 +211,13 @@ pub fn parse_form_xml(content: &str) -> Result<Vec<FormHandler>> {
                 // Атрибут `name` есть и у тега события (там это имя события),
                 // и у тегов элементов формы (там это имя элемента).
                 let mut name_value: Option<String> = None;
-                for attr in e.attributes().with_checks(false) {
-                    if let Ok(a) = attr {
-                        if local_name(a.key.as_ref()) == "name" {
-                            let v = a
-                                .unescape_value()
-                                .map(|s| s.into_owned())
-                                .unwrap_or_default();
-                            name_value = Some(v);
-                        }
+                for a in e.attributes().with_checks(false).flatten() {
+                    if local_name(a.key.as_ref()) == "name" {
+                        let v = a
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                            .map(|s| s.into_owned())
+                            .unwrap_or_default();
+                        name_value = Some(v);
                     }
                 }
                 if local == "Event" {

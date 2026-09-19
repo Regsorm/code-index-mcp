@@ -23,11 +23,11 @@ enrichment = ["bsl-extension/enrichment"]
 
 [dependencies]
 # Ядро code-index — даёт CLI-конструкцию, реестры и MCP-сервер.
-code-index-core = { path = "../code-index-core" }
+code-index-core = { path = "../code-index-core", version = "1.2.3" }
 
 # Расширение для 1С — регистрируется в `main()` и активируется
 # conditional registration'ом при наличии `language = "bsl"` в TOML.
-bsl-extension = { path = "../bsl-extension" }
+bsl-extension = { path = "../bsl-extension", version = "1.2.3" }
 
 # Те же runtime-зависимости, что у публичного code-index.
 clap = { workspace = true }

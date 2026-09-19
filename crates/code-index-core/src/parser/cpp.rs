@@ -8,6 +8,12 @@ use super::LanguageParser;
 /// call_expression/preproc_include плюс class_specifier с телом-методами и namespace).
 pub struct CppParser;
 
+impl Default for CppParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CppParser {
     pub fn new() -> Self {
         CppParser

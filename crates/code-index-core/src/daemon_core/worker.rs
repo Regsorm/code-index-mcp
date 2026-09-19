@@ -15,7 +15,7 @@ use crate::extension::{LanguageProcessor, ProcessorRegistry};
 use crate::indexer::config::IndexConfig;
 use crate::indexer::file_types::{categorize_file_in_repo, FileCategory};
 use crate::indexer::hasher;
-use crate::indexer::Indexer;
+use crate::indexer::{CodeWriteParams, ContentInput, Indexer, TextWriteParams};
 use crate::parser::text::TextParser;
 use crate::parser::LanguageParser;
 use crate::parser::ParserRegistry;
@@ -91,6 +91,23 @@ struct BatchContext<'a> {
     stop: &'a AtomicBool,
 }
 
+struct ApplyContext<'a> {
+    root: &'a Path,
+    registry: &'a ParserRegistry,
+    max_code_file_size: usize,
+    max_file_size: usize,
+    repo_language: Option<&'a str>,
+    extra_text_extensions: &'a [String],
+    exclude_dirs: &'a [String],
+}
+
+pub(crate) struct WorkerOptions {
+    pub initial_limiter: Option<Arc<Semaphore>>,
+    pub indexer_section: IndexerSection,
+    pub processor_registry: Option<Arc<ProcessorRegistry>>,
+    pub cache_client: Option<Arc<CacheClient>>,
+}
+
 /// Паузы перед повторной попыткой прочитать занятый файл, в секундах. Длина
 /// массива — и есть предел числа повторов: в сумме они покрывают выгрузку
 /// примерно на две минуты, дальше файл отпускается с записью в журнал.
@@ -136,7 +153,7 @@ fn process_batch(
     // сверкой mtime на стороне cache-ci. Best-effort.
     if let Some(cc) = ctx.cache_client {
         if !cc.is_empty() {
-            let dirty = collect_dirty_paths(ctx.path, &batch);
+            let dirty = collect_dirty_paths(ctx.path, batch);
             if !dirty.is_empty() {
                 let cc_clone = cc.clone();
                 let repo = ctx.entry.effective_alias();
@@ -155,7 +172,9 @@ fn process_batch(
     let mut extras_ms: u128 = 0;
 
     tokio_block_on(async {
-        ctx.state.set_status(ctx.path, PathStatus::ReindexingBatch).await;
+        ctx.state
+            .set_status(ctx.path, PathStatus::ReindexingBatch)
+            .await;
         ctx.state
             .set_progress(ctx.path, Progress::new(0, batch.len()))
             .await;
@@ -186,7 +205,11 @@ fn process_batch(
     );
 
     if let Err(e) = storage.begin_batch() {
-        tracing::error!("[{}] не удалось начать транзакцию пакета: {}", ctx.path.display(), e);
+        tracing::error!(
+            "[{}] не удалось начать транзакцию пакета: {}",
+            ctx.path.display(),
+            e
+        );
         // Транзакцию начать не удалось — данные батча НЕ применены. Не выдаём
         // Ready (был бы ложный «готово» на старом срезе). Помечаем Error и
         // выходим из воркера: сторож в runner перезапустит его со свежим
@@ -214,21 +237,20 @@ fn process_batch(
     // Имена не применённых файлов для сводки: без них в журнале видно только
     // «сбоев N», и выяснять, какие это файлы, приходится с включённой отладкой.
     let mut stuck_names: Vec<String> = Vec::new();
+    let apply_ctx = ApplyContext {
+        root: ctx.path,
+        registry: ctx.registry,
+        max_code_file_size: ctx.max_code_file_size,
+        max_file_size: ctx.index_config.max_file_size,
+        repo_language: ctx.repo_language,
+        extra_text_extensions: ctx.extra_text_extensions,
+        exclude_dirs: &ctx.index_config.exclude_dirs,
+    };
     for event in batch {
         if ctx.stop.load(Ordering::Acquire) {
             break;
         }
-        match apply_event(
-            storage,
-            ctx.path,
-            event,
-            ctx.registry,
-            ctx.max_code_file_size,
-            ctx.index_config.max_file_size,
-            ctx.repo_language,
-            ctx.extra_text_extensions,
-            &ctx.index_config.exclude_dirs,
-        ) {
+        match apply_event(storage, event, &apply_ctx) {
             ApplyOutcome::Applied => {}
             ApplyOutcome::Failed => {
                 failed += 1;
@@ -242,7 +264,7 @@ fn process_batch(
             }
         }
         done += 1;
-        if done % 50 == 0 || done == batch_len {
+        if done.is_multiple_of(50) || done == batch_len {
             tokio_block_on(async {
                 ctx.state
                     .set_progress(ctx.path, Progress::new(done, batch_len))
@@ -304,7 +326,11 @@ fn process_batch(
     let commit_ok = match storage.commit_batch() {
         Ok(()) => true,
         Err(e) => {
-            tracing::error!("[{}] не удалось зафиксировать пакет: {}", ctx.path.display(), e);
+            tracing::error!(
+                "[{}] не удалось зафиксировать пакет: {}",
+                ctx.path.display(),
+                e
+            );
             // Фиксация не удалась — данных батча в базе НЕТ. Откатываем, чтобы
             // соединение не осталось с открытой транзакцией (SQLITE_BUSY на
             // COMMIT её не снимает) и следующий begin_batch не упал.
@@ -341,29 +367,26 @@ fn process_batch(
             let mut deleted_paths: Vec<PathBuf> = Vec::new();
             for event in processed_batch {
                 match event {
-                    FileEvent::Modified(p) | FileEvent::Created(p) => {
-                        changed_paths.push(p.clone())
-                    }
+                    FileEvent::Modified(p) | FileEvent::Created(p) => changed_paths.push(p.clone()),
                     FileEvent::Deleted(p) => deleted_paths.push(p.clone()),
                 }
             }
             let t0 = std::time::Instant::now();
-            match proc.index_extras_for_files(
-                ctx.path,
-                storage,
-                &changed_paths,
-                &deleted_paths,
-            ) {
+            match proc.index_extras_for_files(ctx.path, storage, &changed_paths, &deleted_paths) {
                 Ok(()) => tracing::info!(
                     "[{}] надстройка обновлена точечно за {} мс (изменено {}, удалено {})",
-                    ctx.path.display(), t0.elapsed().as_millis(),
-                    changed_paths.len(), deleted_paths.len()
+                    ctx.path.display(),
+                    t0.elapsed().as_millis(),
+                    changed_paths.len(),
+                    deleted_paths.len()
                 ),
                 Err(e) => {
                     tracing::warn!(
                         "[{}] точечное обновление надстройки процессора «{}» упало: {}. \
                          Базовая индексация при этом сохранена.",
-                        ctx.path.display(), proc.name(), e
+                        ctx.path.display(),
+                        proc.name(),
+                        e
                     );
                     extras_ok = false;
                 }
@@ -421,7 +444,9 @@ fn process_batch_full_pass(
 
     // Сборщик надстройки участвует только в полном разборе — здесь он уместен
     // ровно так же, как при индексации на старте демона.
-    let parse_collector = ctx.resolved_processor.and_then(|proc| proc.parse_collector());
+    let parse_collector = ctx
+        .resolved_processor
+        .and_then(|proc| proc.parse_collector());
     let core_ok = {
         let mut indexer = Indexer::with_config(storage, ctx.index_config.clone());
         match indexer.full_reindex_with_collector_and_stop(
@@ -552,7 +577,11 @@ fn finish_batch(
     // в себя, WAL не уменьшает. checkpoint_truncate реально схлопывает WAL.
     let wal_started = std::time::Instant::now();
     if let Err(e) = storage.checkpoint_truncate() {
-        tracing::warn!("[{}] схлопывание журнала WAL не удалось: {}", ctx.path.display(), e);
+        tracing::warn!(
+            "[{}] схлопывание журнала WAL не удалось: {}",
+            ctx.path.display(),
+            e
+        );
     }
     // Схлопывание журнала WAL — то же самое, что «сброс на диск» у полной
     // индексации: отдельным этапом не выносим, показываем в итоговой строке.
@@ -593,9 +622,15 @@ fn finish_batch(
         .sum::<u128>();
     let mut parts = vec![format!("ядро {}", crate::logging::human_ms(core_ms))];
     if extras_ms > 0 {
-        parts.push(format!("надстройка {}", crate::logging::human_ms(extras_ms)));
+        parts.push(format!(
+            "надстройка {}",
+            crate::logging::human_ms(extras_ms)
+        ));
     }
-    parts.push(format!("сброс на диск {}", crate::logging::human_ms(flush_ms)));
+    parts.push(format!(
+        "сброс на диск {}",
+        crate::logging::human_ms(flush_ms)
+    ));
 
     tracing::info!(
         target: crate::logging::SUMMARY_TARGET,
@@ -679,23 +714,30 @@ fn mark_incomplete(storage: &Storage, path: &Path) {
 /// используется, cache-ci работает только по TTL fallback. Если задан — после
 /// каждого успешного `commit_batch()` worker асинхронно шлёт
 /// `POST /invalidate {file_paths: [...]}` со списком файлов batch'а.
-pub fn run_worker(
+pub(crate) fn run_worker(
     entry: PathEntry,
     state: DaemonState,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     stop: Arc<AtomicBool>,
-    initial_limiter: Option<Arc<Semaphore>>,
-    indexer_section: IndexerSection,
-    processor_registry: Option<Arc<ProcessorRegistry>>,
-    cache_client: Option<Arc<CacheClient>>,
+    options: WorkerOptions,
 ) {
+    let WorkerOptions {
+        initial_limiter,
+        indexer_section,
+        processor_registry,
+        cache_client,
+    } = options;
     if shutdown_received(&mut shutdown_rx, &stop) {
         return;
     }
     let path = match entry.path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            fail_worker(&state, &entry.path, format!("Не удалось разрешить путь: {}", e));
+            fail_worker(
+                &state,
+                &entry.path,
+                format!("Не удалось разрешить путь: {}", e),
+            );
             return;
         }
     };
@@ -884,7 +926,9 @@ pub fn run_worker(
         if let Err(e) = proc.migrate_schema(storage.conn()) {
             tracing::warn!(
                 "[{}] миграция схемы процессора «{}» упала: {}",
-                path.display(), proc.name(), e
+                path.display(),
+                proc.name(),
+                e
             );
         }
         let exts = proc.schema_extensions();
@@ -893,12 +937,16 @@ pub fn run_worker(
                 tracing::warn!(
                     "[{}] расширение схемы процессора «{}» упало: {}. \
                      Базовая индексация продолжится, но инструменты надстройки могут не работать.",
-                    path.display(), proc.name(), e
+                    path.display(),
+                    proc.name(),
+                    e
                 );
             } else {
                 tracing::info!(
                     "[{}] схема процессора «{}» применена ({} команд)",
-                    path.display(), proc.name(), exts.len()
+                    path.display(),
+                    proc.name(),
+                    exts.len()
                 );
             }
         }
@@ -951,7 +999,11 @@ pub fn run_worker(
                 "[{}] {}: просмотрено {} файлов за {} мс — записано {}, без изменений {}, \
                  не индексируется {}, удалено {}",
                 path.display(),
-                if db_has_rows { "проверка изменений при старте закончена" } else { "первичная индексация закончена" },
+                if db_has_rows {
+                    "проверка изменений при старте закончена"
+                } else {
+                    "первичная индексация закончена"
+                },
                 result.files_scanned,
                 result.elapsed_ms,
                 result.files_indexed,
@@ -1037,8 +1089,11 @@ pub fn run_worker(
                     tracing::info!(
                         "[{}] надстройка процессора «{}» обновлена точечно на старте за {} мс \
                          (изменено {}, удалено {})",
-                        path.display(), proc.name(), t0.elapsed().as_millis(),
-                        changed.len(), deleted.len()
+                        path.display(),
+                        proc.name(),
+                        t0.elapsed().as_millis(),
+                        changed.len(),
+                        deleted.len()
                     );
                 }
                 Err(e) => {
@@ -1047,7 +1102,9 @@ pub fn run_worker(
                     tracing::warn!(
                         "[{}] точечное обновление надстройки процессора «{}» на старте упало: {}. \
                          Переходим на полный пересбор.",
-                        path.display(), proc.name(), e
+                        path.display(),
+                        proc.name(),
+                        e
                     );
                 }
             }
@@ -1061,7 +1118,8 @@ pub fn run_worker(
             tracing::info!(
                 "[{}] начат полный пересбор надстройки процессора «{}» \
                  (на больших конфигурациях занимает минуты)",
-                path.display(), proc.name()
+                path.display(),
+                proc.name()
             );
             let full_outcome = proc.index_extras(&path, &mut storage);
             extras_ms = t0.elapsed().as_millis();
@@ -1069,12 +1127,16 @@ pub fn run_worker(
                 tracing::warn!(
                     "[{}] полный пересбор надстройки процессора «{}» упал: {}. \
                      Базовая индексация при этом сохранена.",
-                    path.display(), proc.name(), e
+                    path.display(),
+                    proc.name(),
+                    e
                 );
             } else {
                 tracing::info!(
                     "[{}] полный пересбор надстройки процессора «{}» выполнен за {} мс",
-                    path.display(), proc.name(), extras_ms
+                    path.display(),
+                    proc.name(),
+                    extras_ms
                 );
             }
         }
@@ -1092,7 +1154,11 @@ pub fn run_worker(
     let flush_started = std::time::Instant::now();
     if worked_in_memory {
         if let Err(e) = storage.flush_to_disk(&db_path) {
-            tracing::warn!("[{}] сброс базы из памяти на диск не удался: {}", path.display(), e);
+            tracing::warn!(
+                "[{}] сброс базы из памяти на диск не удался: {}",
+                path.display(),
+                e
+            );
         }
         drop(storage);
         storage = match Storage::open_file(&db_path) {
@@ -1122,12 +1188,20 @@ pub fn run_worker(
                 path.display(),
                 crate::logging::human_bytes(b),
                 crate::logging::human_bytes(a),
-                if released { "выполнен" } else { "система такого не умеет" }
+                if released {
+                    "выполнен"
+                } else {
+                    "система такого не умеет"
+                }
             ),
             _ => tracing::info!(
                 "[{}] возврат памяти системе: {}",
                 path.display(),
-                if released { "выполнен" } else { "система такого не умеет" }
+                if released {
+                    "выполнен"
+                } else {
+                    "система такого не умеет"
+                }
             ),
         }
     }
@@ -1136,22 +1210,25 @@ pub fn run_worker(
     // репо с 90k+ файлов). `PRAGMA wal_autocheckpoint=500` не гарантирует
     // физическое уменьшение файла — нужен явный TRUNCATE.
     match storage.checkpoint_truncate() {
-        Ok((busy, log_pages, _)) if busy == 0 => {
+        Ok((0, log_pages, _)) => {
             tracing::info!(
                 "[{}] журнал WAL схлопнут: вытеснено страниц {}",
-                path.display(), log_pages
+                path.display(),
+                log_pages
             );
         }
         Ok((busy, _, _)) => {
             tracing::info!(
                 "[{}] журнал WAL схлопнут частично (занято читателями: {})",
-                path.display(), busy
+                path.display(),
+                busy
             );
         }
         Err(e) => {
             tracing::warn!(
                 "[{}] схлопывание журнала WAL после первичной индексации не удалось: {}",
-                path.display(), e
+                path.display(),
+                e
             );
         }
     }
@@ -1163,16 +1240,21 @@ pub fn run_worker(
     // надстройка растёт быстрее ядра.
     let flush_ms = flush_started.elapsed().as_millis();
     let whole_ms = whole_started.elapsed().as_millis();
-    let others_ms = whole_ms.saturating_sub(
-        reindex.elapsed_ms as u128 + extras_ms + flush_ms,
-    );
-    let mut parts = vec![
-        format!("ядро {}", crate::logging::human_ms(reindex.elapsed_ms as u128)),
-    ];
+    let others_ms = whole_ms.saturating_sub(reindex.elapsed_ms as u128 + extras_ms + flush_ms);
+    let mut parts = vec![format!(
+        "ядро {}",
+        crate::logging::human_ms(reindex.elapsed_ms as u128)
+    )];
     if extras_ms > 0 {
-        parts.push(format!("надстройка {}", crate::logging::human_ms(extras_ms)));
+        parts.push(format!(
+            "надстройка {}",
+            crate::logging::human_ms(extras_ms)
+        ));
     }
-    parts.push(format!("сброс на диск {}", crate::logging::human_ms(flush_ms)));
+    parts.push(format!(
+        "сброс на диск {}",
+        crate::logging::human_ms(flush_ms)
+    ));
     // «Прочее» — освобождение памяти под разобранные файлы и переходы между
     // шагами. Показываем, только когда оно заметно, иначе слагаемые не сходятся
     // с полным временем и в это упирается первый же читатель журнала.
@@ -1242,7 +1324,9 @@ pub fn run_worker(
 
     tracing::info!(
         "[{}] слежение за файлами включено (пауза после события {} мс, окно пакета {} мс)",
-        path.display(), debounce_ms, batch_ms
+        path.display(),
+        debounce_ms,
+        batch_ms
     );
 
     let registry = ParserRegistry::from_languages(&index_config.languages);
@@ -1353,9 +1437,16 @@ pub fn run_worker(
         }
     }
 
-    tracing::info!("[{}] остановка worker'а, завершающее схлопывание журнала WAL", path.display());
+    tracing::info!(
+        "[{}] остановка worker'а, завершающее схлопывание журнала WAL",
+        path.display()
+    );
     if let Err(e) = storage.checkpoint_truncate() {
-        tracing::warn!("[{}] завершающее схлопывание журнала WAL не удалось: {}", path.display(), e);
+        tracing::warn!(
+            "[{}] завершающее схлопывание журнала WAL не удалось: {}",
+            path.display(),
+            e
+        );
     }
 }
 
@@ -1439,9 +1530,11 @@ fn batch_outcome(
         ));
     }
     if !extras_ok {
-        return Err("базовый индекс обновлён, но слой extras не пересобран — граф вызовов \
+        return Err(
+            "базовый индекс обновлён, но слой extras не пересобран — граф вызовов \
              и связи данных отстают, см. журнал демона"
-            .to_string());
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -1557,18 +1650,21 @@ mod tests {
 
         let mut storage = Storage::open_in_memory().unwrap();
         let registry = ParserRegistry::new_all();
+        let apply_ctx = ApplyContext {
+            root: &root,
+            registry: &registry,
+            max_code_file_size: 5 * 1024 * 1024,
+            max_file_size: 1024,
+            repo_language: None,
+            extra_text_extensions: &[],
+            exclude_dirs: &[],
+        };
 
         for name in ["big.json", "small.json"] {
             apply_event(
                 &mut storage,
-                &root,
                 &FileEvent::Created(root.join(name)),
-                &registry,
-                5 * 1024 * 1024,
-                1024, // max_file_size — 1 КБ
-                None,
-                &[],
-                &[],
+                &apply_ctx,
             );
         }
 
@@ -1596,17 +1692,20 @@ mod tests {
         let mut storage = Storage::open_in_memory().unwrap();
         let registry = ParserRegistry::new_all();
         let exclude_dirs = vec!["vendor".to_string()];
+        let apply_ctx = ApplyContext {
+            root: &root,
+            registry: &registry,
+            max_code_file_size: 5 * 1024 * 1024,
+            max_file_size: 1024 * 1024,
+            repo_language: None,
+            extra_text_extensions: &[],
+            exclude_dirs: &exclude_dirs,
+        };
 
         let outcome = apply_event(
             &mut storage,
-            &root,
             &FileEvent::Created(root.join("vendor")),
-            &registry,
-            5 * 1024 * 1024,
-            1024 * 1024,
-            None,
-            &[],
-            &exclude_dirs,
+            &apply_ctx,
         );
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert!(
@@ -1628,24 +1727,30 @@ mod tests {
         let mut storage = Storage::open_in_memory().unwrap();
         let registry = ParserRegistry::new_all();
         let exclude_dirs = vec!["vendor".to_string()];
+        let apply_ctx = ApplyContext {
+            root: &root,
+            registry: &registry,
+            max_code_file_size: 5 * 1024 * 1024,
+            max_file_size: 1024 * 1024,
+            repo_language: None,
+            extra_text_extensions: &[],
+            exclude_dirs: &exclude_dirs,
+        };
 
         apply_event(
             &mut storage,
-            &root,
             &FileEvent::Created(root.join("app")),
-            &registry,
-            5 * 1024 * 1024,
-            1024 * 1024,
-            None,
-            &[],
-            &exclude_dirs,
+            &apply_ctx,
         );
         assert!(
             storage.get_file_by_path("app/main.py").unwrap().is_some(),
             "обычный файл из созданной папки обязан попасть в индекс"
         );
         assert!(
-            storage.get_file_by_path("app/vendor/x.py").unwrap().is_none(),
+            storage
+                .get_file_by_path("app/vendor/x.py")
+                .unwrap()
+                .is_none(),
             "файл из вложенной исключённой папки не должен попасть в индекс"
         );
     }
@@ -1663,10 +1768,12 @@ mod tests {
     #[tokio::test]
     async fn свободный_слот_выдаётся() {
         let sem = Arc::new(Semaphore::new(1));
-        assert!(acquire_initial_slot(Some(sem), Arc::new(AtomicBool::new(false)))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            acquire_initial_slot(Some(sem), Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Регресс S-4: на закрытом семафоре раньше была паника `expect("semaphore
@@ -1719,10 +1826,12 @@ mod tests {
                 state,
                 shutdown_tx.subscribe(),
                 stop,
-                None,
-                cfg.indexer,
-                None,
-                None,
+                WorkerOptions {
+                    initial_limiter: None,
+                    indexer_section: cfg.indexer,
+                    processor_registry: None,
+                    cache_client: None,
+                },
             );
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), handle)
@@ -1781,8 +1890,7 @@ mod tests {
     fn созревший_повтор_попадает_в_пачку_сам() {
         let now = std::time::Instant::now();
         let mut retries = std::collections::HashMap::new();
-        let mut busy = Vec::new();
-        busy.push(занятый("C:/repo/Configuration.xml"));
+        let busy = vec![занятый("C:/repo/Configuration.xml")];
         note_busy_retries(&mut retries, &[], busy, now, Path::new("C:/repo"));
 
         // Сразу срок не подошёл — пачка пустая.
@@ -1809,11 +1917,8 @@ mod tests {
             now - std::time::Duration::from_secs(600),
             Path::new("C:/repo"),
         );
-        let (пачка, добавлено) = with_due_retries(
-            vec![занятый("C:/repo/Configuration.xml")],
-            &retries,
-            now,
-        );
+        let (пачка, добавлено) =
+            with_due_retries(vec![занятый("C:/repo/Configuration.xml")], &retries, now);
         assert_eq!(добавлено, 0);
         assert_eq!(пачка.len(), 1);
     }
@@ -1825,11 +1930,23 @@ mod tests {
         let now = std::time::Instant::now();
         let mut retries = std::collections::HashMap::new();
         let событие = занятый("C:/repo/Configuration.xml");
-        note_busy_retries(&mut retries, &[], vec![событие.clone()], now, Path::new("C:/repo"));
+        note_busy_retries(
+            &mut retries,
+            &[],
+            vec![событие.clone()],
+            now,
+            Path::new("C:/repo"),
+        );
         assert_eq!(retries.len(), 1);
 
         // Тот же файл в пачке, среди занятых его нет — значит применён.
-        note_busy_retries(&mut retries, &[событие], Vec::new(), now, Path::new("C:/repo"));
+        note_busy_retries(
+            &mut retries,
+            &[событие],
+            Vec::new(),
+            now,
+            Path::new("C:/repo"),
+        );
         assert!(retries.is_empty());
     }
 
@@ -1866,7 +1983,10 @@ mod tests {
         // Ровно то, что делает сервер выдачи: создать файл со схемой и закрыть.
         drop(Storage::open_file(&db).unwrap());
         assert!(db.exists(), "файл базы создан");
-        assert!(!db_has_data(&db), "схема без записей — это не проиндексированная папка");
+        assert!(
+            !db_has_data(&db),
+            "схема без записей — это не проиндексированная папка"
+        );
 
         let storage = Storage::open_file(&db).unwrap();
         storage
@@ -1881,10 +2001,7 @@ mod tests {
     }
 }
 
-fn shutdown_received(
-    rx: &mut tokio::sync::broadcast::Receiver<()>,
-    stop: &AtomicBool,
-) -> bool {
+fn shutdown_received(rx: &mut tokio::sync::broadcast::Receiver<()>, stop: &AtomicBool) -> bool {
     stop.load(Ordering::Acquire) || matches!(rx.try_recv(), Ok(()))
 }
 
@@ -2032,7 +2149,9 @@ fn dir_name_excluded(name: &str, exclude_dirs: &[String]) -> bool {
 fn dir_path_excluded(root: &Path, dir: &Path, exclude_dirs: &[String]) -> bool {
     let rel = dir.strip_prefix(root).unwrap_or(dir);
     rel.components().any(|c| match c {
-        std::path::Component::Normal(name) => dir_name_excluded(&name.to_string_lossy(), exclude_dirs),
+        std::path::Component::Normal(name) => {
+            dir_name_excluded(&name.to_string_lossy(), exclude_dirs)
+        }
         _ => false,
     })
 }
@@ -2046,17 +2165,14 @@ fn dir_path_excluded(root: &Path, dir: &Path, exclude_dirs: &[String]) -> bool {
 /// Исчезнувший файл (NotFound) ошибкой НЕ считается — это штатный ход
 /// atomic-save через `.tmp` → rename, иначе каждое сохранение из редактора
 /// помечало бы папку сбойной.
-fn apply_event(
-    storage: &mut Storage,
-    root: &PathBuf,
-    event: &FileEvent,
-    registry: &ParserRegistry,
-    max_code_file_size: usize,
-    max_file_size: usize,
-    repo_language: Option<&str>,
-    extra_text_extensions: &[String],
-    exclude_dirs: &[String],
-) -> ApplyOutcome {
+fn apply_event(storage: &mut Storage, event: &FileEvent, ctx: &ApplyContext<'_>) -> ApplyOutcome {
+    let root = ctx.root;
+    let registry = ctx.registry;
+    let max_code_file_size = ctx.max_code_file_size;
+    let max_file_size = ctx.max_file_size;
+    let repo_language = ctx.repo_language;
+    let extra_text_extensions = ctx.extra_text_extensions;
+    let exclude_dirs = ctx.exclude_dirs;
     match event {
         FileEvent::Modified(abs) | FileEvent::Created(abs) => {
             // Событие на существующем каталоге = папку создали или переименовали.
@@ -2069,17 +2185,7 @@ fn apply_event(
                 if dir_path_excluded(root, abs, exclude_dirs) {
                     return ApplyOutcome::Applied;
                 }
-                return apply_dir_scan(
-                    storage,
-                    root,
-                    abs,
-                    registry,
-                    max_code_file_size,
-                    max_file_size,
-                    repo_language,
-                    extra_text_extensions,
-                    exclude_dirs,
-                );
+                return apply_dir_scan(storage, abs, ctx);
             }
 
             // Правило приёма — ровно то же, что у обхода дерева: текстовый файл
@@ -2091,8 +2197,7 @@ fn apply_event(
             // содержимому выясняется ниже, при чтении, и на решение о размере
             // не влияет: двоичный файл всё равно не попадёт в индекс.
             if let Ok(meta) = std::fs::metadata(abs) {
-                let by_name =
-                    categorize_file_in_repo(abs, repo_language, extra_text_extensions);
+                let by_name = categorize_file_in_repo(abs, repo_language, extra_text_extensions);
                 if !crate::indexer::file_types::size_allowed(
                     abs,
                     &by_name,
@@ -2130,7 +2235,8 @@ fn apply_event(
             };
 
             let meta = std::fs::metadata(abs).ok();
-            let mtime = meta.as_ref()
+            let mtime = meta
+                .as_ref()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64);
@@ -2176,31 +2282,37 @@ fn apply_event(
                                 // v0.7.1: для html (и других dual-indexed языков) дополнительно пишем
                                 // raw-content в text_files — чтобы search_text/grep_text/read_file
                                 // продолжали работать как для обычного text-файла.
-                                let text_for_fts = if crate::indexer::file_types::is_dual_indexed_language(&language) {
-                                    Some(content.as_str())
-                                } else {
-                                    None
-                                };
-                                if let Err(e) = indexer.write_code_to_db(
-                                    &rel_path,
-                                    &hash,
-                                    &language,
-                                    pr.lines_total,
-                                    &pr,
-                                    false,
+                                let text_for_fts =
+                                    if crate::indexer::file_types::is_dual_indexed_language(
+                                        &language,
+                                    ) {
+                                        Some(content.as_str())
+                                    } else {
+                                        None
+                                    };
+                                if let Err(e) = indexer.write_code_to_db(CodeWriteParams {
+                                    rel_path: &rel_path,
+                                    content_hash: &hash,
+                                    language: &language,
+                                    lines_total: pr.lines_total,
+                                    parse_result: &pr,
+                                    skip_delete: false,
                                     mtime,
                                     file_size,
                                     text_for_fts,
-                                    crate::indexer::ContentInput::Raw(content.as_str()),
-                                ) {
-                                    tracing::debug!("[{}] запись кода {}: {}",
-                                        root.display(), rel_path, e);
+                                    content: ContentInput::Raw(content.as_str()),
+                                }) {
+                                    tracing::debug!(
+                                        "[{}] запись кода {}: {}",
+                                        root.display(),
+                                        rel_path,
+                                        e
+                                    );
                                     ok = false;
                                 }
                             }
                             Err(e) => {
-                                tracing::debug!("[{}] разбор {}: {}",
-                                    root.display(), rel_path, e);
+                                tracing::debug!("[{}] разбор {}: {}", root.display(), rel_path, e);
                                 ok = false;
                             }
                         }
@@ -2210,10 +2322,7 @@ fn apply_event(
                 FileCategory::Text => {
                     let text_started = std::time::Instant::now();
                     // Попробуем XML 1С — если есть BSL-блоки, пишем как код.
-                    let ext = abs
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("");
+                    let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
                     let indexed_as_code = if ext == "xml" {
                         let xml_parser = crate::parser::xml_1c::Xml1CParser;
                         if let Ok(pr) = xml_parser.parse(&content, &rel_path) {
@@ -2229,18 +2338,18 @@ fn apply_event(
                                     },
                                 );
                                 indexer
-                                    .write_code_to_db(
-                                        &rel_path,
-                                        &hash,
-                                        "xml_1c",
-                                        pr.lines_total,
-                                        &pr,
-                                        false,
+                                    .write_code_to_db(CodeWriteParams {
+                                        rel_path: &rel_path,
+                                        content_hash: &hash,
+                                        language: "xml_1c",
+                                        lines_total: pr.lines_total,
+                                        parse_result: &pr,
+                                        skip_delete: false,
                                         mtime,
                                         file_size,
-                                        None,
-                                        crate::indexer::ContentInput::Raw(content.as_str()),
-                                    )
+                                        text_for_fts: None,
+                                        content: ContentInput::Raw(content.as_str()),
+                                    })
                                     .is_ok()
                             } else {
                                 false
@@ -2254,17 +2363,21 @@ fn apply_event(
                     if !indexed_as_code {
                         let tr = TextParser::parse(&content);
                         let indexer = Indexer::new(storage);
-                        if let Err(e) = indexer.write_text_to_db(
-                            &rel_path,
-                            &hash,
-                            tr.lines_total,
-                            &tr.content,
-                            false,
+                        if let Err(e) = indexer.write_text_to_db(TextWriteParams {
+                            rel_path: &rel_path,
+                            content_hash: &hash,
+                            lines_total: tr.lines_total,
+                            content: &tr.content,
+                            skip_delete: false,
                             mtime,
                             file_size,
-                        ) {
-                            tracing::debug!("[{}] запись текста {}: {}",
-                                root.display(), rel_path, e);
+                        }) {
+                            tracing::debug!(
+                                "[{}] запись текста {}: {}",
+                                root.display(),
+                                rel_path,
+                                e
+                            );
                             ok = false;
                         }
                     }
@@ -2291,8 +2404,12 @@ fn apply_event(
                     // Провал удаления оставляет файл фантомом в выдаче —
                     // это расхождение индекса с диском, а не мелочь для тишины.
                     if let Err(e) = storage.delete_file(id) {
-                        tracing::debug!("[{}] удаление из индекса {}: {}",
-                            root.display(), rel_path, e);
+                        tracing::debug!(
+                            "[{}] удаление из индекса {}: {}",
+                            root.display(),
+                            rel_path,
+                            e
+                        );
                         ok = false;
                     }
                 }
@@ -2305,11 +2422,17 @@ fn apply_event(
                     Ok(0) => {}
                     Ok(n) => tracing::info!(
                         "[{}] каталог {} исчез — удалено файлов из индекса: {}",
-                        root.display(), rel_path, n
+                        root.display(),
+                        rel_path,
+                        n
                     ),
                     Err(e) => {
-                        tracing::warn!("[{}] удаление файлов исчезнувшего каталога {}: {}",
-                            root.display(), rel_path, e);
+                        tracing::warn!(
+                            "[{}] удаление файлов исчезнувшего каталога {}: {}",
+                            root.display(),
+                            rel_path,
+                            e
+                        );
                         ok = false;
                     }
                 }
@@ -2336,17 +2459,9 @@ fn apply_event(
 /// Возвращает худший исход по файлам внутри: `Failed`, если хоть один не
 /// применён насовсем, иначе `Busy`, если хоть один занят и ждёт повтора,
 /// иначе `Applied`.
-fn apply_dir_scan(
-    storage: &mut Storage,
-    root: &PathBuf,
-    dir: &Path,
-    registry: &ParserRegistry,
-    max_code_file_size: usize,
-    max_file_size: usize,
-    repo_language: Option<&str>,
-    extra_text_extensions: &[String],
-    exclude_dirs: &[String],
-) -> ApplyOutcome {
+fn apply_dir_scan(storage: &mut Storage, dir: &Path, ctx: &ApplyContext<'_>) -> ApplyOutcome {
+    let root = ctx.root;
+    let exclude_dirs = ctx.exclude_dirs;
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -2355,7 +2470,12 @@ fn apply_dir_scan(
             if e.kind() == std::io::ErrorKind::NotFound {
                 return ApplyOutcome::Applied;
             }
-            tracing::debug!("[{}] обход каталога {}: {}", root.display(), dir.display(), e);
+            tracing::debug!(
+                "[{}] обход каталога {}: {}",
+                root.display(),
+                dir.display(),
+                e
+            );
             // Причина та же, что у занятого файла, и лечится тем же повтором.
             return ApplyOutcome::Busy;
         }
@@ -2373,29 +2493,9 @@ fn apply_dir_scan(
             if excluded {
                 continue;
             }
-            worst = worst.worse(apply_dir_scan(
-                storage,
-                root,
-                &path,
-                registry,
-                max_code_file_size,
-                max_file_size,
-                repo_language,
-                extra_text_extensions,
-                exclude_dirs,
-            ));
+            worst = worst.worse(apply_dir_scan(storage, &path, ctx));
         } else if path.is_file() {
-            worst = worst.worse(apply_event(
-                storage,
-                root,
-                &FileEvent::Created(path.clone()),
-                registry,
-                max_code_file_size,
-                max_file_size,
-                repo_language,
-                extra_text_extensions,
-                exclude_dirs,
-            ));
+            worst = worst.worse(apply_event(storage, &FileEvent::Created(path.clone()), ctx));
         }
     }
     worst

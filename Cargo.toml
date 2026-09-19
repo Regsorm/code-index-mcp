@@ -27,7 +27,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 
 # MCP протокол
-rmcp = { version = "1.3", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "1.4", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 
 # Парсинг AST
 tree-sitter = "0.25"
@@ -49,7 +49,7 @@ tree-sitter-swift = "0.7"
 # Kotlin остаётся текстовым языком, пока не появится крейт под tree-sitter 0.25.
 
 # XML-парсинг (для выгрузок 1С)
-quick-xml = "0.37"
+quick-xml = "0.41"
 
 # База данных
 rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
@@ -65,8 +65,8 @@ schemars = "1"
 # Файловая система
 walkdir = "2"
 rayon = "1.10"
-notify = "7"
-notify-debouncer-full = "0.4"
+notify = "8"
+notify-debouncer-full = "0.7"
 
 # Хеширование
 sha2 = "0.10"
@@ -107,3 +107,8 @@ arc-swap = "1"
 
 # Тесты
 tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

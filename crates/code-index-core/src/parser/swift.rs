@@ -1,13 +1,12 @@
 use anyhow::{anyhow, Result};
 
-use super::types::{
-    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport,
-    ParsedVariable,
-};
-use super::LanguageParser;
 use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
 use super::types::PARSE_TIMEOUT_MS;
+use super::types::{
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+};
+use super::LanguageParser;
 
 /// Парсер Swift-файлов на основе tree-sitter (грамматика `tree-sitter-swift`).
 ///
@@ -17,6 +16,12 @@ use super::types::PARSE_TIMEOUT_MS;
 /// - у `call_expression` нет полей, вызываемое — первый именованный потомок;
 /// - параметры функции — отдельные узлы `parameter`, без общей обёртки.
 pub struct SwiftParser;
+
+impl Default for SwiftParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SwiftParser {
     pub fn new() -> Self {
@@ -314,7 +319,11 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall {
+        caller,
+        callee,
+        line,
+    });
 }
 
 /// Обработать property_declaration на верхнем уровне файла (`let x = ...`)
@@ -431,7 +440,10 @@ class OrderService: BaseService, Reloadable {
             .iter()
             .find(|f| f.name == "calculate")
             .expect("метод calculate должен быть найден");
-        assert_eq!(calc.qualified_name.as_deref(), Some("OrderService.calculate"));
+        assert_eq!(
+            calc.qualified_name.as_deref(),
+            Some("OrderService.calculate")
+        );
         assert!(calc.args.as_deref().unwrap().contains("retries"));
         assert_eq!(calc.return_type.as_deref(), Some("Int"));
 
@@ -508,7 +520,11 @@ protocol Runnable {
             let names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
             assert!(names.contains(&"before"), "{}: before", tag);
             assert!(names.contains(&"makeMsg"), "{}: makeMsg", tag);
-            assert!(names.contains(&"after"), "{}: after — теряется при CRLF", tag);
+            assert!(
+                names.contains(&"after"),
+                "{}: after — теряется при CRLF",
+                tag
+            );
         }
     }
 

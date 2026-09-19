@@ -31,8 +31,7 @@ pub fn file_hash(path: &Path) -> Result<(String, String, bool)> {
 /// выгрузки): 0 ложных срабатываний — реальные исходники только UTF-8,
 /// NUL не содержат.
 pub fn looks_binary(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0xFF, 0xFF, 0xFF, 0x7F])
-        || bytes.iter().take(8192).any(|&b| b == 0)
+    bytes.starts_with(&[0xFF, 0xFF, 0xFF, 0x7F]) || bytes.iter().take(8192).any(|&b| b == 0)
 }
 
 #[cfg(test)]

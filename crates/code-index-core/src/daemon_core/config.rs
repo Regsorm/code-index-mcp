@@ -551,8 +551,7 @@ pub fn load_from(path: &Path) -> anyhow::Result<DaemonFileConfig> {
 
 /// Разобрать конфиг из строки. Используется в тестах.
 pub fn parse_str(text: &str) -> anyhow::Result<DaemonFileConfig> {
-    toml::from_str(text)
-        .map_err(|e| anyhow::anyhow!("Ошибка парсинга daemon.toml: {}", e))
+    toml::from_str(text).map_err(|e| anyhow::anyhow!("Ошибка парсинга daemon.toml: {}", e))
 }
 
 /// Загрузить конфиг по пути `$CODE_INDEX_HOME/daemon.toml`. Если файла нет —
@@ -670,8 +669,8 @@ mod tests {
         let cfg = parse_str(text).unwrap();
         let e = cfg.enrichment.expect("секция [enrichment] разобралась");
         assert!(e.enabled);
-        assert_eq!(e.provider, "openai_compatible");        // default
-        assert_eq!(e.batch_size, 20);                       // default
+        assert_eq!(e.provider, "openai_compatible"); // default
+        assert_eq!(e.batch_size, 20); // default
         assert!(!e.prompt_template.is_empty(), "default-промпт не пуст");
         assert_eq!(e.url, "https://openrouter.ai/api/v1/chat/completions");
         assert_eq!(e.model, "anthropic/claude-haiku-4.5");
@@ -922,7 +921,10 @@ mod tests {
         let cfg = parse_str(text).unwrap();
         assert_eq!(cfg.cap.max_response_bytes, Some(32000));
         assert_eq!(cfg.cap.max_function_body_chars, Some(9000));
-        assert_eq!(cfg.cap.cap_tools, vec!["get_event_subscriptions", "bsl_sql"]);
+        assert_eq!(
+            cfg.cap.cap_tools,
+            vec!["get_event_subscriptions", "bsl_sql"]
+        );
         assert_eq!(cfg.cap.cap_enabled, Some(false));
         // [mcp] и [cap] не пересекаются: mass_mode пуст.
         assert!(cfg.mcp.mass_mode_tools.is_empty());

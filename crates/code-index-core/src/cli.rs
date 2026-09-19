@@ -15,7 +15,11 @@ use crate::storage::memory::StorageConfig;
 use crate::storage::Storage;
 
 #[derive(Parser)]
-#[command(name = "code-index", version, about = "Высокопроизводительный индексатор кода с MCP-протоколом")]
+#[command(
+    name = "code-index",
+    version,
+    about = "Высокопроизводительный индексатор кода с MCP-протоколом"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -475,7 +479,10 @@ async fn serve_http(
             allowed,
             crate::federation::whitelist::middleware,
         ));
-        tracing::info!("IP-whitelist активен ({} адресов, включая loopback).", count);
+        tracing::info!(
+            "IP-whitelist активен ({} адресов, включая loopback).",
+            count
+        );
     }
 
     let addr: SocketAddr = format!("{}:{}", host, port)
@@ -576,7 +583,11 @@ async fn invalidate_route(
     let paths: Vec<String> = body
         .get("file_paths")
         .and_then(|f| f.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let removed = match repo {
         // Per-file: снести только ключи, зависящие от изменённых файлов.
@@ -625,7 +636,9 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
     // перезапускает себя отвязанным от консоли, и открывать файл журнала
     // должен именно отвязанный клон (см. handle_daemon).
     match &cli.command {
-        Commands::Daemon { action: DaemonAction::Run } => {}
+        Commands::Daemon {
+            action: DaemonAction::Run,
+        } => {}
         Commands::Serve { .. } => {
             match crate::daemon_core::paths::serve_log_file() {
                 Ok(p) => {
@@ -648,11 +661,22 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
     let mut registry = Some(registry);
 
     match cli.command {
-        Commands::Serve { path, transport, host, port, config, serve_config } => {
+        Commands::Serve {
+            path,
+            transport,
+            host,
+            port,
+            config,
+            serve_config,
+        } => {
             cmd_serve(path, transport, host, port, config, serve_config, registry).await?;
         }
 
-        Commands::Index { path, path_named, force } => {
+        Commands::Index {
+            path,
+            path_named,
+            force,
+        } => {
             // Обе формы равноправны; не задана ни одна — текущий каталог,
             // как у соседних команд.
             let path = path_named.or(path).unwrap_or_else(|| ".".to_string());
@@ -663,7 +687,12 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             cmd_stats(path, json)?;
         }
 
-        Commands::Query { symbol, path, language, json } => {
+        Commands::Query {
+            symbol,
+            path,
+            language,
+            json,
+        } => {
             cmd_query(symbol, path, language, json)?;
         }
 
@@ -676,50 +705,80 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
         }
 
         // ── Новые команды: JSON-вывод ─────────────────────────────────────────
-
-        Commands::SearchFunction { query, path, language, limit } => {
+        Commands::SearchFunction {
+            query,
+            path,
+            language,
+            limit,
+        } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_functions(&query, limit, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
-        Commands::SearchClass { query, path, language, limit } => {
+        Commands::SearchClass {
+            query,
+            path,
+            language,
+            limit,
+        } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_classes(&query, limit, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
-        Commands::GetFunction { name, path, language: _ } => {
+        Commands::GetFunction {
+            name,
+            path,
+            language: _,
+        } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_function_by_name(&name)?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
-        Commands::GetClass { name, path, language: _ } => {
+        Commands::GetClass {
+            name,
+            path,
+            language: _,
+        } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_class_by_name(&name)?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
-        Commands::GetCallers { function_name, path, language } => {
+        Commands::GetCallers {
+            function_name,
+            path,
+            language,
+        } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_callers(&function_name, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
-        Commands::GetCallees { function_name, path, language } => {
+        Commands::GetCallees {
+            function_name,
+            path,
+            language,
+        } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_callees(&function_name, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
-        Commands::GetImports { path, file_id, module, language } => {
+        Commands::GetImports {
+            path,
+            file_id,
+            module,
+            language,
+        } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
 
@@ -743,7 +802,12 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
 
-        Commands::SearchText { query, path, language, limit } => {
+        Commands::SearchText {
+            query,
+            path,
+            language,
+            limit,
+        } => {
             let db_path = get_db_path(&path);
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_text(&query, limit, language.as_deref())?;
@@ -762,7 +826,13 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&json_results)?);
         }
 
-        Commands::GrepBody { path, pattern, regex, language, limit } => {
+        Commands::GrepBody {
+            path,
+            pattern,
+            regex,
+            language,
+            limit,
+        } => {
             if pattern.is_none() && regex.is_none() {
                 return Err(anyhow::anyhow!(
                     "Укажите --pattern <подстрока> или --regex <выражение>"
@@ -821,7 +891,11 @@ async fn cmd_serve(
             Some(p)
         } else {
             let p = federation::config::default_path()?;
-            if p.exists() { Some(p) } else { None }
+            if p.exists() {
+                Some(p)
+            } else {
+                None
+            }
         }
     } else {
         None
@@ -858,8 +932,7 @@ async fn cmd_serve(
         }
 
         let repos = federation::repos::merge(&serve_cfg, &daemon_cfg)?;
-        let aliases: Vec<&str> =
-            repos.iter().map(|r| r.alias.as_str()).collect();
+        let aliases: Vec<&str> = repos.iter().map(|r| r.alias.as_str()).collect();
         let local_count = repos.iter().filter(|r| r.is_local).count();
         tracing::info!(
             "Реестр федерации: {} репо ({} local, {} remote): {:?}",
@@ -930,9 +1003,8 @@ async fn cmd_serve(
 
         // Один watcher следит за согласованной парой файлов. Он запускается
         // всегда, в том числе при использовании default daemon.toml.
-        let _config_watch = crate::mcp::config_watch::spawn_federated_watch(
-            config_reloader.clone(),
-        );
+        let _config_watch =
+            crate::mcp::config_watch::spawn_federated_watch(config_reloader.clone());
 
         // Bind: --host имеет приоритет, иначе [me].ip.
         let bind_host = host.unwrap_or_else(|| serve_cfg.me.ip.clone());
@@ -987,21 +1059,23 @@ async fn cmd_serve(
         Some(reg) => {
             let mut map = std::collections::BTreeMap::new();
             for (alias, root_path, db_path) in entries {
-                let language =
-                    mono_repo_language(&alias, &root_path, config_languages.as_ref());
+                let language = mono_repo_language(&alias, &root_path, config_languages.as_ref());
                 let storage = crate::storage::StoragePool::open_file_readonly(
                     &db_path,
                     crate::storage::PoolConfig::default(),
                 )?;
-                map.insert(alias, crate::mcp::RepoEntry {
-                    root_path: Some(root_path),
-                    storage: Some(storage),
-                    ip: "127.0.0.1".to_string(),
-                    port: crate::federation::client::DEFAULT_REMOTE_PORT,
-                    is_local: true,
-                    language,
-                    processor: None,
-                });
+                map.insert(
+                    alias,
+                    crate::mcp::RepoEntry {
+                        root_path: Some(root_path),
+                        storage: Some(storage),
+                        ip: "127.0.0.1".to_string(),
+                        port: crate::federation::client::DEFAULT_REMOTE_PORT,
+                        is_local: true,
+                        language,
+                        processor: None,
+                    },
+                );
             }
             CodeIndexServer::with_repos_and_registry(map, reg)
         }
@@ -1044,14 +1118,9 @@ async fn cmd_serve(
         }
     }
 
-    let _config_watch = if let Some(cfg_path) = config.as_deref() {
-        Some(crate::mcp::config_watch::spawn_watch(
-            server.clone(),
-            cfg_path.to_path_buf(),
-        ))
-    } else {
-        None
-    };
+    let _config_watch = config.as_deref().map(|cfg_path| {
+        crate::mcp::config_watch::spawn_watch(server.clone(), cfg_path.to_path_buf())
+    });
 
     match transport.as_str() {
         "stdio" => {
@@ -1079,11 +1148,7 @@ async fn cmd_serve(
 }
 
 /// Ветка `index`: однократная индексация каталога.
-fn cmd_index(
-    path: String,
-    force: bool,
-    registry: Option<ProcessorRegistry>,
-) -> anyhow::Result<()> {
+fn cmd_index(path: String, force: bool, registry: Option<ProcessorRegistry>) -> anyhow::Result<()> {
     tracing::info!("Индексация: path={}, force={}", path, force);
 
     // 1. Разрешить путь до абсолютного
@@ -1105,16 +1170,14 @@ fn cmd_index(
     // способом, каким демон заполняет это поле на старте. Так результат
     // не зависит от того, кто индексировал: демон или эта команда.
     if config.repo_language.is_none() {
-        config.repo_language = crate::daemon_core::language_detect::detect_language(&abs_path)
-            .map(|s| s.to_string());
+        config.repo_language =
+            crate::daemon_core::language_detect::detect_language(&abs_path).map(|s| s.to_string());
     }
 
     // A2: PID-lock на целевую БД — два `index --force` по одному пути
     // не должны драться за SQLite. RAII, держится до конца команды.
-    let _index_lock = crate::daemon_core::lock::acquire_at(
-        db_dir.join("index.lock"),
-        "Индексация пути",
-    )?;
+    let _index_lock =
+        crate::daemon_core::lock::acquire_at(db_dir.join("index.lock"), "Индексация пути")?;
 
     // A1: при --force пересоздаём БД с нуля. full_reindex(force) поверх
     // большой существующей index.db патологически медленный (грузит всю
@@ -1159,11 +1222,7 @@ fn cmd_index(
     if let Some(reg) = registry.as_ref() {
         if let Some(proc) = reg.resolve(None, &abs_path) {
             if let Err(e) = proc.migrate_schema(storage.conn()) {
-                tracing::warn!(
-                    "migrate_schema процессора '{}' упал: {}",
-                    proc.name(),
-                    e
-                );
+                tracing::warn!("migrate_schema процессора '{}' упал: {}", proc.name(), e);
             }
             let exts = proc.schema_extensions();
             if !exts.is_empty() {
@@ -1234,7 +1293,7 @@ fn cmd_index(
     // журнал к файлу отношения не имеет.
     let wal_start = std::time::Instant::now();
     match Storage::open_file(&db_path).and_then(|s| s.checkpoint_truncate()) {
-        Ok((busy, log_pages, _)) if busy == 0 => {
+        Ok((0, log_pages, _)) => {
             tracing::info!(
                 "журнал WAL схлопнут за {} мс (вытеснено страниц {})",
                 wal_start.elapsed().as_millis(),
@@ -1513,7 +1572,6 @@ fn cmd_init(path: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-
 /// На Windows Rust собирается как console-subsystem приложение. При запуске
 /// в пользовательской сессии (Scheduled Task LogonType=Interactive, ручной
 /// вызов в cmd/powershell) процесс получает консольное окно и становится
@@ -1628,8 +1686,7 @@ fn print_status_text(h: &crate::daemon_core::ipc::HealthResponse) {
     println!("  uptime:    {}с", h.uptime_sec);
     println!("  папок:     {}", h.paths.len());
     for p in &h.paths {
-        let status_s = serde_json::to_string(&p.status)
-            .unwrap_or_else(|_| "\"?\"".into());
+        let status_s = serde_json::to_string(&p.status).unwrap_or_else(|_| "\"?\"".into());
         let status_s = status_s.trim_matches('"');
         let progress_s = match &p.progress {
             Some(pr) => match pr.percent {
@@ -1638,8 +1695,18 @@ fn print_status_text(h: &crate::daemon_core::ipc::HealthResponse) {
             },
             None => String::new(),
         };
-        let err_s = p.error.as_ref().map(|e| format!(" err: {}", e)).unwrap_or_default();
-        println!("    - [{}] {}{}{}", status_s, p.path.display(), progress_s, err_s);
+        let err_s = p
+            .error
+            .as_ref()
+            .map(|e| format!(" err: {}", e))
+            .unwrap_or_default();
+        println!(
+            "    - [{}] {}{}{}",
+            status_s,
+            p.path.display(),
+            progress_s,
+            err_s
+        );
     }
 }
 

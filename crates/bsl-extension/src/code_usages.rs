@@ -55,25 +55,195 @@ struct MetaForm {
 // адресуемые через менеджер коллекции в коде; чисто метаданные-объекты
 // (Subsystem, Role, …) сюда не входят — в коде так не обращаются.
 const META_FORMS: &[MetaForm] = &[
-    MetaForm { canonical: "Catalog", ru_singular: "Справочник", ru_plural: "Справочники", en_singular: "Catalog", en_plural: "Catalogs", reftypes: &["СправочникСсылка", "СправочникОбъект", "СправочникМенеджер"] },
-    MetaForm { canonical: "Document", ru_singular: "Документ", ru_plural: "Документы", en_singular: "Document", en_plural: "Documents", reftypes: &["ДокументСсылка", "ДокументОбъект", "ДокументМенеджер"] },
-    MetaForm { canonical: "Enum", ru_singular: "Перечисление", ru_plural: "Перечисления", en_singular: "Enum", en_plural: "Enums", reftypes: &["ПеречислениеСсылка", "ПеречислениеМенеджер"] },
-    MetaForm { canonical: "InformationRegister", ru_singular: "РегистрСведений", ru_plural: "РегистрыСведений", en_singular: "InformationRegister", en_plural: "InformationRegisters", reftypes: &["РегистрСведенийЗапись", "РегистрСведенийКлючЗаписи", "РегистрСведенийМенеджер", "РегистрСведенийНаборЗаписей"] },
-    MetaForm { canonical: "AccumulationRegister", ru_singular: "РегистрНакопления", ru_plural: "РегистрыНакопления", en_singular: "AccumulationRegister", en_plural: "AccumulationRegisters", reftypes: &["РегистрНакопленияЗапись", "РегистрНакопленияКлючЗаписи", "РегистрНакопленияМенеджер", "РегистрНакопленияНаборЗаписей"] },
-    MetaForm { canonical: "AccountingRegister", ru_singular: "РегистрБухгалтерии", ru_plural: "РегистрыБухгалтерии", en_singular: "AccountingRegister", en_plural: "AccountingRegisters", reftypes: &["РегистрБухгалтерииЗапись", "РегистрБухгалтерииКлючЗаписи", "РегистрБухгалтерииМенеджер", "РегистрБухгалтерииНаборЗаписей"] },
-    MetaForm { canonical: "CalculationRegister", ru_singular: "РегистрРасчета", ru_plural: "РегистрыРасчета", en_singular: "CalculationRegister", en_plural: "CalculationRegisters", reftypes: &["РегистрРасчетаЗапись", "РегистрРасчетаКлючЗаписи", "РегистрРасчетаМенеджер", "РегистрРасчетаНаборЗаписей"] },
-    MetaForm { canonical: "ChartOfCharacteristicTypes", ru_singular: "ПланВидовХарактеристик", ru_plural: "ПланыВидовХарактеристик", en_singular: "ChartOfCharacteristicTypes", en_plural: "ChartsOfCharacteristicTypes", reftypes: &["ПланВидовХарактеристикСсылка", "ПланВидовХарактеристикОбъект", "ПланВидовХарактеристикМенеджер"] },
-    MetaForm { canonical: "ChartOfAccounts", ru_singular: "ПланСчетов", ru_plural: "ПланыСчетов", en_singular: "ChartOfAccounts", en_plural: "ChartsOfAccounts", reftypes: &["ПланСчетовСсылка", "ПланСчетовОбъект", "ПланСчетовМенеджер"] },
-    MetaForm { canonical: "ChartOfCalculationTypes", ru_singular: "ПланВидовРасчета", ru_plural: "ПланыВидовРасчета", en_singular: "ChartOfCalculationTypes", en_plural: "ChartsOfCalculationTypes", reftypes: &["ПланВидовРасчетаСсылка", "ПланВидовРасчетаОбъект", "ПланВидовРасчетаМенеджер"] },
-    MetaForm { canonical: "ExchangePlan", ru_singular: "ПланОбмена", ru_plural: "ПланыОбмена", en_singular: "ExchangePlan", en_plural: "ExchangePlans", reftypes: &["ПланОбменаСсылка", "ПланОбменаОбъект", "ПланОбменаМенеджер"] },
-    MetaForm { canonical: "BusinessProcess", ru_singular: "БизнесПроцесс", ru_plural: "БизнесПроцессы", en_singular: "BusinessProcess", en_plural: "BusinessProcesses", reftypes: &["БизнесПроцессСсылка", "БизнесПроцессОбъект", "БизнесПроцессМенеджер"] },
-    MetaForm { canonical: "Task", ru_singular: "Задача", ru_plural: "Задачи", en_singular: "Task", en_plural: "Tasks", reftypes: &["ЗадачаСсылка", "ЗадачаОбъект", "ЗадачаМенеджер"] },
-    MetaForm { canonical: "Report", ru_singular: "Отчет", ru_plural: "Отчеты", en_singular: "Report", en_plural: "Reports", reftypes: &[] },
-    MetaForm { canonical: "DataProcessor", ru_singular: "Обработка", ru_plural: "Обработки", en_singular: "DataProcessor", en_plural: "DataProcessors", reftypes: &[] },
-    MetaForm { canonical: "Constant", ru_singular: "Константа", ru_plural: "Константы", en_singular: "Constant", en_plural: "Constants", reftypes: &[] },
-    MetaForm { canonical: "DocumentJournal", ru_singular: "ЖурналДокументов", ru_plural: "ЖурналыДокументов", en_singular: "DocumentJournal", en_plural: "DocumentJournals", reftypes: &["ЖурналДокументовМенеджер", "ЖурналДокументовСписок"] },
-    MetaForm { canonical: "Sequence", ru_singular: "Последовательность", ru_plural: "Последовательности", en_singular: "Sequence", en_plural: "Sequences", reftypes: &["ПоследовательностьМенеджер", "ПоследовательностьНаборЗаписей", "ПоследовательностьКлючЗаписи", "ПоследовательностьЗапись"] },
-    MetaForm { canonical: "FilterCriterion", ru_singular: "КритерийОтбора", ru_plural: "КритерииОтбора", en_singular: "FilterCriterion", en_plural: "FilterCriteria", reftypes: &["КритерийОтбораМенеджер", "КритерийОтбораСписок"] },
+    MetaForm {
+        canonical: "Catalog",
+        ru_singular: "Справочник",
+        ru_plural: "Справочники",
+        en_singular: "Catalog",
+        en_plural: "Catalogs",
+        reftypes: &["СправочникСсылка", "СправочникОбъект", "СправочникМенеджер"],
+    },
+    MetaForm {
+        canonical: "Document",
+        ru_singular: "Документ",
+        ru_plural: "Документы",
+        en_singular: "Document",
+        en_plural: "Documents",
+        reftypes: &["ДокументСсылка", "ДокументОбъект", "ДокументМенеджер"],
+    },
+    MetaForm {
+        canonical: "Enum",
+        ru_singular: "Перечисление",
+        ru_plural: "Перечисления",
+        en_singular: "Enum",
+        en_plural: "Enums",
+        reftypes: &["ПеречислениеСсылка", "ПеречислениеМенеджер"],
+    },
+    MetaForm {
+        canonical: "InformationRegister",
+        ru_singular: "РегистрСведений",
+        ru_plural: "РегистрыСведений",
+        en_singular: "InformationRegister",
+        en_plural: "InformationRegisters",
+        reftypes: &[
+            "РегистрСведенийЗапись",
+            "РегистрСведенийКлючЗаписи",
+            "РегистрСведенийМенеджер",
+            "РегистрСведенийНаборЗаписей",
+        ],
+    },
+    MetaForm {
+        canonical: "AccumulationRegister",
+        ru_singular: "РегистрНакопления",
+        ru_plural: "РегистрыНакопления",
+        en_singular: "AccumulationRegister",
+        en_plural: "AccumulationRegisters",
+        reftypes: &[
+            "РегистрНакопленияЗапись",
+            "РегистрНакопленияКлючЗаписи",
+            "РегистрНакопленияМенеджер",
+            "РегистрНакопленияНаборЗаписей",
+        ],
+    },
+    MetaForm {
+        canonical: "AccountingRegister",
+        ru_singular: "РегистрБухгалтерии",
+        ru_plural: "РегистрыБухгалтерии",
+        en_singular: "AccountingRegister",
+        en_plural: "AccountingRegisters",
+        reftypes: &[
+            "РегистрБухгалтерииЗапись",
+            "РегистрБухгалтерииКлючЗаписи",
+            "РегистрБухгалтерииМенеджер",
+            "РегистрБухгалтерииНаборЗаписей",
+        ],
+    },
+    MetaForm {
+        canonical: "CalculationRegister",
+        ru_singular: "РегистрРасчета",
+        ru_plural: "РегистрыРасчета",
+        en_singular: "CalculationRegister",
+        en_plural: "CalculationRegisters",
+        reftypes: &[
+            "РегистрРасчетаЗапись",
+            "РегистрРасчетаКлючЗаписи",
+            "РегистрРасчетаМенеджер",
+            "РегистрРасчетаНаборЗаписей",
+        ],
+    },
+    MetaForm {
+        canonical: "ChartOfCharacteristicTypes",
+        ru_singular: "ПланВидовХарактеристик",
+        ru_plural: "ПланыВидовХарактеристик",
+        en_singular: "ChartOfCharacteristicTypes",
+        en_plural: "ChartsOfCharacteristicTypes",
+        reftypes: &[
+            "ПланВидовХарактеристикСсылка",
+            "ПланВидовХарактеристикОбъект",
+            "ПланВидовХарактеристикМенеджер",
+        ],
+    },
+    MetaForm {
+        canonical: "ChartOfAccounts",
+        ru_singular: "ПланСчетов",
+        ru_plural: "ПланыСчетов",
+        en_singular: "ChartOfAccounts",
+        en_plural: "ChartsOfAccounts",
+        reftypes: &["ПланСчетовСсылка", "ПланСчетовОбъект", "ПланСчетовМенеджер"],
+    },
+    MetaForm {
+        canonical: "ChartOfCalculationTypes",
+        ru_singular: "ПланВидовРасчета",
+        ru_plural: "ПланыВидовРасчета",
+        en_singular: "ChartOfCalculationTypes",
+        en_plural: "ChartsOfCalculationTypes",
+        reftypes: &[
+            "ПланВидовРасчетаСсылка",
+            "ПланВидовРасчетаОбъект",
+            "ПланВидовРасчетаМенеджер",
+        ],
+    },
+    MetaForm {
+        canonical: "ExchangePlan",
+        ru_singular: "ПланОбмена",
+        ru_plural: "ПланыОбмена",
+        en_singular: "ExchangePlan",
+        en_plural: "ExchangePlans",
+        reftypes: &["ПланОбменаСсылка", "ПланОбменаОбъект", "ПланОбменаМенеджер"],
+    },
+    MetaForm {
+        canonical: "BusinessProcess",
+        ru_singular: "БизнесПроцесс",
+        ru_plural: "БизнесПроцессы",
+        en_singular: "BusinessProcess",
+        en_plural: "BusinessProcesses",
+        reftypes: &[
+            "БизнесПроцессСсылка",
+            "БизнесПроцессОбъект",
+            "БизнесПроцессМенеджер",
+        ],
+    },
+    MetaForm {
+        canonical: "Task",
+        ru_singular: "Задача",
+        ru_plural: "Задачи",
+        en_singular: "Task",
+        en_plural: "Tasks",
+        reftypes: &["ЗадачаСсылка", "ЗадачаОбъект", "ЗадачаМенеджер"],
+    },
+    MetaForm {
+        canonical: "Report",
+        ru_singular: "Отчет",
+        ru_plural: "Отчеты",
+        en_singular: "Report",
+        en_plural: "Reports",
+        reftypes: &[],
+    },
+    MetaForm {
+        canonical: "DataProcessor",
+        ru_singular: "Обработка",
+        ru_plural: "Обработки",
+        en_singular: "DataProcessor",
+        en_plural: "DataProcessors",
+        reftypes: &[],
+    },
+    MetaForm {
+        canonical: "Constant",
+        ru_singular: "Константа",
+        ru_plural: "Константы",
+        en_singular: "Constant",
+        en_plural: "Constants",
+        reftypes: &[],
+    },
+    MetaForm {
+        canonical: "DocumentJournal",
+        ru_singular: "ЖурналДокументов",
+        ru_plural: "ЖурналыДокументов",
+        en_singular: "DocumentJournal",
+        en_plural: "DocumentJournals",
+        reftypes: &["ЖурналДокументовМенеджер", "ЖурналДокументовСписок"],
+    },
+    MetaForm {
+        canonical: "Sequence",
+        ru_singular: "Последовательность",
+        ru_plural: "Последовательности",
+        en_singular: "Sequence",
+        en_plural: "Sequences",
+        reftypes: &[
+            "ПоследовательностьМенеджер",
+            "ПоследовательностьНаборЗаписей",
+            "ПоследовательностьКлючЗаписи",
+            "ПоследовательностьЗапись",
+        ],
+    },
+    MetaForm {
+        canonical: "FilterCriterion",
+        ru_singular: "КритерийОтбора",
+        ru_plural: "КритерииОтбора",
+        en_singular: "FilterCriterion",
+        en_plural: "FilterCriteria",
+        reftypes: &["КритерийОтбораМенеджер", "КритерийОтбораСписок"],
+    },
 ];
 
 /// Пары (форма-обращения-в-коде → имя-папки-метаданных) для резолва менеджер-
@@ -94,7 +264,14 @@ pub(crate) fn collection_folder_pairs() -> Vec<(&'static str, &'static str)> {
 /// несуществующие комбинации (`CatalogRecordSet`) не навредят — они просто не
 /// встретятся в коде.
 const EN_REF_SUFFIXES: &[&str] = &[
-    "Ref", "Object", "Manager", "List", "Selection", "RecordSet", "RecordKey", "Record",
+    "Ref",
+    "Object",
+    "Manager",
+    "List",
+    "Selection",
+    "RecordSet",
+    "RecordKey",
+    "Record",
 ];
 
 /// lower(множественная форма) → канонический префикс (только `manager`).
@@ -193,7 +370,10 @@ fn en_reftype_map() -> &'static HashMap<String, &'static str> {
         let mut m = HashMap::new();
         for f in META_FORMS {
             for suf in EN_REF_SUFFIXES {
-                m.insert(format!("{}{}", f.en_singular, suf).to_lowercase(), f.canonical);
+                m.insert(
+                    format!("{}{}", f.en_singular, suf).to_lowercase(),
+                    f.canonical,
+                );
             }
         }
         m
@@ -324,10 +504,22 @@ fn path_triples(s: &str) -> Vec<(String, String, Option<String>)> {
     out
 }
 
-fn make_usage(canonical: &str, name: &str, member: Option<String>, kind: &'static str, line: usize) -> CodeUsage {
+fn make_usage(
+    canonical: &str,
+    name: &str,
+    member: Option<String>,
+    kind: &'static str,
+    line: usize,
+) -> CodeUsage {
     let object_ref = format!("{}.{}", canonical, name);
     let object_ref_key = object_ref.to_lowercase();
-    CodeUsage { object_ref, object_ref_key, member_path: member, usage_kind: kind, line }
+    CodeUsage {
+        object_ref,
+        object_ref_key,
+        member_path: member,
+        usage_kind: kind,
+        line,
+    }
 }
 
 /// Извлечь обращения к объектам метаданных из тела `.bsl`-модуля.
@@ -388,7 +580,14 @@ mod tests {
     #[test]
     fn manager_in_code() {
         let r = kinds("Док = Документы.ПриобретениеТоваровУслуг.СоздатьДокумент();");
-        assert_eq!(r, vec![("Document.ПриобретениеТоваровУслуг".to_string(), None, "manager")]);
+        assert_eq!(
+            r,
+            vec![(
+                "Document.ПриобретениеТоваровУслуг".to_string(),
+                None,
+                "manager"
+            )]
+        );
     }
 
     #[test]
@@ -414,17 +613,37 @@ mod tests {
     fn manager_document_journal_and_filter_criterion() {
         // Категории, которых раньше не было в таблице форм (E-10).
         let r = kinds("Ж = ЖурналыДокументов.ЖурналОпераций.СоставДокументов(\"X\");");
-        assert_eq!(r, vec![("DocumentJournal.ЖурналОпераций".to_string(), None, "manager")]);
+        assert_eq!(
+            r,
+            vec![(
+                "DocumentJournal.ЖурналОпераций".to_string(),
+                None,
+                "manager"
+            )]
+        );
         let r = kinds("Т = КритерииОтбора.СвязанныеДокументы.Состав;");
-        assert_eq!(r, vec![("FilterCriterion.СвязанныеДокументы".to_string(), None, "manager")]);
+        assert_eq!(
+            r,
+            vec![(
+                "FilterCriterion.СвязанныеДокументы".to_string(),
+                None,
+                "manager"
+            )]
+        );
         let r = kinds("П = Последовательности.ПартииТоваров.СоздатьНаборЗаписей();");
-        assert_eq!(r, vec![("Sequence.ПартииТоваров".to_string(), None, "manager")]);
+        assert_eq!(
+            r,
+            vec![("Sequence.ПартииТоваров".to_string(), None, "manager")]
+        );
     }
 
     #[test]
     fn ref_type_ru_in_string() {
         let r = kinds("Т = Тип(\"СправочникСсылка.Контрагенты\");");
-        assert_eq!(r, vec![("Catalog.Контрагенты".to_string(), None, "ref_type")]);
+        assert_eq!(
+            r,
+            vec![("Catalog.Контрагенты".to_string(), None, "ref_type")]
+        );
     }
 
     #[test]
@@ -436,7 +655,8 @@ mod tests {
     #[test]
     fn query_path_with_tabular() {
         // Путь метаданных в тексте запроса: 3-й сегмент = имя ТЧ.
-        let r = kinds("Запрос.Текст = \"ВЫБРАТЬ Ссылка ИЗ Документ.РеализацияТоваровУслуг.Товары\";");
+        let r =
+            kinds("Запрос.Текст = \"ВЫБРАТЬ Ссылка ИЗ Документ.РеализацияТоваровУслуг.Товары\";");
         assert_eq!(
             r,
             vec![(
@@ -481,6 +701,13 @@ mod tests {
     #[test]
     fn register_irregular_plural() {
         let r = kinds("РегистрыСведений.КурсыВалют.СоздатьНаборЗаписей();");
-        assert_eq!(r, vec![("InformationRegister.КурсыВалют".to_string(), None, "manager")]);
+        assert_eq!(
+            r,
+            vec![(
+                "InformationRegister.КурсыВалют".to_string(),
+                None,
+                "manager"
+            )]
+        );
     }
 }

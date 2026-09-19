@@ -76,7 +76,9 @@ impl PoolSettings {
     pub fn resolve(&self) -> PoolConfig {
         PoolConfig {
             max_size: self.pool_size.unwrap_or(DEFAULT_POOL_SIZE),
-            cache_kib: self.per_conn_cache_kib.unwrap_or(DEFAULT_PER_CONN_CACHE_KIB),
+            cache_kib: self
+                .per_conn_cache_kib
+                .unwrap_or(DEFAULT_PER_CONN_CACHE_KIB),
             busy_timeout_ms: self.busy_timeout_ms.unwrap_or(DEFAULT_BUSY_TIMEOUT_MS),
         }
         .sanitized()
@@ -135,8 +137,7 @@ pub fn load_from(path: &Path) -> anyhow::Result<ServeFileConfig> {
 
 /// Разобрать конфиг из строки. Используется в тестах.
 pub fn parse_str(text: &str) -> anyhow::Result<ServeFileConfig> {
-    toml::from_str(text)
-        .map_err(|e| anyhow::anyhow!("Ошибка парсинга serve.toml: {}", e))
+    toml::from_str(text).map_err(|e| anyhow::anyhow!("Ошибка парсинга serve.toml: {}", e))
 }
 
 /// Если в `home/serve.toml` есть файл — загрузить и провалидировать. Иначе
@@ -157,9 +158,10 @@ pub fn validate(cfg: &ServeFileConfig) -> anyhow::Result<()> {
     if cfg.me.ip.trim().is_empty() {
         anyhow::bail!("[me].ip пустой — укажите IP собственной машины.");
     }
-    cfg.me.ip.parse::<IpAddr>().map_err(|e| {
-        anyhow::anyhow!("[me].ip = {:?} не является IP-адресом: {}", cfg.me.ip, e)
-    })?;
+    cfg.me
+        .ip
+        .parse::<IpAddr>()
+        .map_err(|e| anyhow::anyhow!("[me].ip = {:?} не является IP-адресом: {}", cfg.me.ip, e))?;
 
     let mut seen = HashSet::new();
     for (idx, entry) in cfg.paths.iter().enumerate() {

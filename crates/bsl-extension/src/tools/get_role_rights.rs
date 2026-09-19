@@ -125,8 +125,10 @@ impl IndexTool for GetRoleRightsTool {
                 if roles.is_empty() {
                     payload.insert(
                         "hint".into(),
-                        json!("Ни одна роль не упоминает объект: проверьте имя объекта \
-                               (get_object_structure) — в правах оно пишется как 'Catalog.Имя'."),
+                        json!(
+                            "Ни одна роль не упоминает объект: проверьте имя объекта \
+                               (get_object_structure) — в правах оно пишется как 'Catalog.Имя'."
+                        ),
                     );
                 }
             }
@@ -164,9 +166,11 @@ impl IndexTool for GetRoleRightsTool {
                     // нет. По объекту такая подсказка есть, по роли не было.
                     payload.insert(
                         "hint".into(),
-                        json!("Такой роли нет в правах: проверьте имя роли — \
+                        json!(
+                            "Такой роли нет в правах: проверьте имя роли — \
                                перечень ролей отдаёт bsl_sql запросом \
-                               'SELECT DISTINCT role_name FROM role_rights'."),
+                               'SELECT DISTINCT role_name FROM role_rights'."
+                        ),
                     );
                 }
             }

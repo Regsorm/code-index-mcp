@@ -7,6 +7,7 @@ fn main() {
         res.set("LegalCopyright", "Copyright (C) 2026 Regsorm");
         res.set("OriginalFilename", "bsl-indexer.exe");
         res.set("InternalName", "bsl-indexer.exe");
-        res.compile().expect("failed to embed Windows resources for bsl-indexer");
+        res.compile()
+            .expect("failed to embed Windows resources for bsl-indexer");
     }
 }

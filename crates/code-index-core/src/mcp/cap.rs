@@ -53,7 +53,8 @@ use serde_json::{json, Value};
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 48_000;
 
 /// Подсказка, добавляемая на верхний уровень ответа при усечении.
-pub const CAP_HINT: &str = "Ответ усечён до лимита размера ([mcp].max_response_bytes) во избежание \
+pub const CAP_HINT: &str =
+    "Ответ усечён до лимита размера ([mcp].max_response_bytes) во избежание \
 сброса в файл на стороне клиента. Самые длинные массивы сокращены — рядом с каждым `<ключ>_total` \
 (исходное число элементов) и `<ключ>_truncated`. Нужен полный перечень — запросите точечно \
 (по конкретному имени/фильтру) либо поднимите [mcp].max_response_bytes.";
@@ -65,7 +66,10 @@ static RESPONSE_CAP_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_RESPONSE_B
 /// Выставить бюджет (вызывается из serve-init по `[mcp].max_response_bytes`).
 /// `None` → дефолт; `Some(0)` → страж выключен; `Some(n)` → n байт.
 pub fn set_response_cap(bytes: Option<usize>) {
-    RESPONSE_CAP_BYTES.store(bytes.unwrap_or(DEFAULT_MAX_RESPONSE_BYTES), Ordering::Relaxed);
+    RESPONSE_CAP_BYTES.store(
+        bytes.unwrap_or(DEFAULT_MAX_RESPONSE_BYTES),
+        Ordering::Relaxed,
+    );
 }
 
 /// Текущий бюджет в байтах (0 — выключен). Читается обёртками `wrap_with_meta`.
@@ -119,9 +123,21 @@ pub fn resolve_request_budget(requested: Option<usize>) -> RequestBudget {
     let global = response_cap();
     let hard = response_cap_hard();
     match requested {
-        None | Some(0) => RequestBudget { applied: global, requested, clamped: false },
-        Some(n) if n > hard => RequestBudget { applied: hard, requested, clamped: true },
-        Some(n) => RequestBudget { applied: n, requested, clamped: false },
+        None | Some(0) => RequestBudget {
+            applied: global,
+            requested,
+            clamped: false,
+        },
+        Some(n) if n > hard => RequestBudget {
+            applied: hard,
+            requested,
+            clamped: true,
+        },
+        Some(n) => RequestBudget {
+            applied: n,
+            requested,
+            clamped: false,
+        },
     }
 }
 
@@ -134,14 +150,15 @@ pub fn resolve_request_budget(requested: Option<usize>) -> RequestBudget {
 pub const DEFAULT_MAX_FUNCTION_BODY_CHARS: usize = 15_000;
 
 /// Порог тела функции/класса (символы). 0 — выключен (тело всегда целиком).
-static FUNCTION_BODY_CAP_CHARS: AtomicUsize =
-    AtomicUsize::new(DEFAULT_MAX_FUNCTION_BODY_CHARS);
+static FUNCTION_BODY_CAP_CHARS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_FUNCTION_BODY_CHARS);
 
 /// Выставить порог тела (serve-init по `[mcp].max_function_body_chars`).
 /// `None` → дефолт; `Some(0)` → выключено; `Some(n)` → n символов.
 pub fn set_function_body_cap(chars: Option<usize>) {
-    FUNCTION_BODY_CAP_CHARS
-        .store(chars.unwrap_or(DEFAULT_MAX_FUNCTION_BODY_CHARS), Ordering::Relaxed);
+    FUNCTION_BODY_CAP_CHARS.store(
+        chars.unwrap_or(DEFAULT_MAX_FUNCTION_BODY_CHARS),
+        Ordering::Relaxed,
+    );
 }
 
 /// Текущий порог тела в символах (0 — выключен). Читается в get_function/get_class.
@@ -160,8 +177,12 @@ pub fn function_body_cap() -> usize {
 
 /// Дефолтный набор инструментов под cap_response (если `[mcp].cap_tools` пуст).
 /// list-подобные BSL-tools, где обрез до сэмпла + total приемлем.
-pub const DEFAULT_CAP_TOOLS: &[&str] =
-    &["get_event_subscriptions", "bsl_sql", "find_references", "get_register_writers"];
+pub const DEFAULT_CAP_TOOLS: &[&str] = &[
+    "get_event_subscriptions",
+    "bsl_sql",
+    "find_references",
+    "get_register_writers",
+];
 
 fn default_cap_set() -> HashSet<String> {
     DEFAULT_CAP_TOOLS.iter().map(|s| s.to_string()).collect()
@@ -257,7 +278,7 @@ fn heaviest_section(root: &Value) -> Option<(String, String, usize, usize)> {
                 if let Some(k) = key {
                     if arr.len() > 1 {
                         let size = ser_len(v);
-                        if best.as_ref().map_or(true, |b| size > b.3) {
+                        if best.as_ref().is_none_or(|b| size > b.3) {
                             *best = Some((parent.to_string(), k.to_string(), arr.len(), size));
                         }
                     }
@@ -270,7 +291,7 @@ fn heaviest_section(root: &Value) -> Option<(String, String, usize, usize)> {
                 if let Some(k) = key {
                     if map.len() > OMIT_OBJECT_MIN_KEYS {
                         let size = ser_len(v);
-                        if best.as_ref().map_or(true, |b| size > b.3) {
+                        if best.as_ref().is_none_or(|b| size > b.3) {
                             *best = Some((parent.to_string(), k.to_string(), map.len(), size));
                         }
                     }
@@ -364,7 +385,10 @@ impl SearchShrink {
 /// Ужать ответ-поиск под `budget` байт, НЕ теряя опознания найденного.
 /// `budget == 0` → no-op. Возвращает `(value, SearchShrink)`.
 pub fn shrink_search_results(mut value: Value, budget: usize) -> (Value, SearchShrink) {
-    let mut out = SearchShrink { full_bytes: ser_len(&value), ..Default::default() };
+    let mut out = SearchShrink {
+        full_bytes: ser_len(&value),
+        ..Default::default()
+    };
     if budget == 0 || out.full_bytes <= budget {
         return (value, out);
     }
@@ -424,7 +448,7 @@ fn heaviest_section_in_items(root: &Value) -> Option<(String, String, usize, usi
     let mut best: Option<(String, String, usize, usize)> = None;
     for (i, item) in items.iter().enumerate() {
         if let Some((parent, key, count, size)) = heaviest_section(item) {
-            if best.as_ref().map_or(true, |b| size > b.3) {
+            if best.as_ref().is_none_or(|b| size > b.3) {
                 best = Some((
                     format!("/{}/{}{}", RESULTS_KEY, i, parent),
                     key,
@@ -465,7 +489,7 @@ fn heaviest_array(root: &Value) -> Option<(String, String, String, usize)> {
                 if let Some(k) = key {
                     if arr.len() > 1 {
                         let size = ser_len(v);
-                        if best.as_ref().map_or(true, |b| size > b.3) {
+                        if best.as_ref().is_none_or(|b| size > b.3) {
                             *best =
                                 Some((ptr.to_string(), parent.to_string(), k.to_string(), size));
                         }
@@ -620,7 +644,13 @@ pub fn page_by_bytes(items: Vec<Value>, offset: usize, budget: usize) -> Page {
         page.push(item);
     }
     let shown = page.len();
-    Page { items: page, offset, shown, total, has_more: offset + shown < total }
+    Page {
+        items: page,
+        offset,
+        shown,
+        total,
+        has_more: offset + shown < total,
+    }
 }
 
 /// Собрать готовую строку следующего вызова для подсказки:
@@ -684,7 +714,9 @@ mod tests {
 
     #[test]
     fn truncates_nested_array_under_object() {
-        let items: Vec<Value> = (0..3000).map(|i| json!(format!("реквизит_{}", i))).collect();
+        let items: Vec<Value> = (0..3000)
+            .map(|i| json!(format!("реквизит_{}", i)))
+            .collect();
         let v = json!({
             "result": {
                 "structure": {"attributes": items, "name": "Контрагенты"}
@@ -729,9 +761,15 @@ mod tests {
         // Список содержит инструмент, но глобальный выключатель главнее.
         set_cap_tools(Some(vec!["get_event_subscriptions".to_string()]));
         set_cap_enabled(Some(true));
-        assert!(cap_applies("get_event_subscriptions"), "enabled+в списке → cap применяется");
+        assert!(
+            cap_applies("get_event_subscriptions"),
+            "enabled+в списке → cap применяется"
+        );
         set_cap_enabled(Some(false));
-        assert!(!cap_applies("get_event_subscriptions"), "disabled → cap не применяется ни к чему");
+        assert!(
+            !cap_applies("get_event_subscriptions"),
+            "disabled → cap не применяется ни к чему"
+        );
         // Восстановить дефолты, чтобы не влиять на другие тесты.
         set_cap_enabled(Some(true));
         set_cap_tools(None);
@@ -751,7 +789,10 @@ mod tests {
         // enum-подобная структура: большая map (синонимы) + массив имён + мелочь
         let mut syn = serde_json::Map::new();
         for i in 0..800 {
-            syn.insert(format!("Значение_{}", i), json!(format!("Синоним значения номер {}", i)));
+            syn.insert(
+                format!("Значение_{}", i),
+                json!(format!("Синоним значения номер {}", i)),
+            );
         }
         let values: Vec<Value> = (0..800).map(|i| json!(format!("Значение_{}", i))).collect();
         let v = json!({
@@ -771,7 +812,10 @@ mod tests {
         // самая тяжёлая секция (map синонимов) выкинута целиком + count
         assert_eq!(a["enum_synonyms_omitted"], json!(true));
         assert_eq!(a["enum_synonyms_count"], json!(800));
-        assert!(a.get("enum_synonyms").is_none(), "map должна быть удалена целиком");
+        assert!(
+            a.get("enum_synonyms").is_none(),
+            "map должна быть удалена целиком"
+        );
         // НЕ частичный обрез: оставшийся массив значений — ЦЕЛИКОМ (не схлопнут)
         assert_eq!(a["enum_values"].as_array().unwrap().len(), 800);
         // мелкие структурные поля целы
@@ -822,8 +866,16 @@ mod tests {
             assert!(!arr.is_empty(), "бюджет {}: отдан пустой массив", budget);
             // У каждого отданного элемента паспорт на месте.
             for item in arr {
-                assert!(item.get("full_name").is_some(), "бюджет {}: потерян full_name", budget);
-                assert!(item.get("meta_type").is_some(), "бюджет {}: потерян meta_type", budget);
+                assert!(
+                    item.get("full_name").is_some(),
+                    "бюджет {}: потерян full_name",
+                    budget
+                );
+                assert!(
+                    item.get("meta_type").is_some(),
+                    "бюджет {}: потерян meta_type",
+                    budget
+                );
             }
             assert!(sh.any(), "бюджет {}: ужатие не отмечено", budget);
         }
@@ -853,7 +905,10 @@ mod tests {
             .map(|it| &it["attributes"])
             .filter(|a| a.get("attributes_omitted").is_some())
             .collect();
-        assert!(!omitted.is_empty(), "ни одна секция не снята — бюджет не соблюдён?");
+        assert!(
+            !omitted.is_empty(),
+            "ни одна секция не снята — бюджет не соблюдён?"
+        );
         for a in omitted {
             assert_eq!(a["attributes_omitted"], json!(true));
             assert_eq!(a["attributes_count"], json!(20));
@@ -935,7 +990,9 @@ mod tests {
 
     #[test]
     fn fold_switches_to_map_when_full_too_big() {
-        let heavy: Vec<Value> = (0..500).map(|i| json!({"event": format!("Событие{}", i)})).collect();
+        let heavy: Vec<Value> = (0..500)
+            .map(|i| json!({"event": format!("Событие{}", i)}))
+            .collect();
         let full = json!({"handlers": heavy});
         let folded = json!({"handlers_count": 500});
         let (out, was_folded) = fold_to_budget(full, folded.clone(), 1_000);
@@ -955,19 +1012,28 @@ mod tests {
 
     /// Набор однородных элементов по ~120 байт каждый.
     fn items(n: usize) -> Vec<Value> {
-        (0..n).map(|i| json!({"n": i, "s": "x".repeat(100)})).collect()
+        (0..n)
+            .map(|i| json!({"n": i, "s": "x".repeat(100)}))
+            .collect()
     }
 
     #[test]
     fn page_fills_up_to_budget_and_reports_more() {
         let page = page_by_bytes(items(100), 0, 3_000);
-        assert!(page.shown > 0 && page.shown < 100, "набрано {} из 100", page.shown);
+        assert!(
+            page.shown > 0 && page.shown < 100,
+            "набрано {} из 100",
+            page.shown
+        );
         assert_eq!(page.total, 100);
         assert_eq!(page.offset, 0);
         assert!(page.has_more);
         assert_eq!(page.next_offset(), Some(page.shown));
         let room = 3_000 - PAGE_OVERHEAD_BYTES;
-        assert!(ser_len(&json!(page.items)) <= room + 2, "страница не должна перебирать бюджет");
+        assert!(
+            ser_len(&json!(page.items)) <= room + 2,
+            "страница не должна перебирать бюджет"
+        );
     }
 
     #[test]

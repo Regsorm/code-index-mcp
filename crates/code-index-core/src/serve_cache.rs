@@ -19,8 +19,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::Arc;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 /// Запись кэша: сериализованный payload + момент истечения TTL.
@@ -42,7 +42,8 @@ pub(crate) fn lock_r<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 
 /// Захватить замок на запись, переживая отравление (см. [`lock_r`]).
 pub(crate) fn lock_w<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Раз во столько вставок запускается уборка истёкших записей.
@@ -266,7 +267,8 @@ impl ServeCache {
         // (M-5). Лишние пересчёты, не порча данных.
         lock_w(&self.dirty).retain(|(r, _), _| r != scope);
         if removed > 0 {
-            self.invalidations.fetch_add(removed as u64, Ordering::Relaxed);
+            self.invalidations
+                .fetch_add(removed as u64, Ordering::Relaxed);
         }
         removed
     }
@@ -283,7 +285,8 @@ impl ServeCache {
         drop(guard);
         lock_w(&self.reverse).clear();
         lock_w(&self.dirty).clear();
-        self.invalidations.fetch_add(removed as u64, Ordering::Relaxed);
+        self.invalidations
+            .fetch_add(removed as u64, Ordering::Relaxed);
         removed
     }
 
@@ -465,7 +468,12 @@ mod tests {
 
         // Запись с зависимостью живёт по базовому сроку и вытесняется по файлу.
         let long = ServeCache::key("ut", "get_function", &json!({"name": "X"}));
-        c.insert(long.clone(), Arc::new("{}".into()), "ut", &["src/X.bsl".to_string()]);
+        c.insert(
+            long.clone(),
+            Arc::new("{}".into()),
+            "ut",
+            &["src/X.bsl".to_string()],
+        );
         std::thread::sleep(Duration::from_millis(90));
         assert!(c.get(&long).is_some(), "базовый срок не истёк");
         assert_eq!(c.invalidate_files("ut", &["src/X.bsl".to_string()]), 1);
@@ -500,8 +508,18 @@ mod tests {
         // Кэш: ключ k_x зависит от X, k_y — от Y.
         let k_x = ServeCache::key("ut", "get_function", &json!({"name": "x"}));
         let k_y = ServeCache::key("ut", "get_function", &json!({"name": "y"}));
-        c.insert(k_x.clone(), Arc::new("a".into()), "ut", &["src/X.bsl".to_string()]);
-        c.insert(k_y.clone(), Arc::new("b".into()), "ut", &["src/Y.bsl".to_string()]);
+        c.insert(
+            k_x.clone(),
+            Arc::new("a".into()),
+            "ut",
+            &["src/X.bsl".to_string()],
+        );
+        c.insert(
+            k_y.clone(),
+            Arc::new("b".into()),
+            "ut",
+            &["src/Y.bsl".to_string()],
+        );
         // Инвалидация по X сносит только ключ X, не Y.
         assert_eq!(c.invalidate_files("ut", &["src/X.bsl".to_string()]), 1);
         assert!(c.get(&k_x).is_none());
@@ -516,10 +534,18 @@ mod tests {
     fn истёкшая_запись_освобождает_память() {
         let c = ServeCache::new(0, true); // время жизни зажимается в 1 секунду
         let key = ServeCache::key("ut", "t", &json!({"a": 1}));
-        c.insert(key.clone(), Arc::new("x".into()), "ut", &["src/X.bsl".to_string()]);
+        c.insert(
+            key.clone(),
+            Arc::new("x".into()),
+            "ut",
+            &["src/X.bsl".to_string()],
+        );
         assert_eq!(c.stats().0, 1);
         std::thread::sleep(Duration::from_millis(1100));
-        assert!(c.get(&key).is_none(), "истёкшая запись не должна отдаваться");
+        assert!(
+            c.get(&key).is_none(),
+            "истёкшая запись не должна отдаваться"
+        );
         assert_eq!(c.stats().0, 0, "истёкшая запись должна уйти из памяти");
     }
 

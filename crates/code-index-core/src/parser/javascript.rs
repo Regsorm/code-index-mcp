@@ -1,14 +1,21 @@
 use anyhow::{anyhow, Result};
 
-use super::types::{
-    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable, PARSE_TIMEOUT_MS,
-};
-use super::LanguageParser;
 use super::callee::callee_name;
 use super::types::MAX_VISIT_DEPTH;
+use super::types::{
+    sha256_hex, ParseResult, ParsedCall, ParsedClass, ParsedFunction, ParsedImport, ParsedVariable,
+    PARSE_TIMEOUT_MS,
+};
+use super::LanguageParser;
 
 /// Парсер JavaScript-файлов на основе tree-sitter
 pub struct JavaScriptParser;
+
+impl Default for JavaScriptParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl JavaScriptParser {
     pub fn new() -> Self {
@@ -36,14 +43,15 @@ fn node_text<'a>(node: tree_sitter::Node<'a>, source: &'a [u8]) -> &'a str {
 }
 
 /// Найти первый дочерний узел с заданным kind
-fn find_child_by_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+fn find_child_by_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
+    let found = node
+        .children(&mut cursor)
+        .find(|&child| child.kind() == kind);
+    found
 }
 
 /// Извлечь JSDoc-комментарий перед узлом (comment, начинающийся с /**).
@@ -144,7 +152,14 @@ fn visit_node(
                         visit_class(child, ctx, current_func, depth);
                     }
                     "lexical_declaration" | "variable_declaration" => {
-                        visit_variable_declaration(child, ctx, class_name, current_func, node.kind(), depth);
+                        visit_variable_declaration(
+                            child,
+                            ctx,
+                            class_name,
+                            current_func,
+                            node.kind(),
+                            depth,
+                        );
                     }
                     _ => {
                         visit_node(child, ctx, class_name, current_func, node.kind(), depth + 1);
@@ -172,7 +187,8 @@ fn visit_function_declaration(
     let source = ctx.source;
 
     // Имя функции: поле name (identifier)
-    let name = node.child_by_field_name("name")
+    let name = node
+        .child_by_field_name("name")
         .map(|n| node_text(n, source).to_string())
         .unwrap_or_default();
 
@@ -185,7 +201,8 @@ fn visit_function_declaration(
     let line_end = node.end_position().row + 1;
 
     // Параметры
-    let args = node.child_by_field_name("parameters")
+    let args = node
+        .child_by_field_name("parameters")
         .map(|n| node_text(n, source).to_string());
 
     // is_async: ищем "async" среди дочерних узлов перед именем функции
@@ -231,7 +248,8 @@ fn visit_method_definition(
     let source = ctx.source;
 
     // Имя метода: поле name
-    let name = node.child_by_field_name("name")
+    let name = node
+        .child_by_field_name("name")
         .map(|n| node_text(n, source).to_string())
         .unwrap_or_default();
 
@@ -246,7 +264,8 @@ fn visit_method_definition(
     let line_end = node.end_position().row + 1;
 
     // Параметры из поля value (function)
-    let args = node.child_by_field_name("value")
+    let args = node
+        .child_by_field_name("value")
         .and_then(|func_node| func_node.child_by_field_name("parameters"))
         .map(|n| node_text(n, source).to_string());
 
@@ -332,11 +351,14 @@ fn visit_variable_declarator(
 
                 let qualified_name = class_name.map(|cn| format!("{}.{}", cn, var_name));
 
-                let args = val.child_by_field_name("parameters")
+                let args = val
+                    .child_by_field_name("parameters")
                     .map(|n| node_text(n, source).to_string())
                     // Одиночный параметр стрелочной функции: `x => x+1`
-                    .or_else(|| val.child_by_field_name("parameter")
-                        .map(|n| node_text(n, source).to_string()));
+                    .or_else(|| {
+                        val.child_by_field_name("parameter")
+                            .map(|n| node_text(n, source).to_string())
+                    });
 
                 let is_async = is_async_node(val, source);
                 let docstring = extract_jsdoc(node.parent().unwrap_or(node), source);
@@ -361,13 +383,23 @@ fn visit_variable_declarator(
                 if let Some(body_node) = val.child_by_field_name("body") {
                     let mut cursor = body_node.walk();
                     for child in body_node.children(&mut cursor) {
-                        visit_node(child, ctx, class_name, Some(&var_name), body_node.kind(), depth + 1);
+                        visit_node(
+                            child,
+                            ctx,
+                            class_name,
+                            Some(&var_name),
+                            body_node.kind(),
+                            depth + 1,
+                        );
                     }
                 }
             }
             _ => {
                 // Обычная переменная — сохраняем только на верхнем уровне программы
-                if parent_kind == "program" || parent_kind == "module" || parent_kind == "export_statement" {
+                if parent_kind == "program"
+                    || parent_kind == "module"
+                    || parent_kind == "export_statement"
+                {
                     let value_text = node_text(val, source);
                     let value = if value_text.chars().count() > 200 {
                         value_text.chars().take(200).collect()
@@ -397,7 +429,8 @@ fn visit_class(
     let source = ctx.source;
 
     // Имя класса
-    let name = node.child_by_field_name("name")
+    let name = node
+        .child_by_field_name("name")
         .map(|n| node_text(n, source).to_string())
         .unwrap_or_default();
 
@@ -410,8 +443,8 @@ fn visit_class(
 
     // Базовые классы: узел class_heritage (extends X)
     // В tree-sitter-javascript это не поле, а дочерний узел типа "class_heritage"
-    let bases = find_child_by_kind(node, "class_heritage")
-        .map(|n| node_text(n, source).to_string());
+    let bases =
+        find_child_by_kind(node, "class_heritage").map(|n| node_text(n, source).to_string());
 
     let docstring = extract_jsdoc(node, source);
     let body = node_text(node, source).to_string();
@@ -431,7 +464,14 @@ fn visit_class(
     if let Some(class_body) = node.child_by_field_name("body") {
         let mut cursor = class_body.walk();
         for child in class_body.children(&mut cursor) {
-            visit_node(child, ctx, Some(&name), current_func, class_body.kind(), depth + 1);
+            visit_node(
+                child,
+                ctx,
+                Some(&name),
+                current_func,
+                class_body.kind(),
+                depth + 1,
+            );
         }
     }
 }
@@ -442,71 +482,69 @@ fn visit_import(node: tree_sitter::Node, ctx: &mut VisitContext) {
     let line = node.start_position().row + 1;
 
     // Источник импорта: поле source (string-literal "module-name")
-    let module = node.child_by_field_name("source")
-        .map(|n| {
-            // Убираем кавычки
-            let text = node_text(n, source);
-            text.trim_matches(|c| c == '"' || c == '\'').to_string()
-        });
+    let module = node.child_by_field_name("source").map(|n| {
+        // Убираем кавычки
+        let text = node_text(n, source);
+        text.trim_matches(|c| c == '"' || c == '\'').to_string()
+    });
 
     // Импортируемые имена: import_clause
     let mut cursor = node.walk();
     let mut found_names = false;
 
     for child in node.children(&mut cursor) {
-        match child.kind() {
-            "import_clause" => {
-                found_names = true;
-                // import DefaultExport, { Named1, Named2 as Alias } from "..."
-                let mut clause_cursor = child.walk();
-                for clause_child in child.children(&mut clause_cursor) {
-                    match clause_child.kind() {
-                        "identifier" => {
-                            // default import
-                            ctx.imports.push(ParsedImport {
-                                module: module.clone(),
-                                name: Some(node_text(clause_child, source).to_string()),
-                                alias: None,
-                                line,
-                                kind: "import".to_string(),
-                            });
-                        }
-                        "namespace_import" => {
-                            // import * as ns
-                            let alias = find_child_by_kind(clause_child, "identifier")
-                                .map(|n| node_text(n, source).to_string());
-                            ctx.imports.push(ParsedImport {
-                                module: module.clone(),
-                                name: Some("*".to_string()),
-                                alias,
-                                line,
-                                kind: "import".to_string(),
-                            });
-                        }
-                        "named_imports" => {
-                            // { Named1, Named2 as Alias }
-                            let mut ni_cursor = clause_child.walk();
-                            for import_spec in clause_child.children(&mut ni_cursor) {
-                                if import_spec.kind() == "import_specifier" {
-                                    let spec_name = import_spec.child_by_field_name("name")
-                                        .map(|n| node_text(n, source).to_string());
-                                    let spec_alias = import_spec.child_by_field_name("alias")
-                                        .map(|n| node_text(n, source).to_string());
-                                    ctx.imports.push(ParsedImport {
-                                        module: module.clone(),
-                                        name: spec_name,
-                                        alias: spec_alias,
-                                        line,
-                                        kind: "from".to_string(),
-                                    });
-                                }
+        if child.kind() == "import_clause" {
+            found_names = true;
+            // import DefaultExport, { Named1, Named2 as Alias } from "..."
+            let mut clause_cursor = child.walk();
+            for clause_child in child.children(&mut clause_cursor) {
+                match clause_child.kind() {
+                    "identifier" => {
+                        // default import
+                        ctx.imports.push(ParsedImport {
+                            module: module.clone(),
+                            name: Some(node_text(clause_child, source).to_string()),
+                            alias: None,
+                            line,
+                            kind: "import".to_string(),
+                        });
+                    }
+                    "namespace_import" => {
+                        // import * as ns
+                        let alias = find_child_by_kind(clause_child, "identifier")
+                            .map(|n| node_text(n, source).to_string());
+                        ctx.imports.push(ParsedImport {
+                            module: module.clone(),
+                            name: Some("*".to_string()),
+                            alias,
+                            line,
+                            kind: "import".to_string(),
+                        });
+                    }
+                    "named_imports" => {
+                        // { Named1, Named2 as Alias }
+                        let mut ni_cursor = clause_child.walk();
+                        for import_spec in clause_child.children(&mut ni_cursor) {
+                            if import_spec.kind() == "import_specifier" {
+                                let spec_name = import_spec
+                                    .child_by_field_name("name")
+                                    .map(|n| node_text(n, source).to_string());
+                                let spec_alias = import_spec
+                                    .child_by_field_name("alias")
+                                    .map(|n| node_text(n, source).to_string());
+                                ctx.imports.push(ParsedImport {
+                                    module: module.clone(),
+                                    name: spec_name,
+                                    alias: spec_alias,
+                                    line,
+                                    kind: "from".to_string(),
+                                });
                             }
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
-            _ => {}
         }
     }
 
@@ -537,7 +575,11 @@ fn visit_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Opt
     };
 
     let caller = current_func.unwrap_or("<module>").to_string();
-    ctx.calls.push(ParsedCall { caller, callee, line });
+    ctx.calls.push(ParsedCall {
+        caller,
+        callee,
+        line,
+    });
 }
 
 /// Определить, является ли функция асинхронной (наличие "async" keyword)
@@ -624,7 +666,11 @@ mod tests {
         assert_eq!(result.classes.len(), 1);
         assert_eq!(result.classes[0].name, "Animal");
         // Методы класса должны быть извлечены
-        assert!(result.functions.len() >= 1, "ожидаем методы класса: {:?}", result.functions);
+        assert!(
+            !result.functions.is_empty(),
+            "ожидаем методы класса: {:?}",
+            result.functions
+        );
     }
 
     #[test]
@@ -632,7 +678,11 @@ mod tests {
         let parser = JavaScriptParser::new();
         let source = "const add = (a, b) => a + b;\n";
         let result = parser.parse(source, "test.js").unwrap();
-        assert_eq!(result.functions.len(), 1, "стрелочная функция должна быть в functions");
+        assert_eq!(
+            result.functions.len(),
+            1,
+            "стрелочная функция должна быть в functions"
+        );
         assert_eq!(result.functions[0].name, "add");
     }
 
@@ -641,7 +691,11 @@ mod tests {
         let parser = JavaScriptParser::new();
         let source = "import React from 'react';\nimport { useState, useEffect } from 'react';\n";
         let result = parser.parse(source, "test.js").unwrap();
-        assert!(result.imports.len() >= 2, "ожидаем минимум 2 импорта, получили: {:?}", result.imports);
+        assert!(
+            result.imports.len() >= 2,
+            "ожидаем минимум 2 импорта, получили: {:?}",
+            result.imports
+        );
     }
 
     #[test]
@@ -659,6 +713,6 @@ mod tests {
         let parser = JavaScriptParser::new();
         let source = "function process() {\n  fetch('url');\n  console.log('done');\n}\n";
         let result = parser.parse(source, "test.js").unwrap();
-        assert!(result.calls.len() >= 1, "ожидаем вызовы функций");
+        assert!(!result.calls.is_empty(), "ожидаем вызовы функций");
     }
 }

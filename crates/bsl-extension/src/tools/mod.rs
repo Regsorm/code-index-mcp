@@ -19,12 +19,12 @@
 
 pub mod bsl_sql;
 pub mod find_data_path;
-pub mod find_references;
-pub mod get_object_profile;
 pub mod find_path_bsl;
+pub mod find_references;
 pub mod get_data_links;
 pub mod get_event_subscriptions;
 pub mod get_form_handlers;
+pub mod get_object_profile;
 pub mod get_object_structure;
 pub mod get_register_writers;
 pub mod get_role_rights;
@@ -121,8 +121,17 @@ pub(crate) fn wrap_error(error_value: Value) -> Value {
 /// `get_form_handlers` owner+form_name) — там имя ключа значимо.
 pub(crate) fn object_value(args: &Value) -> Option<&str> {
     const SERVICE: &[&str] = &[
-        "repo", "depth", "limit", "direction", "sections", "language", "max_depth", "name_like",
-        "meta_type", "names_only", "max_response_bytes",
+        "repo",
+        "depth",
+        "limit",
+        "direction",
+        "sections",
+        "language",
+        "max_depth",
+        "name_like",
+        "meta_type",
+        "names_only",
+        "max_response_bytes",
     ];
     args.as_object()?
         .iter()
@@ -278,7 +287,11 @@ mod tests {
         let rows = [
             ("Catalog.НастройкиЭДО", "Catalog", "НастройкиЭДО"),
             ("Document.СообщениеЭДО", "Document", "СообщениеЭДО"),
-            ("InformationRegister.АбонентыЭДО", "InformationRegister", "АбонентыЭДО"),
+            (
+                "InformationRegister.АбонентыЭДО",
+                "InformationRegister",
+                "АбонентыЭДО",
+            ),
             ("Catalog.Контрагенты", "Catalog", "Контрагенты"),
         ];
         for (fqn, mt, nm) in rows {

@@ -21,7 +21,7 @@ pub(crate) const READ_FILE_SOFT_CAP_BYTES: usize = 500 * 1024;
 /// Hard-cap: абсолютный максимум для `read_file`, даже с line_start/line_end.
 pub(crate) const READ_FILE_HARD_CAP_BYTES: usize = 2 * 1024 * 1024;
 /// Hard-cap: суммарный размер ответа grep_text/grep_body.
-pub(crate) const GREP_TOTAL_BYTES_CAP: usize = 1 * 1024 * 1024;
+pub(crate) const GREP_TOTAL_BYTES_CAP: usize = 1024 * 1024;
 /// Default-limit grep_text если path_glob и language не заданы.
 pub(crate) const GREP_TEXT_FULL_SCAN_DEFAULT_LIMIT: usize = 30;
 /// Default-limit grep_code по числу совпадений, если `limit` не передан.
@@ -132,13 +132,15 @@ pub(crate) const HINT_GREP_BODY_EMPTY: &str = "0 совпадений в тел�
 regex с гибким пробелом, напр. Объект\\s*\\.\\s*Поле. Тексты запросов внутри строк — это тоже тело, \
 ищите по одному слову, не по всей цепочке.";
 /// grep_text вернул 0 совпадений.
-pub(crate) const HINT_GREP_TEXT_EMPTY: &str = "0 совпадений в text-файлах (md/yaml/json/toml и прочий текст). \
+pub(crate) const HINT_GREP_TEXT_EMPTY: &str =
+    "0 совпадений в text-файлах (md/yaml/json/toml и прочий текст). \
 Для кода .bsl/.py/.rs и т.п. — grep_code(regex=…) или grep_body. Проверьте path_glob=/language=. \
 ▸ XML ОБЪЕКТОВ 1С (справочники, документы, регистры, роли, определяемые типы, формы) с 0.51.0 \
 разбирается как КОД — по ним ищет grep_code(regex=…). Здесь же остаются оглавление конфигурации \
 (Configuration.xml) и прочие XML без объекта метаданных.";
 /// search_text вернул 0 совпадений.
-pub(crate) const HINT_SEARCH_TEXT_EMPTY: &str = "0 совпадений в text-файлах. Это нечёткий FTS-поиск по словам. \
+pub(crate) const HINT_SEARCH_TEXT_EMPTY: &str =
+    "0 совпадений в text-файлах. Это нечёткий FTS-поиск по словам. \
 Для regex по тексту — grep_text(regex=…); для кода — grep_code(regex=…)/grep_body.";
 
 // ── BSL-варианты пустых hint'ов поиска процедур (бенч 11.06) ────────────────
@@ -173,22 +175,37 @@ search_terms(query=…) идёт по ДРУГОМУ, триграммному F
 
 /// Выбор hint'а пустого grep_code по языку репо.
 pub(crate) fn grep_code_empty_hint(language: Option<&str>) -> &'static str {
-    if language == Some("bsl") { HINT_GREP_CODE_EMPTY_BSL } else { HINT_GREP_CODE_EMPTY }
+    if language == Some("bsl") {
+        HINT_GREP_CODE_EMPTY_BSL
+    } else {
+        HINT_GREP_CODE_EMPTY
+    }
 }
 /// Выбор hint'а пустого grep_body по языку репо.
 pub(crate) fn grep_body_empty_hint(language: Option<&str>) -> &'static str {
-    if language == Some("bsl") { HINT_GREP_BODY_EMPTY_BSL } else { HINT_GREP_BODY_EMPTY }
+    if language == Some("bsl") {
+        HINT_GREP_BODY_EMPTY_BSL
+    } else {
+        HINT_GREP_BODY_EMPTY
+    }
 }
 /// Выбор hint'а пустого find_symbol по языку репо.
 pub(crate) fn find_symbol_empty_hint(language: Option<&str>) -> &'static str {
-    if language == Some("bsl") { HINT_FIND_SYMBOL_EMPTY_BSL } else { HINT_FIND_SYMBOL_EMPTY }
+    if language == Some("bsl") {
+        HINT_FIND_SYMBOL_EMPTY_BSL
+    } else {
+        HINT_FIND_SYMBOL_EMPTY
+    }
 }
 
 /// Сериализовать `ToolUnavailable` в JSON-строку.
 pub fn format_unavailable(value: ToolUnavailable) -> String {
     match serde_json::to_string(&value) {
         Ok(s) => s,
-        Err(e) => format!("{{\"status\":\"error\",\"message\":\"Сериализация: {}\"}}", e),
+        Err(e) => format!(
+            "{{\"status\":\"error\",\"message\":\"Сериализация: {}\"}}",
+            e
+        ),
     }
 }
 
@@ -402,13 +419,7 @@ pub(crate) fn wrap_with_meta_extra<T: serde::Serialize>(
 /// get_callers сериализуются в JSON-массив, а не объект). `mtime`/`file_size`
 /// НЕ трогаем намеренно — их смысл несёт stat_file.
 fn strip_plumbing_recursive(v: &mut serde_json::Value) {
-    const PLUMBING_KEYS: [&str; 5] = [
-        "id",
-        "file_id",
-        "node_hash",
-        "content_hash",
-        "indexed_at",
-    ];
+    const PLUMBING_KEYS: [&str; 5] = ["id", "file_id", "node_hash", "content_hash", "indexed_at"];
     match v {
         serde_json::Value::Object(map) => {
             for k in PLUMBING_KEYS {
@@ -555,10 +566,7 @@ fn is_plain_identifier(s: &str) -> bool {
 /// Lookup пути по file_id через storage. Любая ошибка/отсутствие → пустая строка
 /// (она не пройдёт ни один matcher, так что результат честно отбросится).
 /// Storage уже заблокирован вызывающей стороной (передаётся через `&MutexGuard`).
-pub(crate) fn lookup_path(
-    storage: &crate::storage::Storage,
-    file_id: i64,
-) -> String {
+pub(crate) fn lookup_path(storage: &crate::storage::Storage, file_id: i64) -> String {
     storage
         .get_path_by_file_id(file_id)
         .ok()
@@ -618,7 +626,11 @@ fn empty_search_extra(
 /// Признак кладётся рядом с `result`, а НЕ в `_meta`: служебное поле снимается
 /// с ответа перед отдачей клиенту (`strip_meta` в `CodeIndexServer::finish`),
 /// и всё, что туда положено, до модели не доходит.
-fn prefilter_exhausted_extra(prefetched: usize, sql_limit: usize, shown: usize) -> serde_json::Value {
+fn prefilter_exhausted_extra(
+    prefetched: usize,
+    sql_limit: usize,
+    shown: usize,
+) -> serde_json::Value {
     serde_json::json!({
         "prefilter_exhausted": true,
         "prefetched": prefetched,
@@ -644,7 +656,9 @@ fn search_extra(
     shown: usize,
 ) -> Option<serde_json::Value> {
     if shown == 0 {
-        return Some(empty_search_extra(base_hint, has_glob, prefetched, sql_limit));
+        return Some(empty_search_extra(
+            base_hint, has_glob, prefetched, sql_limit,
+        ));
     }
     if has_glob && prefetched >= sql_limit {
         return Some(prefilter_exhausted_extra(prefetched, sql_limit, shown));
@@ -857,11 +871,7 @@ fn cap_record_body(
     record
 }
 
-pub async fn get_function(
-    entry: &RepoEntry,
-    name: String,
-    path_glob: Option<String>,
-) -> String {
+pub async fn get_function(entry: &RepoEntry, name: String, path_glob: Option<String>) -> String {
     bail_if_not_ready!(entry);
     let storage = acquire_storage!(entry);
     get_function_with(&storage, name, path_glob)
@@ -939,11 +949,7 @@ pub fn get_function_with(
     }
 }
 
-pub async fn get_class(
-    entry: &RepoEntry,
-    name: String,
-    path_glob: Option<String>,
-) -> String {
+pub async fn get_class(entry: &RepoEntry, name: String, path_glob: Option<String>) -> String {
     bail_if_not_ready!(entry);
     let storage = acquire_storage!(entry);
     get_class_with(&storage, name, path_glob)
@@ -1028,11 +1034,11 @@ pub async fn get_callers(
             // Вызовы с квалификатором (1С: `Модуль.Метод`, `Справочники.X.Метод`,
             // `ОбработкаОбъект.Метод` из формы): точный поиск по голому имени их не
             // видит. Дубли по id отбрасываем, порядок — сначала точные совпадения.
-            if language.as_deref().map_or(true, |l| l == "bsl") {
+            if language.as_deref().is_none_or(|l| l == "bsl") {
                 let mut seen: std::collections::HashSet<i64> =
                     r.iter().filter_map(|c| c.id).collect();
                 for c in qualified_callers_of(entry, &storage, &function_name) {
-                    if c.id.map_or(true, |id| seen.insert(id)) {
+                    if c.id.is_none_or(|id| seen.insert(id)) {
                         r.push(c);
                     }
                 }
@@ -1091,7 +1097,7 @@ pub async fn get_callers(
                 // На пустом результате — hint (модель повторяет тот же вызов).
                 extra.insert("hint".into(), serde_json::json!(HINT_CALL_GRAPH_EMPTY));
             }
-            let extra = (!extra.is_empty()).then(|| serde_json::Value::Object(extra));
+            let extra = (!extra.is_empty()).then_some(serde_json::Value::Object(extra));
             wrap_with_meta_extra(&storage, &enriched, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"get_callers: {}\"}}", e),
@@ -1261,12 +1267,14 @@ pub async fn find_path(
             language.as_deref(),
             &|file_id, caller, callee| {
                 let mut cache = bound.borrow_mut();
-                let map = cache.entry((file_id, caller.to_string())).or_insert_with(|| {
-                    bound_callees_of(entry, &storage, &lookup_path(&storage, file_id), caller)
-                        .into_iter()
-                        .map(|(written, (_, name))| (written, name))
-                        .collect()
-                });
+                let map = cache
+                    .entry((file_id, caller.to_string()))
+                    .or_insert_with(|| {
+                        bound_callees_of(entry, &storage, &lookup_path(&storage, file_id), caller)
+                            .into_iter()
+                            .map(|(written, (_, name))| (written, name))
+                            .collect()
+                    });
                 map.get(callee).cloned()
             },
         )
@@ -1293,15 +1301,17 @@ pub async fn find_path(
             // найденном пути они ничего не значат.
             if !found {
                 if let Some(obj) = result.as_object_mut() {
-                    obj.insert("walk_depth_exhausted".to_string(),
-                               serde_json::json!(outcome.depth_exhausted));
+                    obj.insert(
+                        "walk_depth_exhausted".to_string(),
+                        serde_json::json!(outcome.depth_exhausted),
+                    );
                     if outcome.nodes_capped {
                         obj.insert("walk_nodes_capped".to_string(), serde_json::json!(true));
                     }
                 }
             }
             // На пустом результате — hint (модель часто повторяет тот же вызов).
-            let hint = (!found).then(|| {
+            let hint = (!found).then_some({
                 if outcome.nodes_capped {
                     "Обход остановлен на потолке узлов графа — «пути нет» отсюда НЕ следует. \
                      Сузьте поиск: задайте language= или возьмите более специфичный конец пути."
@@ -1319,17 +1329,29 @@ pub async fn find_path(
     }
 }
 
-pub async fn get_call_tree(
+pub(crate) struct CallTreeOptions {
+    pub root: String,
+    pub direction: Option<String>,
+    pub max_depth: Option<i64>,
+    pub max_nodes: Option<i64>,
+    pub language: Option<String>,
+    pub max_response_bytes: Option<usize>,
+}
+
+pub(crate) async fn get_call_tree(
     entry: &RepoEntry,
-    root: String,
-    direction: Option<String>,
-    max_depth: Option<i64>,
-    max_nodes: Option<i64>,
-    language: Option<String>,
-    max_response_bytes: Option<usize>,
+    options: CallTreeOptions,
     repo: &str,
 ) -> String {
     bail_if_not_ready!(entry);
+    let CallTreeOptions {
+        root,
+        direction,
+        max_depth,
+        max_nodes,
+        language,
+        max_response_bytes,
+    } = options;
     // direction: callees|down (что вызывает root, вглубь) | callers|up (кто вызывает root).
     let down = !matches!(direction.as_deref(), Some("callers") | Some("up"));
     let depth = max_depth.unwrap_or(3);
@@ -1353,12 +1375,14 @@ pub async fn get_call_tree(
             &|name| qualified_callers_of(entry, &storage, name),
             &|file_id, caller, callee| {
                 let mut cache = bound.borrow_mut();
-                let map = cache.entry((file_id, caller.to_string())).or_insert_with(|| {
-                    bound_callees_of(entry, &storage, &lookup_path(&storage, file_id), caller)
-                        .into_iter()
-                        .map(|(written, (_, name))| (written, name))
-                        .collect()
-                });
+                let map = cache
+                    .entry((file_id, caller.to_string()))
+                    .or_insert_with(|| {
+                        bound_callees_of(entry, &storage, &lookup_path(&storage, file_id), caller)
+                            .into_iter()
+                            .map(|(written, (_, name))| (written, name))
+                            .collect()
+                    });
                 map.get(callee).cloned()
             },
         )
@@ -1453,7 +1477,8 @@ pub async fn get_call_tree(
 const CALL_TREE_OVERHEAD_BYTES: usize = 2_000;
 
 /// Подсказка `get_call_tree`, когда поле `tree` опущено по размеру ответа.
-const CALL_TREE_OMITTED_HINT: &str = "Поле tree опущено по размеру ответа: все рёбра — в edges, уровень каждого — в depth.";
+const CALL_TREE_OMITTED_HINT: &str =
+    "Поле tree опущено по размеру ответа: все рёбра — в edges, уровень каждого — в depth.";
 
 /// Бюджет ответа `get_call_tree`, когда клиент его не передал. Не больше
 /// серверного бюджета: выключенный конфигом страж (0) остаётся выключенным.
@@ -1496,7 +1521,9 @@ fn call_tree_cut_hint(
             )
         ));
     }
-    steps.push("дальние уровни от нужного узла — get_call_tree с root = этот узел из edges".to_string());
+    steps.push(
+        "дальние уровни от нужного узла — get_call_tree с root = этот узел из edges".to_string(),
+    );
     steps.push("цепочка до конкретной функции — find_path".to_string());
     steps.push(if down {
         "все вызываемые одного узла — get_callees с limit".to_string()
@@ -1524,12 +1551,16 @@ fn fit_call_tree_to_budget(
     down: bool,
     mut edges: Vec<crate::storage::models::CallTreeEdge>,
     budget: usize,
-) -> (Vec<crate::storage::models::CallTreeEdge>, Option<serde_json::Value>) {
-    let size = |edges: &[crate::storage::models::CallTreeEdge], tree: &serde_json::Value| -> usize {
-        serde_json::to_vec(&serde_json::json!({ "edges": edges, "tree": tree }))
-            .map(|v| v.len())
-            .unwrap_or(usize::MAX)
-    };
+) -> (
+    Vec<crate::storage::models::CallTreeEdge>,
+    Option<serde_json::Value>,
+) {
+    let size =
+        |edges: &[crate::storage::models::CallTreeEdge], tree: &serde_json::Value| -> usize {
+            serde_json::to_vec(&serde_json::json!({ "edges": edges, "tree": tree }))
+                .map(|v| v.len())
+                .unwrap_or(usize::MAX)
+        };
     let tree = build_call_tree_json(root, down, &edges);
     if budget == 0 || edges.len() <= 1 {
         return (edges, Some(tree));
@@ -1541,7 +1572,7 @@ fn fit_call_tree_to_budget(
     edges.sort_by_key(|e| e.depth);
     let (mut lo, mut hi) = (1usize, edges.len());
     while lo < hi {
-        let mid = lo + (hi - lo + 1) / 2;
+        let mid = lo + (hi - lo).div_ceil(2);
         let fits = serde_json::to_vec(&edges[..mid])
             .map(|v| v.len())
             .unwrap_or(usize::MAX)
@@ -1567,8 +1598,9 @@ fn build_call_tree_json(
     edges: &[crate::storage::models::CallTreeEdge],
 ) -> serde_json::Value {
     use std::collections::{BTreeSet, HashMap, HashSet};
+    type CallTreeLevels<'a> = HashMap<i64, HashMap<&'a str, BTreeSet<(&'a str, i64)>>>;
     // by_depth: глубина → родитель → отсортированное множество (ребёнок, line).
-    let mut by_depth: HashMap<i64, HashMap<&str, BTreeSet<(&str, i64)>>> = HashMap::new();
+    let mut by_depth: CallTreeLevels<'_> = HashMap::new();
     for e in edges {
         let (parent, child) = if down {
             (e.caller.as_str(), e.callee.as_str())
@@ -1592,7 +1624,7 @@ fn build_call_tree_json(
         node: &str,
         depth: i64,
         max_d: i64,
-        by_depth: &HashMap<i64, HashMap<&str, BTreeSet<(&str, i64)>>>,
+        by_depth: &CallTreeLevels<'_>,
         expanded: &mut HashSet<String>,
     ) -> serde_json::Value {
         let first_time = expanded.insert(node.to_string());
@@ -1651,14 +1683,22 @@ pub async fn find_symbol(
                 && r.classes.is_empty()
                 && r.variables.is_empty()
                 && r.imports.is_empty();
-            let hint = if empty { Some(find_symbol_empty_hint(entry.language.as_deref())) } else { None };
+            let hint = if empty {
+                Some(find_symbol_empty_hint(entry.language.as_deref()))
+            } else {
+                None
+            };
             // Навигационная выдача БЕЗ тел (как search_function/search_class): локации символа.
             // Тело конкретного — get_function/get_class. Иначе на горячем имени find_symbol
             // раздувался телами всех совпадений (десятки-сотни K токенов).
             // Cap на ЧИСЛО локаций по каждой категории: на сверхгорячем имени
             // даже локации без тел раздувают ответ. Показываем первые LOCATION_CAP.
-            let (f_total, c_total, v_total, i_total) =
-                (r.functions.len(), r.classes.len(), r.variables.len(), r.imports.len());
+            let (f_total, c_total, v_total, i_total) = (
+                r.functions.len(),
+                r.classes.len(),
+                r.variables.len(),
+                r.imports.len(),
+            );
             let functions: Vec<serde_json::Value> = r
                 .functions
                 .iter()
@@ -1721,7 +1761,8 @@ pub async fn get_imports(
     let storage = acquire_storage!(entry);
     let cap = limit.unwrap_or(IMPORTS_DEFAULT_LIMIT);
     let cap_extra = |total: usize| {
-        (total > cap).then(|| serde_json::json!({ "truncated": true, "total": total, "limit": cap }))
+        (total > cap)
+            .then(|| serde_json::json!({ "truncated": true, "total": total, "limit": cap }))
     };
     if let Some(fid) = file_id {
         return match storage.get_imports_by_file(fid) {
@@ -1976,9 +2017,7 @@ pub async fn get_stats(server: &CodeIndexServer, repo: Option<String>) -> String
         .collect();
     for (alias, entry) in repos {
         let server_clone = server.clone();
-        set.spawn(async move {
-            one_stats(&server_clone, &alias, &entry).await
-        });
+        set.spawn(async move { one_stats(&server_clone, &alias, &entry).await });
     }
 
     let mut all = Vec::new();
@@ -2063,15 +2102,15 @@ pub async fn grep_body(
     let ctx = context_lines.unwrap_or(0);
     let want = limit.unwrap_or(30);
     let result = if path_glob.is_some() || ctx > 0 {
-        storage.grep_body_with_options(
-            pattern.as_deref(),
-            regex.as_deref(),
-            language.as_deref(),
-            path_glob.as_deref(),
-            want,
-            ctx,
-            GREP_TOTAL_BYTES_CAP,
-        )
+        storage.grep_body_with_options(crate::storage::GrepBodyOptions {
+            pattern: pattern.as_deref(),
+            regex_pattern: regex.as_deref(),
+            language: language.as_deref(),
+            path_glob: path_glob.as_deref(),
+            limit: want,
+            context_lines: ctx,
+            max_total_bytes: GREP_TOTAL_BYTES_CAP,
+        })
     } else {
         storage
             .grep_body(
@@ -2208,15 +2247,15 @@ pub async fn read_file(
     let storage = acquire_storage!(entry);
     match storage.read_file_text(
         &path,
-        line_start,
-        line_end,
-        READ_FILE_SOFT_CAP_LINES,
-        READ_FILE_SOFT_CAP_BYTES,
-        READ_FILE_HARD_CAP_BYTES,
-        // size_limit_bytes для hint в oversize-ответе. MCP-слой не знает per-repo
-        // лимит daemon'а — передаём None, hint будет короткий «файл превышает лимит».
-        // file_size в ответе всё равно показывается, оператор может сравнить.
-        None,
+        crate::storage::ReadFileOptions::new(
+            line_start,
+            line_end,
+            READ_FILE_SOFT_CAP_LINES,
+            READ_FILE_SOFT_CAP_BYTES,
+            READ_FILE_HARD_CAP_BYTES,
+            // MCP-слой не знает per-repo лимит daemon'а; hint будет коротким.
+            None,
+        ),
     ) {
         Ok(Some(r)) => wrap_with_meta(&storage, &r, vec![path.clone()]),
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден в индексе\"}}", path),
@@ -2263,7 +2302,11 @@ pub async fn grep_text(
                 "truncated": truncated,
             });
             annotate_unreadable(&mut payload, unreadable);
-            let hint = if shown == 0 { Some(HINT_GREP_TEXT_EMPTY) } else { None };
+            let hint = if shown == 0 {
+                Some(HINT_GREP_TEXT_EMPTY)
+            } else {
+                None
+            };
             wrap_with_meta_hint(&storage, &payload, deps, hint)
         }
         Err(e) => format!("{{\"error\": \"grep_text: {}\"}}", e),
@@ -2320,7 +2363,10 @@ fn compact_body_matches(
             .collect::<Vec<_>>()
             .join(",");
         if let Some(total) = m.match_count {
-            mls.push_str(&format!(" (+{})", total.saturating_sub(m.match_lines.len())));
+            mls.push_str(&format!(
+                " (+{})",
+                total.saturating_sub(m.match_lines.len())
+            ));
         }
         let locator = format!(
             "{} ({}) L{}-{}: {}",
@@ -2329,7 +2375,10 @@ fn compact_body_matches(
         let arr = acc.entry(m.file_path.clone()).or_default();
         arr.push(serde_json::Value::String(locator));
         for c in &m.context {
-            arr.push(serde_json::Value::String(format!("{}: {}", c.line, c.content)));
+            arr.push(serde_json::Value::String(format!(
+                "{}: {}",
+                c.line, c.content
+            )));
         }
     }
     acc.into_iter()
@@ -2339,9 +2388,7 @@ fn compact_body_matches(
 
 /// list_files: каждый файл — строка "<path> | <lang> | <N> lines | <size>".
 /// mtime НЕ включаем — он уже в _meta.file_mtimes (дублировать = лишние токены).
-fn compact_listed_files(
-    files: &[crate::storage::models::ListedFile],
-) -> Vec<serde_json::Value> {
+fn compact_listed_files(files: &[crate::storage::models::ListedFile]) -> Vec<serde_json::Value> {
     files
         .iter()
         .map(|lf| {
@@ -2418,7 +2465,10 @@ fn annotate_unreadable(payload: &mut serde_json::Value, unreadable: usize) {
         return;
     }
     if let Some(obj) = payload.as_object_mut() {
-        obj.insert("files_unreadable".to_string(), serde_json::json!(unreadable));
+        obj.insert(
+            "files_unreadable".to_string(),
+            serde_json::json!(unreadable),
+        );
         obj.insert(
             "files_unreadable_hint".to_string(),
             serde_json::json!(format!(
@@ -2443,7 +2493,10 @@ pub async fn health(server: &CodeIndexServer) -> String {
         .iter()
         .map(|(alias, entry)| (alias.clone(), entry.clone()))
         .collect();
-    let repo_aliases: Vec<_> = repo_entries.iter().map(|(alias, _)| alias.clone()).collect();
+    let repo_aliases: Vec<_> = repo_entries
+        .iter()
+        .map(|(alias, _)| alias.clone())
+        .collect();
 
     // Сводка по репо: для local — статус пути у демона; для remote —
     // короткая запись без HTTP-ping (ping вне rc6).
@@ -2510,13 +2563,19 @@ mod tests {
 
         // Образец с сегментом в середине: обе глубины.
         let m2 = build_path_matcher("crates/**/mod.rs").expect("образец должен компилироваться");
-        assert!(matches_with(&m2, "crates/mod.rs"), "без промежуточных каталогов");
+        assert!(
+            matches_with(&m2, "crates/mod.rs"),
+            "без промежуточных каталогов"
+        );
         assert!(matches_with(&m2, "crates/core/src/mod.rs"), "с каталогами");
 
         // Brace-альтернативы вместе с `**/` — и корень, и вложенность.
         let m3 = build_path_matcher("**/*.{md,toml}").expect("образец должен компилироваться");
         assert!(matches_with(&m3, "Cargo.toml"), "корневой toml");
-        assert!(matches_with(&m3, "crates/core/Cargo.toml"), "вложенный toml");
+        assert!(
+            matches_with(&m3, "crates/core/Cargo.toml"),
+            "вложенный toml"
+        );
     }
 
     /// M-8: пустая выдача поиска, где сужение по пути съело всю предвыборку,
@@ -2553,7 +2612,10 @@ mod tests {
         assert_eq!(v["prefetched"], serde_json::json!(100));
         assert_eq!(v["shown"], serde_json::json!(12));
         let hint = v["hint"].as_str().unwrap();
-        assert!(hint.contains("НЕ весь результат"), "сказано, что выдача неполна");
+        assert!(
+            hint.contains("НЕ весь результат"),
+            "сказано, что выдача неполна"
+        );
 
         // Потолок не достигнут — выдача честно полная, признака нет.
         assert!(search_extra("база", true, 7, 100, 7).is_none());
@@ -2630,18 +2692,37 @@ mod tests {
         assert_eq!(out["body_truncated"], serde_json::json!(true));
         assert_eq!(out["body_lines_total"], serde_json::json!(300));
         let b = out["body"].as_str().unwrap();
-        assert!(b.contains("строка_0") && b.contains("строка_299"), "голова+хвост");
+        assert!(
+            b.contains("строка_0") && b.contains("строка_299"),
+            "голова+хвост"
+        );
         assert!(!b.contains("строка_150"), "середина выкинута");
-        assert!(b.contains("ТЕЛО УСЕЧЕНО") && b.contains("read_file") && b.contains("base/X/Module.bsl"));
+        assert!(
+            b.contains("ТЕЛО УСЕЧЕНО")
+                && b.contains("read_file")
+                && b.contains("base/X/Module.bsl")
+        );
         assert!(b.len() < big.len(), "стаб реально короче тела");
         // 2) малое тело — без изменений
         let small = "малое тело\nвторая".to_string();
-        let out2 = cap_record_body(serde_json::json!({ "body": small.clone() }), &small, "p", 1, 2);
+        let out2 = cap_record_body(
+            serde_json::json!({ "body": small.clone() }),
+            &small,
+            "p",
+            1,
+            2,
+        );
         assert!(out2.get("body_truncated").is_none());
         assert_eq!(out2["body"], serde_json::json!(small));
         // 3) cap=0 → выключено (тело целиком)
         crate::mcp::cap::set_function_body_cap(Some(0));
-        let out3 = cap_record_body(serde_json::json!({ "body": big.clone() }), &big, "p", 1, 300);
+        let out3 = cap_record_body(
+            serde_json::json!({ "body": big.clone() }),
+            &big,
+            "p",
+            1,
+            300,
+        );
         assert!(out3.get("body_truncated").is_none());
         // вернуть дефолт, чтобы не влиять на другие тесты
         crate::mcp::cap::set_function_body_cap(None);
@@ -2663,11 +2744,17 @@ mod tests {
             grep_code_empty_hint(Some("bsl")),
             find_symbol_empty_hint(Some("bsl")),
         ] {
-            assert!(h.contains("search_terms"), "BSL grep/find hint должен звать search_terms");
+            assert!(
+                h.contains("search_terms"),
+                "BSL grep/find hint должен звать search_terms"
+            );
         }
         assert_eq!(grep_body_empty_hint(Some("rust")), HINT_GREP_BODY_EMPTY);
         assert_eq!(grep_code_empty_hint(None), HINT_GREP_CODE_EMPTY);
-        assert_eq!(find_symbol_empty_hint(Some("python")), HINT_FIND_SYMBOL_EMPTY);
+        assert_eq!(
+            find_symbol_empty_hint(Some("python")),
+            HINT_FIND_SYMBOL_EMPTY
+        );
         assert!(!HINT_GREP_BODY_EMPTY.contains("search_terms"));
     }
 
@@ -2723,13 +2810,31 @@ mod tests {
     #[test]
     fn compact_text_matches_no_context() {
         let matches = vec![
-            GrepTextMatch { path: "b.rs".into(), line: 10, content: "ten".into(), context: vec![] },
-            GrepTextMatch { path: "a.rs".into(), line: 5, content: "five".into(), context: vec![] },
-            GrepTextMatch { path: "a.rs".into(), line: 2, content: "two".into(), context: vec![] },
+            GrepTextMatch {
+                path: "b.rs".into(),
+                line: 10,
+                content: "ten".into(),
+                context: vec![],
+            },
+            GrepTextMatch {
+                path: "a.rs".into(),
+                line: 5,
+                content: "five".into(),
+                context: vec![],
+            },
+            GrepTextMatch {
+                path: "a.rs".into(),
+                line: 2,
+                content: "two".into(),
+                context: vec![],
+            },
         ];
         let files = compact_text_matches(&matches);
         let a = files.get("a.rs").unwrap().as_array().unwrap();
-        assert_eq!(a, &vec![serde_json::json!("2: two"), serde_json::json!("5: five")]);
+        assert_eq!(
+            a,
+            &vec![serde_json::json!("2: two"), serde_json::json!("5: five")]
+        );
         let b = files.get("b.rs").unwrap().as_array().unwrap();
         assert_eq!(b, &vec![serde_json::json!("10: ten")]);
         let keys: Vec<&str> = files.keys().map(|s| s.as_str()).collect();
@@ -2745,9 +2850,18 @@ mod tests {
             line: 3,
             content: "MATCH".into(),
             context: vec![
-                ContextLine { line: 2, content: "before".into() },
-                ContextLine { line: 3, content: "ctx-dup".into() },
-                ContextLine { line: 4, content: "after".into() },
+                ContextLine {
+                    line: 2,
+                    content: "before".into(),
+                },
+                ContextLine {
+                    line: 3,
+                    content: "ctx-dup".into(),
+                },
+                ContextLine {
+                    line: 4,
+                    content: "after".into(),
+                },
             ],
         }];
         let files = compact_text_matches(&matches);
@@ -2785,13 +2899,22 @@ mod tests {
                 line_end: 410,
                 match_lines: vec![405],
                 match_count: None,
-                context: vec![ContextLine { line: 405, content: "x = 1;".into() }],
+                context: vec![ContextLine {
+                    line: 405,
+                    content: "x = 1;".into(),
+                }],
             },
         ];
         let files = compact_body_matches(&matches);
         let arr = files.get("doc.bsl").unwrap().as_array().unwrap();
-        assert_eq!(arr[0], serde_json::json!("Провести (function) L120-340: 125,130,200 (+5)"));
-        assert_eq!(arr[1], serde_json::json!("Отменить (function) L400-410: 405"));
+        assert_eq!(
+            arr[0],
+            serde_json::json!("Провести (function) L120-340: 125,130,200 (+5)")
+        );
+        assert_eq!(
+            arr[1],
+            serde_json::json!("Отменить (function) L400-410: 405")
+        );
         assert_eq!(arr[2], serde_json::json!("405: x = 1;"));
     }
 
@@ -2799,11 +2922,26 @@ mod tests {
     #[test]
     fn compact_listed_files_format() {
         let files = vec![
-            ListedFile { path: "src/foo.rs".into(), language: "rust".into(), lines_total: 724, size: Some(28504), mtime: Some(123) },
-            ListedFile { path: "bar.md".into(), language: "markdown".into(), lines_total: 3, size: None, mtime: None },
+            ListedFile {
+                path: "src/foo.rs".into(),
+                language: "rust".into(),
+                lines_total: 724,
+                size: Some(28504),
+                mtime: Some(123),
+            },
+            ListedFile {
+                path: "bar.md".into(),
+                language: "markdown".into(),
+                lines_total: 3,
+                size: None,
+                mtime: None,
+            },
         ];
         let out = compact_listed_files(&files);
-        assert_eq!(out[0], serde_json::json!("src/foo.rs | rust | 724 lines | 28504"));
+        assert_eq!(
+            out[0],
+            serde_json::json!("src/foo.rs | rust | 724 lines | 28504")
+        );
         assert_eq!(out[1], serde_json::json!("bar.md | markdown | 3 lines | ?"));
     }
 
@@ -2825,7 +2963,11 @@ mod tests {
         }
         for i in 0..30 {
             for j in 0..30 {
-                v.push(tree_edge(&format!("Ребёнок{i}"), &format!("Внук{i}_{j}"), 2));
+                v.push(tree_edge(
+                    &format!("Ребёнок{i}"),
+                    &format!("Внук{i}_{j}"),
+                    2,
+                ));
             }
         }
         v
@@ -2836,7 +2978,11 @@ mod tests {
         let edges = wide_tree();
         let before = serde_json::to_string(&edges).unwrap();
         let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, 10_000_000);
-        assert_eq!(serde_json::to_string(&kept).unwrap(), before, "в бюджете рёбра и порядок не меняются");
+        assert_eq!(
+            serde_json::to_string(&kept).unwrap(),
+            before,
+            "в бюджете рёбра и порядок не меняются"
+        );
         assert_eq!(tree, Some(build_call_tree_json("Корень", true, &kept)));
     }
 
@@ -2855,12 +3001,23 @@ mod tests {
         let total = edges.len();
         let budget = 20_000;
         let (kept, tree) = fit_call_tree_to_budget("Корень", true, edges, budget);
-        assert!(kept.len() < total, "ответ сокращён: {} из {}", kept.len(), total);
+        assert!(
+            kept.len() < total,
+            "ответ сокращён: {} из {}",
+            kept.len(),
+            total
+        );
         assert!(tree.is_none(), "сокращённый ответ отдаётся без дерева");
         let size = serde_json::to_vec(&kept).unwrap().len();
-        assert!(size <= budget - CALL_TREE_OVERHEAD_BYTES, "уложилось в бюджет: {size}");
+        assert!(
+            size <= budget - CALL_TREE_OVERHEAD_BYTES,
+            "уложилось в бюджет: {size}"
+        );
         let d1 = kept.iter().filter(|e| e.depth == 1).count();
-        assert!(kept.iter().all(|e| e.depth == 1) || d1 == 30, "ребро глубины 2 не остаётся без рёбер глубины 1");
+        assert!(
+            kept.iter().all(|e| e.depth == 1) || d1 == 30,
+            "ребро глубины 2 не остаётся без рёбер глубины 1"
+        );
     }
 
     #[test]
@@ -2881,9 +3038,10 @@ mod tests {
         let mut n_with_tree = 0usize;
         for k in 1..=edges.len() {
             let tree = build_call_tree_json("Корень", true, &edges[..k]);
-            let size = serde_json::to_vec(&serde_json::json!({ "edges": &edges[..k], "tree": tree }))
-                .unwrap()
-                .len();
+            let size =
+                serde_json::to_vec(&serde_json::json!({ "edges": &edges[..k], "tree": tree }))
+                    .unwrap()
+                    .len();
             if size <= 18_000 {
                 n_with_tree = k;
             }

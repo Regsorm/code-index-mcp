@@ -661,7 +661,7 @@ Backfill выполняется автоматически при первом �
 
 ### Storage API
 
-`code-index-core` предоставляет библиотеку для прямой работы с SQLite. Storage API v0.8.0 изменён несовместимо: `Indexer::write_code_to_db`, `Storage::read_file_text`, `worker::run_worker` получили новые параметры. Внешних публичных callers нет, но при прямом использовании крейта требуется обновление.
+`code-index-core` предоставляет библиотеку для прямой работы с SQLite. Связанные параметры сгруппированы в именованные структуры `CodeWriteParams`, `TextWriteParams`, `ReadFileOptions` и `GrepBodyOptions`; `worker::run_worker` остаётся внутренним API крейта. Внешних публичных callers сейчас нет, но при прямом использовании крейта нужно передавать соответствующую структуру параметров.
 
 ### Схема БД
 

@@ -1,15 +1,21 @@
 use anyhow::{anyhow, Result};
 
-use super::types::{
-    empty_parse_result, looks_binary, sha256_hex,
-    ParseResult, ParsedCall, ParsedFunction, ParsedVariable, PARSE_TIMEOUT_MS,
-};
-use super::LanguageParser;
 use super::callee::is_plain_qualifier;
 use super::types::MAX_VISIT_DEPTH;
+use super::types::{
+    empty_parse_result, looks_binary, sha256_hex, ParseResult, ParsedCall, ParsedFunction,
+    ParsedVariable, PARSE_TIMEOUT_MS,
+};
+use super::LanguageParser;
 
 /// Парсер BSL-файлов (1С:Предприятие / OneScript) на основе tree-sitter-bsl
 pub struct BslParser;
+
+impl Default for BslParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl BslParser {
     pub fn new() -> Self {
@@ -42,12 +48,10 @@ fn find_child_by_kind<'a>(
     kind: &str,
 ) -> Option<tree_sitter::Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
+    let found = node
+        .children(&mut cursor)
+        .find(|&child| child.kind() == kind);
+    found
 }
 
 /// Извлечь директиву компиляции и (для расширений) информацию о переопределении
@@ -161,11 +165,7 @@ fn visit_node(
 }
 
 /// Обработать procedure_definition или function_definition
-fn visit_proc_or_func(
-    node: tree_sitter::Node,
-    ctx: &mut VisitContext,
-    proc_type: &str,
-) {
+fn visit_proc_or_func(node: tree_sitter::Node, ctx: &mut VisitContext, proc_type: &str) {
     let source = ctx.source;
 
     let name = node
@@ -245,8 +245,11 @@ fn visit_proc_or_func(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "parameters" | "annotation" | "EXPORT_KEYWORD"
-            | "procedure_definition" | "function_definition" => {
+            "parameters"
+            | "annotation"
+            | "EXPORT_KEYWORD"
+            | "procedure_definition"
+            | "function_definition" => {
                 // Не рекурсируем в служебные узлы и вложенные определения
             }
             _ => {
@@ -295,11 +298,7 @@ fn visit_body_for_calls(
 /// ребёнка. Голый вызов `ГолыйВызов(2)` — method_call, чей родитель НЕ
 /// call_expression/access, либо родитель access с единственным именованным
 /// ребёнком (голова цепочки `Ф().Метод()`). caller — имя процедуры-контейнера.
-fn record_method_call(
-    node: tree_sitter::Node,
-    ctx: &mut VisitContext,
-    current_func: Option<&str>,
-) {
+fn record_method_call(node: tree_sitter::Node, ctx: &mut VisitContext, current_func: Option<&str>) {
     if let Some(ident) = find_child_by_kind(node, "identifier") {
         let method = node_text(ident, ctx.source).to_string();
         if method.is_empty() {
@@ -408,7 +407,6 @@ fn parse_bsl(source: &str) -> Result<ParseResult> {
     let root = tree.root_node();
     let source_bytes = source.as_bytes();
 
-
     // Количество строк
     let lines_total = source.lines().count();
 
@@ -422,7 +420,7 @@ fn parse_bsl(source: &str) -> Result<ParseResult> {
     Ok(ParseResult {
         functions: ctx.functions,
         classes: Vec::new(), // BSL не имеет классов
-        imports: Vec::new(),  // BSL не имеет импортов
+        imports: Vec::new(), // BSL не имеет импортов
         calls: ctx.calls,
         variables: ctx.variables,
         lines_total,
@@ -468,21 +466,37 @@ mod tests {
         let result = parser.parse(source, "test.bsl").unwrap();
         let names: Vec<&str> = result.calls.iter().map(|c| c.callee.as_str()).collect();
         // Неквалифицированный вызов-оператор — остаётся голым именем (точки нет).
-        assert!(names.contains(&"Сообщить"), "Сообщить не найден: {:?}", names);
+        assert!(
+            names.contains(&"Сообщить"),
+            "Сообщить не найден: {:?}",
+            names
+        );
         // Главный кейс: вызов ФУНКЦИИ в ВЫРАЖЕНИИ через общий модуль —
         // квалификатор приклеен: `ОбщегоНазначения.ЗначениеРеквизита`.
-        assert!(names.contains(&"ОбщегоНазначения.ЗначениеРеквизита"),
-            "склеенный вызов функции в выражении не найден: {:?}", names);
+        assert!(
+            names.contains(&"ОбщегоНазначения.ЗначениеРеквизита"),
+            "склеенный вызов функции в выражении не найден: {:?}",
+            names
+        );
         // Квалифицированный вызов-процедура (call_statement) — тоже склеен.
-        assert!(names.contains(&"ОбщийМодуль.МетодМодуля"),
-            "склеенный МетодМодуля не найден: {:?}", names);
+        assert!(
+            names.contains(&"ОбщийМодуль.МетодМодуля"),
+            "склеенный МетодМодуля не найден: {:?}",
+            names
+        );
         // Голый метод без модуля не должен появляться отдельно для
         // квалифицированных вызовов (квалификатор приклеен).
-        assert!(!names.contains(&"ЗначениеРеквизита") && !names.contains(&"МетодМодуля"),
-            "квалифицированный вызов попал в callee голым: {:?}", names);
+        assert!(
+            !names.contains(&"ЗначениеРеквизита") && !names.contains(&"МетодМодуля"),
+            "квалифицированный вызов попал в callee голым: {:?}",
+            names
+        );
         // Имена модулей-приёмников не должны попадать в callee как отдельные «вызовы».
-        assert!(!names.contains(&"ОбщегоНазначения") && !names.contains(&"ОбщийМодуль"),
-            "имя модуля ошибочно записано как отдельный вызов: {:?}", names);
+        assert!(
+            !names.contains(&"ОбщегоНазначения") && !names.contains(&"ОбщийМодуль"),
+            "имя модуля ошибочно записано как отдельный вызов: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -490,7 +504,8 @@ mod tests {
         // Простейший прямой случай из плана миграции: один квалифицированный
         // и один голый вызов, оба операторы верхнего уровня тела процедуры.
         let parser = BslParser::new();
-        let source = "Процедура Тест()\n    ОбщийМодуль.Метод(1);\n    ГолыйВызов(2);\nКонецПроцедуры";
+        let source =
+            "Процедура Тест()\n    ОбщийМодуль.Метод(1);\n    ГолыйВызов(2);\nКонецПроцедуры";
         let result = parser.parse(source, "test.bsl").unwrap();
         let names: Vec<&str> = result.calls.iter().map(|c| c.callee.as_str()).collect();
         assert!(names.contains(&"ОбщийМодуль.Метод"), "callee: {:?}", names);
@@ -658,7 +673,12 @@ mod tests {
         let parser = BslParser::new();
         let source = "Процедура СчётаУчёта()\nКонецПроцедуры";
         let result = parser.parse(source, "test.bsl").unwrap();
-        assert_eq!(result.functions.len(), 1, "функция не найдена: {:?}", result.functions);
+        assert_eq!(
+            result.functions.len(),
+            1,
+            "функция не найдена: {:?}",
+            result.functions
+        );
         assert_eq!(result.functions[0].name, "СчётаУчёта");
     }
 
@@ -671,5 +691,4 @@ mod tests {
         let result = parser.parse(binary, "ObjectModule.bsl").unwrap();
         assert_eq!(result.functions.len(), 0);
     }
-
 }

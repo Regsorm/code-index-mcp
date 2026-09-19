@@ -62,9 +62,7 @@ pub fn merge(
         if is_local {
             match local_paths.get(&entry.alias) {
                 Some(raw_path) => {
-                    let root = raw_path
-                        .canonicalize()
-                        .unwrap_or_else(|_| raw_path.clone());
+                    let root = raw_path.canonicalize().unwrap_or_else(|_| raw_path.clone());
                     let db = root.join(".code-index").join("index.db");
                     out.push(FederatedRepo {
                         alias: entry.alias.clone(),
@@ -108,7 +106,10 @@ mod tests {
 
     fn serve(me_ip: &str, paths: Vec<(&str, &str)>) -> ServeFileConfig {
         ServeFileConfig {
-            me: MeSection { ip: me_ip.to_string(), token: None },
+            me: MeSection {
+                ip: me_ip.to_string(),
+                token: None,
+            },
             paths: paths
                 .into_iter()
                 .map(|(alias, ip)| ServePathEntry {
@@ -122,12 +123,12 @@ mod tests {
     }
 
     /// Расширенный builder с явным портом — для тестов per-host port.
-    fn serve_with_ports(
-        me_ip: &str,
-        paths: Vec<(&str, &str, Option<u16>)>,
-    ) -> ServeFileConfig {
+    fn serve_with_ports(me_ip: &str, paths: Vec<(&str, &str, Option<u16>)>) -> ServeFileConfig {
         ServeFileConfig {
-            me: MeSection { ip: me_ip.to_string(), token: None },
+            me: MeSection {
+                ip: me_ip.to_string(),
+                token: None,
+            },
             paths: paths
                 .into_iter()
                 .map(|(alias, ip, port)| ServePathEntry {
@@ -149,7 +150,11 @@ mod tests {
                     path: PathBuf::from(path),
                     debounce_ms: None,
                     batch_ms: None,
-                    alias: if alias.is_empty() { None } else { Some(alias.to_string()) },
+                    alias: if alias.is_empty() {
+                        None
+                    } else {
+                        Some(alias.to_string())
+                    },
                     language: None,
                     max_code_file_size_bytes: None,
                     bulk_batch_threshold: None,
@@ -210,9 +215,9 @@ mod tests {
         let s = serve(
             "192.0.2.10",
             vec![
-                ("ut", "192.0.2.50"),         // remote
-                ("dev", "192.0.2.10"),       // local (есть в daemon.toml)
-                ("missing", "192.0.2.10"),   // local, но нет в daemon.toml — skip
+                ("ut", "192.0.2.50"),      // remote
+                ("dev", "192.0.2.10"),     // local (есть в daemon.toml)
+                ("missing", "192.0.2.10"), // local, но нет в daemon.toml — skip
             ],
         );
         let d = daemon(vec![("/tmp/dev_repo", "dev")]);

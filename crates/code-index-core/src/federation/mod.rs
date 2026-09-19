@@ -15,7 +15,7 @@
 pub mod client;
 pub mod config;
 pub mod dispatcher;
-pub mod repos;
 pub mod reload;
+pub mod repos;
 pub mod server;
 pub mod whitelist;

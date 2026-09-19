@@ -151,7 +151,6 @@ pub trait LanguageProcessor: Send + Sync {
         Ok(())
     }
 
-
     /// Наполнены ли специфичные extras-таблицы процессора в текущей БД.
     /// Используется демоном на старте: если `full_reindex` по mtime не нашёл
     /// изменений (0 проиндексировано / 0 удалено) И extras уже на месте —
@@ -313,7 +312,11 @@ impl StandardLanguageProcessor {
         parser: Box<dyn LanguageParser>,
         detects_fn: fn(&Path) -> bool,
     ) -> Self {
-        Self { name, parser, detects_fn }
+        Self {
+            name,
+            parser,
+            detects_fn,
+        }
     }
 
     pub fn python() -> Self {

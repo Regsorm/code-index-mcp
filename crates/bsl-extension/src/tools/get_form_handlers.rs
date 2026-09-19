@@ -86,7 +86,10 @@ impl IndexTool for GetFormHandlersTool {
                     }));
                 }
             };
-            let form_name = args.get("form_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let form_name = args
+                .get("form_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let budget = resolve_request_budget(
                 args.get("max_response_bytes")
                     .and_then(|v| v.as_u64())
@@ -192,8 +195,8 @@ impl IndexTool for GetFormHandlersTool {
                              ORDER BY form_name LIMIT 50",
                         );
                         if let Ok(mut stmt) = stmt {
-                            let rows = stmt
-                                .query_map(params!["default", key], |r| r.get::<_, String>(0));
+                            let rows =
+                                stmt.query_map(params!["default", key], |r| r.get::<_, String>(0));
                             if let Ok(rows) = rows {
                                 available.extend(rows.flatten());
                             }
@@ -342,7 +345,11 @@ fn one_form_response(
     let mut by_element = serde_json::Map::new();
     if let Some(items) = handlers.as_array() {
         for h in items {
-            let key = h.get("element").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let key = h
+                .get("element")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let n = by_element.get(&key).and_then(|v| v.as_u64()).unwrap_or(0) + 1;
             by_element.insert(key, json!(n));
         }
@@ -367,7 +374,9 @@ fn one_form_response(
         }
         out
     };
-    let full_bytes = serde_json::to_string(&handlers).map(|s| s.len()).unwrap_or(0);
+    let full_bytes = serde_json::to_string(&handlers)
+        .map(|s| s.len())
+        .unwrap_or(0);
     let (mut value, folded) = fold_to_budget(
         head(("handlers", handlers), true),
         head(("handlers_by_element", Value::Object(by_element)), false),
@@ -458,7 +467,10 @@ mod tests {
         assert_eq!(v["handlers_by_element"]["Товары"], json!(30));
         assert!(v.get("handlers").is_none(), "содержимое не отдаётся");
         let hint = v["hint"].as_str().unwrap();
-        assert!(hint.contains("element='Товары'"), "подсказка ведёт к элементу: {hint}");
+        assert!(
+            hint.contains("element='Товары'"),
+            "подсказка ведёт к элементу: {hint}"
+        );
     }
 
     #[test]

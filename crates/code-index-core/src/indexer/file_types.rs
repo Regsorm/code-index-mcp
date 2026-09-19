@@ -45,12 +45,8 @@ const CODE_EXTENSIONS: &[(&str, &str)] = &[
 /// Внимание: `html`/`htm` ушли в CODE_EXTENSIONS (v0.7.1) — для них применяется
 /// AST-парсинг + дополнительная text-индексация (см. `is_dual_indexed_language`).
 const TEXT_EXTENSIONS: &[&str] = &[
-    "md", "txt", "rst",
-    "json", "yaml", "yml", "toml",
-    "xml", "css",
-    "kt",
-    "csv", "env", "ini", "cfg",
-    "sql", "sh", "bat", "ps1",
+    "md", "txt", "rst", "json", "yaml", "yml", "toml", "xml", "css", "kt", "csv", "env", "ini",
+    "cfg", "sql", "sh", "bat", "ps1",
     // Выгрузка 1C:EDT — тот же XML, что у формата Конфигуратора, но с другими
     // расширениями: `.mdo` (описание объекта), `.form` (форма), `.rights`
     // (права роли). Без них файлы считались двоичными: поиска по метаданным
@@ -118,12 +114,7 @@ pub fn is_size_exempt(path: &Path) -> bool {
 ///
 /// Код индексируется независимо от размера; для текста действует
 /// `max_file_size`, кроме файлов выгрузки 1С из [`SIZE_EXEMPT_FILES`].
-pub fn size_allowed(
-    path: &Path,
-    category: &FileCategory,
-    size: u64,
-    max_file_size: usize,
-) -> bool {
+pub fn size_allowed(path: &Path, category: &FileCategory, size: u64, max_file_size: usize) -> bool {
     matches!(category, FileCategory::Code(_))
         || is_size_exempt(path)
         || size as usize <= max_file_size
@@ -131,9 +122,20 @@ pub fn size_allowed(
 
 /// Директории, которые следует исключать при обходе
 pub const EXCLUDE_DIRS: &[&str] = &[
-    "node_modules", ".venv", "__pycache__", ".git",
-    ".code-index", "target", ".mypy_cache", ".pytest_cache",
-    ".tox", "dist", "build", "venv", "env", ".env",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+    ".git",
+    ".code-index",
+    "target",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    "dist",
+    "build",
+    "venv",
+    "env",
+    ".env",
 ];
 
 /// Категория файла с учётом языка репозитория и дополнительных текстовых
@@ -278,7 +280,10 @@ mod tests {
     #[test]
     fn test_text_extensions() {
         assert_eq!(categorize_file(Path::new("readme.md")), FileCategory::Text);
-        assert_eq!(categorize_file(Path::new("config.toml")), FileCategory::Text);
+        assert_eq!(
+            categorize_file(Path::new("config.toml")),
+            FileCategory::Text
+        );
         assert_eq!(categorize_file(Path::new("data.json")), FileCategory::Text);
         assert_eq!(categorize_file(Path::new("setup.cfg")), FileCategory::Text);
     }
@@ -434,8 +439,14 @@ mod tests {
 
     #[test]
     fn test_binary_extension() {
-        assert_eq!(categorize_file(Path::new("image.png")), FileCategory::Binary);
-        assert_eq!(categorize_file(Path::new("archive.zip")), FileCategory::Binary);
+        assert_eq!(
+            categorize_file(Path::new("image.png")),
+            FileCategory::Binary
+        );
+        assert_eq!(
+            categorize_file(Path::new("archive.zip")),
+            FileCategory::Binary
+        );
         assert_eq!(categorize_file(Path::new("lib.so")), FileCategory::Binary);
     }
 

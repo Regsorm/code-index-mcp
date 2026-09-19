@@ -84,7 +84,10 @@ mod tests {
     #[test]
     fn fresh_when_table_is_empty() {
         let conn = fresh_db();
-        assert_eq!(check_signature(&conn, "anything").unwrap(), SignatureCheck::Fresh);
+        assert_eq!(
+            check_signature(&conn, "anything").unwrap(),
+            SignatureCheck::Fresh
+        );
     }
 
     #[test]
