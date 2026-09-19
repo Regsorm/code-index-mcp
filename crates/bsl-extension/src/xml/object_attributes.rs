@@ -52,7 +52,7 @@ use quick_xml::Reader;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::BytesTextExt;
+use super::{general_ref_text, BytesTextExt};
 
 /// Страховочный предел на число конкретных типов в составном реквизите.
 /// Перечни в реальных конфигурациях короткие (2–20); если перечислено
@@ -135,7 +135,9 @@ enum TextTarget {
 /// его проставляет вызывающий при вставке), но имя поля/ТЧ берётся из XML.
 pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
 
     let mut out: Vec<DataLinkEdge> = Vec::new();
     let mut buf = Vec::new();
@@ -153,6 +155,7 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
     // Внутри <Owners> — список владельцев подчинённого справочника.
     let mut in_owners = false;
     let mut text_target = TextTarget::None;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -229,62 +232,70 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                     continue;
                 }
                 let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                let txt = txt.trim().to_string();
-                match text_target {
-                    TextTarget::FieldName => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() {
-                                f.name = Some(txt);
-                            }
-                        }
-                    }
-                    TextTarget::TabularName => {
-                        if !txt.is_empty() {
-                            tabular = Some(txt);
-                            expecting_tabular_name = false;
-                        }
-                    }
-                    TextTarget::TypeValue => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() {
-                                f.types.push(txt);
-                            }
-                        }
-                    }
-                    TextTarget::RegisterRef => {
-                        // Документ → регистр: ребро recorder. Цель уже
-                        // в каноническом виде (AccumulationRegister.X и т.п.).
-                        if !txt.is_empty() {
-                            out.push(DataLinkEdge {
-                                from_path: String::new(),
-                                to_object: txt,
-                                link_kind: "recorder",
-                                is_composite: false,
-                                is_universal: false,
-                            });
-                        }
-                    }
-                    TextTarget::OwnerRef => {
-                        // Подчинённый справочник → владелец: ребро owner.
-                        // Цель уже каноническая (Catalog.X / ExchangePlan.X).
-                        if !txt.is_empty() {
-                            out.push(DataLinkEdge {
-                                from_path: String::new(),
-                                to_object: txt,
-                                link_kind: "owner",
-                                is_composite: false,
-                                is_universal: false,
-                            });
-                        }
-                    }
-                    // Прочие цели (свойства шапки/проведения, синонимы,
-                    // FillChecking, корневой Type) в парсере связей данных не
-                    // возникают — их обрабатывает parse_object_structure_xml.
-                    _ => {}
+                acc.push_str(&txt);
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if text_target != TextTarget::None {
+                    acc.push_str(&general_ref_text(&r));
                 }
-                text_target = TextTarget::None;
             }
             Ok(Event::End(e)) => {
+                if text_target != TextTarget::None {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
+                    match text_target {
+                        TextTarget::FieldName => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() {
+                                    f.name = Some(txt);
+                                }
+                            }
+                        }
+                        TextTarget::TabularName => {
+                            if !txt.is_empty() {
+                                tabular = Some(txt);
+                                expecting_tabular_name = false;
+                            }
+                        }
+                        TextTarget::TypeValue => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() {
+                                    f.types.push(txt);
+                                }
+                            }
+                        }
+                        TextTarget::RegisterRef => {
+                            // Документ → регистр: ребро recorder. Цель уже
+                            // в каноническом виде (AccumulationRegister.X и т.п.).
+                            if !txt.is_empty() {
+                                out.push(DataLinkEdge {
+                                    from_path: String::new(),
+                                    to_object: txt,
+                                    link_kind: "recorder",
+                                    is_composite: false,
+                                    is_universal: false,
+                                });
+                            }
+                        }
+                        TextTarget::OwnerRef => {
+                            // Подчинённый справочник → владелец: ребро owner.
+                            // Цель уже каноническая (Catalog.X / ExchangePlan.X).
+                            if !txt.is_empty() {
+                                out.push(DataLinkEdge {
+                                    from_path: String::new(),
+                                    to_object: txt,
+                                    link_kind: "owner",
+                                    is_composite: false,
+                                    is_universal: false,
+                                });
+                            }
+                        }
+                        // Прочие цели (свойства шапки/проведения, синонимы,
+                        // FillChecking, корневой Type) в парсере связей данных не
+                        // возникают — их обрабатывает parse_object_structure_xml.
+                        _ => {}
+                    }
+                    text_target = TextTarget::None;
+                }
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = local_name(&raw);
                 match local.as_str() {
@@ -309,6 +320,10 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                         }
                     }
                 }
+            }
+            Ok(Event::Empty(_)) => {
+                text_target = TextTarget::None;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -754,13 +769,16 @@ pub fn parse_object_structure_file(path: &Path) -> Result<Option<ObjectStructure
 /// элементов — `<Item>/<Name>` (первое имя в каждом `<Item>`).
 pub fn parse_predefined_xml(content: &str) -> Vec<String> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut out: Vec<String> = Vec::new();
     let mut buf = Vec::new();
     // Внутри <Item> и имя ещё не взято.
     let mut in_item = false;
     let mut want_name = false;
     let mut take_text = false;
+    let mut acc = String::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
@@ -775,19 +793,31 @@ pub fn parse_predefined_xml(content: &str) -> Vec<String> {
             Ok(Event::Text(t)) => {
                 if take_text {
                     let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                    let txt = txt.trim().to_string();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if take_text {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if take_text {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if !txt.is_empty() {
                         out.push(txt);
                         want_name = false;
                     }
                     take_text = false;
                 }
-            }
-            Ok(Event::End(e)) => {
                 let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
                 if local == "Item" {
                     in_item = false;
                 }
+            }
+            Ok(Event::Empty(_)) => {
+                take_text = false;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -804,9 +834,12 @@ pub fn parse_predefined_xml(content: &str) -> Vec<String> {
 /// не указан явно, и тогда платформа считает его табличным документом.
 pub fn parse_template_type(content: &str) -> Option<String> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut want_value = false;
+    let mut acc = String::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
@@ -816,13 +849,22 @@ pub fn parse_template_type(content: &str) -> Option<String> {
                 }
             }
             Ok(Event::Text(t)) if want_value => {
-                let txt = t
-                    .unescape()
-                    .map(|s| s.into_owned())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                return (!txt.is_empty()).then_some(txt);
+                let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                acc.push_str(&txt);
+            }
+            Ok(Event::GeneralRef(r)) if want_value => {
+                acc.push_str(&general_ref_text(&r));
+            }
+            Ok(Event::End(_)) if want_value => {
+                let txt = std::mem::take(&mut acc).trim().to_string();
+                want_value = false;
+                if !txt.is_empty() {
+                    return Some(txt);
+                }
+            }
+            Ok(Event::Empty(_)) => {
+                want_value = false;
+                acc.clear();
             }
             Ok(Event::Eof) | Err(_) => return None,
             _ => {}
@@ -842,7 +884,9 @@ pub fn parse_template_type(content: &str) -> Option<String> {
 /// непустой `<v8:content>`.
 pub fn parse_object_header_xml(content: &str) -> Option<(String, String, Option<String>)> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
 
     let mut depth = 0i32;
@@ -857,6 +901,7 @@ pub fn parse_object_header_xml(content: &str) -> Option<(String, String, Option<
     let mut want_lang = false;
     let mut want_content = false;
     let mut want_name = false;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -882,12 +927,18 @@ pub fn parse_object_header_xml(content: &str) -> Option<(String, String, Option<
                 }
             }
             Ok(Event::Text(t)) => {
-                let txt = t
-                    .unescape()
-                    .map(|s| s.into_owned())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
+                if want_name || want_lang || want_content {
+                    let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if want_name || want_lang || want_content {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                let txt = std::mem::take(&mut acc).trim().to_string();
                 if want_name {
                     if !txt.is_empty() {
                         name = Some(txt);
@@ -907,14 +958,18 @@ pub fn parse_object_header_xml(content: &str) -> Option<(String, String, Option<
                     cur_lang = None;
                     want_content = false;
                 }
-            }
-            Ok(Event::End(e)) => {
                 depth -= 1;
                 let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
                 if local == "Synonym" && in_synonym {
                     in_synonym = false;
                     synonym_done = true;
                 }
+            }
+            Ok(Event::Empty(_)) => {
+                want_name = false;
+                want_lang = false;
+                want_content = false;
+                acc.clear();
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -939,9 +994,12 @@ pub fn parse_object_header_xml(content: &str) -> Option<(String, String, Option<
 /// (иначе подхватился бы `ObjectBelonging` вложенного реквизита).
 pub fn parse_object_belonging(content: &str) -> Option<String> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut want = false;
+    let mut acc = String::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
@@ -954,13 +1012,22 @@ pub fn parse_object_belonging(content: &str) -> Option<String> {
                 want = local == "ObjectBelonging";
             }
             Ok(Event::Text(t)) if want => {
-                let txt = t
-                    .unescape()
-                    .map(|s| s.into_owned())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                return if txt.is_empty() { None } else { Some(txt) };
+                let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                acc.push_str(&txt);
+            }
+            Ok(Event::GeneralRef(r)) if want => {
+                acc.push_str(&general_ref_text(&r));
+            }
+            Ok(Event::End(_)) if want => {
+                let txt = std::mem::take(&mut acc).trim().to_string();
+                want = false;
+                if !txt.is_empty() {
+                    return Some(txt);
+                }
+            }
+            Ok(Event::Empty(_)) => {
+                want = false;
+                acc.clear();
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -972,7 +1039,9 @@ pub fn parse_object_belonging(content: &str) -> Option<String> {
 
 pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
 
     let mut out = ObjectStructure::default();
     let mut buf = Vec::new();
@@ -1015,6 +1084,7 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
     // W11: внутри <Synonym> текущего поля; последний прочитанный <v8:lang>.
     let mut in_field_syn = false;
     let mut syn_lang: Option<String> = None;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1161,94 +1231,99 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                     continue;
                 }
                 let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                let txt = txt.trim().to_string();
-                match text_target {
-                    TextTarget::FieldName => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() {
-                                f.name = Some(txt);
-                            }
-                        }
-                    }
-                    TextTarget::TabularName => {
-                        if !txt.is_empty() {
-                            out.tabular_sections.push(StructTabular {
-                                name: txt,
-                                attributes: Vec::new(),
-                            });
-                            cur_tab = Some(out.tabular_sections.len() - 1);
-                            expecting_tabular_name = false;
-                        }
-                    }
-                    TextTarget::TypeValue => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() {
-                                f.types.push(txt);
-                            }
-                        }
-                    }
-                    TextTarget::PostingProp => {
-                        if let Some(prop) = cur_posting_prop.take() {
-                            if !txt.is_empty() {
-                                out.posting.push((prop, txt));
-                            }
-                        }
-                    }
-                    // W6: владелец подчинённого справочника → секция owners.
-                    TextTarget::OwnerRef => {
-                        if !txt.is_empty() {
-                            out.owners.push(txt);
-                        }
-                    }
-                    // W13: тип значения характеристик / тип константы.
-                    TextTarget::RootTypeValue => {
-                        if !txt.is_empty() {
-                            out.value_types.push(pretty_one_type(&txt));
-                        }
-                    }
-                    // W11: синоним поля — ru-приоритет, иначе первый попавшийся.
-                    TextTarget::FieldSynLang => {
-                        syn_lang = Some(txt);
-                    }
-                    TextTarget::FieldSynContent => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty()
-                                && (syn_lang.as_deref() == Some("ru") || f.synonym.is_none())
-                            {
-                                f.synonym = Some(txt);
-                            }
-                        }
-                    }
-                    // W9: FillChecking=ShowError → поле обязательно к заполнению.
-                    TextTarget::FieldFillChecking => {
-                        if let Some(f) = field.as_mut() {
-                            f.required = txt == "ShowError";
-                        }
-                    }
-                    // Индексирование: DontIndex (и пустое) не сохраняем.
-                    TextTarget::FieldIndexing => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() && txt != "DontIndex" {
-                                f.indexing = Some(txt);
-                            }
-                        }
-                    }
-                    // W8: скалярное свойство шапки из белого списка.
-                    TextTarget::HeaderProp => {
-                        if let Some(prop) = cur_header_prop.take() {
-                            if !txt.is_empty() {
-                                out.properties.push((prop, txt));
-                            }
-                        }
-                    }
-                    TextTarget::None => {}
-                    // RegisterRef в структурном парсере не возникает
-                    // (RegisterRecords обрабатывает только parse_object_attributes_xml).
-                    TextTarget::RegisterRef => {}
+                acc.push_str(&txt);
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if text_target != TextTarget::None {
+                    acc.push_str(&general_ref_text(&r));
                 }
-                text_target = TextTarget::None;
             }
             Ok(Event::End(e)) => {
+                if text_target != TextTarget::None {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
+                    match text_target {
+                        TextTarget::FieldName => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() {
+                                    f.name = Some(txt);
+                                }
+                            }
+                        }
+                        TextTarget::TabularName => {
+                            if !txt.is_empty() {
+                                out.tabular_sections.push(StructTabular {
+                                    name: txt,
+                                    attributes: Vec::new(),
+                                });
+                                cur_tab = Some(out.tabular_sections.len() - 1);
+                                expecting_tabular_name = false;
+                            }
+                        }
+                        TextTarget::TypeValue => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() {
+                                    f.types.push(txt);
+                                }
+                            }
+                        }
+                        TextTarget::PostingProp => {
+                            if let Some(prop) = cur_posting_prop.take() {
+                                if !txt.is_empty() {
+                                    out.posting.push((prop, txt));
+                                }
+                            }
+                        }
+                        // W6: владелец подчинённого справочника → секция owners.
+                        TextTarget::OwnerRef => {
+                            if !txt.is_empty() {
+                                out.owners.push(txt);
+                            }
+                        }
+                        // W13: тип значения характеристик / тип константы.
+                        TextTarget::RootTypeValue => {
+                            if !txt.is_empty() {
+                                out.value_types.push(pretty_one_type(&txt));
+                            }
+                        }
+                        // W11: синоним поля — ru-приоритет, иначе первый попавшийся.
+                        TextTarget::FieldSynLang => syn_lang = Some(txt),
+                        TextTarget::FieldSynContent => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty()
+                                    && (syn_lang.as_deref() == Some("ru") || f.synonym.is_none())
+                                {
+                                    f.synonym = Some(txt);
+                                }
+                            }
+                        }
+                        // W9: FillChecking=ShowError → поле обязательно к заполнению.
+                        TextTarget::FieldFillChecking => {
+                            if let Some(f) = field.as_mut() {
+                                f.required = txt == "ShowError";
+                            }
+                        }
+                        // Индексирование: DontIndex (и пустое) не сохраняем.
+                        TextTarget::FieldIndexing => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() && txt != "DontIndex" {
+                                    f.indexing = Some(txt);
+                                }
+                            }
+                        }
+                        // W8: скалярное свойство шапки из белого списка.
+                        TextTarget::HeaderProp => {
+                            if let Some(prop) = cur_header_prop.take() {
+                                if !txt.is_empty() {
+                                    out.properties.push((prop, txt));
+                                }
+                            }
+                        }
+                        TextTarget::None => {}
+                        // RegisterRef в структурном парсере не возникает.
+                        TextTarget::RegisterRef => {}
+                    }
+                    text_target = TextTarget::None;
+                }
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = local_name(&raw);
                 depth = depth.saturating_sub(1);
@@ -1310,6 +1385,10 @@ pub fn parse_object_structure_xml(content: &str) -> Result<ObjectStructure> {
                         }
                     }
                 }
+            }
+            Ok(Event::Empty(_)) => {
+                text_target = TextTarget::None;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -1416,6 +1495,18 @@ mod tests {
         assert_eq!(name, "Контрагенты");
         // Синоним именно ОБЪЕКТА, не вложенного реквизита (break на ChildObjects).
         assert_eq!(syn.as_deref(), Some("Контрагенты (партнёры)"));
+    }
+
+    /// Сущность внутри синонима приходит отдельным событием; итоговая строка
+    /// должна сохранить и амперсанд, и пробелы вокруг него.
+    #[test]
+    fn сущность_в_синониме_объекта_сохраняется() {
+        let xml = r#"<MetaDataObject xmlns:v8="v"><Catalog><Properties>
+          <Name>Партнёры</Name><Synonym><v8:item><v8:lang>ru</v8:lang>
+          <v8:content>Отдел &amp; Партнёры</v8:content></v8:item></Synonym>
+        </Properties></Catalog></MetaDataObject>"#;
+        let (_, _, synonym) = parse_object_header_xml(xml).unwrap();
+        assert_eq!(synonym.as_deref(), Some("Отдел & Партнёры"));
     }
 
     #[test]

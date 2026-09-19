@@ -25,7 +25,7 @@ use quick_xml::Reader;
 use std::path::Path;
 
 use super::object_attributes::classify_type;
-use super::BytesTextExt;
+use super::{general_ref_text, BytesTextExt};
 
 /// Имя тега без namespace-префикса (`xr:Item` → `Item`).
 fn local_name(name: &str) -> String {
@@ -49,12 +49,15 @@ fn read_to_string_opt(path: &Path) -> Result<Option<String>> {
 /// `MetaType.Name`, как лежат в `<xr:Item>`). Пустой список, если состава нет.
 pub fn parse_subsystem_content_xml(content: &str) -> Result<Vec<String>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut out: Vec<String> = Vec::new();
     // Состав живёт строго внутри <Content>; ChildObjects/прочее игнорируем.
     let mut in_content = false;
     let mut expect_item = false;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -69,17 +72,29 @@ pub fn parse_subsystem_content_xml(content: &str) -> Result<Vec<String>> {
             Ok(Event::Text(t)) => {
                 if expect_item {
                     let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                    let txt = txt.trim().to_string();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if expect_item {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if expect_item {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if !txt.is_empty() {
                         out.push(txt);
                     }
                     expect_item = false;
                 }
-            }
-            Ok(Event::End(e)) => {
                 if local_name(&String::from_utf8_lossy(e.name().as_ref())) == "Content" {
                     in_content = false;
                 }
+            }
+            Ok(Event::Empty(_)) => {
+                expect_item = false;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -103,10 +118,13 @@ pub fn parse_subsystem_content_xml(content: &str) -> Result<Vec<String>> {
 /// только факт ребра, без атрибута авторегистрации).
 pub fn parse_exchange_plan_content_xml(content: &str) -> Result<Vec<String>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut out: Vec<String> = Vec::new();
     let mut expect_meta = false;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -118,12 +136,26 @@ pub fn parse_exchange_plan_content_xml(content: &str) -> Result<Vec<String>> {
             Ok(Event::Text(t)) => {
                 if expect_meta {
                     let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                    let txt = txt.trim().to_string();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if expect_meta {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(_)) => {
+                if expect_meta {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if !txt.is_empty() {
                         out.push(txt);
                     }
                     expect_meta = false;
                 }
+            }
+            Ok(Event::Empty(_)) => {
+                expect_meta = false;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -148,11 +180,14 @@ pub fn parse_exchange_plan_content_xml(content: &str) -> Result<Vec<String>> {
 /// (как в `object_attributes`): `raw == "Type"` vs `raw.ends_with(":Type")`.
 pub fn parse_defined_type_targets_xml(content: &str) -> Result<Vec<(String, bool)>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut raw_types: Vec<String> = Vec::new();
     let mut in_type = false;
     let mut expect_value = false;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -167,17 +202,29 @@ pub fn parse_defined_type_targets_xml(content: &str) -> Result<Vec<(String, bool
             Ok(Event::Text(t)) => {
                 if expect_value {
                     let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                    let txt = txt.trim().to_string();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if expect_value {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if expect_value {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if !txt.is_empty() {
                         raw_types.push(txt);
                     }
                     expect_value = false;
                 }
-            }
-            Ok(Event::End(e)) => {
                 if String::from_utf8_lossy(e.name().as_ref()) == "Type" {
                     in_type = false;
                 }
+            }
+            Ok(Event::Empty(_)) => {
+                expect_value = false;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -207,10 +254,13 @@ pub fn parse_defined_type_targets_xml(content: &str) -> Result<Vec<(String, bool
 /// Возвращает `(object, raw_location)` либо `None`, если `<Location>` пуст.
 pub fn parse_functional_option_location_xml(content: &str) -> Result<Option<(String, String)>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut expect_loc = false;
     let mut raw_location: Option<String> = None;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -222,12 +272,26 @@ pub fn parse_functional_option_location_xml(content: &str) -> Result<Option<(Str
             Ok(Event::Text(t)) => {
                 if expect_loc {
                     let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                    let txt = txt.trim().to_string();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if expect_loc {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(_)) => {
+                if expect_loc {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if !txt.is_empty() {
                         raw_location = Some(txt);
                     }
                     expect_loc = false;
                 }
+            }
+            Ok(Event::Empty(_)) => {
+                expect_loc = false;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -270,7 +334,9 @@ pub struct RoleRight {
 /// имя права.
 pub fn parse_role_rights_xml(content: &str) -> Result<Vec<RoleRight>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut out: Vec<RoleRight> = Vec::new();
 
@@ -289,6 +355,7 @@ pub fn parse_role_rights_xml(content: &str) -> Result<Vec<RoleRight>> {
         Value,
     }
     let mut tt = T::None;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -320,7 +387,17 @@ pub fn parse_role_rights_xml(content: &str) -> Result<Vec<RoleRight>> {
             Ok(Event::Text(t)) => {
                 if tt != T::None {
                     let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                    let txt = txt.trim().to_string();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if tt != T::None {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if tt != T::None {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     match tt {
                         T::ObjName => {
                             if !txt.is_empty() {
@@ -337,8 +414,6 @@ pub fn parse_role_rights_xml(content: &str) -> Result<Vec<RoleRight>> {
                     }
                     tt = T::None;
                 }
-            }
-            Ok(Event::End(e)) => {
                 let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
                 match local.as_str() {
                     "right" => {
@@ -362,6 +437,10 @@ pub fn parse_role_rights_xml(content: &str) -> Result<Vec<RoleRight>> {
                     }
                     _ => {}
                 }
+            }
+            Ok(Event::Empty(_)) => {
+                tt = T::None;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -414,11 +493,14 @@ pub fn parse_functional_option_location_file(path: &Path) -> Result<Option<(Stri
 /// отдаём как есть (потребитель видит точную гранулярность включения).
 pub fn parse_functional_option_content_xml(content: &str) -> Result<Vec<String>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut in_content = false;
     let mut expect_obj = false;
     let mut out: Vec<String> = Vec::new();
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -433,17 +515,29 @@ pub fn parse_functional_option_content_xml(content: &str) -> Result<Vec<String>>
             Ok(Event::Text(t)) => {
                 if expect_obj {
                     let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                    let txt = txt.trim().to_string();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if expect_obj {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if expect_obj {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if !txt.is_empty() {
                         out.push(txt);
                     }
                     expect_obj = false;
                 }
-            }
-            Ok(Event::End(e)) => {
                 if local_name(&String::from_utf8_lossy(e.name().as_ref())) == "Content" {
                     in_content = false;
                 }
+            }
+            Ok(Event::Empty(_)) => {
+                expect_obj = false;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -501,6 +595,19 @@ mod tests {
                 "Document.РассылкаКлиентам".to_string(),
                 "Catalog.Претензии".to_string()
             ]
+        );
+    }
+
+    /// Сущность внутри элемента состава не должна делить его на два значения;
+    /// раскрытый знак и окружающие пробелы сохраняются в одной строке.
+    #[test]
+    fn сущность_в_составе_подсистемы_сохраняется() {
+        let xml = r#"<MetaDataObject xmlns:xr="x"><Subsystem><Properties><Content>
+          <xr:Item>Document.Счёт &lt; Оплата</xr:Item>
+        </Content></Properties></Subsystem></MetaDataObject>"#;
+        assert_eq!(
+            parse_subsystem_content_xml(xml).unwrap(),
+            vec!["Document.Счёт < Оплата".to_string()]
         );
     }
 

@@ -2,7 +2,7 @@
 /// Использует событийный (SAX-подобный) парсинг через quick-xml
 /// без tree-sitter — XML-грамматика не нужна, структура предсказуема.
 use anyhow::Result;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesRef, Event};
 use quick_xml::Reader;
 
 use super::types::{sha256_hex, ParseResult, ParsedClass, ParsedVariable};
@@ -71,6 +71,29 @@ pub const METADATA_TYPES: &[&str] = &[
     "Bot",
     "ExternalDataSource",
 ];
+
+/// Текст ссылки на сущность — события `Event::GeneralRef`.
+///
+/// С quick-xml 0.38 сущности внутри текста (`&amp;`, `&lt;`, `&#38;`) больше
+/// не входят в `Event::Text`, а приходят отдельным событием между двумя
+/// текстовыми. Разборщик, который его не ловит, молча теряет символ: выражение
+/// СКД `Код в (&amp;Параметр)` превращалось в `Код в (Параметр)`. Стандартные
+/// имена и числовые ссылки раскрываются; незнакомая сущность возвращается как
+/// была — `&имя;` — чтобы текст хотя бы не искажался молча.
+pub fn general_ref_text(r: &BytesRef<'_>) -> String {
+    if let Ok(Some(ch)) = r.resolve_char_ref() {
+        return ch.to_string();
+    }
+    let name = r.decode().map(|c| c.into_owned()).unwrap_or_default();
+    match name.as_str() {
+        "amp" => "&".to_string(),
+        "lt" => "<".to_string(),
+        "gt" => ">".to_string(),
+        "quot" => "\"".to_string(),
+        "apos" => "'".to_string(),
+        other => format!("&{other};"),
+    }
+}
 
 impl Default for Xml1CParser {
     fn default() -> Self {
@@ -177,6 +200,56 @@ fn strip_ns(tag: &str) -> &str {
     }
 }
 
+fn apply_element_text(
+    text: &str,
+    line: usize,
+    ctx: &mut ParseContext,
+    classes: &mut Vec<ParsedClass>,
+    variables: &mut Vec<ParsedVariable>,
+) {
+    let _ = line;
+    // <v8:content> внутри Synonym — синоним объекта
+    if text.is_empty() {
+        // нечего разбирать
+    } else if ctx.reading_synonym && ctx.object_synonym.is_none() {
+        ctx.object_synonym = Some(text.to_string());
+    }
+    // <Name> внутри <Properties>
+    else if ctx.in_properties_name() {
+        if ctx.in_attribute && ctx.attribute_depth > 0 {
+            // Имя реквизита (самого верхнего уровня — depth == 1)
+            if ctx.attribute_depth == 1 && ctx.current_attribute_name.is_none() {
+                ctx.current_attribute_name = Some(text.to_string());
+            }
+        } else if ctx.in_tabular_section && ctx.tabular_section_name.is_none() {
+            // Имя табличной части
+            let ts_name = text.to_string();
+            // Сохраняем табличную часть как класс
+            classes.push(ParsedClass {
+                name: format!("ТабличнаяЧасть.{}", ts_name),
+                line_start: ctx.tabular_start_line,
+                line_end: ctx.tabular_start_line,
+                bases: Some("TabularSection".to_string()),
+                docstring: None,
+                body: String::new(),
+                node_hash: sha256_hex(&format!("tabular_section:{}", ts_name)),
+            });
+            ctx.tabular_section_name = Some(ts_name);
+        } else if ctx.in_form && ctx.form_name.is_none() {
+            // Имя формы
+            ctx.form_name = Some(text.to_string());
+        } else if ctx.object_type.is_some()
+            && ctx.object_name.is_none()
+            && !ctx.in_attribute
+            && !ctx.in_tabular_section
+        {
+            // Имя корневого объекта метаданных
+            ctx.object_name = Some(text.to_string());
+        }
+    }
+    let _ = variables;
+}
+
 /// Основная функция парсинга XML-выгрузки 1С
 fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
     // Быстрая предварительная проверка
@@ -196,8 +269,12 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
     let lines_total = source.lines().count();
 
     let mut reader = Reader::from_str(source);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
+    let mut acc = String::new();
+    let mut acc_line: usize = 1;
 
     let mut ctx = ParseContext::default();
     let source_bytes = source.as_bytes();
@@ -271,6 +348,11 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
             }
 
             Ok(Event::End(ref e)) => {
+                let text = acc.trim().to_string();
+                if !text.is_empty() {
+                    apply_element_text(&text, acc_line, &mut ctx, &mut classes, &mut variables);
+                }
+                acc.clear();
                 let raw = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 let tag = strip_ns(&raw).to_string();
 
@@ -337,57 +419,30 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
             }
 
             Ok(Event::Text(ref e)) => {
-                // Нечитаемый текст (ошибка снятия экранирования) и пробельные узлы
-                // пропускаем — фактов в них нет.
+                if acc.is_empty() {
+                    acc_line = current_line;
+                }
                 let text = e
                     .xml10_content()
                     .ok()
                     .and_then(|decoded| {
                         quick_xml::escape::unescape(&decoded)
                             .ok()
-                            .map(|text| text.trim().to_string())
+                            .map(|text| text.into_owned())
                     })
                     .unwrap_or_default();
+                acc.push_str(&text);
+            }
 
-                // <v8:content> внутри Synonym — синоним объекта
-                if text.is_empty() {
-                    // нечего разбирать
-                } else if ctx.reading_synonym && ctx.object_synonym.is_none() {
-                    ctx.object_synonym = Some(text.clone());
+            Ok(Event::GeneralRef(ref r)) => {
+                if acc.is_empty() {
+                    acc_line = current_line;
                 }
-                // <Name> внутри <Properties>
-                else if ctx.in_properties_name() {
-                    if ctx.in_attribute && ctx.attribute_depth > 0 {
-                        // Имя реквизита (самого верхнего уровня — depth == 1)
-                        if ctx.attribute_depth == 1 && ctx.current_attribute_name.is_none() {
-                            ctx.current_attribute_name = Some(text.clone());
-                        }
-                    } else if ctx.in_tabular_section && ctx.tabular_section_name.is_none() {
-                        // Имя табличной части
-                        let ts_name = text.clone();
-                        // Сохраняем табличную часть как класс
-                        classes.push(ParsedClass {
-                            name: format!("ТабличнаяЧасть.{}", ts_name),
-                            line_start: ctx.tabular_start_line,
-                            line_end: ctx.tabular_start_line,
-                            bases: Some("TabularSection".to_string()),
-                            docstring: None,
-                            body: String::new(),
-                            node_hash: sha256_hex(&format!("tabular_section:{}", ts_name)),
-                        });
-                        ctx.tabular_section_name = Some(ts_name);
-                    } else if ctx.in_form && ctx.form_name.is_none() {
-                        // Имя формы
-                        ctx.form_name = Some(text.clone());
-                    } else if ctx.object_type.is_some()
-                        && ctx.object_name.is_none()
-                        && !ctx.in_attribute
-                        && !ctx.in_tabular_section
-                    {
-                        // Имя корневого объекта метаданных
-                        ctx.object_name = Some(text.clone());
-                    }
-                }
+                acc.push_str(&general_ref_text(r));
+            }
+
+            Ok(Event::Empty(_)) => {
+                acc.clear();
             }
 
             Ok(Event::Eof) => break,
@@ -543,6 +598,23 @@ mod tests {
                 .any(|c| c.name.contains("КонтактнаяИнформация")),
             "Должна быть табличная часть КонтактнаяИнформация, найдено: {:?}",
             result.classes
+        );
+    }
+
+    /// Сущность внутри синонима приходит отдельным событием; docstring класса
+    /// должен содержать целую строку с сохранёнными пробелами.
+    #[test]
+    fn сущность_в_синониме_объекта_сохраняется() {
+        let source = r#"<MetaDataObject xmlns:v8="v"><Catalog><Properties>
+          <Name>Партнёры</Name><Synonym><v8:item><v8:lang>ru</v8:lang>
+          <v8:content>Отдел &amp; Партнёры</v8:content></v8:item></Synonym>
+        </Properties></Catalog></MetaDataObject>"#;
+        let result = Xml1CParser::new()
+            .parse(source, "Catalogs/Партнёры.xml")
+            .unwrap();
+        assert_eq!(
+            result.classes[0].docstring.as_deref(),
+            Some("Отдел & Партнёры")
         );
     }
 

@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use super::forms::FormHandler;
-use super::BytesTextExt;
+use super::{general_ref_text, BytesTextExt};
 
 use super::object_attributes::{
     classify_type, pretty_types, DataLinkEdge, ObjectStructure, StructField, StructTabular,
@@ -114,7 +114,9 @@ impl FieldBuild {
 /// значения перечисления/свойства проведения/команды) — для `attributes_json`.
 pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut out = ObjectStructure::default();
     let mut buf = Vec::new();
 
@@ -156,6 +158,7 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
     let mut tt = T::None;
     let mut cur_posting_prop: Option<String> = None;
     let mut cur_header_prop: Option<String> = None;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -318,92 +321,95 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                     buf.clear();
                     continue;
                 }
-                let txt = t
-                    .unescape()
-                    .map(|s| s.into_owned())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                match tt {
-                    T::FieldName => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() {
-                                f.name = Some(txt);
-                            }
-                        }
-                    }
-                    T::TabName => {
-                        if !txt.is_empty() {
-                            if let Some(i) = cur_tab {
-                                out.tabular_sections[i].name = txt;
-                            }
-                            expecting_tab_name = false;
-                        }
-                    }
-                    T::TypeValue => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() {
-                                f.types.push(edt_type_to_cfg(&txt));
-                            }
-                        }
-                    }
-                    T::SynValue => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() && f.synonym.is_none() {
-                                f.synonym = Some(txt);
-                            }
-                        }
-                    }
-                    T::FillChecking => {
-                        if let Some(f) = field.as_mut() {
-                            f.required = txt == "ShowError";
-                        }
-                    }
-                    // Индексирование: DontIndex (и пустое) не сохраняем.
-                    T::Indexing => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() && txt != "DontIndex" {
-                                f.indexing = Some(txt);
-                            }
-                        }
-                    }
-                    T::PostingProp => {
-                        if let Some(p) = cur_posting_prop.take() {
-                            if !txt.is_empty() {
-                                out.posting.push((p, txt));
-                            }
-                        }
-                    }
-                    T::Owner => {
-                        if !txt.is_empty() {
-                            out.owners.push(txt);
-                        }
-                    }
-                    T::PredefName => {
-                        if !txt.is_empty() {
-                            out.predefined.push(txt);
-                            took_predef_name = true;
-                        }
-                    }
-                    T::ValueType => {
-                        if !txt.is_empty() {
-                            let cfg = edt_type_to_cfg(&txt);
-                            out.value_types
-                                .push(pretty_types(std::slice::from_ref(&cfg)));
-                        }
-                    }
-                    T::HeaderProp => {
-                        if let Some(p) = cur_header_prop.take() {
-                            if !txt.is_empty() {
-                                out.properties.push((p, txt));
-                            }
-                        }
-                    }
-                    T::None => {}
+                let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                acc.push_str(&txt);
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if tt != T::None {
+                    acc.push_str(&general_ref_text(&r));
                 }
-                tt = T::None;
             }
             Ok(Event::End(e)) => {
+                if tt != T::None {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
+                    match tt {
+                        T::FieldName => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() {
+                                    f.name = Some(txt);
+                                }
+                            }
+                        }
+                        T::TabName => {
+                            if !txt.is_empty() {
+                                if let Some(i) = cur_tab {
+                                    out.tabular_sections[i].name = txt;
+                                }
+                                expecting_tab_name = false;
+                            }
+                        }
+                        T::TypeValue => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() {
+                                    f.types.push(edt_type_to_cfg(&txt));
+                                }
+                            }
+                        }
+                        T::SynValue => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() && f.synonym.is_none() {
+                                    f.synonym = Some(txt);
+                                }
+                            }
+                        }
+                        T::FillChecking => {
+                            if let Some(f) = field.as_mut() {
+                                f.required = txt == "ShowError";
+                            }
+                        }
+                        T::Indexing => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() && txt != "DontIndex" {
+                                    f.indexing = Some(txt);
+                                }
+                            }
+                        }
+                        T::PostingProp => {
+                            if let Some(p) = cur_posting_prop.take() {
+                                if !txt.is_empty() {
+                                    out.posting.push((p, txt));
+                                }
+                            }
+                        }
+                        T::Owner => {
+                            if !txt.is_empty() {
+                                out.owners.push(txt);
+                            }
+                        }
+                        T::PredefName => {
+                            if !txt.is_empty() {
+                                out.predefined.push(txt);
+                                took_predef_name = true;
+                            }
+                        }
+                        T::ValueType => {
+                            if !txt.is_empty() {
+                                let cfg = edt_type_to_cfg(&txt);
+                                out.value_types
+                                    .push(pretty_types(std::slice::from_ref(&cfg)));
+                            }
+                        }
+                        T::HeaderProp => {
+                            if let Some(p) = cur_header_prop.take() {
+                                if !txt.is_empty() {
+                                    out.properties.push((p, txt));
+                                }
+                            }
+                        }
+                        T::None => {}
+                    }
+                    tt = T::None;
+                }
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = local_name(&raw).to_string();
                 depth = depth.saturating_sub(1);
@@ -475,6 +481,10 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                     _ => {}
                 }
             }
+            Ok(Event::Empty(_)) => {
+                tt = T::None;
+                acc.clear();
+            }
             Ok(Event::Eof) => break,
             Err(e) => return Err(anyhow::anyhow!("mdo structure: {}", e)),
             _ => {}
@@ -489,7 +499,9 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
 /// (`<registerRecords>` → `recorder`).
 pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut edges: Vec<DataLinkEdge> = Vec::new();
     let mut buf = Vec::new();
 
@@ -510,6 +522,7 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
     let mut field: Option<FieldBuild> = None;
     let mut in_type = false;
     let mut tt = T::None;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -583,63 +596,64 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                     buf.clear();
                     continue;
                 }
-                let txt = t
-                    .unescape()
-                    .map(|s| s.into_owned())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                match tt {
-                    T::FieldName => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() {
-                                f.name = Some(txt);
-                            }
-                        }
-                    }
-                    T::TabName => {
-                        if !txt.is_empty() {
-                            cur_tab_name = Some(txt);
-                            expecting_tab_name = false;
-                        }
-                    }
-                    T::TypeValue => {
-                        if let Some(f) = field.as_mut() {
-                            if !txt.is_empty() {
-                                f.types.push(edt_type_to_cfg(&txt));
-                            }
-                        }
-                    }
-                    // Движение документа: `<registerRecords>AccumulationRegister.X`.
-                    // Значение уже каноническое имя регистра → прямое ребро recorder.
-                    T::RegisterRec => {
-                        if !txt.is_empty() {
-                            edges.push(DataLinkEdge {
-                                from_path: String::new(),
-                                to_object: txt,
-                                link_kind: "recorder",
-                                is_composite: false,
-                                is_universal: false,
-                            });
-                        }
-                    }
-                    // Владелец подчинённого справочника → ребро owner (E-9).
-                    T::OwnerRef => {
-                        if !txt.is_empty() {
-                            edges.push(DataLinkEdge {
-                                from_path: String::new(),
-                                to_object: txt,
-                                link_kind: "owner",
-                                is_composite: false,
-                                is_universal: false,
-                            });
-                        }
-                    }
-                    T::None => {}
+                let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                acc.push_str(&txt);
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if tt != T::None {
+                    acc.push_str(&general_ref_text(&r));
                 }
-                tt = T::None;
             }
             Ok(Event::End(e)) => {
+                if tt != T::None {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
+                    match tt {
+                        T::FieldName => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() {
+                                    f.name = Some(txt);
+                                }
+                            }
+                        }
+                        T::TabName => {
+                            if !txt.is_empty() {
+                                cur_tab_name = Some(txt);
+                                expecting_tab_name = false;
+                            }
+                        }
+                        T::TypeValue => {
+                            if let Some(f) = field.as_mut() {
+                                if !txt.is_empty() {
+                                    f.types.push(edt_type_to_cfg(&txt));
+                                }
+                            }
+                        }
+                        T::RegisterRec => {
+                            if !txt.is_empty() {
+                                edges.push(DataLinkEdge {
+                                    from_path: String::new(),
+                                    to_object: txt,
+                                    link_kind: "recorder",
+                                    is_composite: false,
+                                    is_universal: false,
+                                });
+                            }
+                        }
+                        T::OwnerRef => {
+                            if !txt.is_empty() {
+                                edges.push(DataLinkEdge {
+                                    from_path: String::new(),
+                                    to_object: txt,
+                                    link_kind: "owner",
+                                    is_composite: false,
+                                    is_universal: false,
+                                });
+                            }
+                        }
+                        T::None => {}
+                    }
+                    tt = T::None;
+                }
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = local_name(&raw).to_string();
                 if local == "standardAttributes" {
@@ -692,6 +706,10 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                     _ => {}
                 }
             }
+            Ok(Event::Empty(_)) => {
+                tt = T::None;
+                acc.clear();
+            }
             Ok(Event::Eof) => break,
             Err(e) => return Err(anyhow::anyhow!("mdo data_links: {}", e)),
             _ => {}
@@ -706,7 +724,9 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
 /// Возвращает `None`, если корневой тег/имя не распознаны.
 pub fn parse_mdo_header(content: &str) -> Option<(String, String, Option<String>)> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
 
     let mut depth = 0i32;
@@ -717,6 +737,7 @@ pub fn parse_mdo_header(content: &str) -> Option<(String, String, Option<String>
     let mut want_name = false; // ждём текст прямого <name> объекта (depth 2)
     let mut in_obj_synonym = false; // внутри прямого <synonym> объекта
     let mut want_syn_value = false;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -752,31 +773,38 @@ pub fn parse_mdo_header(content: &str) -> Option<(String, String, Option<String>
             }
             Ok(Event::Text(t)) => {
                 if want_name || want_syn_value {
-                    let txt = t
-                        .unescape()
-                        .map(|s| s.into_owned())
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    if want_name {
-                        if !txt.is_empty() {
-                            name = Some(txt);
-                        }
-                        want_name = false;
-                    } else if want_syn_value {
-                        if !txt.is_empty() {
-                            synonym = Some(txt);
-                        }
-                        want_syn_value = false;
-                    }
+                    let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if want_name || want_syn_value {
+                    acc.push_str(&general_ref_text(&r));
                 }
             }
             Ok(Event::End(e)) => {
+                let txt = std::mem::take(&mut acc).trim().to_string();
+                if want_name {
+                    if !txt.is_empty() {
+                        name = Some(txt);
+                    }
+                    want_name = false;
+                } else if want_syn_value {
+                    if !txt.is_empty() {
+                        synonym = Some(txt);
+                    }
+                    want_syn_value = false;
+                }
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 if local_name(&raw) == "synonym" {
                     in_obj_synonym = false;
                 }
                 depth -= 1;
+            }
+            Ok(Event::Empty(_)) => {
+                want_name = false;
+                want_syn_value = false;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -809,7 +837,9 @@ pub struct MdoTemplate {
 /// (`SpreadsheetDocument`). Элемент без `<name>` пропускаем.
 pub fn parse_mdo_templates(content: &str) -> Vec<MdoTemplate> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut out: Vec<MdoTemplate> = Vec::new();
 
@@ -818,6 +848,7 @@ pub fn parse_mdo_templates(content: &str) -> Vec<MdoTemplate> {
     let mut in_synonym = false;
     // Подхватываемый текст: 1 — `<name>`, 2 — `<value>` синонима, 3 — `<templateType>`.
     let mut tt = 0u8;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -844,12 +875,18 @@ pub fn parse_mdo_templates(content: &str) -> Vec<MdoTemplate> {
             }
             Ok(Event::Text(t)) => {
                 if tt != 0 {
-                    let txt = t
-                        .unescape()
-                        .map(|s| s.into_owned())
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
+                    let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if tt != 0 {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if tt != 0 {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if let Some(cur) = out.last_mut() {
                         match tt {
                             1 if !txt.is_empty() && cur.name.is_empty() => cur.name = txt,
@@ -862,8 +899,6 @@ pub fn parse_mdo_templates(content: &str) -> Vec<MdoTemplate> {
                     }
                     tt = 0;
                 }
-            }
-            Ok(Event::End(e)) => {
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = local_name(&raw).to_string();
                 if depth == 2 && local == "templates" {
@@ -878,6 +913,10 @@ pub fn parse_mdo_templates(content: &str) -> Vec<MdoTemplate> {
                     tt = 0;
                 }
                 depth -= 1;
+            }
+            Ok(Event::Empty(_)) => {
+                tt = 0;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -904,7 +943,9 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
     use super::forms::form_event_to_russian;
 
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut out: Vec<FormHandler> = Vec::new();
     let mut buf = Vec::new();
 
@@ -919,6 +960,7 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
     // <items>; пусто — обработчик самой формы (его <handlers> лежат в корне).
     let mut depth = 0usize;
     let mut items_stack: Vec<(usize, Option<String>)> = Vec::new();
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -949,12 +991,18 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
             }
             Ok(Event::Text(t)) => {
                 if tt != 0 {
-                    let txt = t
-                        .unescape()
-                        .map(|s| s.into_owned())
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
+                    let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if tt != 0 {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if tt != 0 {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if tt == 1 && !txt.is_empty() {
                         cur_event = Some(txt);
                     } else if tt == 2 && !txt.is_empty() {
@@ -966,8 +1014,6 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
                     }
                     tt = 0;
                 }
-            }
-            Ok(Event::End(e)) => {
                 let local = local_name(&String::from_utf8_lossy(e.name().as_ref())).to_string();
                 if local == "handlers" {
                     if let (Some(ev), Some(nm)) = (cur_event.take(), cur_name.take()) {
@@ -986,6 +1032,10 @@ pub fn parse_mdo_form_handlers(content: &str) -> Vec<FormHandler> {
                     items_stack.pop();
                 }
                 depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Empty(_)) => {
+                tt = 0;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -1008,7 +1058,9 @@ pub fn parse_mdo_event_subscription(
     use super::event_subscriptions::event_to_russian;
 
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
 
     let mut depth = 0i32;
@@ -1019,6 +1071,7 @@ pub fn parse_mdo_event_subscription(
     let mut in_source = false;
     // 0 нет; 1 name; 2 event; 3 handler; 4 types(source).
     let mut tt = 0u8;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1039,12 +1092,18 @@ pub fn parse_mdo_event_subscription(
             }
             Ok(Event::Text(t)) => {
                 if tt != 0 {
-                    let txt = t
-                        .unescape()
-                        .map(|s| s.into_owned())
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
+                    let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if tt != 0 {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if tt != 0 {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if !txt.is_empty() {
                         match tt {
                             1 => name = Some(txt),
@@ -1056,13 +1115,15 @@ pub fn parse_mdo_event_subscription(
                     }
                     tt = 0;
                 }
-            }
-            Ok(Event::End(e)) => {
                 let local = local_name(&String::from_utf8_lossy(e.name().as_ref())).to_string();
                 if local == "source" {
                     in_source = false;
                 }
                 depth -= 1;
+            }
+            Ok(Event::Empty(_)) => {
+                tt = 0;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -1139,7 +1200,9 @@ pub fn parse_mdo_config_refs(
     }
 
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
 
     let mut depth = 0i32;
@@ -1148,6 +1211,7 @@ pub fn parse_mdo_config_refs(
     let mut in_type = false; // <type> определяемого типа (обёртка над <types>)
     let mut raw_types: Vec<String> = Vec::new();
     let mut out: Vec<(&'static str, String, String, bool, bool)> = Vec::new();
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1168,12 +1232,18 @@ pub fn parse_mdo_config_refs(
             }
             Ok(Event::Text(t)) => {
                 if want != Want::None {
-                    let txt = t
-                        .unescape()
-                        .map(|s| s.into_owned())
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
+                    let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if want != Want::None {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if want != Want::None {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if !txt.is_empty() {
                         match want {
                             Want::SubsystemContent => {
@@ -1216,8 +1286,6 @@ pub fn parse_mdo_config_refs(
                     }
                     want = Want::None;
                 }
-            }
-            Ok(Event::End(e)) => {
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 match local_name(&raw) {
                     "content" => in_content = false,
@@ -1225,6 +1293,10 @@ pub fn parse_mdo_config_refs(
                     _ => {}
                 }
                 depth -= 1;
+            }
+            Ok(Event::Empty(_)) => {
+                want = Want::None;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -1287,12 +1359,15 @@ pub fn parse_mdo_root_uuid(content: &str) -> Option<String> {
 /// формы (`Form.form`) нет вовсе, поэтому для перечня модулей его берут отсюда.
 pub fn parse_mdo_child_uuid(content: &str, container: &str, child_name: &str) -> Option<String> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
 
     let mut depth = 0i32;
     let mut current: Option<String> = None; // uuid открытого контейнера
     let mut want_name = false;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1312,13 +1387,18 @@ pub fn parse_mdo_child_uuid(content: &str, container: &str, child_name: &str) ->
             }
             Ok(Event::Text(t)) => {
                 if want_name {
-                    want_name = false;
-                    let txt = t
-                        .unescape()
-                        .map(|s| s.into_owned())
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
+                    let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if want_name {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::End(e)) => {
+                if want_name {
+                    let txt = std::mem::take(&mut acc).trim().to_string();
                     if txt == child_name {
                         if let Some(u) = current.take() {
                             if !u.is_empty() {
@@ -1326,14 +1406,17 @@ pub fn parse_mdo_child_uuid(content: &str, container: &str, child_name: &str) ->
                             }
                         }
                     }
+                    want_name = false;
                 }
-            }
-            Ok(Event::End(e)) => {
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 if depth == 2 && local_name(&raw) == container {
                     current = None;
                 }
                 depth -= 1;
+            }
+            Ok(Event::Empty(_)) => {
+                want_name = false;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -1378,6 +1461,18 @@ mod tests {
         assert_eq!(h.0, "Catalog");
         assert_eq!(h.1, "АвансовыйОтчетПрисоединенныеФайлы");
         assert_eq!(h.2.as_deref(), Some("Присоединенные файлы"));
+    }
+
+    /// Именованная и числовая XML-сущности делят значение на части; шапка
+    /// должна собрать их в один синоним без потери пробелов и символов.
+    #[test]
+    fn сущности_в_синониме_mdo_сохраняются() {
+        let xml = r#"<mdclass:Catalog xmlns:mdclass="m">
+          <name>Партнёры</name>
+          <synonym><key>ru</key><value>Отдел &amp; Партнёры &#1040;</value></synonym>
+        </mdclass:Catalog>"#;
+        let header = parse_mdo_header(xml).unwrap();
+        assert_eq!(header.2.as_deref(), Some("Отдел & Партнёры А"));
     }
 
     #[test]

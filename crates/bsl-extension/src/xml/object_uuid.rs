@@ -28,7 +28,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::path::Path;
 
-use super::BytesTextExt;
+use super::{general_ref_text, BytesTextExt};
 
 /// Извлечь UUID из XML объекта (Documents/X.xml, Catalogs/X.xml и т.п.).
 /// Возвращает значение атрибута `uuid` первого дочернего элемента
@@ -78,7 +78,9 @@ pub fn extract_object_uuid_from_file(path: &Path) -> Result<Option<String>> {
 /// Возвращает uuid команды с указанным именем, иначе None.
 pub fn extract_command_uuid_from_str(xml: &str, command_name: &str) -> Option<String> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
 
     let local = |raw: &[u8]| -> Vec<u8> {
         match raw.iter().rposition(|c| *c == b':') {
@@ -92,9 +94,10 @@ pub fn extract_command_uuid_from_str(xml: &str, command_name: &str) -> Option<St
     // Имя команды — ПЕРВЫЙ <Name> внутри <Command>; вложенные элементы команды
     // (например, параметры) имеют свои <Name>, их не смотрим.
     let mut expect_name = false;
+    let mut acc = String::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+            Ok(Event::Start(e)) => {
                 let name = local(e.name().as_ref());
                 if name == b"Command" {
                     cur_uuid = e
@@ -113,15 +116,25 @@ pub fn extract_command_uuid_from_str(xml: &str, command_name: &str) -> Option<St
             }
             Ok(Event::Text(t)) if expect_name => {
                 let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                let txt = txt.trim();
+                acc.push_str(&txt);
+            }
+            Ok(Event::GeneralRef(r)) if expect_name => {
+                acc.push_str(&general_ref_text(&r));
+            }
+            Ok(Event::End(_)) if expect_name => {
+                let txt = std::mem::take(&mut acc).trim().to_string();
                 if !txt.is_empty() {
                     if txt == command_name {
                         return cur_uuid;
                     }
                     // имя этой команды прочитано и не подошло — ждём следующую
-                    expect_name = false;
                     cur_uuid = None;
                 }
+                expect_name = false;
+            }
+            Ok(Event::Empty(_)) => {
+                expect_name = false;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(_) => return None,
@@ -207,6 +220,21 @@ mod tests {
         assert_eq!(
             extract_object_uuid_from_str(xml).as_deref(),
             Some("12f1d8bf-4a3c-4d51-9e0a-1234567890ab")
+        );
+    }
+
+    /// Имя команды с сущностью должно сравниваться после сборки всех частей,
+    /// иначе UUID команды не будет найден.
+    #[test]
+    fn сущность_в_имени_команды_сохраняется() {
+        let xml = r#"<MetaDataObject><Catalog><ChildObjects>
+          <Command uuid="command-uuid"><Properties>
+            <Name>Печать &amp; Продажа</Name>
+          </Properties></Command>
+        </ChildObjects></Catalog></MetaDataObject>"#;
+        assert_eq!(
+            extract_command_uuid_from_str(xml, "Печать & Продажа").as_deref(),
+            Some("command-uuid")
         );
     }
 

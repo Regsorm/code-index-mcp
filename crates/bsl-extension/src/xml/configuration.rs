@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::BytesTextExt;
+use super::{general_ref_text, BytesTextExt};
 
 /// Один объект конфигурации, перечисленный в Configuration.xml/<ChildObjects>.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,12 +106,15 @@ pub(crate) const KNOWN_META_TYPES: &[&str] = &[
 /// Распарсить содержимое Configuration.xml в список объектов.
 pub fn parse_configuration_xml(content: &str) -> Result<Vec<ObjectRef>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
 
     let mut out = Vec::new();
     let mut buf = Vec::new();
     let mut tag_stack: Vec<String> = Vec::new();
     let mut in_child_objects = false;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -123,6 +126,24 @@ pub fn parse_configuration_xml(content: &str) -> Result<Vec<ObjectRef>> {
                 tag_stack.push(local);
             }
             Ok(Event::End(e)) => {
+                if in_child_objects {
+                    let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
+                    if KNOWN_META_TYPES.contains(&parent) {
+                        let name = std::mem::take(&mut acc).trim().to_string();
+                        if !name.is_empty() {
+                            let full_name = format!("{}.{}", parent, name);
+                            out.push(ObjectRef {
+                                meta_type: parent.to_string(),
+                                name,
+                                full_name,
+                            });
+                        }
+                    } else {
+                        acc.clear();
+                    }
+                } else {
+                    acc.clear();
+                }
                 let local = local_name(e.name().as_ref());
                 if local == "ChildObjects" {
                     in_child_objects = false;
@@ -135,18 +156,19 @@ pub fn parse_configuration_xml(content: &str) -> Result<Vec<ObjectRef>> {
                 }
                 let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
                 if KNOWN_META_TYPES.contains(&parent) {
-                    let name = text.unescape().map(|s| s.into_owned()).unwrap_or_default();
-                    let name = name.trim().to_string();
-                    if !name.is_empty() {
-                        let full_name = format!("{}.{}", parent, name);
-                        out.push(ObjectRef {
-                            meta_type: parent.to_string(),
-                            name,
-                            full_name,
-                        });
+                    let txt = text.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                if in_child_objects {
+                    let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
+                    if KNOWN_META_TYPES.contains(&parent) {
+                        acc.push_str(&general_ref_text(&r));
                     }
                 }
             }
+            Ok(Event::Empty(_)) => acc.clear(),
             Ok(Event::Eof) => break,
             Err(e) => {
                 return Err(anyhow::anyhow!(
@@ -219,6 +241,24 @@ mod tests {
                 "CommonModule.ОбщегоНазначенияСервер",
             ],
             "должны попасть только теги из KNOWN_META_TYPES",
+        );
+    }
+
+    /// Сущность делит текст элемента на несколько событий; имя объекта должно
+    /// собраться один раз и сохранить пробелы вокруг раскрытого символа.
+    #[test]
+    fn сущность_в_имени_объекта_состава_сохраняется() {
+        let xml = r#"<MetaDataObject><Configuration><ChildObjects>
+          <Catalog>Товары &amp; Услуги</Catalog>
+        </ChildObjects></Configuration></MetaDataObject>"#;
+        let objects = parse_configuration_xml(xml).unwrap();
+        assert_eq!(
+            objects,
+            vec![ObjectRef {
+                meta_type: "Catalog".to_string(),
+                name: "Товары & Услуги".to_string(),
+                full_name: "Catalog.Товары & Услуги".to_string(),
+            }]
         );
     }
 

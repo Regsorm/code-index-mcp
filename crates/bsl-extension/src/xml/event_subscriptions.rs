@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::BytesTextExt;
+use super::{general_ref_text, BytesTextExt};
 
 /// Описание одной подписки на событие.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +92,9 @@ pub fn event_to_russian(event: &str) -> &str {
 /// Распарсить XML-описание подписки.
 pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscription>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
 
     let mut buf = Vec::new();
     let mut tag_stack: Vec<String> = Vec::new();
@@ -101,6 +103,7 @@ pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscri
     let mut handler_value: Option<String> = None;
     let mut sources: Vec<String> = Vec::new();
     let mut in_subscription = false;
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -112,6 +115,33 @@ pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscri
                 tag_stack.push(local);
             }
             Ok(Event::End(e)) => {
+                if in_subscription {
+                    let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
+                    let value = std::mem::take(&mut acc).trim().to_string();
+                    if !value.is_empty() {
+                        match parent {
+                            "Name" => {
+                                if tag_stack.iter().any(|t| t == "Properties") && name.is_none() {
+                                    name = Some(value);
+                                }
+                            }
+                            "Event" => {
+                                if tag_stack.iter().any(|t| t == "Properties") {
+                                    event_value = Some(value);
+                                }
+                            }
+                            "Handler" => handler_value = Some(value),
+                            "Type" => {
+                                if tag_stack.iter().any(|t| t == "Source") {
+                                    sources.push(value);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    acc.clear();
+                }
                 let local = local_name(e.name().as_ref());
                 if local == "EventSubscription" {
                     in_subscription = false;
@@ -123,40 +153,20 @@ pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscri
                     continue;
                 }
                 let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
-                let value = text
-                    .unescape()
-                    .map(|s| s.into_owned())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                if value.is_empty() {
-                    continue;
-                }
-                match parent {
-                    "Name" => {
-                        // <Name> внутри <Properties>, не глобальный `<Name>` другого уровня.
-                        if tag_stack.iter().any(|t| t == "Properties") && name.is_none() {
-                            name = Some(value);
-                        }
-                    }
-                    "Event" => {
-                        if tag_stack.iter().any(|t| t == "Properties") {
-                            event_value = Some(value);
-                        }
-                    }
-                    "Handler" => {
-                        handler_value = Some(value);
-                    }
-                    "Type" => {
-                        // <v8:Type>cfg:DocumentRef.РеализацияТоваровУслуг</v8:Type>
-                        // — внутри <Source>/<Type>/<v8:Type>. Парсим все вхождения.
-                        if tag_stack.iter().any(|t| t == "Source") {
-                            sources.push(value);
-                        }
-                    }
-                    _ => {}
+                if matches!(parent, "Name" | "Event" | "Handler" | "Type") {
+                    let txt = text.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    acc.push_str(&txt);
                 }
             }
+            Ok(Event::GeneralRef(r)) => {
+                if in_subscription {
+                    let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
+                    if matches!(parent, "Name" | "Event" | "Handler" | "Type") {
+                        acc.push_str(&general_ref_text(&r));
+                    }
+                }
+            }
+            Ok(Event::Empty(_)) => acc.clear(),
             Ok(Event::Eof) => break,
             Err(e) => {
                 return Err(anyhow::anyhow!(
@@ -244,6 +254,18 @@ mod tests {
             .sources
             .iter()
             .any(|s| s.contains("РеализацияТоваровУслуг")));
+    }
+
+    /// Разделённое сущностью имя подписки должно собираться целиком, включая
+    /// пробелы по обе стороны раскрытого амперсанда.
+    #[test]
+    fn сущность_в_имени_подписки_сохраняется() {
+        let xml = r#"<MetaDataObject><EventSubscription><Properties>
+          <Name>Обновление &amp; Среза</Name><Event>OnWrite</Event>
+          <Handler>Модуль.Обработчик</Handler>
+        </Properties></EventSubscription></MetaDataObject>"#;
+        let sub = parse_event_subscription_xml(xml).unwrap().unwrap();
+        assert_eq!(sub.name, "Обновление & Среза");
     }
 
     #[test]

@@ -25,7 +25,9 @@
 
 use std::borrow::Cow;
 
-use quick_xml::events::{BytesRef, BytesText};
+use quick_xml::events::BytesText;
+
+pub(crate) use code_index_core::parser::xml_1c::general_ref_text;
 
 /// Совместимый с прежним quick-xml путь: декодировать XML-текст и раскрыть
 /// стандартные entity (`&amp;`, `&lt;` и т.д.).
@@ -38,29 +40,6 @@ impl BytesTextExt for BytesText<'_> {
         let decoded = self.xml10_content().map_err(|_| ())?;
         let unescaped = quick_xml::escape::unescape(&decoded).map_err(|_| ())?;
         Ok(Cow::Owned(unescaped.into_owned()))
-    }
-}
-
-/// Текст ссылки на сущность — события `Event::GeneralRef`.
-///
-/// С quick-xml 0.38 сущности внутри текста (`&amp;`, `&lt;`, `&#38;`) больше
-/// не входят в `Event::Text`, а приходят отдельным событием между двумя
-/// текстовыми. Разборщик, который его не ловит, молча теряет символ: выражение
-/// СКД `Код в (&amp;Параметр)` превращалось в `Код в (Параметр)`. Стандартные
-/// имена и числовые ссылки раскрываются; незнакомая сущность возвращается как
-/// была — `&имя;` — чтобы текст хотя бы не искажался молча.
-pub(crate) fn general_ref_text(r: &BytesRef<'_>) -> String {
-    if let Ok(Some(ch)) = r.resolve_char_ref() {
-        return ch.to_string();
-    }
-    let name = r.decode().map(|c| c.into_owned()).unwrap_or_default();
-    match name.as_str() {
-        "amp" => "&".to_string(),
-        "lt" => "<".to_string(),
-        "gt" => ">".to_string(),
-        "quot" => "\"".to_string(),
-        "apos" => "'".to_string(),
-        other => format!("&{other};"),
     }
 }
 

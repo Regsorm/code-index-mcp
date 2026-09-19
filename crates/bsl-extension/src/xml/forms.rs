@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::BytesTextExt;
+use super::{general_ref_text, BytesTextExt};
 
 /// Один обработчик события формы.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,7 +193,9 @@ pub fn handlers_to_json(handlers: &[FormHandler]) -> Result<String> {
 /// Распарсить XML-описание формы.
 pub fn parse_form_xml(content: &str) -> Result<Vec<FormHandler>> {
     let mut reader = Reader::from_str(content);
-    reader.config_mut().trim_text(true);
+    // Текст вокруг XML-сущности приходит частями, поэтому обрезаем его
+    // только после сборки.
+    reader.config_mut().trim_text(false);
 
     let mut out = Vec::new();
     let mut buf = Vec::new();
@@ -203,6 +205,7 @@ pub fn parse_form_xml(content: &str) -> Result<Vec<FormHandler>> {
     // атрибутом `name` (`<InputField name="Товар">`, `<Table name="Товары">`).
     // Владелец обработчика — ближайший такой предок; пусто — сама форма.
     let mut owner_stack: Vec<Option<String>> = Vec::new();
+    let mut acc = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -231,21 +234,8 @@ pub fn parse_form_xml(content: &str) -> Result<Vec<FormHandler>> {
             Ok(Event::End(e)) => {
                 let local = local_name(e.name().as_ref());
                 if local == "Event" {
-                    current_event_name = None;
-                }
-                tag_stack.pop();
-                owner_stack.pop();
-            }
-            Ok(Event::Text(text)) => {
-                let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
-                if parent == "Event" {
+                    let handler_name = std::mem::take(&mut acc).trim().to_string();
                     if let Some(event_name) = &current_event_name {
-                        let handler_name = text
-                            .unescape()
-                            .map(|s| s.into_owned())
-                            .unwrap_or_default()
-                            .trim()
-                            .to_string();
                         if !handler_name.is_empty() && !event_name.is_empty() {
                             // Ближайший предок с именем — сам тег `Event`
                             // владельцем не считается (он уже вытолкнут в None).
@@ -257,7 +247,31 @@ pub fn parse_form_xml(content: &str) -> Result<Vec<FormHandler>> {
                             });
                         }
                     }
+                } else {
+                    acc.clear();
                 }
+                if local == "Event" {
+                    current_event_name = None;
+                }
+                tag_stack.pop();
+                owner_stack.pop();
+            }
+            Ok(Event::Text(text)) => {
+                let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
+                if parent == "Event" {
+                    let txt = text.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    acc.push_str(&txt);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
+                if parent == "Event" {
+                    acc.push_str(&general_ref_text(&r));
+                }
+            }
+            Ok(Event::Empty(_)) => {
+                current_event_name = None;
+                acc.clear();
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -314,6 +328,18 @@ mod tests {
     fn parses_three_handlers() {
         let handlers = parse_form_xml(SAMPLE).unwrap();
         assert_eq!(handlers.len(), 3);
+    }
+
+    /// Имя обработчика с XML-сущностью приходит несколькими событиями, но
+    /// должно дать ровно один обработчик с полной строкой.
+    #[test]
+    fn сущность_в_имени_обработчика_сохраняется() {
+        let xml = r#"<Form><Events>
+          <Event name="OnOpen">Открытие &amp; Проверка</Event>
+        </Events></Form>"#;
+        let handlers = parse_form_xml(xml).unwrap();
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0].handler, "Открытие & Проверка");
     }
 
     #[test]
