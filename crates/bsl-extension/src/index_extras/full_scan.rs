@@ -4,6 +4,7 @@
 use crate::code_usages::extract_code_usages;
 use crate::xml::config_dump_info::{parse_config_dump_info_id_map, parse_config_dump_info_rows};
 use crate::xml::configuration::parse_configuration_file;
+use crate::xml::edt_mdo::MdoTemplate;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
 use crate::xml::forms::parse_form_file;
 use crate::xml::metadata_refs::{
@@ -1338,29 +1339,47 @@ pub(crate) struct TemplateRow {
     content_size: Option<u64>,
 }
 
-/// Двоичное ли содержимое макета — по расширению файла. Такие в текстовый
-/// индекс не попадают в принципе, и списывать это на предел размера неверно.
-fn is_binary_template_content(rel: &str) -> bool {
-    let ext = rel.rsplit('.').next().unwrap_or_default().to_lowercase();
-    !matches!(
-        ext.as_str(),
-        "xml" | "txt" | "html" | "htm" | "json" | "css" | "js"
-    )
+/// Как содержимое макета относится к текстовому индексу — по расширению файла.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TemplateContentKind {
+    /// Текст (XML схемы компоновки, `txt` и прочее) — индексируется общими
+    /// правилами, вплоть до предела размера.
+    Text,
+    /// Табличный документ (`.mxlx` в 1C:EDT, `.mxl`): разметка ячеек, искать
+    /// по ней нечего, а печатные формы доходят до 79 МБ.
+    Spreadsheet,
+    /// Двоичные данные и внешние компоненты — в индекс не попадают в принципе.
+    Binary,
 }
 
-/// Файл с содержимым макета: `Templates/<Имя>/Ext/Template.<чем-то>`.
+fn template_content_kind(rel: &str) -> TemplateContentKind {
+    let ext = rel.rsplit('.').next().unwrap_or_default().to_lowercase();
+    match ext.as_str() {
+        "xml" | "txt" | "html" | "htm" | "json" | "css" | "js" | "dcs" => TemplateContentKind::Text,
+        "mxlx" | "mxl" => TemplateContentKind::Spreadsheet,
+        _ => TemplateContentKind::Binary,
+    }
+}
+
+/// Файл с содержимым макета, лежащий в папке `dir`: первый файл с именем
+/// `Template.<что угодно>`.
 ///
 /// Расширение зависит от вида макета и по имени не угадывается: табличный
-/// документ и схема компоновки лежат в `.xml`, текстовый документ — в `.txt`,
-/// двоичные данные и внешние компоненты — в своих форматах. Поэтому смотрим,
-/// что реально лежит в папке, а не подставляем `.xml` всем подряд.
-fn template_content_path(descriptor: &Path) -> Option<std::path::PathBuf> {
-    let ext_dir = descriptor.with_extension("").join("Ext");
-    let entries = std::fs::read_dir(&ext_dir).ok()?;
+/// документ и схема компоновки лежат в `.xml`, в выгрузке 1C:EDT — в `.mxlx`
+/// и `.dcs`, текстовый документ — в `.txt`, двоичные данные и внешние
+/// компоненты — в своих форматах. Поэтому смотрим, что реально лежит в папке.
+fn template_content_in_dir(dir: &Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
     entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| p.is_file() && p.file_stem().and_then(|s| s.to_str()) == Some("Template"))
+}
+
+/// Файл с содержимым макета формата Конфигуратора:
+/// `Templates/<Имя>/Ext/Template.<чем-то>`.
+fn template_content_path(descriptor: &Path) -> Option<std::path::PathBuf> {
+    template_content_in_dir(&descriptor.with_extension("").join("Ext"))
 }
 
 /// Собрать паспорт макета по пути его описания. `None` — файл не читается,
@@ -1388,6 +1407,34 @@ pub(crate) fn template_row_from_path(repo_root: &Path, path: &Path) -> Option<Te
         content_rel,
         content_size,
     })
+}
+
+/// Собрать паспорт макета по данным EDT: описание макета лежит не отдельным
+/// файлом `Templates/<Имя>.xml`, а элементом `<templates>` в `.mdo` объекта-
+/// владельца, содержимое — в `Templates/<Имя>/Template.<расширение>`
+/// (расширение зависит от вида: `.dcs` у схемы компоновки, `.mxlx` у
+/// табличного документа).
+pub(crate) fn template_row_from_edt(
+    repo_root: &Path,
+    owner_full_name: &str,
+    obj_dir: &Path,
+    t: &MdoTemplate,
+) -> TemplateRow {
+    let content_path = template_content_in_dir(&obj_dir.join("Templates").join(&t.name));
+    let content_size = content_path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len());
+    let content_rel = content_path.as_ref().map(|p| rel_path(repo_root, p));
+    TemplateRow {
+        full_name: format!("{}.Template.{}", owner_full_name, t.name),
+        name: t.name.clone(),
+        synonym: t.synonym.clone(),
+        owner_full_name: owner_full_name.to_string(),
+        template_type: Some(t.template_type.clone()),
+        content_rel,
+        content_size,
+    }
 }
 
 /// Записать паспорт макета в перечень. Возвращает (сколько строк добавлено,
@@ -1426,7 +1473,11 @@ pub(crate) fn insert_template_row(
         // разные ответы на вопрос «а что с этим делать».
         passport["content_note"] = serde_json::json!(match &row.content_rel {
             None => "у макета нет файла содержимого в выгрузке — есть только его описание",
-            Some(rel) if is_binary_template_content(rel) =>
+            Some(rel) if template_content_kind(rel) == TemplateContentKind::Spreadsheet =>
+                "табличный документ (.mxlx / .mxl) в индекс не берётся: \
+                 печатные формы доходят до 79 МБ, искать по разметке ячеек нечего; \
+                 сам макет существует",
+            Some(rel) if template_content_kind(rel) == TemplateContentKind::Binary =>
                 "содержимое макета двоичное (внешняя компонента, двоичные данные) — \
                  в индекс не берётся; сам макет существует",
             Some(_) =>

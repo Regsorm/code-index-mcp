@@ -52,7 +52,12 @@ const TEXT_EXTENSIONS: &[&str] = &[
     // (права роли). Без них файлы считались двоичными: поиска по метаданным
     // EDT не было вовсе, а наблюдатель за файлами не порождал событий —
     // правка конфигурации не доезжала до индекса до полной переиндексации (E-4).
-    "mdo", "form", "rights",
+    //
+    // `.dcs` — схема компоновки данных в выгрузке EDT: обычный XML с текстом
+    // запросов, ровно то, ради чего файл и индексируют. `.mxlx` (табличный
+    // документ) здесь НЕТ: файлов 11 587 на 3 ГБ, крупнейший 79 МБ, а искать
+    // по разметке ячеек нечего.
+    "mdo", "form", "rights", "dcs",
 ];
 
 /// Языки, для которых при индексации делается «двойная вставка»: и
@@ -86,6 +91,13 @@ pub fn is_dual_indexed_language(language: &str) -> bool {
 /// Те же три файла в выгрузке 1C:EDT называются иначе — `Configuration.mdo`,
 /// `Rights.rights`, `Form.form`, — и перерастают лимит ровно так же: описание
 /// конфигурации 1,6 МБ, крупнейшие права 2,7 МБ, крупные формы за мегабайт.
+///
+/// `Template.dcs` (выгрузка 1C:EDT) освобождён как раз потому, что в этом
+/// формате имя `Template.dcs` носит ТОЛЬКО схема компоновки: она ограничена
+/// самой конфигурацией (421 файл, до 2,4 МБ, 48 МБ всего), и её текст
+/// запросов — именно то, ради чего файл индексируют. В формате Конфигуратора
+/// `Template.xml` носят и печатные формы до 78 МБ, поэтому освобождения по
+/// имени там по-прежнему нет.
 const SIZE_EXEMPT_FILES: &[&str] = &[
     "Configuration.xml",
     "Rights.xml",
@@ -93,6 +105,7 @@ const SIZE_EXEMPT_FILES: &[&str] = &[
     "Configuration.mdo",
     "Rights.rights",
     "Form.form",
+    "Template.dcs",
 ];
 
 /// Освобождён ли файл от лимита размера для текстовых файлов.
@@ -472,6 +485,29 @@ mod tests {
             categorize_file(Path::new("base/Catalogs/Контрагенты.xml")),
             FileCategory::Text
         );
+    }
+
+    /// Макеты выгрузки 1C:EDT: схема компоновки данных (`.dcs`) — текст и
+    /// освобождена от лимита размера, табличный документ (`.mxlx`) — ни то,
+    /// ни другое (до 79 МБ на файл, искать по разметке ячеек нечего).
+    #[test]
+    fn edt_template_files_dcs_text_mxlx_not() {
+        assert_eq!(
+            categorize_file(Path::new("src/Reports/Отчет/Templates/Схема/Template.dcs")),
+            FileCategory::Text
+        );
+        assert!(is_size_exempt(Path::new(
+            "src/Reports/Отчет/Templates/Схема/Template.dcs"
+        )));
+        assert_eq!(
+            categorize_file(Path::new(
+                "src/Reports/Отчет/Templates/Печать/Template.mxlx"
+            )),
+            FileCategory::Binary
+        );
+        assert!(!is_size_exempt(Path::new(
+            "src/Reports/Отчет/Templates/Печать/Template.mxlx"
+        )));
     }
 
     #[test]

@@ -3997,7 +3997,7 @@ fn edt_layer_indexes_nested_subsystems() {
     );
 
     let st = fresh_storage(&tmp);
-    run_edt_metadata_layer(&src, st.conn()).unwrap();
+    run_edt_metadata_layer(tmp.path(), &src, st.conn()).unwrap();
 
     let synonym_of = |full_name: &str| -> Option<String> {
         st.conn()
@@ -4349,7 +4349,7 @@ fn common_form_indexed_in_both_dump_formats() {
     );
 
     let st = fresh_storage(&tmp);
-    run_edt_metadata_layer(&src, st.conn()).unwrap();
+    run_edt_metadata_layer(tmp.path(), &src, st.conn()).unwrap();
 
     let (form_name, handlers): (String, String) = st
         .conn()
@@ -4399,6 +4399,58 @@ fn edt_stand(root: &Path) {
             .join("Товары")
             .join("ObjectModule.bsl"),
         "Процедура ПередЗаписью(Отказ) КонецПроцедуры",
+    );
+}
+
+/// Стенд выгрузки 1C:EDT с объектом-владельцем макетов: отчёт с двумя
+/// макетами — схемой компоновки (`.dcs`, вид указан) и печатной формой
+/// (`.mxlx`, вид по умолчанию EDT не пишет).
+#[cfg(test)]
+fn edt_stand_with_report(root: &Path) {
+    edt_stand(root);
+    write(
+        &root
+            .join("src")
+            .join("Reports")
+            .join("Отчет")
+            .join("Отчет.mdo"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Report xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="rep">
+  <name>Отчет</name>
+  <synonym><key>ru</key><value>Отчет</value></synonym>
+  <templates uuid="t1">
+    <name>Схема</name>
+    <synonym><key>ru</key><value>Схема компоновки</value></synonym>
+    <templateType>DataCompositionSchema</templateType>
+  </templates>
+  <templates uuid="t2">
+    <name>Печать</name>
+    <synonym><key>ru</key><value>Печатная форма</value></synonym>
+  </templates>
+</mdclass:Report>"#,
+    );
+    write(
+        &root
+            .join("src")
+            .join("Reports")
+            .join("Отчет")
+            .join("Templates")
+            .join("Схема")
+            .join("Template.dcs"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema">
+  <dataSources><name>ИсточникДанных1</name></dataSources>
+</DataCompositionSchema>"#,
+    );
+    write(
+        &root
+            .join("src")
+            .join("Reports")
+            .join("Отчет")
+            .join("Templates")
+            .join("Печать")
+            .join("Template.mxlx"),
+        "mxlx-байты",
     );
 }
 
@@ -4562,6 +4614,217 @@ fn edt_incremental_removes_deleted_object() {
         ),
         0,
         "модули удалённого объекта тоже убираются"
+    );
+}
+
+/// Макеты объектов EDT описаны не отдельным файлом `Templates/<Имя>.xml`, как
+/// в выгрузке Конфигуратора, а элементом `<templates>` в `.mdo` владельца:
+/// без этой ветки паспортов макетов в перечне не было вовсе.
+#[test]
+fn edt_layer_indexes_object_templates() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand_with_report(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let passport = |st: &Storage, full: &str| -> (String, String, String) {
+        st.conn()
+            .query_row(
+                "SELECT meta_type, name, attributes_json FROM metadata_objects \
+                 WHERE repo = ? AND full_name = ?",
+                params![REPO_DEFAULT, full],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap_or_else(|e| panic!("паспорт {full} обязан быть в перечне: {e}"))
+    };
+
+    let (meta_type, name, json) = passport(&storage, "Report.Отчет.Template.Схема");
+    assert_eq!(meta_type, "Template");
+    assert_eq!(name, "Схема");
+    let p: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(p["owner"].as_str(), Some("Report.Отчет"));
+    assert_eq!(p["template_type"].as_str(), Some("DataCompositionSchema"));
+    assert!(
+        p["content_file"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("Template.dcs"),
+        "содержимое схемы компоновки лежит в Template.dcs: {p}"
+    );
+    assert!(
+        p["content_size_bytes"].as_u64().unwrap_or(0) > 0,
+        "размер файла содержимого должен быть известен: {p}"
+    );
+
+    let (_, name, json) = passport(&storage, "Report.Отчет.Template.Печать");
+    assert_eq!(name, "Печать");
+    let p: serde_json::Value = serde_json::from_str(&json).unwrap();
+    // Вид макета EDT по умолчанию не пишет — значит табличный документ.
+    assert_eq!(p["template_type"].as_str(), Some("SpreadsheetDocument"));
+    assert_eq!(p["content_indexed"].as_bool(), Some(false));
+    assert!(
+        p["content_note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("табличный документ"),
+        "причина должна называться по факту: {p}"
+    );
+}
+
+/// Переименование макета в `.mdo` владельца: прежний паспорт уходит, новый
+/// заводится, соседние макеты не задеты.
+#[test]
+fn edt_incremental_templates_follow_mdo() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand_with_report(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let count = |st: &Storage, full: &str| -> i64 {
+        st.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_objects WHERE repo = ? AND full_name = ?",
+                params![REPO_DEFAULT, full],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count(&storage, "Report.Отчет.Template.Схема"), 1);
+
+    let mdo = repo
+        .join("src")
+        .join("Reports")
+        .join("Отчет")
+        .join("Отчет.mdo");
+    write(
+        &mdo,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Report xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="rep">
+  <name>Отчет</name>
+  <templates uuid="t1">
+    <name>Схема2</name>
+    <synonym><key>ru</key><value>Схема компоновки</value></synonym>
+    <templateType>DataCompositionSchema</templateType>
+  </templates>
+  <templates uuid="t2">
+    <name>Печать</name>
+  </templates>
+</mdclass:Report>"#,
+    );
+    run_incremental_extras_edt(&repo, &mut storage, std::slice::from_ref(&mdo), &[]).unwrap();
+
+    assert_eq!(
+        count(&storage, "Report.Отчет.Template.Схема"),
+        0,
+        "прежнее имя макета снято"
+    );
+    assert_eq!(
+        count(&storage, "Report.Отчет.Template.Схема2"),
+        1,
+        "новое имя макета заведено"
+    );
+    assert_eq!(
+        count(&storage, "Report.Отчет.Template.Печать"),
+        1,
+        "соседний макет не задет"
+    );
+}
+
+/// Содержимое макета EDT лежит отдельным файлом: его удаление оставляет
+/// паспорт с честной причиной, возврат файла — снова с размером.
+#[test]
+fn edt_incremental_templates_follow_content_file() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand_with_report(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let note_and_size = |st: &Storage| -> (Option<String>, u64) {
+        let json: String = st
+            .conn()
+            .query_row(
+                "SELECT attributes_json FROM metadata_objects \
+                 WHERE repo = ? AND full_name = 'Report.Отчет.Template.Схема'",
+                params![REPO_DEFAULT],
+                |r| r.get(0),
+            )
+            .expect("паспорт макета обязан быть в перечне");
+        let p: serde_json::Value = serde_json::from_str(&json).unwrap();
+        (
+            p["content_note"].as_str().map(|s| s.to_string()),
+            p["content_size_bytes"].as_u64().unwrap_or(0),
+        )
+    };
+    assert!(
+        note_and_size(&storage).1 > 0,
+        "исходно файл содержимого прочитан"
+    );
+
+    let dcs = repo
+        .join("src")
+        .join("Reports")
+        .join("Отчет")
+        .join("Templates")
+        .join("Схема")
+        .join("Template.dcs");
+    std::fs::remove_file(&dcs).unwrap();
+    run_incremental_extras_edt(&repo, &mut storage, &[], std::slice::from_ref(&dcs)).unwrap();
+    let (note, size) = note_and_size(&storage);
+    assert!(
+        note.unwrap_or_default().contains("нет файла содержимого"),
+        "у удалённого содержимого причина называется прямо"
+    );
+    assert_eq!(size, 0, "размера у удалённого файла нет");
+
+    write(
+        &dcs,
+        r#"<?xml version="1.0" encoding="UTF-8"?><DataCompositionSchema/>"#,
+    );
+    run_incremental_extras_edt(&repo, &mut storage, std::slice::from_ref(&dcs), &[]).unwrap();
+    assert!(
+        note_and_size(&storage).1 > 0,
+        "вернувшийся файл снова даёт размер"
+    );
+}
+
+/// У удалённого объекта EDT макеты уходят вместе с ним.
+#[test]
+fn edt_incremental_removes_templates_of_deleted_object() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand_with_report(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let count = |st: &Storage| -> i64 {
+        st.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM metadata_objects WHERE repo = ? AND meta_type = 'Template'",
+                params![REPO_DEFAULT],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count(&storage), 2, "оба макета заведены полным проходом");
+
+    let mdo = repo
+        .join("src")
+        .join("Reports")
+        .join("Отчет")
+        .join("Отчет.mdo");
+    std::fs::remove_file(&mdo).unwrap();
+    run_incremental_extras_edt(&repo, &mut storage, &[], std::slice::from_ref(&mdo)).unwrap();
+    assert_eq!(
+        count(&storage),
+        0,
+        "строк Template удалённого объекта остаться не должно"
     );
 }
 

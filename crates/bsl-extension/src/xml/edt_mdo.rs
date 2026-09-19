@@ -791,6 +791,105 @@ pub fn parse_mdo_header(content: &str) -> Option<(String, String, Option<String>
     }
 }
 
+/// Описание макета объекта из `.mdo` EDT: имя, синоним (ru) и вид макета.
+#[derive(Debug, Clone, Default)]
+pub struct MdoTemplate {
+    pub name: String,
+    pub synonym: Option<String>,
+    pub template_type: String,
+}
+
+/// Разобрать описания макетов объекта из `.mdo` EDT — элементы `<templates>`.
+///
+/// В отличие от `parse_mdo_header`, который прерывается на первой секции
+/// состава, здесь нужен ВЕСЬ файл: `<templates>` идут вперемешку с прочими
+/// секциями. Берём только прямых детей корня (глубина 2), внутри — прямые
+/// `<name>`, `<synonym><value>` и `<templateType>`. Вид макета EDT по
+/// умолчанию не пишет: нет `<templateType>` — значит табличный документ
+/// (`SpreadsheetDocument`). Элемент без `<name>` пропускаем.
+pub fn parse_mdo_templates(content: &str) -> Vec<MdoTemplate> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut out: Vec<MdoTemplate> = Vec::new();
+
+    let mut depth = 0i32;
+    let mut in_templates = false;
+    let mut in_synonym = false;
+    // Подхватываемый текст: 1 — `<name>`, 2 — `<value>` синонима, 3 — `<templateType>`.
+    let mut tt = 0u8;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                if depth == 2 && local == "templates" {
+                    in_templates = true;
+                    out.push(MdoTemplate {
+                        template_type: "SpreadsheetDocument".to_string(),
+                        ..Default::default()
+                    });
+                } else if in_templates && depth == 3 {
+                    match local.as_str() {
+                        "name" => tt = 1,
+                        "synonym" => in_synonym = true,
+                        "templateType" => tt = 3,
+                        _ => {}
+                    }
+                } else if in_templates && depth == 4 && in_synonym && local == "value" {
+                    tt = 2;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if tt != 0 {
+                    let txt = t
+                        .unescape()
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if let Some(cur) = out.last_mut() {
+                        match tt {
+                            1 if !txt.is_empty() && cur.name.is_empty() => cur.name = txt,
+                            2 if !txt.is_empty() && cur.synonym.is_none() => {
+                                cur.synonym = Some(txt)
+                            }
+                            3 if !txt.is_empty() => cur.template_type = txt,
+                            _ => {}
+                        }
+                    }
+                    tt = 0;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(&raw).to_string();
+                if depth == 2 && local == "templates" {
+                    in_templates = false;
+                }
+                if local == "synonym" {
+                    in_synonym = false;
+                }
+                // Пустой элемент (`<name></name>`) не должен оставить ждущий
+                // текст флаг: иначе значение подхватит первый же чужой текст.
+                if matches!(local.as_str(), "name" | "value" | "templateType") {
+                    tt = 0;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    out.retain(|t| !t.name.is_empty());
+    out
+}
+
 /// Разобрать обработчики событий формы из EDT `Form.form`.
 /// Form-level и element-level обработчики записаны единообразно:
 /// `<handlers><event>OnCreateAtServer</event><name>ПриСозданииНаСервере</name></handlers>`,
@@ -1660,5 +1759,56 @@ mod tests {
 
         // Вид без конфигурационных рёбер — пустой результат без разбора.
         assert!(parse_mdo_config_refs("Catalog", sub).is_empty());
+    }
+
+    /// Макеты объекта в EDT описаны элементами `<templates>` внутри `.mdo`
+    /// владельца: имя, синоним (ru) и вид. Вид по умолчанию EDT не пишет —
+    /// это табличный документ.
+    #[test]
+    fn templates_read_name_synonym_and_type() {
+        let mdo = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Report xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="r">
+  <name>АнализНачисленийИУдержаний</name>
+  <synonym><key>ru</key><value>Анализ начислений и удержаний</value></synonym>
+  <mainDataCompositionSchema>Report.АнализНачисленийИУдержаний.Template.ОсновнаяСхемаКомпоновкиДанных</mainDataCompositionSchema>
+  <templates uuid="t1">
+    <name>ОсновнаяСхемаКомпоновкиДанных</name>
+    <synonym><key>ru</key><value>Основная схема компоновки данных</value></synonym>
+    <templateType>DataCompositionSchema</templateType>
+  </templates>
+  <templates uuid="t2">
+    <name>ПФ_MXL_РасчетныйЛисток</name>
+    <synonym><key>ru</key><value>Расчетный листок</value></synonym>
+  </templates>
+  <templates uuid="t3">
+    <name>БезСинонима</name>
+  </templates>
+</mdclass:Report>"#;
+        let t = parse_mdo_templates(mdo);
+        assert_eq!(t.len(), 3, "три макета: {t:?}");
+        assert_eq!(t[0].name, "ОсновнаяСхемаКомпоновкиДанных");
+        assert_eq!(t[0].template_type, "DataCompositionSchema");
+        assert_eq!(
+            t[0].synonym.as_deref(),
+            Some("Основная схема компоновки данных")
+        );
+        // Вид по умолчанию в EDT не пишется → табличный документ.
+        assert_eq!(t[1].name, "ПФ_MXL_РасчетныйЛисток");
+        assert_eq!(t[1].template_type, "SpreadsheetDocument");
+        assert_eq!(t[1].synonym.as_deref(), Some("Расчетный листок"));
+        assert_eq!(t[2].template_type, "SpreadsheetDocument");
+        assert_eq!(t[2].synonym, None);
+        // Синоним САМОГО объекта макетом не считается.
+        assert!(!t.iter().any(|x| x.name == "АнализНачисленийИУдержаний"));
+    }
+
+    #[test]
+    fn templates_absent_gives_empty_vec() {
+        let mdo = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:Catalog xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="c">
+  <name>Товары</name>
+  <synonym><key>ru</key><value>Товары</value></synonym>
+</mdclass:Catalog>"#;
+        assert!(parse_mdo_templates(mdo).is_empty());
     }
 }

@@ -1155,8 +1155,15 @@ fn edt_role_name(path: &Path) -> Option<String> {
 }
 
 /// Завести/обновить один объект EDT по его `.mdo`: строка перечня, структура,
-/// связи данных (объектные и конфигурационные), подписка на событие.
-fn upsert_edt_object(conn: &rusqlite::Connection, mdo_path: &Path, obj_name: &str) -> Result<()> {
+/// связи данных (объектные и конфигурационные), подписка на событие, паспорта
+/// макетов. `repo_root` нужен паспортам макетов — путь их содержимого пишется
+/// относительно корня репозитория.
+fn upsert_edt_object(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    mdo_path: &Path,
+    obj_name: &str,
+) -> Result<()> {
     use crate::xml::edt_mdo;
 
     let content = match std::fs::read_to_string(mdo_path) {
@@ -1200,6 +1207,24 @@ fn upsert_edt_object(conn: &rusqlite::Connection, mdo_path: &Path, obj_name: &st
             attributes_json
         ],
     )?;
+
+    // Паспорта макетов объекта пересобираются целиком: их описания лежат в
+    // этом же `.mdo`, а прежние строки могли остаться от прошлой версии файла
+    // (удалённый или переименованный макет).
+    conn.execute(
+        "DELETE FROM metadata_objects \
+         WHERE repo = ? AND meta_type = 'Template' AND full_name LIKE ? ESCAPE '\\'",
+        params![
+            REPO_DEFAULT,
+            format!("{}.Template.%", like_escape(&full_name))
+        ],
+    )?;
+    if let Some(obj_dir) = mdo_path.parent() {
+        for t in edt_mdo::parse_mdo_templates(&content) {
+            let row = template_row_from_edt(repo_root, &full_name, obj_dir, &t);
+            insert_template_row(conn, &row)?;
+        }
+    }
 
     // Связи данных объекта пересобираются целиком: и объектные, и
     // конфигурационные лежат в этом же файле.
@@ -1384,6 +1409,70 @@ fn update_edt_role_rights(conn: &rusqlite::Connection, rights_path: &Path) -> Re
     Ok(())
 }
 
+/// Обновить паспорт одного макета EDT по файлу его содержимого (или убрать
+/// паспорт, если файл исчез).
+///
+/// Описание макета живёт в `.mdo` объекта-владельца, поэтому читаем его и
+/// берём имя/вид оттуда. Объект удалён — паспорта уже снял `delete_edt_object`,
+/// здесь делать нечего.
+fn update_edt_template_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    path: &Path,
+) -> Result<()> {
+    let template_name = match path
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|s| s.to_str())
+    {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+    let obj_dir = match path
+        .parent()
+        .and_then(|d| d.parent())
+        .and_then(|d| d.parent())
+    {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+    let obj_name = match obj_dir.file_name().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(()),
+    };
+    let mdo = obj_dir.join(format!("{}.mdo", obj_name));
+    let content = match std::fs::read_to_string(&mdo) {
+        Ok(c) => c,
+        // Объект удалён вместе с макетами — их паспорта снял delete_edt_object.
+        Err(_) => return Ok(()),
+    };
+    let meta_type = match crate::xml::edt_mdo::parse_mdo_header(&content) {
+        Some((mt, _name, _syn)) => mt,
+        None => return Ok(()),
+    };
+    let full_name = format!("{}.{}", meta_type, obj_name);
+    let template_full = format!("{}.Template.{}", full_name, template_name);
+
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_objects WHERE repo = ? AND meta_type = 'Template' AND full_name = ?",
+        params![REPO_DEFAULT, &template_full],
+    )?;
+    // У удалённого файла содержимого паспорт получит причину «нет файла
+    // содержимого», у нового — размер и путь.
+    if let Some(t) = crate::xml::edt_mdo::parse_mdo_templates(&content)
+        .into_iter()
+        .find(|t| t.name == template_name)
+    {
+        let row = template_row_from_edt(repo_root, &full_name, obj_dir, &t);
+        insert_template_row(conn, &row)?;
+    }
+    crate::schema::backfill_metadata_object_keys(conn)?;
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
 /// Инкрементальное обновление extras для батча выгрузки 1C:EDT.
 pub(crate) fn run_incremental_extras_edt(
     repo_root: &Path,
@@ -1397,11 +1486,26 @@ pub(crate) fn run_incremental_extras_edt(
     let mut removed_objects: Vec<(String, String)> = Vec::new();
     let mut forms: Vec<&std::path::PathBuf> = Vec::new();
     let mut roles: Vec<&std::path::PathBuf> = Vec::new();
+    // Файлы содержимого макетов (`<Тип>/<Объект>/Templates/<Имя>/Template.<ext>`).
+    let mut templates: Vec<&std::path::PathBuf> = Vec::new();
 
     let classify = |p: &std::path::PathBuf| -> (&'static str, Option<(String, String)>) {
         let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if ext.eq_ignore_ascii_case("bsl") {
+        // Макет: имя файла содержимого в EDT всегда `Template`, а папка
+        // `<Имя>` лежит внутри папки `Templates` объекта. Расширение зависит
+        // от вида макета (`.dcs` у схемы компоновки, `.mxlx` у табличного
+        // документа, `.txt` у текстового, своё у двоичных данных), так что
+        // опознаём по стему, а не по расширению.
+        let in_templates = p
+            .parent()
+            .and_then(|d| d.parent())
+            .and_then(|d| d.file_name())
+            .and_then(|s| s.to_str())
+            == Some("Templates");
+        if in_templates && p.file_stem().and_then(|s| s.to_str()) == Some("Template") {
+            ("template", None)
+        } else if ext.eq_ignore_ascii_case("bsl") {
             ("bsl", None)
         } else if fname == "Form.form" {
             ("form", None)
@@ -1422,6 +1526,7 @@ pub(crate) fn run_incremental_extras_edt(
             ("bsl", _) => bsl_changed.push(p),
             ("form", _) => forms.push(p),
             ("rights", _) => roles.push(p),
+            ("template", _) => templates.push(p),
             ("object", Some((folder, name))) => objects.push((p, folder, name)),
             _ => {}
         }
@@ -1431,6 +1536,7 @@ pub(crate) fn run_incremental_extras_edt(
             ("bsl", _) => bsl_deleted.push(p),
             ("form", _) => forms.push(p),
             ("rights", _) => roles.push(p),
+            ("template", _) => templates.push(p),
             ("object", Some((folder, name))) => removed_objects.push((folder, name)),
             _ => {}
         }
@@ -1444,7 +1550,7 @@ pub(crate) fn run_incremental_extras_edt(
         }
     }
     for (path, _folder, name) in &objects {
-        if let Err(e) = upsert_edt_object(conn, path, name) {
+        if let Err(e) = upsert_edt_object(repo_root, conn, path, name) {
             tracing::warn!("edt upsert {}: {}", path.display(), e);
         }
     }
@@ -1456,6 +1562,11 @@ pub(crate) fn run_incremental_extras_edt(
     for p in &roles {
         if let Err(e) = update_edt_role_rights(conn, p) {
             tracing::warn!("edt rights {}: {}", p.display(), e);
+        }
+    }
+    for p in &templates {
+        if let Err(e) = update_edt_template_for_file(repo_root, conn, p) {
+            tracing::warn!("edt template {}: {}", p.display(), e);
         }
     }
 

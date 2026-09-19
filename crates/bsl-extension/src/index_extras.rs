@@ -128,7 +128,7 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
     // (metadata_objects / data_links), поэтому downstream-инструменты не меняются.
     if let Some(src_root) = crate::xml::edt_mdo::detect_edt_src(repo_root) {
         phase("объекты (EDT)", "edt metadata layer", || {
-            run_edt_metadata_layer(&src_root, conn)
+            run_edt_metadata_layer(repo_root, &src_root, conn)
         });
         // Права ролей EDT лежат отдельными файлами и в общий проход по `.mdo`
         // не попадают — своя фаза, как у формата Конфигуратора (E-1).
@@ -207,12 +207,19 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
 }
 
 /// EDT-аналог metadata-слоя: обходит `src/<Тип>/<Имя>/<Имя>.mdo` и заполняет
-/// `metadata_objects` (состав + синоним + `attributes_json`) и `data_links`
-/// (ссылочные реквизиты/измерения + движения документов). Один проход по
-/// объектам вместо серии раздельных (в формате EDT весь объект — в одном
-/// `.mdo`, читать файл повторно незачем). Идемпотентно: DELETE+INSERT всего
+/// `metadata_objects` (состав + синоним + `attributes_json` + паспорта макетов)
+/// и `data_links` (ссылочные реквизиты/измерения + движения документов). Один
+/// проход по объектам вместо серии раздельных (в формате EDT весь объект — в
+/// одном `.mdo`, читать файл повторно незачем; описание макетов — тоже внутри
+/// `.mdo`, элементами `<templates>`). Идемпотентно: DELETE+INSERT всего
 /// репо. Формы/подписки/права/модули EDT — отдельными проходами (этап 2).
-fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+/// `repo_root` нужен паспортам макетов: путь их содержимого пишется
+/// относительно корня репозитория.
+fn run_edt_metadata_layer(
+    repo_root: &Path,
+    src_root: &Path,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
     use crate::xml::edt_mdo;
 
     let _ = conn.execute("ROLLBACK", []);
@@ -259,6 +266,7 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
     let mut cfg_links = 0usize;
     let mut forms = 0usize;
     let mut subs = 0usize;
+    let mut templates = 0usize;
     // Обходим ВСЕ папки типов в src/ (не только OBJECT_FOLDERS): meta_type берём
     // из корневого тега `.mdo` (parse_mdo_header) — как index_object_synonyms для
     // формата Конфигуратора. Так в metadata_objects попадают и объекты без
@@ -347,6 +355,16 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
                 attributes_json,
             ])?;
             objects += 1;
+
+            // Макеты объекта: описание лежит здесь же, элементами
+            // `<templates>` (вид, имя, синоним), содержимое — отдельным
+            // файлом `Templates/<Имя>/Template.<расширение>`. Паспорт макета
+            // пишется в тот же перечень; транзакция уже открыта.
+            for t in edt_mdo::parse_mdo_templates(&content) {
+                let row = template_row_from_edt(repo_root, &full_name, &obj_dir, &t);
+                insert_template_row(conn, &row)?;
+                templates += 1;
+            }
 
             // Подписка на событие: помимо строки в metadata_objects пишем в
             // event_subscriptions (источник get_event_subscriptions).
@@ -477,12 +495,13 @@ fn run_edt_metadata_layer(src_root: &Path, conn: &rusqlite::Connection) -> Resul
 
     tracing::info!(
         "edt metadata: {} объектов, {} рёбер data_links ({} конфигурационных), \
-         {} форм, {} подписок (src={})",
+         {} форм, {} подписок, {} макетов (src={})",
         objects,
         links,
         cfg_links,
         forms,
         subs,
+        templates,
         src_root.display()
     );
     Ok(())
