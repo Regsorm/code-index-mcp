@@ -17,6 +17,12 @@ Versioning — [SemVer](https://semver.org/).
   unknown sources and unapproved licenses. Duplicate transitive versions are
   currently reported as warnings.
 
+### Fixed
+
+- The Windows retry-queue test no longer subtracts 600 seconds from the
+  `Instant` of a fresh CI runner. Its test clock advances instead, avoiding an
+  underflow immediately after the virtual machine starts.
+
 ### Changed
 
 - All Rust code now follows one `rustfmt` baseline; strict Clippy passes for

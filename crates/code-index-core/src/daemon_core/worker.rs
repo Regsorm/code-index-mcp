@@ -1914,11 +1914,12 @@ mod tests {
             &mut retries,
             &[],
             vec![занятый("C:/repo/Configuration.xml")],
-            now - std::time::Duration::from_secs(600),
+            now,
             Path::new("C:/repo"),
         );
+        let позже = now + std::time::Duration::from_secs(600);
         let (пачка, добавлено) =
-            with_due_retries(vec![занятый("C:/repo/Configuration.xml")], &retries, now);
+            with_due_retries(vec![занятый("C:/repo/Configuration.xml")], &retries, позже);
         assert_eq!(добавлено, 0);
         assert_eq!(пачка.len(), 1);
     }
