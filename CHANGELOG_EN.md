@@ -5,6 +5,32 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.4.0] — 2026-09-19
+
+**Data composition schemas are parsed into index tables: a single `get_dcs_schema` call returns data sets with fields, query texts, links, calculated fields, totals, parameters and variants instead of reading a megabyte of XML piece by piece. Reports also enter the data-links graph: new "report reads object" edges extracted from query texts. On a typical accounting configuration — 470 schemas, 911 data sets, 2,324 such edges across 449 objects. Both export formats: Designer and 1C:EDT.**
+
+> Context. In 1.3.0 an EDT composition schema became searchable as text — that covered "find", but not "understand": answering where a report takes its data from still meant reading markup. Here the schema is decomposed at index time, and the tool serves the pieces ready to use.
+
+### Added
+
+- **`get_dcs_schema` — a composition schema in one call.** Accepts a template name (`Report.MyReport.Template.Schema`), an owner name (`Report.MyReport`) or a common template (`CommonTemplate.Schema`). Returns data sets (kind, source, fields with presentation and type, query text), nested union sets, set links, calculated fields, totals, parameters, setting variants and counters. The `reads` section lists configuration objects the schema reads in its query texts. `sections` narrows the output, `include_query=false` returns query lengths only, and `max_response_bytes` sets a response budget: when space runs short, query texts are dropped first, then set fields, then whole sections — identification and counters are never truncated.
+- **Two index tables — `dcs_schemas` and `dcs_datasets`**, available through `bsl_sql`: parsed schemas with sections as JSON, and data sets with query texts. Filled at index time; the watcher keeps them current in both export formats.
+- **`dcs_query` edges in the data-links graph** — "report reads object", extracted from set query texts with virtual tables taken into account. A report now appears in `find_references` and `get_data_links` as a data consumer.
+
+### Fixed
+
+- **XML entity references are no longer lost during parsing.** Since 0.38 `quick-xml` delivers `&amp;`, `&lt;`, `&#NN;` as a separate event rather than inside the text; after the dependency was raised to 0.41 (v1.2.4) every parser in the project silently dropped them — `&`, `<`, `>` and quotes disappeared from synonyms, titles, expressions and query texts. Spotted on live data: the composition expression "Код в (&Параметр)" arrived as "Код в (Параметр)", turning a parameter into plain text. Fixed in all 26 places across nine parsers; whitespace trimming at the reader level was disabled as well, otherwise the text fragments around an entity were glued together ("Код <> 0" → "Код<>0").
+
+### Verification
+
+- `cargo test --workspace --all-features`: 920 passed, 0 failed (including 8 new regression tests — one per affected parser, checking the whole string and the numeric reference `&#1040;`). `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- Forced reindex of a typical accounting configuration in both formats: 1C:EDT — 47,995 files in 3 min 3 s, Designer — 88,284 files in 3 min 58 s. Both databases hold 470 composition schemas and 911 data sets.
+- Lost entities on live data: in the Designer format 38 schemas contain `&` in expressions and 537 data sets in query texts; before the fix there were none. Whitespace around the restored characters is intact (`Период <=`, `(СтоимостьУслуг - СуммаНалога) < 0 И СуммаНалога > 0`).
+- `get_dcs_schema` verified on both exports in five modes (by template, by owner, common template, budget truncation, missing name) — the answers match, only the content file path differs.
+- Counters of the same configuration in two formats agree: objects 30,597 vs 30,563, forms 7,905 vs 7,903, subscriptions 449 vs 447, role rights 48,489 vs 48,476, modules 18,291 vs 18,263.
+- Federation on a local build: six remote repositories ready, call forwarding and the new tool work through the node.
+- **On an existing database** the schemas appear after a one-off `bsl-indexer index <path> --force`: the change affects parsing, so the extras layer does not rebuild on its own.
+
 ## [1.3.0] — 2026-09-19
 
 **1C:EDT exports: data composition schemas (`.dcs`) are now searchable as text, and object templates appear in the object registry. Previously the schema never reached the index in this format, and objects had no templates at all. On a typical accounting configuration exported from 1C:EDT: 470 schemas with indexed text and 14,490 template passports — up from 0 and 0.**
