@@ -17,8 +17,9 @@ use std::sync::Arc;
 use bsl_extension::{
     schema::SCHEMA_EXTENSIONS,
     tools::{
-        FindDataPathTool, FindPathBslTool, GetDataLinksTool, GetEventSubscriptionsTool,
-        GetFormHandlersTool, GetObjectStructureTool, GetRegisterWritersTool, SearchTermsTool,
+        FindDataPathTool, FindPathBslTool, GetDataLinksTool, GetDcsSchemaTool,
+        GetEventSubscriptionsTool, GetFormHandlersTool, GetObjectStructureTool,
+        GetRegisterWritersTool, SearchTermsTool,
     },
 };
 use code_index_core::extension::{IndexTool, ToolContext};
@@ -56,6 +57,166 @@ async fn run_tool(tool: &dyn IndexTool, storage: &Arc<StoragePool>, args: Value)
         "tool обязан возвращать _meta.dependent_files (массив, возможно пустой). Получили: {raw}"
     );
     raw["result"].clone()
+}
+
+// ── get_dcs_schema ────────────────────────────────────────────────────────
+
+/// Схема компоновки: одна строка `dcs_schemas`, один набор и одно ребро
+/// `dcs_query` на прочитанный объект.
+async fn seed_dcs(storage: &Arc<StoragePool>) {
+    let s = storage.get().await.unwrap();
+    let conn = s.conn();
+    conn.execute(
+        "INSERT INTO dcs_schemas (repo, template_full_name, owner_full_name, title, content_file, \
+         links_json, calculated_fields_json, totals_json, parameters_json, variants_json, \
+         templates_count, data_sets_count, fields_count, links_count, calculated_fields_count, \
+         totals_count, parameters_count, variants_count) \
+         VALUES ('default', 'Report.Отчет.Template.Схема', 'Report.Отчет', 'Схема', \
+         'Reports/Отчет/Templates/Схема/Ext/Template.xml', '[]', '[]', '[]', \
+         '[{\"name\":\"Параметр1\"}]', '[]', 0, 1, 1, 0, 0, 0, 1, 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO dcs_datasets (repo, template_full_name, data_set_name, kind, data_source, \
+         object_name, query_text, fields_json, parent_set) \
+         VALUES ('default', 'Report.Отчет.Template.Схема', 'Набор1', 'query', 'ИсточникДанных1', \
+         NULL, 'ВЫБРАТЬ Контрагент ИЗ Справочник.Контрагенты', '[{\"name\":\"Контрагент\"}]', '')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO data_links (repo, from_object, from_path, to_object, link_kind, is_composite, \
+         is_universal, to_object_key) \
+         VALUES ('default', 'Report.Отчет', 'Схема.Набор1', 'Catalog.Контрагенты', 'dcs_query', \
+         0, 0, 'catalog.контрагенты')",
+        [],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn get_dcs_schema_by_template_and_owner() {
+    let (_tmp, storage) = fresh_storage();
+    seed_dcs(&storage).await;
+
+    // По имени макета.
+    let res = run_tool(
+        &GetDcsSchemaTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_name": "Report.Отчет.Template.Схема"}),
+    )
+    .await;
+    // Форма ответа одна и по макету, и по владельцу: список схем + их число.
+    assert_eq!(res["schemas_count"].as_u64(), Some(1));
+    let s = &res["schemas"][0];
+    assert_eq!(s["owner"].as_str(), Some("Report.Отчет"));
+    assert_eq!(
+        s["template_full_name"].as_str(),
+        Some("Report.Отчет.Template.Схема")
+    );
+    assert_eq!(s["data_sets"][0]["name"].as_str(), Some("Набор1"));
+    assert!(s["data_sets"][0]["query"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Справочник.Контрагенты"));
+    assert!(s["data_sets"][0]["fields"].is_array());
+    assert_eq!(s["reads"][0].as_str(), Some("Catalog.Контрагенты"));
+
+    // По имени владельца (синоним ключа object).
+    let res = run_tool(
+        &GetDcsSchemaTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "object": "Report.Отчет"}),
+    )
+    .await;
+    assert_eq!(res["requested"].as_str(), Some("Report.Отчет"));
+    assert_eq!(
+        res["schemas"][0]["template_full_name"].as_str(),
+        Some("Report.Отчет.Template.Схема")
+    );
+
+    // include_query=false → только длина запроса.
+    let res = run_tool(
+        &GetDcsSchemaTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "template": "Report.Отчет.Template.Схема", "include_query": false}),
+    )
+    .await;
+    let s = &res["schemas"][0];
+    assert!(s["data_sets"][0]["query"].is_null());
+    assert!(s["data_sets"][0]["query_length"].as_u64().unwrap_or(0) > 0);
+
+    // sections=['parameters'] → наборов нет, параметры есть.
+    let res = run_tool(
+        &GetDcsSchemaTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "name": "Report.Отчет.Template.Схема", "sections": ["parameters"]}),
+    )
+    .await;
+    let s = &res["schemas"][0];
+    assert!(s.get("data_sets").is_none());
+    assert!(s["parameters"].is_array());
+    // Опознание и счётчики остаются при любой выборке секций.
+    assert!(s["data_sets_count"].is_number());
+    assert_eq!(
+        s["template_full_name"].as_str(),
+        Some("Report.Отчет.Template.Схема")
+    );
+
+    // sections=['data_sets'] без 'fields' → наборы без полей, с их числом.
+    let res = run_tool(
+        &GetDcsSchemaTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_name": "Report.Отчет.Template.Схема", "sections": ["data_sets"]}),
+    )
+    .await;
+    let s = &res["schemas"][0];
+    assert!(s["data_sets"][0].get("fields").is_none());
+    assert!(s["data_sets"][0]["fields_count"].is_number());
+
+    // «Не найдено» — ошибка и подсказка.
+    let res = run_tool(
+        &GetDcsSchemaTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "full_name": "НичегоТакого"}),
+    )
+    .await;
+    assert!(res["error"].is_string());
+    assert!(res["hint"].is_string());
+}
+
+#[tokio::test]
+async fn get_dcs_schema_truncates_under_budget() {
+    let (_tmp, storage) = fresh_storage();
+    seed_dcs(&storage).await;
+
+    let res = run_tool(
+        &GetDcsSchemaTool,
+        &storage,
+        serde_json::json!({
+            "repo": REPO,
+            "full_name": "Report.Отчет.Template.Схема",
+            "max_response_bytes": 200
+        }),
+    )
+    .await;
+    // Текст запроса ушёл первым, но его длина и признак усечения на месте.
+    let s = &res["schemas"][0];
+    assert!(s["data_sets"][0]["query_length"].is_number());
+    assert_eq!(s["data_sets"][0]["query_truncated"].as_bool(), Some(true));
+    // Опознание и счётчики не урезаются никогда.
+    assert_eq!(
+        s["template_full_name"].as_str(),
+        Some("Report.Отчет.Template.Схема")
+    );
+    assert!(s["content_file"].is_string());
+    assert!(s["parameters_count"].is_number());
+    // Подсказка называет ручку повтора.
+    assert!(res["hint"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("max_response_bytes="));
 }
 
 // ── get_object_structure ──────────────────────────────────────────────────

@@ -22,6 +22,7 @@ use rusqlite::params;
 
 mod call_graph;
 mod common;
+mod dcs;
 mod exported;
 mod full_scan;
 mod incremental;
@@ -29,6 +30,7 @@ mod modules;
 
 pub(crate) use call_graph::*;
 pub(crate) use common::*;
+pub(crate) use dcs::*;
 pub(crate) use exported::*;
 pub(crate) use full_scan::*;
 pub(crate) use incremental::*;
@@ -140,8 +142,26 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
         phase("модули (EDT)", "edt metadata_modules", || {
             index_metadata_modules_edt(repo_root, &src_root, conn)
         });
-        return Ok(());
+    } else {
+        run_metadata_layer_configurator(repo_root, conn)?;
     }
+    // Схемы компоновки данных — ПОСЛЕДНЯЯ фаза слоя, и это обязательно: и
+    // `index_data_links` (Конфигуратор), и `run_edt_metadata_layer` (EDT) сносят
+    // ВСЕ рёбра репо целиком, а паспорта макетов появляются в
+    // `index_object_templates` / `run_edt_metadata_layer`. Рёбра `dcs_query` и
+    // строки `dcs_*` обязаны лечь поверх уже собранного.
+    phase("схемы компоновки", "dcs_schemas", || {
+        index_dcs_schemas(repo_root, conn)
+    });
+    Ok(())
+}
+
+/// XML-слой метаданных формата Конфигуратора: перечень объектов, связи данных,
+/// конфиг-уровневые рёбра, права ролей, структура объектов (attributes_json),
+/// синонимы, макеты, формы, подписки, модули, опись состава. Вынесен из
+/// `run_index_extras_metadata_layer` отдельной функцией, чтобы ветки EDT и
+/// Конфигуратора читались как два равноправных пути одного слоя.
+fn run_metadata_layer_configurator(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
     phase("объекты", "metadata_objects", || {
         index_metadata_objects(repo_root, conn)
     });

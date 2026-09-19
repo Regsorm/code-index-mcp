@@ -78,9 +78,14 @@ impl IndexTool for BslSqlTool {
          metadata_code_usages(object_ref, object_ref_key, member_path, usage_kind, file_path, line; \
          фильтровать по точному object_ref='Document.X' — SQLite lower() НЕ лоуэркейсит кириллицу, \
          object_ref_key уже в нижнем регистре для поиска из приложения), procedure_enrichment(proc_key, \
-         terms, signature), direct_edge_files(caller, callee, source_file). \
+         terms, signature), direct_edge_files(caller, callee, source_file), \
+         dcs_schemas(template_full_name, owner_full_name, content_file, data_sets_json, \
+         links_json, calculated_fields_json, totals_json, parameters_json, variants_json, \
+         templates_count, *_count), dcs_datasets(template_full_name, data_set_name, kind, \
+         data_source, object_name, query_text, fields_json, parent_set). \
          link_kind в data_links: объектные attr/tabular_attr/register_dim/recorder/owner \
-         (owner: подчинённый справочник → владелец); \
+         (owner: подчинённый справочник → владелец); dcs_query — макет СКД читает объект \
+         (from_object — владелец макета, from_path — «<Макет>.<Набор>»); \
          конфиг-уровень subsystem_content/exchange_plan_content/defined_type_content/\
          functional_option_location/functional_option_content (from_object соответственно \
          Subsystem.X/ExchangePlan.X/DefinedType.X/FunctionalOption.X; *_content у ФО — \

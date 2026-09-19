@@ -18,10 +18,14 @@
 //   планов обмена, типы определяемых типов, расположение функциональных
 //   опций) → доп. рёбра `data_links`; плюс права ролей (Rights.xml) для
 //   отдельной таблицы `role_rights`.
+// - `dcs` — макеты «Схема компоновки данных» (`Templates/<Имя>/Ext/Template.xml`
+//   и `Template.dcs` выгрузки EDT): наборы данных с полями, связи наборов,
+//   вычисляемые поля, итоги, параметры и варианты настроек. Источник для
+//   таблиц `dcs_schemas` / `dcs_datasets` и рёбер `data_links` вида `dcs_query`.
 
 use std::borrow::Cow;
 
-use quick_xml::events::BytesText;
+use quick_xml::events::{BytesRef, BytesText};
 
 /// Совместимый с прежним quick-xml путь: декодировать XML-текст и раскрыть
 /// стандартные entity (`&amp;`, `&lt;` и т.д.).
@@ -37,8 +41,32 @@ impl BytesTextExt for BytesText<'_> {
     }
 }
 
+/// Текст ссылки на сущность — события `Event::GeneralRef`.
+///
+/// С quick-xml 0.38 сущности внутри текста (`&amp;`, `&lt;`, `&#38;`) больше
+/// не входят в `Event::Text`, а приходят отдельным событием между двумя
+/// текстовыми. Разборщик, который его не ловит, молча теряет символ: выражение
+/// СКД `Код в (&amp;Параметр)` превращалось в `Код в (Параметр)`. Стандартные
+/// имена и числовые ссылки раскрываются; незнакомая сущность возвращается как
+/// была — `&имя;` — чтобы текст хотя бы не искажался молча.
+pub(crate) fn general_ref_text(r: &BytesRef<'_>) -> String {
+    if let Ok(Some(ch)) = r.resolve_char_ref() {
+        return ch.to_string();
+    }
+    let name = r.decode().map(|c| c.into_owned()).unwrap_or_default();
+    match name.as_str() {
+        "amp" => "&".to_string(),
+        "lt" => "<".to_string(),
+        "gt" => ">".to_string(),
+        "quot" => "\"".to_string(),
+        "apos" => "'".to_string(),
+        other => format!("&{other};"),
+    }
+}
+
 pub mod config_dump_info;
 pub mod configuration;
+pub mod dcs;
 // `edt_mdo` — формат 1C:EDT (`.mdo`): структура объектов, связи данных,
 // синоним/шапка. Заполняет те же таблицы, что и формат Конфигуратора.
 pub mod edt_mdo;

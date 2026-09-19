@@ -1368,7 +1368,7 @@ fn template_content_kind(rel: &str) -> TemplateContentKind {
 /// документ и схема компоновки лежат в `.xml`, в выгрузке 1C:EDT — в `.mxlx`
 /// и `.dcs`, текстовый документ — в `.txt`, двоичные данные и внешние
 /// компоненты — в своих форматах. Поэтому смотрим, что реально лежит в папке.
-fn template_content_in_dir(dir: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn template_content_in_dir(dir: &Path) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     entries
         .filter_map(|e| e.ok())

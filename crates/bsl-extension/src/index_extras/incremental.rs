@@ -283,6 +283,8 @@ pub(crate) fn update_object_template_for_file(
         "DELETE FROM metadata_objects WHERE repo = ? AND meta_type = 'Template' AND full_name = ?",
         params![REPO_DEFAULT, &full_name],
     )?;
+    // Строки схемы компоновки и её рёбра уходят вместе с паспортом макета.
+    delete_dcs_for_template(conn, &full_name)?;
     if template_xml_path.is_file() {
         if let Some(row) = template_row_from_path(repo_root, template_xml_path) {
             // Имя в шапке может отличаться от имени файла (переименование
@@ -294,8 +296,72 @@ pub(crate) fn update_object_template_for_file(
                      WHERE repo = ? AND meta_type = 'Template' AND full_name = ?",
                     params![REPO_DEFAULT, &row.full_name],
                 )?;
+                delete_dcs_for_template(conn, &row.full_name)?;
             }
             insert_template_row(conn, &row)?;
+            // Строка заведена заново: если это схема компоновки с
+            // существующим файлом содержимого — пересобираем её `dcs_*`.
+            rebuild_dcs_for_config_descriptor(repo_root, conn, template_xml_path, &row.full_name)?;
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Пересобрать `dcs_*` макета формата Конфигуратора по файлу его СОДЕРЖИМОГО
+/// (`<…>/Templates/<Имя>/Ext/Template.<ext>`). Имя макета — папка-прародитель
+/// (`<Имя>`), владелец — из восстановленного пути описания
+/// `<…>/Templates/<Имя>.xml`.
+///
+/// Своя транзакция; прежние строки макета сносятся ВСЕГДА (файл мог быть
+/// удалён или перестать быть схемой), новая заводится при наличии содержимого
+/// и корня `DataCompositionSchema`.
+fn update_dcs_for_config_template(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    path: &Path,
+) -> Result<()> {
+    let Some(template_dir) = path.parent().and_then(|d| d.parent()) else {
+        return Ok(());
+    };
+    let Some(name) = template_dir.file_name().and_then(|s| s.to_str()) else {
+        return Ok(());
+    };
+    let Some(templates_dir) = template_dir.parent() else {
+        return Ok(());
+    };
+    // Общие макеты лежат прямо в `CommonTemplates/<Имя>/Ext` — папки
+    // `Templates` у них нет, и `template_owner_from_path` тут ничего не разберёт
+    // (объекта-владельца у общего макета не существует).
+    let owner = match templates_dir.file_name().and_then(|s| s.to_str()) {
+        Some("CommonTemplates") => format!("CommonTemplate.{}", name),
+        _ => {
+            let descriptor = templates_dir.join(format!("{}.xml", name));
+            match template_owner_from_path(&descriptor) {
+                Some(o) => o,
+                None => return Ok(()),
+            }
+        }
+    };
+    let template_full = if owner.starts_with("CommonTemplate.") {
+        owner.clone()
+    } else {
+        format!("{}.Template.{}", owner, name)
+    };
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    delete_dcs_for_template(conn, &template_full)?;
+    if path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if crate::xml::dcs::is_dcs_content(&content) {
+                let target = DcsTarget {
+                    template_full_name: template_full,
+                    owner_full_name: owner,
+                    content_rel: rel_path(repo_root, path),
+                    content_abs: path.to_path_buf(),
+                };
+                rebuild_dcs_schema(conn, &target)?;
+            }
         }
     }
     conn.execute("COMMIT", [])?;
@@ -362,6 +428,29 @@ pub(crate) fn update_event_subscription_for_file(
     Ok(())
 }
 
+/// Файл СОДЕРЖИМОГО макета формата Конфигуратора по его пути:
+/// `<…>/Templates/<Имя>/Ext/Template.<ext>` — стем `Template`, родительская
+/// папка `Ext`, а её прародитель лежит в `Templates`. Расширение не проверяем:
+/// у схемы компоновки это `.xml`, у табличного документа `.mxl`, и вид макета
+/// из раскладки не виден.
+fn is_config_template_content(path: &Path) -> bool {
+    if path.file_stem().and_then(|s| s.to_str()) != Some("Template") {
+        return false;
+    }
+    let Some(ext_dir) = path.parent() else {
+        return false;
+    };
+    if ext_dir.file_name().and_then(|s| s.to_str()) != Some("Ext") {
+        return false;
+    }
+    ext_dir
+        .parent()
+        .and_then(|d| d.parent())
+        .and_then(|d| d.file_name())
+        .and_then(|s| s.to_str())
+        == Some("Templates")
+}
+
 /// Инкрементально обновить extras для файлов одного watcher-батча.
 ///
 /// Маршрутизация по типу файла:
@@ -407,6 +496,9 @@ pub fn run_incremental_extras(
     let mut sub_xmls: Vec<&std::path::PathBuf> = Vec::new();
     // Описания макетов объектов (`<Объект>/Templates/<Имя>.xml`).
     let mut template_xmls: Vec<&std::path::PathBuf> = Vec::new();
+    // Файлы содержимого макетов (`<Объект>/Templates/<Имя>/Ext/Template.<ext>`):
+    // для схемы компоновки по ним пересобираются `dcs_*`.
+    let mut dcs_contents: Vec<&std::path::PathBuf> = Vec::new();
     // Источники data_links конфиг-уровня / role_rights изменились в этом батче.
     // Они лежат вне OBJECT_FOLDERS и не привязаны к одному объекту → при
     // попадании дешевле полностью пересобрать соответствующую таблицу.
@@ -452,6 +544,10 @@ pub fn run_incremental_extras(
         {
             // Описание макета объекта: паспорт в перечне обновляется точечно.
             template_xmls.push(p);
+        } else if is_config_template_content(p) {
+            // Содержимое макета объекта (`Templates/<Имя>/Ext/Template.<ext>`):
+            // у схемы компоновки по нему пересобираются `dcs_*`.
+            dcs_contents.push(p);
         } else if p
             .parent()
             .and_then(|d| d.file_name())
@@ -560,6 +656,13 @@ pub fn run_incremental_extras(
         let t = std::time::Instant::now();
         update_object_template_for_file(repo_root, conn, p)?;
         code_index_core::logging::stage_add("макеты", t.elapsed());
+    }
+    for p in &dcs_contents {
+        let t = std::time::Instant::now();
+        if let Err(e) = update_dcs_for_config_template(repo_root, conn, p) {
+            tracing::warn!("dcs {}: {}", p.display(), e);
+        }
+        code_index_core::logging::stage_add("схемы компоновки", t.elapsed());
     }
     for p in &sub_xmls {
         let t = std::time::Instant::now();
@@ -797,6 +900,10 @@ pub(crate) fn delete_object_cascade(
         "DELETE FROM data_links WHERE repo = ? AND (from_object = ? OR to_object = ?)",
         params![REPO_DEFAULT, full_name, full_name],
     )?;
+    // Строки схем компоновки объекта (и общих макетов, владелец которых — сам
+    // макет) уносим вместе с объектом; его рёбра `dcs_query` уже унёс DELETE
+    // строкой выше.
+    delete_dcs_for_owner(conn, full_name)?;
     if let Some(folder) = plural_folder(meta_type) {
         let plural = format!("{}.{}", folder, name);
         conn.execute(
@@ -1211,6 +1318,10 @@ fn upsert_edt_object(
     // Паспорта макетов объекта пересобираются целиком: их описания лежат в
     // этом же `.mdo`, а прежние строки могли остаться от прошлой версии файла
     // (удалённый или переименованный макет).
+    //
+    // Строки схем компоновки снимаются ДО переустановки паспортов — так
+    // закрывается и переименование, и удаление макета в `.mdo`.
+    delete_dcs_for_owner(conn, &full_name)?;
     conn.execute(
         "DELETE FROM metadata_objects \
          WHERE repo = ? AND meta_type = 'Template' AND full_name LIKE ? ESCAPE '\\'",
@@ -1220,8 +1331,9 @@ fn upsert_edt_object(
         ],
     )?;
     if let Some(obj_dir) = mdo_path.parent() {
-        for t in edt_mdo::parse_mdo_templates(&content) {
-            let row = template_row_from_edt(repo_root, &full_name, obj_dir, &t);
+        let tpls = edt_mdo::parse_mdo_templates(&content);
+        for t in &tpls {
+            let row = template_row_from_edt(repo_root, &full_name, obj_dir, t);
             insert_template_row(conn, &row)?;
         }
     }
@@ -1266,6 +1378,33 @@ fn upsert_edt_object(
                 is_composite as i64,
                 is_universal as i64,
             ])?;
+        }
+    }
+
+    // Схемы компоновки макетов объекта пересобираются ПОСЛЕ связей данных, и
+    // это обязательно: блок выше сносит ВСЕ рёбра объекта (`from_object = ?`)
+    // и унёс бы вместе с ними только что записанные рёбра `dcs_query`.
+    // Пересобираем сразу, не дожидаясь полного прохода: иначе после правки
+    // `.mdo` строк схемы в индексе не было бы вовсе.
+    if let Some(obj_dir) = mdo_path.parent() {
+        for t in edt_mdo::parse_mdo_templates(&content) {
+            if t.template_type != "DataCompositionSchema" {
+                continue;
+            }
+            let dir = obj_dir.join("Templates").join(&t.name);
+            let Some(abs) = template_content_in_dir(&dir) else {
+                continue;
+            };
+            if !abs.is_file() {
+                continue;
+            }
+            let target = DcsTarget {
+                template_full_name: format!("{}.Template.{}", full_name, t.name),
+                owner_full_name: full_name.clone(),
+                content_rel: rel_path(repo_root, &abs),
+                content_abs: abs,
+            };
+            rebuild_dcs_schema(conn, &target)?;
         }
     }
 
@@ -1321,6 +1460,8 @@ fn delete_edt_object(conn: &rusqlite::Connection, folder: &str, obj_name: &str) 
         "DELETE FROM data_links WHERE repo = ? AND from_object = ?",
         params![REPO_DEFAULT, &full_name],
     )?;
+    // Строки схем компоновки объекта уходят вместе с объектом.
+    delete_dcs_for_owner(conn, &full_name)?;
     conn.execute(
         "DELETE FROM metadata_forms WHERE repo = ? AND owner_full_name = ?",
         params![REPO_DEFAULT, &owner_key],
@@ -1420,25 +1561,18 @@ fn update_edt_template_for_file(
     conn: &rusqlite::Connection,
     path: &Path,
 ) -> Result<()> {
-    let template_name = match path
-        .parent()
-        .and_then(|d| d.file_name())
-        .and_then(|s| s.to_str())
-    {
-        Some(s) => s.to_string(),
-        None => return Ok(()),
+    let Some((full_name, template_name)) = edt_template_ident(path) else {
+        return Ok(());
     };
-    let obj_dir = match path
+    let Some(obj_dir) = path
         .parent()
         .and_then(|d| d.parent())
         .and_then(|d| d.parent())
-    {
-        Some(d) => d,
-        None => return Ok(()),
+    else {
+        return Ok(());
     };
-    let obj_name = match obj_dir.file_name().and_then(|s| s.to_str()) {
-        Some(s) => s.to_string(),
-        None => return Ok(()),
+    let Some(obj_name) = obj_dir.file_name().and_then(|s| s.to_str()) else {
+        return Ok(());
     };
     let mdo = obj_dir.join(format!("{}.mdo", obj_name));
     let content = match std::fs::read_to_string(&mdo) {
@@ -1446,11 +1580,6 @@ fn update_edt_template_for_file(
         // Объект удалён вместе с макетами — их паспорта снял delete_edt_object.
         Err(_) => return Ok(()),
     };
-    let meta_type = match crate::xml::edt_mdo::parse_mdo_header(&content) {
-        Some((mt, _name, _syn)) => mt,
-        None => return Ok(()),
-    };
-    let full_name = format!("{}.{}", meta_type, obj_name);
     let template_full = format!("{}.Template.{}", full_name, template_name);
 
     let _ = conn.execute("ROLLBACK", []);
@@ -1469,6 +1598,55 @@ fn update_edt_template_for_file(
         insert_template_row(conn, &row)?;
     }
     crate::schema::backfill_metadata_object_keys(conn)?;
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Полное имя владельца макета EDT и имя макета по пути файла его содержимого
+/// (`<Папка типа>/<Объект>/Templates/<Имя>/Template.<ext>`). `None`, если
+/// раскладка не та или описание объекта (`.mdo`) уже исчезло.
+///
+/// Вывод вынесен отдельно: одним и тем же разбором пути пользуются и обновление
+/// паспорта макета, и пересборка строк схемы компоновки.
+fn edt_template_ident(path: &Path) -> Option<(String, String)> {
+    let template_name = path.parent()?.file_name()?.to_str()?.to_string();
+    let obj_dir = path.parent()?.parent()?.parent()?;
+    let obj_name = obj_dir.file_name()?.to_str()?;
+    let mdo = obj_dir.join(format!("{}.mdo", obj_name));
+    let content = std::fs::read_to_string(&mdo).ok()?;
+    let (meta_type, _name, _syn) = crate::xml::edt_mdo::parse_mdo_header(&content)?;
+    Some((format!("{}.{}", meta_type, obj_name), template_name))
+}
+
+/// Пересобрать `dcs_*` макета EDT по файлу его содержимого: своя транзакция,
+/// прежние строки макета сносятся ВСЕГДА, а новая заводится только если файл
+/// на месте и действительно является схемой компоновки (проверка по корню —
+/// вид макета из раскладки тут не виден).
+fn update_dcs_for_edt_template(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    path: &Path,
+) -> Result<()> {
+    let Some((owner, template_name)) = edt_template_ident(path) else {
+        return Ok(());
+    };
+    let template_full = format!("{}.Template.{}", owner, template_name);
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    delete_dcs_for_template(conn, &template_full)?;
+    if path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if crate::xml::dcs::is_dcs_content(&content) {
+                let target = DcsTarget {
+                    template_full_name: template_full,
+                    owner_full_name: owner,
+                    content_rel: rel_path(repo_root, path),
+                    content_abs: path.to_path_buf(),
+                };
+                rebuild_dcs_schema(conn, &target)?;
+            }
+        }
+    }
     conn.execute("COMMIT", [])?;
     Ok(())
 }
@@ -1567,6 +1745,11 @@ pub(crate) fn run_incremental_extras_edt(
     for p in &templates {
         if let Err(e) = update_edt_template_for_file(repo_root, conn, p) {
             tracing::warn!("edt template {}: {}", p.display(), e);
+        }
+        // Содержимое макета — отдельная сущность: у схемы компоновки по нему
+        // пересобираются её строки `dcs_*` и рёбра `dcs_query`.
+        if let Err(e) = update_dcs_for_edt_template(repo_root, conn, p) {
+            tracing::warn!("edt dcs {}: {}", p.display(), e);
         }
     }
 

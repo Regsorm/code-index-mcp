@@ -522,6 +522,33 @@ fn make_usage(
     }
 }
 
+/// Виртуальные таблицы языка запросов 1С: третий сегмент пути метаданных вида
+/// `<Тип>.<Имя>.<ВиртуальнаяТаблица>` — это НЕ табличная часть объекта, а
+/// виртуальная таблица платформы (остатки регистра, срез последних и т.п.).
+/// Такое обращение остаётся обращением к самому объекту, поэтому третий сегмент
+/// в `member_path` не пишется.
+pub const QUERY_VIRTUAL_TABLES: &[&str] = &[
+    // Русские имена.
+    "Остатки",
+    "Обороты",
+    "ОстаткиИОбороты",
+    "СрезПоследних",
+    "СрезПервых",
+    "ДвиженияСубконто",
+    "ДвиженияССубконто",
+    "ОборотыДтКт",
+    "Изменения",
+    // Английские соответствия (тексты запросов встречаются на обоих языках).
+    "Balance",
+    "Turnovers",
+    "BalanceAndTurnovers",
+    "SliceLast",
+    "SliceFirst",
+    "RecordsWithExtDimensions",
+    "DrCrTurnovers",
+    "Changes",
+];
+
 /// Извлечь обращения к объектам метаданных из тела `.bsl`-модуля.
 pub fn extract_code_usages(content: &str) -> Vec<CodeUsage> {
     let mut out: Vec<CodeUsage> = Vec::new();
@@ -566,12 +593,62 @@ pub fn extract_code_usages(content: &str) -> Vec<CodeUsage> {
     out
 }
 
+/// Извлечь обращения к объектам метаданных из ТЕКСТА ЗАПРОСА (не из тела
+/// модуля). В отличие от [`extract_code_usages`] здесь нет разбора литералов и
+/// комментариев — на вход приходит уже чистый текст запроса (например, из
+/// `<query>` макета схемы компоновки), поэтому пути метаданных ищутся по ВСЕЙ
+/// строке, построчно.
+///
+/// Отличия от `extract_code_usages`:
+///   * сопоставление только через [`query_map`] (единственная форма типа —
+///     `Документ`/`Document`), менеджерных коллекций в запросах нет;
+///   * `usage_kind = "query"`;
+///   * третий сегмент пути, совпавший с виртуальной таблицей платформы
+///     ([`QUERY_VIRTUAL_TABLES`]), не является членом объекта —
+///     `member_path = None`.
+pub fn extract_query_usages(text: &str) -> Vec<CodeUsage> {
+    let mut out: Vec<CodeUsage> = Vec::new();
+    for (idx, raw) in text.split('\n').enumerate() {
+        let lineno = idx + 1;
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        if !raw.contains('.') {
+            continue;
+        }
+        for (g1, g2, g3) in path_triples(raw) {
+            let Some(&canon) = query_map().get(&g1.to_lowercase()) else {
+                continue;
+            };
+            let member = match g3 {
+                Some(t) if is_virtual_table(&t) => None,
+                other => other,
+            };
+            out.push(make_usage(canon, &g2, member, "query", lineno));
+        }
+    }
+    out
+}
+
+/// Третий сегмент пути — виртуальная таблица платформы (регистр независимо от
+/// регистра записи: имена виртуальных таблиц кириллические).
+fn is_virtual_table(name: &str) -> bool {
+    let low = name.to_lowercase();
+    QUERY_VIRTUAL_TABLES.iter().any(|v| v.to_lowercase() == low)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn kinds(c: &str) -> Vec<(String, Option<String>, &'static str)> {
         extract_code_usages(c)
+            .into_iter()
+            .map(|u| (u.object_ref, u.member_path, u.usage_kind))
+            .collect()
+    }
+
+    /// То же для текста запроса вне строковых литералов (`extract_query_usages`).
+    fn qkinds(c: &str) -> Vec<(String, Option<String>, &'static str)> {
+        extract_query_usages(c)
             .into_iter()
             .map(|u| (u.object_ref, u.member_path, u.usage_kind))
             .collect()
@@ -709,5 +786,41 @@ mod tests {
                 "manager"
             )]
         );
+    }
+
+    #[test]
+    fn query_usages_keep_virtual_tables_out_of_member_path() {
+        // Регистр бухгалтерии: третий сегмент `Остатки` — виртуальная таблица
+        // платформы, а не табличная часть, поэтому член объекта не пишется.
+        let r = qkinds("ИЗ РегистрБухгалтерии.Хозрасчетный.Остатки КАК Остатки");
+        assert_eq!(
+            r,
+            vec![("AccountingRegister.Хозрасчетный".to_string(), None, "query")]
+        );
+        // Английское написание виртуальной таблицы — тоже не член объекта.
+        let r = extract_query_usages("ИЗ AccountingRegister.Хозрасчетный.Balance КАК Остатки");
+        assert_eq!(r[0].object_ref, "AccountingRegister.Хозрасчетный");
+        assert_eq!(r[0].member_path, None);
+
+        // Справочник без третьего сегмента.
+        let r = qkinds("ВЫБРАТЬ Ссылка ИЗ Справочник.Контрагенты");
+        assert_eq!(r, vec![("Catalog.Контрагенты".to_string(), None, "query")]);
+
+        // Документ с табличной частью: третий сегмент — член объекта.
+        let r = qkinds("ВЫБРАТЬ Номенклатура ИЗ Документ.РеализацияТоваров.Товары");
+        assert_eq!(
+            r,
+            vec![(
+                "Document.РеализацияТоваров".to_string(),
+                Some("Товары".to_string()),
+                "query"
+            )]
+        );
+
+        // Номер строки — физический, по переводам строк текста запроса.
+        let r = extract_query_usages("ВЫБРАТЬ\nСсылка\nИЗ Справочник.Организации");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].line, 3);
+        assert_eq!(r[0].usage_kind, "query");
     }
 }

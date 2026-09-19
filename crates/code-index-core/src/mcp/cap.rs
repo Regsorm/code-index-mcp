@@ -236,7 +236,11 @@ pub fn cap_applies(tool: &str) -> bool {
 // (выкидывают тяжёлую секцию ЦЕЛИКОМ с маркером, не обрезая частично).
 //
 // Единый источник правды — этот список. Расширять сюда.
-const STRUCTURAL_TOOLS: &[&str] = &["get_object_structure", "get_object_profile"];
+const STRUCTURAL_TOOLS: &[&str] = &[
+    "get_object_structure",
+    "get_object_profile",
+    "get_dcs_schema",
+];
 
 /// Инструмент «структурный» (исключён из cap_response, использует
 /// posекционный `omit_oversize_sections` + structural-wrap)?

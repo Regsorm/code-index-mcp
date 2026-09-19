@@ -4454,6 +4454,262 @@ fn edt_stand_with_report(root: &Path) {
     );
 }
 
+/// Схема компоновки с одним набором данных и одним запросом: минимальная, но
+/// со всеми секциями, которые нужны проверкам СКД.
+const DCS_WITH_QUERY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema"
+    xmlns:v8="http://v8.1c.ru/8.1/data/core"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dataSets>
+    <name>НаборДанных1</name>
+    <field xsi:type="DataSetFieldField">
+      <dataPath>Контрагент</dataPath>
+      <title xsi:type="v8:LocalStringType">
+        <v8:item><v8:lang>ru</v8:lang><v8:content>Контрагент</v8:content></v8:item>
+      </title>
+    </field>
+    <query>ВЫБРАТЬ Контрагент ИЗ Справочник.Контрагенты</query>
+  </dataSets>
+  <parameters>
+    <name>НачалоПериода</name>
+  </parameters>
+  <settingsVariants>
+    <dcsset:name xmlns:dcsset="http://v8.1c.ru/8.1/data-composition-system/settings">Основной</dcsset:name>
+  </settingsVariants>
+</DataCompositionSchema>"#;
+
+/// Полный проход формата Конфигуратора: макет-схема попадает в `dcs_schemas` /
+/// `dcs_datasets`, а текст запроса даёт ребро `dcs_query` на прочитанный объект.
+#[test]
+fn dcs_schema_indexed_in_configurator_format() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    write(
+        &repo.join("Configuration.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects><Report>Отчет</Report></ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    write(
+        &repo.join("Reports").join("Отчет.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Report><Properties><Name>Отчет</Name></Properties></Report></MetaDataObject>"#,
+    );
+    write(
+        &repo
+            .join("Reports")
+            .join("Отчет")
+            .join("Templates")
+            .join("Схема.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Template><Properties><Name>Схема</Name><TemplateType>DataCompositionSchema</TemplateType></Properties></Template></MetaDataObject>"#,
+    );
+    write(
+        &repo
+            .join("Reports")
+            .join("Отчет")
+            .join("Templates")
+            .join("Схема")
+            .join("Ext")
+            .join("Template.xml"),
+        DCS_WITH_QUERY,
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    // Повторный полный проход не плодит дублей (проверяется ниже).
+    run_index_extras(&repo, &mut storage).unwrap();
+    let conn = storage.conn();
+
+    let (owner, dss): (String, i64) = conn
+        .query_row(
+            "SELECT owner_full_name, data_sets_count FROM dcs_schemas \
+             WHERE repo = ?1 AND template_full_name = 'Report.Отчет.Template.Схема'",
+            params![REPO_DEFAULT],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("схема компоновки обязана попасть в dcs_schemas");
+    assert_eq!(owner, "Report.Отчет");
+    assert_eq!(dss, 1);
+
+    let (kind, query): (String, String) = conn
+        .query_row(
+            "SELECT kind, query_text FROM dcs_datasets \
+             WHERE repo = ?1 AND data_set_name = 'НаборДанных1'",
+            params![REPO_DEFAULT],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("набор данных обязан попасть в dcs_datasets");
+    assert_eq!(kind, "query");
+    assert!(
+        query.contains("Справочник.Контрагенты"),
+        "текст запроса сохранён: {query}"
+    );
+
+    let to: String = conn
+        .query_row(
+            "SELECT to_object FROM data_links WHERE repo = ?1 AND link_kind = 'dcs_query'",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .expect("запрос схемы обязан дать ребро dcs_query");
+    assert_eq!(to, "Catalog.Контрагенты");
+    let key: String = conn
+        .query_row(
+            "SELECT to_object_key FROM data_links WHERE repo = ?1 AND link_kind = 'dcs_query'",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        key, "catalog.контрагенты",
+        "ключ цели заполнен в том же INSERT"
+    );
+
+    let count = |sql: &str| -> i64 {
+        conn.query_row(sql, params![REPO_DEFAULT], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count("SELECT COUNT(*) FROM dcs_schemas WHERE repo = ?1"), 1);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM dcs_datasets WHERE repo = ?1"),
+        1
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM data_links WHERE repo = ?1 AND link_kind = 'dcs_query'"),
+        1
+    );
+}
+
+/// Правка `.dcs` наблюдателем меняет `query_text`; удаление файла содержимого
+/// убирает и строки, и рёбра.
+#[test]
+fn dcs_schema_follows_edt_content_edit() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand_with_report(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let count =
+        |st: &Storage, sql: &str| -> i64 { st.conn().query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(
+        count(
+            &storage,
+            "SELECT COUNT(*) FROM dcs_schemas WHERE template_full_name = 'Report.Отчет.Template.Схема'"
+        ),
+        1,
+        "схема из стенда обязана попасть в таблицу уже полным проходом"
+    );
+
+    let dcs = repo
+        .join("src")
+        .join("Reports")
+        .join("Отчет")
+        .join("Templates")
+        .join("Схема")
+        .join("Template.dcs");
+    write(&dcs, DCS_WITH_QUERY);
+    run_incremental_extras_edt(&repo, &mut storage, std::slice::from_ref(&dcs), &[]).unwrap();
+
+    let query: String = storage
+        .conn()
+        .query_row(
+            "SELECT query_text FROM dcs_datasets \
+             WHERE template_full_name = 'Report.Отчет.Template.Схема'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("правка .dcs обязана доехать до dcs_datasets");
+    assert!(query.contains("Справочник.Контрагенты"));
+    assert_eq!(
+        count(
+            &storage,
+            "SELECT COUNT(*) FROM data_links WHERE link_kind = 'dcs_query' AND from_object = 'Report.Отчет'"
+        ),
+        1
+    );
+
+    // Удаление файла содержимого убирает строки схемы и её рёбра.
+    std::fs::remove_file(&dcs).unwrap();
+    run_incremental_extras_edt(&repo, &mut storage, &[], std::slice::from_ref(&dcs)).unwrap();
+    assert_eq!(
+        count(
+            &storage,
+            "SELECT COUNT(*) FROM dcs_schemas WHERE template_full_name = 'Report.Отчет.Template.Схема'"
+        ),
+        0,
+        "нет файла содержимого — нет строки схемы"
+    );
+    assert_eq!(
+        count(&storage, "SELECT COUNT(*) FROM dcs_datasets"),
+        0,
+        "наборы удалённой схемы тоже уходят"
+    );
+    assert_eq!(
+        count(
+            &storage,
+            "SELECT COUNT(*) FROM data_links WHERE link_kind = 'dcs_query'"
+        ),
+        0
+    );
+}
+
+/// Общий макет-схема: объекта-владельца у него нет, поэтому владельцем записан
+/// он сам — и в `dcs_schemas`, и в `from_object` его рёбер.
+#[test]
+fn dcs_common_template_owns_itself() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    edt_stand(&repo);
+    write(
+        &repo
+            .join("src")
+            .join("CommonTemplates")
+            .join("ОбщаяСхема")
+            .join("ОбщаяСхема.mdo"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:CommonTemplate xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="ct">
+  <name>ОбщаяСхема</name>
+  <templateType>DataCompositionSchema</templateType>
+</mdclass:CommonTemplate>"#,
+    );
+    write(
+        &repo
+            .join("src")
+            .join("CommonTemplates")
+            .join("ОбщаяСхема")
+            .join("Template.dcs"),
+        DCS_WITH_QUERY,
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let (owner, dss): (String, i64) = storage
+        .conn()
+        .query_row(
+            "SELECT owner_full_name, data_sets_count FROM dcs_schemas \
+             WHERE template_full_name = 'CommonTemplate.ОбщаяСхема'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("общий макет-схема обязан попасть в dcs_schemas");
+    assert_eq!(owner, "CommonTemplate.ОбщаяСхема");
+    assert_eq!(dss, 1);
+    let from: String = storage
+        .conn()
+        .query_row(
+            "SELECT from_object FROM data_links \
+             WHERE link_kind = 'dcs_query' AND from_object = 'CommonTemplate.ОбщаяСхема'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("ребро общего макета обязано иметь владельцем сам макет");
+    assert_eq!(from, "CommonTemplate.ОбщаяСхема");
+}
+
 #[test]
 fn edt_incremental_updates_object_form_and_rights() {
     // До правки инкрементальный путь не срабатывал для EDT ни на одной ветке:

@@ -142,6 +142,11 @@ impl LanguageProcessor for BslLanguageProcessor {
             // одним вызовом (реверс data_links + metadata_code_usages +
             // role_rights). Реверс get_data_links плюс код и права.
             Arc::new(crate::tools::FindReferencesTool),
+            // get_dcs_schema — макет «Схема компоновки данных» за 1 вызов:
+            // наборы данных с полями, текст запроса, связи наборов, параметры
+            // и варианты настроек (таблицы dcs_schemas / dcs_datasets). Вместо
+            // чтения Template.xml по кускам и пересказа его вручную.
+            Arc::new(crate::tools::GetDcsSchemaTool),
         ]
     }
 
@@ -337,11 +342,12 @@ mod tests {
 
     #[test]
     fn additional_tools_registered() {
-        // 12 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
+        // 13 1С-tool'ов: 4 от метаданных + search_terms + 2 графа связей данных
         // + get_register_writers (регистраторы/движения) + get_role_rights
         // (права ролей) + bsl_sql (произвольный read-only SELECT)
         // + get_object_profile (паспорт объекта за 1 вызов)
-        // + find_references (карта влияния: реверс data_links + код + права).
+        // + find_references (карта влияния: реверс data_links + код + права)
+        // + get_dcs_schema (макет СКД: наборы, поля, текст запроса, варианты).
         let p = BslLanguageProcessor::new();
         let tools = p.additional_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -357,7 +363,8 @@ mod tests {
         assert!(names.contains(&"bsl_sql"));
         assert!(names.contains(&"get_object_profile"));
         assert!(names.contains(&"find_references"));
-        assert_eq!(tools.len(), 12);
+        assert!(names.contains(&"get_dcs_schema"));
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]

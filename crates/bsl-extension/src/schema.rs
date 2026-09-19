@@ -557,6 +557,110 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_mcu_ref ON metadata_code_usages(repo, object_ref_key);",
     // idx_mcu_file — per-file DELETE при инкрементальном обновлении модуля.
     "CREATE INDEX IF NOT EXISTS idx_mcu_file ON metadata_code_usages(repo, file_path);",
+
+    // ── dcs_schemas ───────────────────────────────────────────────────────
+    // Макеты «Схема компоновки данных» (СКД) — по одной строке на макет.
+    // Источник — файл содержимого макета (`Templates/<Имя>/Ext/Template.xml`
+    // формата Конфигуратора, `Templates/<Имя>/Template.dcs` выгрузки 1C:EDT,
+    // `CommonTemplates/<Имя>/Ext/Template.xml` и `CommonTemplates/<Имя>/Template.dcs`
+    // общих макетов), который разбирает `xml::dcs::parse_dcs`.
+    //
+    // Зачем отдельная таблица: без неё вопрос «что считает отчёт и какие поля
+    // он отдаёт» решается чтением Template.xml по кускам — файл на десятки
+    // килобайт и с десятком секций. Здесь схема лежит разобранной, а рёбра
+    // `dcs_query` (link_kind в `data_links`) связывают макет с объектами,
+    // которые он читает в текстах запросов.
+    //
+    //   * `template_full_name` — полное имя макета как строка перечня объектов:
+    //     `<Владелец>.Template.<Имя>` для макета объекта и `CommonTemplate.<Имя>`
+    //     для общего макета (у общих макетов своего объекта-владельца в
+    //     выгрузке нет — путь `CommonTemplates/<Имя>` не привязан к объекту).
+    //   * `owner_full_name` — владелец: `<MetaType>.<Имя>` для макета объекта.
+    //     У общего макета владельцем записан ОН САМ (`CommonTemplate.<Имя>`):
+    //     так же пишется `from_object` его рёбер `dcs_query`, поэтому владелец
+    //     макета и источник рёбер совпадают и удаление по владельцу работает
+    //     единообразно (решение зафиксировано здесь, чтобы не расходилось).
+    //   * `content_file` — путь файла содержимого относительно корня репо
+    //     (`files.path`); NULL, если файла в выгрузке нет.
+    //   * `data_sets_json` … `variants_json` — разобранные секции схемы в JSON.
+    //     В `data_sets_json` текстов запросов НЕТ (`query: null` у всех наборов):
+    //     текст живёт только в `dcs_datasets.query_text`, чтобы не дублировать
+    //     десятки килобайт. `*_count` — размеры секций ДО сериализации, по ним
+    //     инструмент отвечает счётчиками, не разбирая JSON.
+    //   * `templates_count` — сколько макетов оформления объявлено в схеме
+    //     (их содержимое `.mxlx`/`.mxl` в индекс не берётся).
+    //
+    // UNIQUE(repo, template_full_name): полное имя макета — его канонический
+    // идентификатор в перечне (`metadata_objects.full_name`), и повторный
+    // проход обязан пере-собирать ту же схему, а не плодить дубли.
+    "
+    CREATE TABLE IF NOT EXISTS dcs_schemas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        template_full_name TEXT NOT NULL,
+        owner_full_name TEXT NOT NULL,
+        title TEXT,
+        content_file TEXT,
+        data_sets_json TEXT,
+        links_json TEXT,
+        calculated_fields_json TEXT,
+        totals_json TEXT,
+        parameters_json TEXT,
+        variants_json TEXT,
+        templates_count INTEGER NOT NULL DEFAULT 0,
+        data_sets_count INTEGER NOT NULL DEFAULT 0,
+        fields_count INTEGER NOT NULL DEFAULT 0,
+        links_count INTEGER NOT NULL DEFAULT 0,
+        calculated_fields_count INTEGER NOT NULL DEFAULT 0,
+        totals_count INTEGER NOT NULL DEFAULT 0,
+        parameters_count INTEGER NOT NULL DEFAULT 0,
+        variants_count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(repo, template_full_name)
+    );
+    ",
+    // idx_dcs_owner — «какие СКД у объекта» (вход инструмента по владельцу).
+    "CREATE INDEX IF NOT EXISTS idx_dcs_owner ON dcs_schemas(repo, owner_full_name);",
+
+    // ── dcs_datasets ──────────────────────────────────────────────────────
+    // Наборы данных схемы компоновки — по строке на набор. Плоский список:
+    // вложенные наборы объединения (`items`) лежат тут же и ссылаются на
+    // родителя через `parent_set`. Нужны отдельно от `dcs_schemas`, потому
+    // что по ним ведётся поиск текстов запросов и строится дерево наборов
+    // в ответе `get_dcs_schema` (порядок — по rowid, т.е. по файлу).
+    //
+    //   * `data_set_name` — имя набора (`<name>`).
+    //   * `kind` — вид набора по `xsi:type`: `query` | `object` | `union`.
+    //   * `data_source` / `object_name` — источник данных и имя объекта
+    //     метаданных (у набора-объекта).
+    //   * `query_text` — текст запроса набора как есть. ЕДИНСТВЕННОЕ место,
+    //     где он хранится (в `dcs_schemas.data_sets_json` его нет).
+    //   * `fields_json` — поля набора (имя, представление, тип, роль, папка);
+    //     поля из папок лежат в том же плоском списке с `is_folder`.
+    //   * `parent_set` — имя набора-родителя для вложенного набора объединения.
+    //     ПУСТАЯ СТРОКА (а не NULL) у наборов верхнего уровня: в SQLite NULL-ы
+    //     в UNIQUE считаются различными, и с NULL заявленный
+    //     `UNIQUE(repo, template_full_name, data_set_name, parent_set)` не
+    //     защищал бы от дублей наборов верхнего уровня.
+    //
+    // UNIQUE защищает от дублей при повторном проходе; строки макета
+    // сносятся по `template_full_name` перед вставкой.
+    "
+    CREATE TABLE IF NOT EXISTS dcs_datasets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        template_full_name TEXT NOT NULL,
+        data_set_name TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'query',
+        data_source TEXT,
+        object_name TEXT,
+        query_text TEXT,
+        fields_json TEXT,
+        parent_set TEXT NOT NULL DEFAULT '',
+        UNIQUE(repo, template_full_name, data_set_name, parent_set)
+    );
+    ",
+    // idx_dcs_ds_template — выборка наборов одной схемы (дерево ответа инструмента).
+    "CREATE INDEX IF NOT EXISTS idx_dcs_ds_template ON dcs_datasets(repo, template_full_name);",
 ];
 
 /// Идемпотентная миграция существующей БД до текущей схемы расширений.
