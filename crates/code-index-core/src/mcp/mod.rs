@@ -12,8 +12,9 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResult, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResult, CustomRequest, CustomResult, ErrorCode,
+        Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+        Tool,
     },
     service::{NotificationContext, Peer, RequestContext},
     tool, tool_router, ErrorData, RoleServer, ServerHandler,
@@ -2212,6 +2213,37 @@ impl ServerHandler for CodeIndexServer {
             *guard = Some(context.peer.clone());
         }
         tracing::info!("client initialized");
+    }
+
+    /// Нестандартный метод, которого у сервера нет. rmcp по умолчанию отвечает
+    /// `-32601`, где текстом служит само имя метода: клиент видит «method not
+    /// found» и не понимает, жив ли сервер и что делать дальше. Отвечаем тем же
+    /// кодом, но с объяснением и перечнем поддерживаемых методов. Соединение
+    /// при этом остаётся живым — клиенты со своими запросами (например
+    /// `server/discover` у Antigravity) доходят до `tools/list`.
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        tracing::warn!(method = %request.method, "unsupported method");
+        Err(ErrorData::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            format!(
+                "Method '{}' is not supported. code-index serves the standard MCP methods: \
+                 initialize, notifications/initialized, tools/list, tools/call. \
+                 The connection stays open — send notifications/initialized, then tools/list.",
+                request.method
+            ),
+            Some(serde_json::json!({
+                "supported": [
+                    "initialize",
+                    "notifications/initialized",
+                    "tools/list",
+                    "tools/call",
+                ],
+            })),
+        ))
     }
 }
 
