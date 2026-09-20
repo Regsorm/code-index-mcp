@@ -851,6 +851,12 @@ All data tools return a unified JSON envelope:
 
 Diagnostic tools (`health`, `get_stats`, `stat_file`) are not wrapped — their format is unchanged.
 
+**Data version number (1.4.1).** A database carries a number describing how its data was built, and that number is compared with the one baked into the binary. The release number is unrelated: the data number is raised only when a change alters what is collected or how it is parsed, so upgrading by itself does not mark a database stale. The number is stored only after a pass that parsed every file (`index <path> --force` or building an empty database) — a routine update over changed files does not raise it, since the remaining files were parsed the old way.
+
+`get_stats` and `health` return a `data_version` block — what built the database, what the binary has, and whether they differ; on a mismatch an explanation and a ready-to-run rebuild command are added. BSL tool responses that **ended in an error** carry the same set under `stale_index`; successful responses are untouched. For a remote node's folders the decision is made against that node's own database. A rebuild never starts on its own — when to run it is the operator's call.
+
+No hint is attached to empty responses: an empty list is very often legitimate, and telling "data was not collected" from "this is not in the configuration" is impossible without reading the source files. In those cases the mismatch is still visible in `get_stats`.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
