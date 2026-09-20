@@ -5,6 +5,28 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.4.2] — 2026-09-20
+
+**A rejection of an unknown method is no longer a riddle. Previously a client got a "method not found" code whose message was the method name itself — there was no way to tell from it whether the server keeps working and what to do next. The response now names the unsupported method, lists the protocol methods the server does answer, and states that the connection stays open.**
+
+> Context. Some clients send their own requests that the protocol does not define — sometimes right after the connection is established, before the ready notification. The server rejects them and carries on, but the old rejection looked like a breakage: one word with the method name and nothing else. Whoever reported such a case spent hours tracking down the cause.
+
+### Changed
+
+- **The rejection text for an unsupported method.** The response code is the same, "method not found" (-32601). The message now carries the method name, the list of protocol methods the server answers (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`), and a note that the connection keeps working. The same list arrives in the `data` field — it can be parsed without reading the text.
+- **A warning with the method name goes to the server log** — it shows which request arrived and from which client to expect a repeat.
+
+### Compatibility
+
+- Protocol behaviour is unchanged: same response code, the connection stays alive as before.
+- The connection drop on an outside request sent before the ready notification was a separate defect of the protocol library, fixed in 1.2.4 along with its upgrade. It is not affected here.
+
+### Verification
+
+- `cargo test --workspace --all-features`: 928 passed, 0 failed. `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- Live check against the installed server: a four-message exchange — connect, outside request, ready notification, tool list request. The outside request gets the new rejection text, the connection is not dropped, and the tool list arrives right after.
+- Releases 1.2.2 and 1.2.3 drop the connection on the same exchange, 1.2.4 and later do not. Checked against the published builds of those releases, not against sources.
+
 ## [1.4.1] — 2026-09-20
 
 **The index now says for itself that it was built by an older builder. A database carries a data version number: it is compared with the number baked into the binary, and on a mismatch `get_stats`, `health` and BSL tool responses carry an explanation and a ready-to-run rebuild command. Previously there was no way to tell "this object is not in the configuration" from "its data was never collected" — the tool answered the same in both cases.**
