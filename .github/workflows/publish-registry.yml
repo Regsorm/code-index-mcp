@@ -40,7 +40,7 @@ jobs:
       # Берём содержимое ИМЕННО того тега, который публикуем: при ручном
       # запуске процесс идёт из главной ветки, а выложить нужно то, что было
       # в выпуске.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
