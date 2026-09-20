@@ -268,6 +268,35 @@ pub fn bulk_load_in_progress(conn: &rusqlite::Connection) -> bool {
         == 1
 }
 
+/// Номер версии данных, которые собирает ТЕКУЩИЙ бинарник.
+///
+/// Это НЕ `CARGO_PKG_VERSION`: номер поднимается вручную и только тогда, когда
+/// правка меняет СОСТАВ или РАЗБОР собираемых данных — новая таблица надстройки,
+/// новый разбор, изменившийся смысл колонки. Правки слоя выдачи номер не трогают.
+///
+/// Значение 1 выбрано так, что все базы, собранные прежними версиями, читаются
+/// как версия 0 и объявляются устаревшими. Это решение владельца, а не следствие
+/// сравнения номеров.
+pub const INDEX_DATA_VERSION: u32 = 1;
+
+/// Ключ номера версии данных в таблице `index_state`.
+pub const DATA_VERSION_KEY: &str = "index_data_version";
+
+/// Номер версии данных, которым собрана база.
+///
+/// Как и [`bulk_load_in_progress`]: отсутствие ключа, отсутствие таблицы (база от
+/// прежней версии) и нечисловое значение читаются как `0` — «номер не проставлен».
+pub fn index_data_version(conn: &rusqlite::Connection) -> u32 {
+    conn.query_row(
+        "SELECT value FROM index_state WHERE key = ?1",
+        rusqlite::params![DATA_VERSION_KEY],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.trim().parse::<u32>().ok())
+    .unwrap_or(0)
+}
+
 /// Инициализирует базу данных: применяет PRAGMA и создаёт схему
 pub fn initialize(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // Включаем WAL для параллельного чтения/записи

@@ -490,6 +490,11 @@ async fn handle_extension_tool(
     };
 
     let value = ext.execute(p.args, ctx).await;
+    // Федерация — второй вход к тем же extension-tools, и подсказка об
+    // устаревшей базе нужна здесь так же, как в штатном `call_tool`: вызывающая
+    // сторона отдаёт наш ответ клиенту как есть, ничего к нему не добавляя.
+    // Решение принимается по базе ЭТОЙ ноды — она и собрана своим сборщиком.
+    let value = crate::mcp::tools::annotate_stale_index(value, storage, root_path).await;
     // Сериализуем результат — он уже валидный JSON.
     let body = serde_json::to_string(&value).unwrap_or_else(|e| {
         federation_error(&p.tool_name, &server.own_ip, format!("serialize: {}", e))

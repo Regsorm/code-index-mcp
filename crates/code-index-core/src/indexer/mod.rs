@@ -99,6 +99,10 @@ pub struct IndexResult {
     pub deleted_paths: Vec<String>,
     /// Списки переполнились и очищены: точечный пересбор недоступен, нужен полный.
     pub paths_overflow: bool,
+    /// Проход разобрал КАЖДЫЙ файл (`--force` или пустая база) и не был прерван;
+    /// только после такого прохода базу можно объявлять собранной текущей версией
+    /// данных.
+    pub full_rebuild: bool,
 }
 
 /// Потолок на списки путей в [`IndexResult`]. Смысл потолка — не копить память
@@ -283,6 +287,7 @@ impl<'a> Indexer<'a> {
             changed_paths: Vec::new(),
             deleted_paths: Vec::new(),
             paths_overflow: false,
+            full_rebuild: false,
         };
 
         // ── Этап 0: загрузка состояния БД ─────────────────────────────────────
@@ -318,17 +323,20 @@ impl<'a> Indexer<'a> {
             );
         }
 
+        // Полный разбор — это `--force` или пустая база: только тогда в работу
+        // идёт КАЖДЫЙ файл. Условие одно на два решения: участвует ли сборщик
+        // extras и можно ли по итогам прохода объявить базу собранной текущей
+        // версией данных. Разъехавшиеся условия дали бы запись номера версии
+        // при несобранной надстройке.
+        let full_parse = force || is_fresh_db;
+
         // Сборщик extras участвует ТОЛЬКО в полном парсинге (--force или свежая
         // БД): тогда парсятся все файлы и его полный DELETE+rebuild корректен.
         // При частичном mtime-fast-path (демон с изменениями) сборщик выключаем
         // — extras-слои пересобирает index_extras как раньше (с диска). Сюда же
         // попадает продолжение прерванной загрузки: разбирается только остаток
         // файлов, и слой, собранный по нему одному, был бы неполным.
-        let collector = if force || is_fresh_db {
-            collector
-        } else {
-            None
-        };
+        let collector = if full_parse { collector } else { None };
 
         // ── Этап 1: обход дерева (без чтения содержимого) ────────────────────
         // О начале каждого тяжёлого этапа сообщаем ДО его выполнения: если
@@ -416,6 +424,9 @@ impl<'a> Indexer<'a> {
         if nothing_to_do && metadata_updates.is_empty() && !resume {
             let ничего_не_исчезло = !existing_files.keys().any(|p| !seen_paths.contains(p));
             if ничего_не_исчезло {
+                // Проход ничего не разбирал и не удалял; прерывать его было нечем,
+                // поэтому признак полного пересбора равен признаку полного разбора.
+                result.full_rebuild = full_parse;
                 result.elapsed_ms = start.elapsed().as_millis() as u64;
                 return Ok(result);
             }
@@ -678,6 +689,7 @@ impl<'a> Indexer<'a> {
         }
 
         if cancelled {
+            result.full_rebuild = false;
             result.elapsed_ms = start.elapsed().as_millis() as u64;
             return Ok(result);
         }
@@ -773,6 +785,7 @@ impl<'a> Indexer<'a> {
             );
         }
 
+        result.full_rebuild = full_parse && !cancelled;
         result.elapsed_ms = start.elapsed().as_millis() as u64;
         tracing::info!("работа с базой заняла {} мс", result.elapsed_ms);
         Ok(result)
@@ -1951,6 +1964,7 @@ class App:
             changed_paths: Vec::new(),
             deleted_paths: Vec::new(),
             paths_overflow: false,
+            full_rebuild: false,
         };
         for i in 0..PATHS_CAP {
             r.note_changed(&format!("f{i}.py"));
@@ -2637,5 +2651,49 @@ class App:
                 .is_empty(),
             "старый текстовый маркер не должен оставаться в contentless-указателе"
         );
+    }
+
+    /// `full_rebuild` — признак того, что проход разобрал КАЖДЫЙ файл: пустая база
+    /// или `--force`. Повторный проход по неизменённой папке и точечное обновление
+    /// (один файл изменился) признак не поднимают: остальные файлы разобраны
+    /// прежней версией.
+    #[test]
+    fn full_rebuild_поднимается_только_на_полном_проходе() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.py"), "def a():\n    pass\n").unwrap();
+        fs::write(tmp.path().join("b.py"), "def b():\n    pass\n").unwrap();
+
+        let mut storage = Storage::open_in_memory().unwrap();
+
+        // Пустая база — разобран каждый файл.
+        let fresh = Indexer::new(&mut storage)
+            .full_reindex(tmp.path(), false)
+            .unwrap();
+        assert!(fresh.full_rebuild, "пустая база разбирается целиком");
+
+        // Ничего не менялось — проход ничего не разбирал.
+        let repeat = Indexer::new(&mut storage)
+            .full_reindex(tmp.path(), false)
+            .unwrap();
+        assert!(
+            !repeat.full_rebuild,
+            "повторный проход по неизменённой папке — не полный пересбор"
+        );
+
+        // Изменился один файл: остальные разобраны прежней версией.
+        fs::write(tmp.path().join("a.py"), "def a():\n    return 1\n").unwrap();
+        let partial = Indexer::new(&mut storage)
+            .full_reindex(tmp.path(), false)
+            .unwrap();
+        assert!(
+            !partial.full_rebuild,
+            "точечное обновление номер версии данных не поднимает"
+        );
+
+        // `--force` перезаписывает каждый файл.
+        let forced = Indexer::new(&mut storage)
+            .full_reindex(tmp.path(), true)
+            .unwrap();
+        assert!(forced.full_rebuild, "--force разбирает каждый файл");
     }
 }

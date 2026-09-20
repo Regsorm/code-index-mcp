@@ -1041,6 +1041,10 @@ pub(crate) fn run_worker(
     // Сколько заняла надстройка целиком — для раскладки в итоге. Ноль
     // означает, что её не пересобирали (данные не менялись).
     let mut extras_ms: u128 = 0;
+    // Надстройка пересобрана полностью и успешно. При пропуске пересбора и на
+    // точечном пути признак остаётся истинным, но там и `full_rebuild` ложен —
+    // проверять их по отдельности не нужно.
+    let mut extras_full_ok = true;
     if let Some(proc) = resolved_processor.as_ref() {
         // Гейт против холостого re-enrichment на старте: если БД уже была и
         // mtime-fast-path не нашёл изменений (0 записано / 0 удалено), а extras
@@ -1124,6 +1128,7 @@ pub(crate) fn run_worker(
             let full_outcome = proc.index_extras(&path, &mut storage);
             extras_ms = t0.elapsed().as_millis();
             if let Err(e) = full_outcome {
+                extras_full_ok = false;
                 tracing::warn!(
                     "[{}] полный пересбор надстройки процессора «{}» упал: {}. \
                      Базовая индексация при этом сохранена.",
@@ -1139,6 +1144,22 @@ pub(crate) fn run_worker(
                     extras_ms
                 );
             }
+        }
+    }
+
+    // 6b. Номер версии данных — только если проход разобрал КАЖДЫЙ файл
+    //     (`--force` или пустая база) и надстройка пересобрана полностью и
+    //     успешно. Строго ДО flush_to_disk: в in-memory режиме запись после
+    //     сброса осталась бы только в памяти. Провал записи не фатален — базовая
+    //     индексация уже сохранена, а расхождение видно по отсутствию номера.
+    if reindex.full_rebuild && extras_full_ok {
+        if let Err(e) = storage.set_data_version(Storage::INDEX_DATA_VERSION) {
+            tracing::warn!(
+                "[{}] не удалось записать номер версии данных: {}. \
+                 Базовая индексация при этом сохранена.",
+                path.display(),
+                e
+            );
         }
     }
 

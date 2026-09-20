@@ -1258,9 +1258,11 @@ fn cmd_index(path: String, force: bool, registry: Option<ProcessorRegistry>) -> 
     // если бы мы дописали в conn после flush, записи остались бы
     // только в памяти и пропали бы при выходе.
     let extras_start = std::time::Instant::now();
+    let mut extras_ok = true;
     if let Some(reg) = registry.as_ref() {
         if let Some(proc) = reg.resolve(None, &abs_path) {
             if let Err(e) = proc.index_extras(&abs_path, &mut storage) {
+                extras_ok = false;
                 tracing::warn!(
                     "index_extras процессора '{}' завершился с ошибкой: {}. \
                      Базовая индексация при этом сохранена.",
@@ -1271,6 +1273,24 @@ fn cmd_index(path: String, force: bool, registry: Option<ProcessorRegistry>) -> 
         }
     }
     let extras_ms = extras_start.elapsed().as_millis();
+
+    // 6b. Номер версии данных. Пишется только после прохода, разобравшего КАЖДЫЙ
+    // файл (`--force` или пустая база) и успешной надстройки: иначе номер
+    // объявил бы текущей версией данные, собранные прежней. Провал записи не
+    // фатален — базовая индексация уже сохранена, а расхождение следующий запуск
+    // увидит по отсутствию номера.
+    //
+    // ВАЖНО: строго ДО flush_to_disk — в in-memory режиме запись после сброса
+    // осталась бы только в памяти и пропала бы при выходе.
+    if result.full_rebuild && extras_ok {
+        if let Err(e) = storage.set_data_version(Storage::INDEX_DATA_VERSION) {
+            tracing::warn!(
+                "не удалось записать номер версии данных: {}. \
+                 Базовая индексация при этом сохранена.",
+                e
+            );
+        }
+    }
 
     // 7. Если работаем в in-memory режиме — сохранить результаты на диск.
     // Должно идти ПОСЛЕ index_extras, иначе записи расширения

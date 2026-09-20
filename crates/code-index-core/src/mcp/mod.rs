@@ -2175,7 +2175,11 @@ impl ServerHandler for CodeIndexServer {
         };
 
         // Прогон через `IndexTool::execute` и обёртка результата.
+        // Единственная общая точка всех extension-tools: ответ с ошибкой
+        // дополняется подсказкой о расхождении версий данных (ни один инструмент
+        // по отдельности не правится). Успешные ответы подсказку не получают.
         let value = ext.execute(args, ctx).await;
+        let value = crate::mcp::tools::annotate_stale_index(value, storage, root_path).await;
         let r = Ok(CallToolResult::structured(value));
         self.maybe_cache(
             &cache_key,

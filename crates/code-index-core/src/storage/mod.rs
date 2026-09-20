@@ -196,6 +196,21 @@ pub struct CallPathOutcome {
     pub depth_exhausted: bool,
 }
 
+/// Расхождение версии данных базы с версией текущего бинарника.
+///
+/// `stale` — строго `built < current`, а не `!=`: база, собранная бинарником
+/// НОВЕЕ (откат версии), предупреждением не помечается — команда `--force` там
+/// ничего не чинит.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct DataVersionStatus {
+    /// Версия данных, которой собрана база. `0` — номер не проставлен.
+    pub built: u32,
+    /// Версия данных текущего бинарника.
+    pub current: u32,
+    /// Часть данных в базе собрана прежней версией.
+    pub stale: bool,
+}
+
 impl Storage {
     // ── Конструкторы ────────────────────────────────────────────────────────
 
@@ -3098,6 +3113,44 @@ impl Storage {
     /// такие базы собирались одним куском и либо достроены, либо пусты.
     pub fn bulk_in_progress(&self) -> bool {
         schema::bulk_load_in_progress(&self.conn)
+    }
+
+    /// Номер версии данных, который собирает ТЕКУЩИЙ бинарник.
+    pub const INDEX_DATA_VERSION: u32 = schema::INDEX_DATA_VERSION;
+
+    /// Ключ номера версии данных в таблице `index_state`.
+    pub const DATA_VERSION_KEY: &'static str = schema::DATA_VERSION_KEY;
+
+    /// Записать номер версии данных, которой собрана база.
+    ///
+    /// Отдельная транзакция вне батчей записи файлов: номер подводит итог всему
+    /// проходу и должен попасть на диск вместе с ним, а не раствориться в откате
+    /// последнего батча.
+    pub fn set_data_version(&self, version: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO index_state (key, value) VALUES (?1, ?2)",
+                params![Self::DATA_VERSION_KEY, version.to_string()],
+            )
+            .context("set_data_version: не удалось записать номер версии данных")?;
+        Ok(())
+    }
+
+    /// Номер версии данных, которым собрана база. `0` — база от прежней версии
+    /// (номера в ней нет).
+    pub fn data_version(&self) -> u32 {
+        schema::index_data_version(&self.conn)
+    }
+
+    /// Расхождение номера в базе с номером текущего бинарника — признак того,
+    /// что часть данных собрана прежней версией.
+    pub fn data_version_status(&self) -> DataVersionStatus {
+        let built = self.data_version();
+        DataVersionStatus {
+            built,
+            current: Self::INDEX_DATA_VERSION,
+            stale: built < Self::INDEX_DATA_VERSION,
+        }
     }
 
     pub fn prepare_bulk_load(&self) -> Result<()> {
@@ -6150,5 +6203,58 @@ mod tests {
             oversize, 1,
             "после идемпотентных вызовов таблица должна работать"
         );
+    }
+
+    // ── Номер версии данных ──────────────────────────────────────────────────
+
+    /// Свежая база номера не содержит: он читается как 0, и база объявляется
+    /// собранной прежней версией.
+    #[test]
+    fn data_version_на_свежей_базе_ноль_и_устаревшая() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert_eq!(storage.data_version(), 0, "номера в базе ещё нет");
+        let status = storage.data_version_status();
+        assert_eq!(status.built, 0);
+        assert_eq!(status.current, Storage::INDEX_DATA_VERSION);
+        assert!(status.stale, "база без номера собрана прежней версией");
+    }
+
+    /// Записанный номер читается обратно и снимает признак устаревания, а
+    /// повторная запись не плодит строк в `index_state`.
+    #[test]
+    fn data_version_пишется_обратно_и_без_дублей() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .set_data_version(Storage::INDEX_DATA_VERSION)
+            .unwrap();
+        assert_eq!(storage.data_version(), Storage::INDEX_DATA_VERSION);
+        assert!(!storage.data_version_status().stale);
+
+        storage
+            .set_data_version(Storage::INDEX_DATA_VERSION)
+            .unwrap();
+        let rows: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM index_state WHERE key = ?1",
+                params![Storage::DATA_VERSION_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "повторная запись перезаписывает ту же строку");
+    }
+
+    /// Нечисловое значение в базе читается как «номер не проставлен».
+    #[test]
+    fn data_version_нечисловое_значение_читается_как_ноль() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .conn()
+            .execute(
+                "INSERT OR REPLACE INTO index_state (key, value) VALUES (?1, 'мусор')",
+                params![Storage::DATA_VERSION_KEY],
+            )
+            .unwrap();
+        assert_eq!(storage.data_version(), 0);
     }
 }

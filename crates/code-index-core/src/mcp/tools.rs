@@ -1897,6 +1897,137 @@ pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
     }
 }
 
+// ── Расхождение версии данных ────────────────────────────────────────────────
+//
+// База собрана прежней версией сборщика: часть данных надстройки в неё не
+// попала вовсе, и ни один запрос этого не покажет — расхождение видно только по
+// номеру версии данных. Поэтому инструменты сообщают о нём рядом с ошибкой
+// «объект не найден», не подменяя саму ошибку: отличить «объекта нет в
+// конфигурации» от «данные не собраны» в этой точке нечем.
+
+/// Команда разового полного пересбора для локального репо.
+fn stale_index_command(root: &std::path::Path) -> String {
+    // Команда идёт человеку в терминал, поэтому расширенный префикс Windows
+    // (`\\?\`) из пути убираем — скопировать команду с ним нельзя.
+    let полный = root.display().to_string();
+    let путь = полный.strip_prefix(r"\\?\").unwrap_or(&полный);
+    format!("bsl-indexer index \"{путь}\" --force")
+}
+
+/// Пояснение к расхождению версий: что произошло и что это исправляет.
+fn stale_index_message(
+    status: crate::storage::DataVersionStatus,
+    root: Option<&std::path::Path>,
+) -> String {
+    // Сообщение НЕ утверждает причину ошибки: оно приходит на любую ошибку
+    // инструмента, а её причиной с тем же успехом может быть опечатка в имени.
+    // Поэтому говорим об обстоятельстве («ответ может быть неполным») и об
+    // условии, при котором помогает пересборка.
+    let fix = match root {
+        Some(_) => "Если искомое точно есть в конфигурации, помогает разовый полный проход \
+                    сборщика с `--force` (готовая команда — в поле `command`); \
+                    операция длительная."
+            .to_string(),
+        None => "Если искомое точно есть в конфигурации, помогает разовый полный проход \
+                 сборщика (`bsl-indexer index <корень репо> --force` на машине с базой); \
+                 операция длительная."
+            .to_string(),
+    };
+    format!(
+        "База собрана сборщиком версии {}, текущая версия данных {}. Индекс работает, но \
+         данные, которые появились в новых версиях сборщика, в нём могут отсутствовать — \
+         ответ может быть неполным. {}",
+        status.built, status.current, fix
+    )
+}
+
+/// Блок расхождения версий данных для ответа инструмента: всегда `built`,
+/// `current` и `stale`; при расхождении — ещё `message` и, для локального репо,
+/// `command`.
+pub fn data_version_block(
+    status: crate::storage::DataVersionStatus,
+    root: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let mut block = serde_json::json!({
+        "built": status.built,
+        "current": status.current,
+        "stale": status.stale,
+    });
+    if status.stale {
+        let obj = block
+            .as_object_mut()
+            .expect("блок расхождения собирается как объект");
+        obj.insert(
+            "message".to_string(),
+            serde_json::json!(stale_index_message(status, root)),
+        );
+        if let Some(r) = root {
+            obj.insert(
+                "command".to_string(),
+                serde_json::json!(stale_index_command(r)),
+            );
+        }
+    }
+    block
+}
+
+/// Подсказка о расхождении версий: `None`, когда база собрана текущей версией.
+pub fn stale_index_note(
+    status: crate::storage::DataVersionStatus,
+    root: Option<&std::path::Path>,
+) -> Option<serde_json::Value> {
+    status.stale.then(|| data_version_block(status, root))
+}
+
+/// Есть ли в ответе `result.error` — единственная форма, к которой клеится
+/// подсказка о расхождении версий.
+fn result_has_error(value: &serde_json::Value) -> bool {
+    value
+        .get("result")
+        .and_then(|v| v.as_object())
+        .is_some_and(|o| o.contains_key("error"))
+}
+
+/// Положить подсказку в объект `result` ответа — и только если там `error`.
+///
+/// Форма `{result, _meta}` задана обёртками `wrap_error` /
+/// `wrap_with_meta_structural` (bsl-extension): инструмент кладёт свою ошибку
+/// внутрь `result`. Успешные ответы и ответы иной формы не трогаем.
+pub fn attach_stale_note(
+    mut value: serde_json::Value,
+    note: serde_json::Value,
+) -> serde_json::Value {
+    if !result_has_error(&value) {
+        return value;
+    }
+    if let Some(obj) = value.get_mut("result").and_then(|v| v.as_object_mut()) {
+        obj.insert("stale_index".to_string(), note);
+    }
+    value
+}
+
+/// Дописать подсказку о расхождении версий данных в ответ инструмента.
+///
+/// Соединение берётся из пула ТОЛЬКО после дешёвой проверки «в `result` есть
+/// `error`»: подсказка адресована ошибке, и на успешном ответе пул не занимается.
+pub(crate) async fn annotate_stale_index(
+    value: serde_json::Value,
+    pool: &std::sync::Arc<crate::storage::StoragePool>,
+    root: Option<&std::path::Path>,
+) -> serde_json::Value {
+    if !result_has_error(&value) {
+        return value;
+    }
+    let storage = match pool.get().await {
+        Ok(s) => s,
+        Err(_) => return value,
+    };
+    match stale_index_note(storage.data_version_status(), root) {
+        Some(note) => attach_stale_note(value, note),
+        None => value,
+    }
+}
+
 /// Статистика по одному репо: читает локальный SQLite. Для remote — паника
 /// (диспатчер не должен сюда попадать). get_stats остаётся диагностическим:
 /// возвращает данные даже если папка не Ready.
@@ -1919,6 +2050,7 @@ async fn local_stats(alias: &str, entry: &RepoEntry) -> serde_json::Value {
             serde_json::json!({
                 "repo": alias,
                 "db": stats,
+                "data_version": data_version_block(storage.data_version_status(), Some(root)),
                 "path": root.display().to_string(),
                 "daemon": path_info,
             })
@@ -2515,11 +2647,24 @@ pub async fn health(server: &CodeIndexServer) -> String {
             Ok(s) => serde_json::to_value(s).unwrap_or(serde_json::Value::Null),
             Err(e) => serde_json::json!({ "error": e.to_string() }),
         };
-        repos.push(serde_json::json!({
+        // Соединение может не выдаться (пул закрыт, БД недоступна) — тогда поле
+        // опускается: сводка живости важна целиком, и номер версии её не ломает.
+        let data_version = match entry.storage_pool().get().await {
+            Ok(storage) => Some(data_version_block(
+                storage.data_version_status(),
+                Some(root),
+            )),
+            Err(_) => None,
+        };
+        let mut repo_obj = serde_json::json!({
             "repo": alias,
             "root_path": root.display().to_string(),
             "path_status": path_status,
-        }));
+        });
+        if let Some(dv) = data_version {
+            repo_obj["data_version"] = dv;
+        }
+        repos.push(repo_obj);
     }
 
     let daemon_health = match daemon_info {
@@ -2548,6 +2693,27 @@ mod tests {
     use super::*;
     use crate::storage::{PoolConfig, Storage, StoragePool};
     use std::time::{Duration, Instant};
+
+    /// Готовая команда идёт человеку в терминал, поэтому расширенного префикса
+    /// Windows в ней быть не должно; обычный путь остаётся как есть.
+    #[test]
+    fn stale_index_command_убирает_расширенный_префикс() {
+        let с_префиксом = stale_index_command(std::path::Path::new(r"\\?\C:\Repo1C"));
+        assert!(
+            !с_префиксом.contains(r"\\?\"),
+            "префикс не убран: {с_префиксом}"
+        );
+        assert!(
+            с_префиксом.contains(r"C:\Repo1C"),
+            "путь потерян: {с_префиксом}"
+        );
+
+        let обычный = stale_index_command(std::path::Path::new(r"C:\Repo"));
+        assert!(
+            обычный.contains(r"C:\Repo"),
+            "обычный путь изменён: {обычный}"
+        );
+    }
 
     /// M-6: пост-фильтр по образцу пути обязан находить файлы в КОРНЕ репо.
     /// До правки `**/` схлопывался в `*/`, разделитель оставался обязательным,
@@ -3098,5 +3264,106 @@ mod tests {
             call_tree_budget(Some(10_000)),
             crate::mcp::cap::resolve_request_budget(Some(10_000)).applied
         );
+    }
+
+    // ── Расхождение версии данных ────────────────────────────────────────────
+
+    /// Подсказка появляется только при расхождении версий и несёт готовую команду
+    /// с корнем репо; без корня (удалённое репо) команда опускается.
+    #[test]
+    fn stale_note_только_при_расхождении_версий() {
+        let актуальная = crate::storage::DataVersionStatus {
+            built: 1,
+            current: 1,
+            stale: false,
+        };
+        assert!(
+            stale_index_note(актуальная, Some(std::path::Path::new("/srv/repo"))).is_none(),
+            "база текущей версии подсказки не получает"
+        );
+
+        let устаревшая = crate::storage::DataVersionStatus {
+            built: 0,
+            current: 1,
+            stale: true,
+        };
+        let root = std::path::Path::new("/srv/repo");
+        let note = stale_index_note(устаревшая, Some(root)).expect("расхождение — есть подсказка");
+        let command = note["command"].as_str().expect("команда пересбора");
+        assert!(
+            command.contains("/srv/repo"),
+            "корень репо в команде: {command}"
+        );
+        assert!(command.contains("--force"), "команда: {command}");
+        assert!(note["message"].as_str().is_some_and(|m| m.contains('0')));
+
+        let без_корня = stale_index_note(устаревшая, None).expect("подсказка есть");
+        assert!(без_корня.get("command").is_none(), "команда опущена");
+        assert!(без_корня.get("message").is_some(), "сообщение остаётся");
+    }
+
+    /// Подсказка клеится в объект `result` с `error` и не трогает ответы другой
+    /// формы; сама ошибка не подменяется.
+    #[test]
+    fn attach_stale_note_только_к_ошибке() {
+        let note = serde_json::json!({ "built": 0, "current": 1, "stale": true });
+        let error_response = serde_json::json!({
+            "result": { "error": "Объект 'X' не найден" },
+            "_meta": { "dependent_files": [] },
+        });
+        let out = attach_stale_note(error_response, note.clone());
+        assert_eq!(out["result"]["stale_index"]["stale"], true);
+        assert_eq!(
+            out["result"]["error"], "Объект 'X' не найден",
+            "исходная ошибка не подменяется"
+        );
+
+        let success = serde_json::json!({ "result": { "items": [] }, "_meta": {} });
+        let out = attach_stale_note(success, note.clone());
+        assert!(
+            out["result"].get("stale_index").is_none(),
+            "успешный ответ не трогаем"
+        );
+
+        let без_result = serde_json::json!({ "items": [] });
+        let out = attach_stale_note(без_result, note);
+        assert!(out.get("stale_index").is_none(), "иная форма — без правок");
+    }
+
+    /// `get_stats` по локальному репо показывает расхождение версий данных: база
+    /// без номера читается как собранная прежней версией. Демон для этого не
+    /// нужен — недоступный path-status гасится в `None`.
+    #[tokio::test]
+    async fn local_stats_показывает_устаревшую_версию_данных() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let storage = Storage::open_file(&db_path).unwrap();
+        let entry = crate::mcp::RepoEntry {
+            root_path: Some(tmp.path().to_path_buf()),
+            storage: Some(StoragePool::single(storage)),
+            ip: "127.0.0.1".to_string(),
+            port: crate::federation::client::DEFAULT_REMOTE_PORT,
+            is_local: true,
+            language: None,
+            processor: None,
+        };
+
+        let value = local_stats("test", &entry).await;
+        let data_version = &value["data_version"];
+        assert_eq!(data_version["built"].as_u64(), Some(0), "номера в базе нет");
+        assert_eq!(
+            data_version["current"].as_u64(),
+            Some(u64::from(Storage::INDEX_DATA_VERSION))
+        );
+        assert_eq!(data_version["stale"], serde_json::json!(true));
+
+        // После записи номера расхождение исчезает.
+        let storage = Storage::open_file(&db_path).unwrap();
+        storage
+            .set_data_version(Storage::INDEX_DATA_VERSION)
+            .unwrap();
+        drop(storage);
+        let value = local_stats("test", &entry).await;
+        assert_eq!(value["data_version"]["stale"], serde_json::json!(false));
     }
 }
