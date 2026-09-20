@@ -5,6 +5,41 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.4.1] — 2026-09-20
+
+**The index now says for itself that it was built by an older builder. A database carries a data version number: it is compared with the number baked into the binary, and on a mismatch `get_stats`, `health` and BSL tool responses carry an explanation and a ready-to-run rebuild command. Previously there was no way to tell "this object is not in the configuration" from "its data was never collected" — the tool answered the same in both cases.**
+
+> Context. The database schema migrates itself when a new binary first opens it, but data for new tables does not appear on its own: the fast path by file time and size treats files as unchanged. After 1.4.0 this looked like composition schema parsing working fine yet answering "not found" for every report. The data version number makes that state visible without changing the fact that a rebuild stays voluntary and manual.
+
+### Added
+
+- **Index data version number.** An integer in the binary, mirrored in a service table of the database. Raised by hand and only when a change alters what data is collected or how it is parsed; response-layer changes leave it alone, so the release number and the data number are different things. Databases built by earlier versions read as version 0.
+- **A `data_version` block in `get_stats` and in the `health` summary** — what built the database, what the binary has now, and whether they differ. On a mismatch it also carries a plain-text explanation and a ready-to-run `index <path> --force` command with the path to that folder.
+- **A `stale_index` section in BSL tool responses that ended in an error.** Attached at two shared points — the normal call path and the receiving side of a network node — no individual tool was touched. For a node's folders the decision is made against its own database, since its own builder produced it.
+
+### Changed
+
+- **The number is written only after a pass that parsed every file** (`--force` or an empty database) and a successful extras build. A routine update over changed files does not raise it: the remaining files were parsed the old way.
+- **A rebuild still never starts on its own.** The mismatch is only reported; when to rebuild is the operator's call.
+
+### Known limitations
+
+- **The hint is attached to error responses, not to empty ones.** An empty list is very often a legitimate result, and telling "data was not collected" from "this is not in the configuration" is impossible without checking the source files. Checking sources on every empty response costs more than it gives, so such responses carry no hint; the mismatch remains visible in `get_stats`.
+- **The hint text does not claim to explain the error.** It says the answer may be incomplete and that a rebuild helps if the thing being looked for really exists in the configuration — the same error may well come from a typo in a name.
+
+### Compatibility
+
+- No rebuild is needed for the mechanism itself — replacing the binary is enough.
+- **Every existing database will be reported as built by version 0** until it goes through a one-time `index <path> --force`. That is accurate: data introduced in 1.4.0 is not in them.
+- The database schema did not change: the number lives in a service table introduced by an earlier release.
+
+### Verification
+
+- `cargo test --workspace --all-features`: 928 passed, 0 failed (was 920). New tests pin down that the full-rebuild flag is raised only by `--force` and an empty database — not by a repeat pass or a pointwise update — and that the path in the ready-to-run command is served without the Windows extended prefix. `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- Live check on the local installation in both states: on a database without the number — mismatch, explanation and command; after a one-time full pass over a small repository — the number is stored, the mismatch flag is false, no extra fields.
+- A successful tool response carries no hint — verified separately, on a local and on a remote folder.
+- Federated check on a network node: an error response arrives with the hint and with the node's own filesystem path; before the receiving side was fixed the hint was lost — the federated smoke test is what caught it.
+
 ## [1.4.0] — 2026-09-19
 
 **Data composition schemas are parsed into index tables: a single `get_dcs_schema` call returns data sets with fields, query texts, links, calculated fields, totals, parameters and variants instead of reading a megabyte of XML piece by piece. Reports also enter the data-links graph: new "report reads object" edges extracted from query texts. On a typical accounting configuration — 470 schemas, 911 data sets, 2,324 such edges across 449 objects. Both export formats: Designer and 1C:EDT.**
