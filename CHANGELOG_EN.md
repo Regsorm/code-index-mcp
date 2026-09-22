@@ -5,6 +5,35 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.5.0] — 2026-09-22
+
+**The `repo` parameter now has a default. With several repositories, a call without `repo` used to fail with a deserialization error and the client spent a turn retrying. The server now fills in the alias from the new `[mcp].default_repo` setting in `daemon.toml`, or the only repository when there is just one. When there is nothing to fill in, the rejection is the same for every tool and lists the available aliases.**
+
+> Context. Issue #10: 32 "missing field `repo`" rejections in two projects over one week, almost all on the first call of a session. The 1C tools answered with a different text (`tool requires 'repo' parameter`), so one error looked two different ways.
+
+### Added
+
+- **`[mcp].default_repo` setting** in `daemon.toml`: the alias filled into a call without `repo`. If the alias is not in the table, a warning is logged and the call is resolved by the general rules. The repository table is reloaded on the fly, so the default is computed per call.
+- **A single repository is filled in automatically**, no setting needed.
+- **In `tools/list`, the `repo` parameter description lists the available aliases** (up to 20, then "and N more, full list — get_stats"). With a default configured, the description names it and `repo` is removed from the required list.
+
+### Changed
+
+- **One rejection for a missing `repo`** — for regular tools and 1C tools alike: it lists the available aliases and hints at `default_repo`. An empty string and `null` count as missing.
+- With several repositories and no default, the server does not pick the first one: an answer from the wrong base is worse than a rejection.
+- Tools where `repo` is optional (`get_stats`) are unaffected: without `repo` they still answer for all repositories.
+- Also fixed seven findings of the new clippy (1.98) in XML parsing and the call graph — no behaviour change.
+
+### Compatibility
+
+- Calls with an explicit `repo` work as before. Tool parameter structures are unchanged: the value is filled in before arguments are parsed.
+
+### Verification
+
+- `cargo test --workspace --all-features`: 943 passed, 0 failed. `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- Live check on the installed server (dozens of repositories, no default): calls without `repo` to a regular tool and to a 1C tool get the same rejection with the alias list; `get_stats` without `repo` answers as before.
+- A separate server with two repositories and `default_repo`: calls without `repo` and with an empty `repo` return data from the default repository; `repo` is not marked required in `tools/list`.
+
 ## [1.4.2] — 2026-09-20
 
 **A rejection of an unknown method is no longer a riddle. Previously a client got a "method not found" code whose message was the method name itself — there was no way to tell from it whether the server keeps working and what to do next. The response now names the unsupported method, lists the protocol methods the server does answer, and states that the connection stays open.**
