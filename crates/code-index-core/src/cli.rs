@@ -967,7 +967,8 @@ async fn cmd_serve(
         )?
         .apply_tools_whitelist(&daemon_cfg.tools.enabled)
         .apply_mass_mode_tools(&daemon_cfg.mcp.mass_mode_tools)
-        .apply_dedup_enabled(daemon_cfg.mcp.dedup_enabled);
+        .apply_dedup_enabled(daemon_cfg.mcp.dedup_enabled)
+        .apply_default_repo(daemon_cfg.mcp.default_repo.as_deref());
         crate::mcp::cap::set_response_cap(daemon_cfg.cap.max_response_bytes);
         crate::mcp::cap::set_response_cap_hard(daemon_cfg.cap.max_response_bytes_hard);
         crate::mcp::cap::set_function_body_cap(daemon_cfg.cap.max_function_body_chars);
@@ -1085,7 +1086,8 @@ async fn cmd_serve(
         Some(cfg) => server
             .apply_tools_whitelist(&cfg.tools.enabled)
             .apply_mass_mode_tools(&cfg.mcp.mass_mode_tools)
-            .apply_dedup_enabled(cfg.mcp.dedup_enabled),
+            .apply_dedup_enabled(cfg.mcp.dedup_enabled)
+            .apply_default_repo(cfg.mcp.default_repo.as_deref()),
         None => server,
     };
     if let Some(cfg) = &daemon_cfg {

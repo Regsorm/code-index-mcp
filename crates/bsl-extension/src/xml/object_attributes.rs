@@ -276,10 +276,10 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                                 });
                             }
                         }
-                        TextTarget::OwnerRef => {
+                        TextTarget::OwnerRef
                             // Подчинённый справочник → владелец: ребро owner.
                             // Цель уже каноническая (Catalog.X / ExchangePlan.X).
-                            if !txt.is_empty() {
+                            if !txt.is_empty() => {
                                 out.push(DataLinkEdge {
                                     from_path: String::new(),
                                     to_object: txt,
@@ -288,7 +288,6 @@ pub fn parse_object_attributes_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                                     is_universal: false,
                                 });
                             }
-                        }
                         // Прочие цели (свойства шапки/проведения, синонимы,
                         // FillChecking, корневой Type) в парсере связей данных не
                         // возникают — их обрабатывает parse_object_structure_xml.

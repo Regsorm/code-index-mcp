@@ -450,6 +450,14 @@ pub struct CodeIndexServer {
     /// отбивает вызов с ним. Управляется `daemon.toml [mcp].mass_mode_tools`.
     /// Перечень массовых инструментов — [`MASS_MODE_PARAMS`].
     pub mass_mode_tools: Arc<BTreeSet<String>>,
+    /// Алиас репозитория по умолчанию из `daemon.toml [mcp].default_repo`.
+    /// Подставляется в `arguments` инструмента, принимающего `repo`, когда
+    /// клиент `repo` не передал (шаг «0c» в `call_tool`). `None` — умолчание
+    /// не задано: подходит единственный репозиторий, когда он один; при
+    /// нескольких репо вызов без `repo` отклоняется с перечнем доступных
+    /// алиасов. Хранится в `Arc<Option<..>>`, чтобы разделяться клонами
+    /// сервера на сессии.
+    pub default_repo: Arc<Option<String>>,
     /// In-process кэш результатов tool-вызовов (встроенная форма прокси
     /// mcp-cache-ci для ci-цепочки). Общий на все сессии (поле `Arc`, сервер
     /// клонируется на сессию). Кэшируются только LOCAL-репо (federation
@@ -483,6 +491,7 @@ impl CodeIndexServer {
             peer: Arc::new(Mutex::new(None)),
             allowed_tools: Arc::new(None),
             mass_mode_tools: Arc::new(BTreeSet::new()),
+            default_repo: Arc::new(None),
             // TTL 3600с — подстраховка; основной механизм корректности —
             // инвалидация по scope от демона при переиндексации.
             cache: Arc::new(ServeCache::new(3600, true)),
@@ -513,6 +522,7 @@ impl CodeIndexServer {
             peer: Arc::new(Mutex::new(None)),
             allowed_tools: Arc::new(None),
             mass_mode_tools: Arc::new(BTreeSet::new()),
+            default_repo: Arc::new(None),
             // TTL 3600с — подстраховка; основной механизм корректности —
             // инвалидация по scope от демона при переиндексации.
             cache: Arc::new(ServeCache::new(3600, true)),
@@ -560,6 +570,7 @@ impl CodeIndexServer {
             peer: Arc::new(Mutex::new(None)),
             allowed_tools: Arc::new(None),
             mass_mode_tools: Arc::new(BTreeSet::new()),
+            default_repo: Arc::new(None),
             // TTL 3600с — подстраховка; основной механизм корректности —
             // инвалидация по scope от демона при переиндексации.
             cache: Arc::new(ServeCache::new(3600, true)),
@@ -621,6 +632,28 @@ impl CodeIndexServer {
     /// Список алиасов для описаний и диагностики.
     pub fn repo_aliases(&self) -> Vec<String> {
         self.repos.load().keys().cloned().collect()
+    }
+
+    /// Принимает ли инструмент обязательный параметр `repo`.
+    ///
+    /// Основные инструменты (tool_router) берутся из реестра роутера,
+    /// extension-инструменты — из `self.extension_tools` (`input_schema()`).
+    /// Признак — схема объявляет обязательный `repo` (ключ есть в `properties`
+    /// и он же перечислен в `required`). `get_stats`, где `repo` опционален,
+    /// и `health` без параметров сюда не попадают: подстановка умолчания им
+    /// не нужна (без `repo` `get_stats` осмысленно отдаёт сводку по всем репо).
+    fn tool_accepts_repo(&self, name: &str) -> bool {
+        if let Some(tool) = self.tool_router.get(name) {
+            return schema_declares_repo(&tool.input_schema);
+        }
+        let snapshot = self.extension_tools.load();
+        match snapshot.iter().find(|t| t.name() == name) {
+            Some(ext) => match ext.input_schema() {
+                serde_json::Value::Object(map) => schema_declares_repo(&map),
+                _ => false,
+            },
+            None => false,
+        }
     }
 
     /// Builder для опционального whitelist'а MCP-инструментов
@@ -748,6 +781,66 @@ impl CodeIndexServer {
         }
         self.dedup = Arc::new(SessionDedup::new(enabled));
         self
+    }
+
+    /// Применить алиас по умолчанию из `daemon.toml [mcp].default_repo`.
+    /// Пустая строка (и отсутствие настройки) трактуются как «умолчания нет».
+    /// Значение сохраняется даже если такого алиаса сейчас нет среди репо —
+    /// таблица репозиториев перечитывается на лету, и настройка догонит её;
+    /// при этом пишется warning. Единственная точка интеграции `[mcp]` для
+    /// обеих веток serve.
+    pub fn apply_default_repo(mut self, alias: Option<&str>) -> Self {
+        let configured: Option<String> = alias
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let known = match configured.as_deref() {
+            Some(a) => self.repos.load().contains_key(a),
+            None => false,
+        };
+        match configured.as_deref() {
+            Some(a) if known => {
+                tracing::info!(
+                    "[mcp].default_repo = '{}' — подставляется в вызовы без параметра `repo`",
+                    a
+                );
+            }
+            Some(a) => {
+                tracing::warn!(
+                    "[mcp].default_repo = '{}' не найден среди репозиториев {:?}. \
+                     Значение сохранено: таблица репозиториев перечитывается на лету, \
+                     до тех пор вызов без `repo` разрешится по общим правилам.",
+                    a,
+                    self.repo_aliases()
+                );
+            }
+            None => {
+                tracing::info!(
+                    "[mcp].default_repo не задан — вызов без `repo` возможен только при единственном репозитории"
+                );
+            }
+        }
+        self.default_repo = Arc::new(configured);
+        self
+    }
+
+    /// Эффективный алиас по умолчанию для вызова без `repo`.
+    ///
+    /// Заданный `[mcp].default_repo`, если он есть в текущей таблице репо;
+    /// иначе — единственный репозиторий, когда он один. Несколько репо без
+    /// (или с несуществующей) настройкой → `None`: первый по списку не берётся.
+    /// Вычисляется на каждый вызов — таблица меняется при перечитке конфигов.
+    pub(crate) fn effective_default_repo(&self) -> Option<String> {
+        let snapshot = self.repos.load();
+        if let Some(configured) = self.default_repo.as_deref() {
+            if snapshot.contains_key(configured) {
+                return Some(configured.to_string());
+            }
+        }
+        if snapshot.len() == 1 {
+            return snapshot.keys().next().cloned();
+        }
+        None
     }
 
     /// Проверить, какие имена из whitelist'а НЕ соответствуют ни одному
@@ -1972,6 +2065,16 @@ impl ServerHandler for CodeIndexServer {
                 }
             }
         }
+        // Параметр `repo`: в описании — перечень доступных алиасов; если
+        // умолчание задано (или репозиторий единственный) — `repo` убирается
+        // из `required`, потому что сервер подставляет его сам (шаг «0c»).
+        let repo_aliases = self.repo_aliases();
+        let default_repo = self.effective_default_repo();
+        for tool in tools.iter_mut() {
+            if schema_declares_repo(&tool.input_schema) {
+                annotate_repo_param(tool, &repo_aliases, default_repo.as_deref());
+            }
+        }
         // Стабильный порядок (как у tool_router::list_all): по имени.
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(ListToolsResult {
@@ -1983,7 +2086,7 @@ impl ServerHandler for CodeIndexServer {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
+        mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         // Session id из HTTP-заголовка `mcp-session-id`: rmcp вкладывает
@@ -2039,6 +2142,30 @@ impl ServerHandler for CodeIndexServer {
                         ),
                         None,
                     ));
+                }
+            }
+        }
+        // 0c. Параметр `repo` не передан? Подставляем алиас по умолчанию
+        // (`[mcp].default_repo`, иначе единственный репозиторий) — до разбора
+        // аргументов и расчёта ключа кэша, чтобы кэш и сессионный отсев
+        // считались уже с подставленным repo. Умолчания нет — единый отказ с
+        // перечнем доступных алиасов (тот же текст, что в ветке extension).
+        // Инструменты без обязательного `repo` (get_stats, health) не трогаем.
+        let accepts_repo = self.tool_accepts_repo(request.name.as_ref());
+        if accepts_repo && !repo_param_present(&request.arguments) {
+            let aliases = self.repo_aliases();
+            match self.effective_default_repo() {
+                Some(alias) => {
+                    request
+                        .arguments
+                        .get_or_insert_with(Default::default)
+                        .insert("repo".to_string(), serde_json::Value::String(alias));
+                }
+                None => {
+                    return Err(ErrorData::invalid_params(
+                        missing_repo_message(&aliases),
+                        None,
+                    ))
                 }
             }
         }
@@ -2112,13 +2239,15 @@ impl ServerHandler for CodeIndexServer {
             .map(serde_json::Value::Object)
             .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
 
-        // Параметр `repo` обязателен у всех tools (см. ТЗ). Извлекаем его
-        // из аргументов, чтобы построить ToolContext с правильным RepoEntry.
+        // Параметр `repo` обязателен у всех tools, принимающих его. Сюда
+        // попадаем уже после шага «0c» call_tool: умолчание подставлено, и
+        // ошибка ниже достижима только когда `repo` не передан вовсе —
+        // текст отказа общий (`missing_repo_message`), как у основных tools.
         let repo = args
             .get("repo")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                ErrorData::invalid_params("tool requires 'repo' parameter (string)", None)
+                ErrorData::invalid_params(missing_repo_message(&self.repo_aliases()), None)
             })?
             .to_string();
 
@@ -2276,6 +2405,98 @@ fn strip_mass_mode_param(tool: &mut Tool, plural: &str) {
             tool.description = Some(std::borrow::Cow::Owned(trimmed));
         }
     }
+}
+
+/// Единый текст отказа «параметр `repo` не передан». Используется обеими
+/// ветками `call_tool` (основные инструменты и extension-tools) — модель
+/// должна видеть один и тот же отказ с перечнем доступных алиасов.
+fn missing_repo_message(aliases: &[String]) -> String {
+    format!(
+        "не передан параметр 'repo'. Доступные: {}. Укажите один из них либо задайте \
+         [mcp].default_repo в daemon.toml",
+        format_repo_list(aliases)
+    )
+}
+
+/// Перечень алиасов через запятую. Слишком длинный список не раздувает ни
+/// отказ, ни описания схем: после первых 20 идёт хвост с числом остальных.
+fn format_repo_list(aliases: &[String]) -> String {
+    const MAX_LISTED: usize = 20;
+    if aliases.len() > MAX_LISTED {
+        format!(
+            "{} … и ещё {} (полный список — get_stats)",
+            aliases[..MAX_LISTED].join(", "),
+            aliases.len() - MAX_LISTED
+        )
+    } else {
+        aliases.join(", ")
+    }
+}
+
+/// Объявляет ли схема инструмента ОБЯЗАТЕЛЬНЫЙ параметр `repo`: ключ есть в
+/// `properties` и он же перечислен в `required`. Инструменты с опциональным
+/// `repo` (`get_stats`) и без параметров (`health`) под правило не попадают —
+/// и подстановка умолчания, и переписывание описания им не нужны.
+fn schema_declares_repo(schema: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let has_prop = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|props| props.contains_key("repo"))
+        .unwrap_or(false);
+    let is_required = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|req| req.iter().any(|v| v.as_str() == Some("repo")))
+        .unwrap_or(false);
+    has_prop && is_required
+}
+
+/// Передан ли в аргументах пригодный `repo`. Отсутствие ключа, значение
+/// `null` и пустая строка равнозначны «не передан».
+fn repo_param_present(args: &Option<serde_json::Map<String, serde_json::Value>>) -> bool {
+    args.as_ref()
+        .and_then(|m| m.get("repo"))
+        .map(|v| !(v.is_null() || v.as_str().map(|s| s.is_empty()).unwrap_or(false)))
+        .unwrap_or(false)
+}
+
+/// Переписать в схеме инструмента описание параметра `repo`: перечень
+/// доступных алиасов, а при заданном умолчании — ещё и снятие `repo` из
+/// `required` (сервер подставляет значение сам). По образцу
+/// [`strip_mass_mode_param`]: клон схемы, правка, `Arc::new`.
+fn annotate_repo_param(tool: &mut Tool, aliases: &[String], default: Option<&str>) {
+    let mut schema = tool.input_schema.as_ref().clone();
+    let Some(serde_json::Value::Object(props)) = schema.get_mut("properties") else {
+        return;
+    };
+    let Some(repo) = props.get_mut("repo") else {
+        return;
+    };
+    let desc = match default {
+        Some(alias) => format!(
+            "Алиас репозитория. Не передан — берётся '{}'. Доступные: {}.",
+            alias,
+            format_repo_list(aliases)
+        ),
+        None => format!(
+            "ОБЯЗАТЕЛЕН. Алиас репозитория. Доступные: {}.",
+            format_repo_list(aliases)
+        ),
+    };
+    match repo {
+        serde_json::Value::Object(obj) => {
+            obj.insert("description".to_string(), serde_json::Value::String(desc));
+        }
+        other => {
+            *other = serde_json::json!({ "type": "string", "description": desc });
+        }
+    }
+    if default.is_some() {
+        if let Some(serde_json::Value::Array(req)) = schema.get_mut("required") {
+            req.retain(|v| v.as_str() != Some("repo"));
+        }
+    }
+    tool.input_schema = Arc::new(schema);
 }
 
 /// Конвертация `IndexTool` (наш trait) в `rmcp::model::Tool` (формат для
@@ -2989,5 +3210,200 @@ mod strip_meta_tests {
         assert_eq!(deps, vec!["src/X.bsl".to_string(), "src/Y.bsl".to_string()]);
         // нет поля → пусто
         assert!(meta_dependent_files(&json!({})).is_empty());
+    }
+}
+
+// ── Тесты параметра `repo` по умолчанию ([mcp].default_repo, задача №10) ─────
+
+#[cfg(test)]
+mod default_repo_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn remote_entry(ip: &str) -> RepoEntry {
+        RepoEntry {
+            root_path: None,
+            storage: None,
+            ip: ip.to_string(),
+            port: crate::federation::client::DEFAULT_REMOTE_PORT,
+            is_local: false,
+            language: None,
+            processor: None,
+        }
+    }
+
+    fn server_with_aliases(names: &[&str]) -> CodeIndexServer {
+        let map: BTreeMap<String, RepoEntry> = names
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.to_string(), remote_entry(&format!("192.0.2.{}", i + 1))))
+            .collect();
+        CodeIndexServer::with_repos(map)
+    }
+
+    fn aliases(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("repo{}", i)).collect()
+    }
+
+    /// Инструмент с обязательным `repo` (как у core-tools: `repo: String`).
+    fn tool_with_repo(required: bool) -> Tool {
+        let required_list = if required {
+            serde_json::json!(["repo", "query"])
+        } else {
+            serde_json::json!(["query"])
+        };
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "старое описание"},
+                "query": {"type": "string"}
+            },
+            "required": required_list
+        });
+        let map = match schema {
+            serde_json::Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        let mut tool = Tool::default();
+        tool.name = Cow::Owned("grep_code".to_string());
+        tool.description = Some(Cow::Owned("описание".to_string()));
+        tool.input_schema = Arc::new(map);
+        tool
+    }
+
+    fn required_of(tool: &Tool) -> Vec<String> {
+        let schema: &serde_json::Map<String, serde_json::Value> = &tool.input_schema;
+        schema["required"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn description_of_repo(tool: &Tool) -> String {
+        let schema: &serde_json::Map<String, serde_json::Value> = &tool.input_schema;
+        schema["properties"]["repo"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn single_repo_is_used_as_default() {
+        let server = server_with_aliases(&["only"]);
+        assert_eq!(server.effective_default_repo().as_deref(), Some("only"));
+    }
+
+    #[test]
+    fn two_repos_without_setting_yield_none() {
+        let server = server_with_aliases(&["a", "b"]);
+        assert!(
+            server.effective_default_repo().is_none(),
+            "при нескольких репо без настройки угадывать нельзя"
+        );
+    }
+
+    #[test]
+    fn configured_alias_wins() {
+        let server = server_with_aliases(&["a", "b"]).apply_default_repo(Some("b"));
+        assert_eq!(server.effective_default_repo().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn unknown_alias_with_two_repos_yields_none() {
+        let server = server_with_aliases(&["a", "b"]).apply_default_repo(Some("zzz"));
+        assert!(server.effective_default_repo().is_none());
+    }
+
+    #[test]
+    fn unknown_alias_with_single_repo_falls_back_to_it() {
+        let server = server_with_aliases(&["only"]).apply_default_repo(Some("zzz"));
+        assert_eq!(server.effective_default_repo().as_deref(), Some("only"));
+    }
+
+    #[test]
+    fn empty_alias_is_treated_as_absent() {
+        let server = server_with_aliases(&["a", "b"]).apply_default_repo(Some("   "));
+        assert!(server.default_repo.is_none());
+        assert!(server.effective_default_repo().is_none());
+    }
+
+    #[test]
+    fn format_repo_list_joins_short_lists() {
+        let list = aliases(20);
+        let text = format_repo_list(&list);
+        assert_eq!(text, list.join(", "));
+        assert!(!text.contains("и ещё"));
+    }
+
+    #[test]
+    fn format_repo_list_shortens_long_lists() {
+        let list = aliases(25);
+        let text = format_repo_list(&list);
+        assert!(text.contains(&list[19]), "20-й алиас ещё виден: {}", text);
+        assert!(!text.contains(&list[20]), "21-й уже скрыт: {}", text);
+        assert!(text.contains("и ещё 5"), "хвост: {}", text);
+        assert!(text.contains("get_stats"), "подсказка: {}", text);
+    }
+
+    #[test]
+    fn missing_repo_message_lists_aliases() {
+        let msg = missing_repo_message(&["ut".to_string(), "bp".to_string()]);
+        assert!(msg.contains("ut"), "текст: {}", msg);
+        assert!(msg.contains("bp"), "текст: {}", msg);
+        assert!(msg.contains("default_repo"), "текст: {}", msg);
+    }
+
+    #[test]
+    fn annotate_with_default_drops_repo_from_required() {
+        let mut tool = tool_with_repo(true);
+        annotate_repo_param(&mut tool, &["ut".to_string(), "bp".to_string()], Some("ut"));
+        let required = required_of(&tool);
+        assert!(!required.contains(&"repo".to_string()), "{:?}", required);
+        assert!(required.contains(&"query".to_string()), "{:?}", required);
+        let desc = description_of_repo(&tool);
+        assert!(desc.contains("'ut'"), "описание: {}", desc);
+        assert!(desc.contains("ut, bp"), "описание: {}", desc);
+    }
+
+    #[test]
+    fn annotate_without_default_keeps_repo_required() {
+        let mut tool = tool_with_repo(true);
+        annotate_repo_param(&mut tool, &["ut".to_string()], None);
+        let required = required_of(&tool);
+        assert!(required.contains(&"repo".to_string()), "{:?}", required);
+        let desc = description_of_repo(&tool);
+        assert!(desc.starts_with("ОБЯЗАТЕЛЕН"), "описание: {}", desc);
+        assert!(desc.contains("ut"), "описание: {}", desc);
+    }
+
+    #[test]
+    fn tool_accepts_repo_only_for_required_repo() {
+        let server = server_with_aliases(&["only"]);
+        assert!(server.tool_accepts_repo("grep_code"));
+        assert!(
+            !server.tool_accepts_repo("get_stats"),
+            "у get_stats `repo` опционален — подстановка ему не нужна"
+        );
+        assert!(!server.tool_accepts_repo("health"));
+        assert!(!server.tool_accepts_repo("no_such_tool"));
+    }
+
+    #[test]
+    fn repo_param_present_rejects_null_and_empty() {
+        assert!(!repo_param_present(&None));
+        let mut args = serde_json::Map::new();
+        args.insert("repo".to_string(), serde_json::Value::Null);
+        assert!(!repo_param_present(&Some(args.clone())));
+        args.insert("repo".to_string(), serde_json::Value::String(String::new()));
+        assert!(!repo_param_present(&Some(args.clone())));
+        args.insert(
+            "repo".to_string(),
+            serde_json::Value::String("ut".to_string()),
+        );
+        assert!(repo_param_present(&Some(args)));
     }
 }

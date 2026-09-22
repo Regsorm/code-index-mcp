@@ -68,10 +68,7 @@ pub fn callee_name(node: Node, source: &[u8]) -> Option<String> {
             .find(|(kind, _)| *kind == cur.kind())
             .map(|(_, field)| *field)
         {
-            Some(field) => match cur.child_by_field_name(field) {
-                Some(next) => cur = next,
-                None => return None,
-            },
+            Some(field) => cur = cur.child_by_field_name(field)?,
             None => break,
         }
     }

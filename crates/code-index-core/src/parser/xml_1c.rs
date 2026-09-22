@@ -337,11 +337,9 @@ fn parse_xml_1c(source: &str, _file_path: &str) -> Result<ParseResult> {
                     "Synonym" => {
                         ctx.in_synonym = true;
                     }
-                    "content" => {
-                        // <v8:content> внутри Synonym — читаем синоним объекта
-                        if ctx.in_synonym && !ctx.root_properties_done {
-                            ctx.reading_synonym = true;
-                        }
+                    // <v8:content> внутри Synonym — читаем синоним объекта
+                    "content" if ctx.in_synonym && !ctx.root_properties_done => {
+                        ctx.reading_synonym = true;
                     }
                     _ => {}
                 }

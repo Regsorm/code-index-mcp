@@ -307,11 +307,11 @@ pub fn parse_mdo_structure_xml(content: &str) -> Result<ObjectStructure> {
                     // Регламентное задание: вызываемая процедура и параметры
                     // перезапуска. `predefined` сюда не входит: в EDT это имя
                     // занято блоком предопределённых элементов справочника.
-                    "methodName" | "use" | "restartCountOnFailure" | "restartIntervalOnFailure" => {
-                        if field.is_none() && depth == 2 {
-                            cur_header_prop = Some(cap_first(&local));
-                            tt = T::HeaderProp;
-                        }
+                    "methodName" | "use" | "restartCountOnFailure" | "restartIntervalOnFailure"
+                        if field.is_none() && depth == 2 =>
+                    {
+                        cur_header_prop = Some(cap_first(&local));
+                        tt = T::HeaderProp;
                     }
                     _ => {}
                 }
@@ -583,10 +583,8 @@ pub fn parse_mdo_datalinks_xml(content: &str) -> Result<Vec<DataLinkEdge>> {
                             tt = T::TypeValue;
                         }
                     }
-                    "registerRecords" => {
-                        if field.is_none() {
-                            tt = T::RegisterRec;
-                        }
+                    "registerRecords" if field.is_none() => {
+                        tt = T::RegisterRec;
                     }
                     _ => {}
                 }

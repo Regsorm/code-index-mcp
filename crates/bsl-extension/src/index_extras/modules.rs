@@ -605,14 +605,13 @@ pub(crate) fn find_form_owner(bsl_path: &Path) -> Option<(std::path::PathBuf, St
             form_name,
             format!("{}.{}.Form.{}", meta_type, owner_name, form_name),
         )
-    } else if let Some(idx) = segments.iter().rposition(|s| *s == "CommonForms") {
+    } else {
+        let idx = segments.iter().rposition(|s| *s == "CommonForms")?;
         if idx + 1 >= segments.len() {
             return None;
         }
         let form_name = segments[idx + 1];
         (form_name, format!("CommonForms.{}", form_name))
-    } else {
-        return None;
     };
     // Поднимаемся до папки с именем формы.
     let mut form_dir = bsl_path.to_path_buf();

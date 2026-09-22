@@ -131,10 +131,8 @@ pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscri
                                 }
                             }
                             "Handler" => handler_value = Some(value),
-                            "Type" => {
-                                if tag_stack.iter().any(|t| t == "Source") {
-                                    sources.push(value);
-                                }
+                            "Type" if tag_stack.iter().any(|t| t == "Source") => {
+                                sources.push(value);
                             }
                             _ => {}
                         }

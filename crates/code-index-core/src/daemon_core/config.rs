@@ -227,6 +227,19 @@ pub struct McpSection {
     /// ```
     #[serde(default = "default_dedup_enabled")]
     pub dedup_enabled: bool,
+    /// Алиас репозитория, подставляемый в вызов инструмента без `repo`.
+    /// Отсутствует → работает единственный репозиторий, когда он один;
+    /// при нескольких репозиториях вызов без `repo` отклоняется с перечнем
+    /// доступных алиасов (первый по списку не берётся — угадывания нет).
+    /// Алиас, которого нет среди `[[paths]]`, не подставляется; сервер
+    /// пишет warning при старте (таблица репозиториев перечитывается на лету).
+    ///
+    /// ```toml
+    /// [mcp]
+    /// default_repo = "ut"
+    /// ```
+    #[serde(default)]
+    pub default_repo: Option<String>,
 }
 
 impl Default for McpSection {
@@ -234,6 +247,7 @@ impl Default for McpSection {
         Self {
             mass_mode_tools: Vec::new(),
             dedup_enabled: default_dedup_enabled(),
+            default_repo: None,
         }
     }
 }
@@ -941,5 +955,23 @@ mod tests {
             cfg.mcp.mass_mode_tools,
             vec!["get_object_structure".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_mcp_default_repo() {
+        // Секция задана только под default_repo — mass_mode остаётся дефолтным.
+        let text = r#"
+            [mcp]
+            default_repo = "x"
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(cfg.mcp.default_repo.as_deref(), Some("x"));
+        assert!(cfg.mcp.mass_mode_tools.is_empty());
+    }
+
+    #[test]
+    fn mcp_default_repo_absent_is_none() {
+        let cfg: DaemonFileConfig = parse_str("").unwrap();
+        assert!(cfg.mcp.default_repo.is_none());
     }
 }
