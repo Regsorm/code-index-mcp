@@ -427,13 +427,39 @@ fn load_datasets(
             return json!([]);
         }
     };
-    json!(build_sets(&rows, "", include_query, with_fields))
+    let mut used = vec![false; rows.len()];
+    json!(build_sets(&rows, None, &mut used, include_query, with_fields))
 }
 
-/// Рекурсивно собрать наборы с указанным родителем.
-fn build_sets(rows: &[DsRow], parent: &str, include_query: bool, with_fields: bool) -> Vec<Value> {
+/// Рекурсивно собрать наборы под родителем `parent` (индекс строки; `None` —
+/// верхний уровень). Родитель задан только именем, а вложенный набор
+/// объединения может называться так же, как само объединение (типовой
+/// `Report.Запасы`: объединение `НаборДанных3` содержит запрос `НаборДанных3`).
+/// Поэтому каждая строка попадает в дерево ровно один раз (`used`), а дети
+/// ищутся только после родителя по порядку файла — иначе рекурсия по
+/// одноимённому набору бесконечна и роняет сервер переполнением стека.
+fn build_sets(
+    rows: &[DsRow],
+    parent: Option<usize>,
+    used: &mut [bool],
+    include_query: bool,
+    with_fields: bool,
+) -> Vec<Value> {
+    let (parent_name, start) = match parent {
+        Some(p) => (rows[p].name.as_str(), p + 1),
+        None => ("", 0),
+    };
+    // Разобрать детей этого уровня целиком до спуска вглубь, чтобы одноимённый
+    // вложенный набор не забрал себе соседей.
+    let children: Vec<usize> = (start..rows.len())
+        .filter(|&i| !used[i] && rows[i].parent == parent_name)
+        .collect();
+    for &i in &children {
+        used[i] = true;
+    }
     let mut out = Vec::new();
-    for r in rows.iter().filter(|r| r.parent == parent) {
+    for i in children {
+        let r = &rows[i];
         let mut m = serde_json::Map::new();
         m.insert("name".into(), json!(r.name.as_str()));
         m.insert("kind".into(), json!(r.kind.as_str()));
@@ -459,7 +485,7 @@ fn build_sets(rows: &[DsRow], parent: &str, include_query: bool, with_fields: bo
             let n = r.fields.as_array().map(|a| a.len()).unwrap_or(0);
             m.insert("fields_count".into(), json!(n));
         }
-        let items = build_sets(rows, &r.name, include_query, with_fields);
+        let items = build_sets(rows, Some(i), used, include_query, with_fields);
         if !items.is_empty() {
             m.insert("items".into(), json!(items));
         }
@@ -752,6 +778,56 @@ mod tests {
         assert_eq!(v["data_sets"][0]["fields_omitted"].as_bool(), Some(true));
         assert_eq!(v["parameters_omitted"].as_bool(), Some(true));
         assert_eq!(v["parameters_count"].as_u64(), Some(1));
+    }
+
+    fn ds(name: &str, kind: &str, parent: &str) -> DsRow {
+        DsRow {
+            name: name.into(),
+            kind: kind.into(),
+            data_source: None,
+            object_name: None,
+            query: None,
+            fields: json!([]),
+            parent: parent.into(),
+        }
+    }
+
+    #[test]
+    fn вложенный_набор_с_именем_объединения_не_зацикливает() {
+        // Порядок строк как в индексе для типового Report.Запасы.
+        let rows = vec![
+            ds("НаборДанных3", "union", ""),
+            ds("НаборДанных1", "query", "НаборДанных3"),
+            ds("НаборДанных3", "query", "НаборДанных3"),
+            ds("НаборДанных2", "query", ""),
+        ];
+        let mut used = vec![false; rows.len()];
+        let v = json!(build_sets(&rows, None, &mut used, true, true));
+        assert_eq!(v.as_array().map(|a| a.len()), Some(2), "{v}");
+        assert_eq!(v[0]["kind"].as_str(), Some("union"));
+        let items = v[0]["items"].as_array().expect("items у объединения");
+        assert_eq!(items.len(), 2, "{v}");
+        assert_eq!(items[0]["name"].as_str(), Some("НаборДанных1"));
+        assert_eq!(items[1]["name"].as_str(), Some("НаборДанных3"));
+        assert_eq!(items[1]["kind"].as_str(), Some("query"));
+        assert!(items[1].get("items").is_none(), "{v}");
+        assert_eq!(v[1]["name"].as_str(), Some("НаборДанных2"));
+        assert!(used.iter().all(|&u| u));
+    }
+
+    #[test]
+    fn вложенное_объединение_собирает_своих_детей() {
+        let rows = vec![
+            ds("О", "union", ""),
+            ds("Вн", "union", "О"),
+            ds("А", "query", "Вн"),
+            ds("Б", "query", "О"),
+        ];
+        let mut used = vec![false; rows.len()];
+        let v = json!(build_sets(&rows, None, &mut used, true, true));
+        assert_eq!(v[0]["items"][0]["name"].as_str(), Some("Вн"));
+        assert_eq!(v[0]["items"][0]["items"][0]["name"].as_str(), Some("А"));
+        assert_eq!(v[0]["items"][1]["name"].as_str(), Some("Б"));
     }
 
     #[test]
