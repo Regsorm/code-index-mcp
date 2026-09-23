@@ -5,6 +5,27 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.5.1] — 2026-09-23
+
+**`get_dcs_schema` no longer crashes the server. A nested data set of a union may have the same name as the union itself — on such a schema building the data set tree recursed forever, and the serving process died of a stack overflow (Windows: `0xC00000FD`). Every connected client lost its connection.**
+
+> Context. The fix was contributed by an external participant (PR #11). Such schemas exist in standard configurations: 4 in "Управление нашей фирмой", 11 in "Бухгалтерия 3.0"; 5 in the test accounting base.
+
+### Fixed
+
+- **The schema data set tree is built by row position, not by parent name.** Each data set enters the tree exactly once, nested data sets are looked up only after their parent in file order, and one level's data sets are collected before descending — a nested set with the same name does not take over its siblings. For schemas without same-name sets the response is unchanged.
+
+### Compatibility
+
+- Only the serving layer changes: no reindexing needed, the response format is the same.
+
+### Verification
+
+- `cargo test --workspace --all-features`: 945 passed, 0 failed, including two new tests — a same-name nested set and a union nested in a union. `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- The previous algorithm reproduces the crash on the same rows: `STATUS_STACK_OVERFLOW`.
+- Live check on the installed server: all five schemas of the test base, including a union with three nesting levels, return the correct tree; a regular schema and a non-existent name answer as before.
+- Through the federation node (Linux) after reindexing the same base (92K files, 5 min): the same five schemas return the correct tree, the server never restarted. A schema of another base with two unions, each holding a nested set with the same name — every set sits under its own union.
+
 ## [1.5.0] — 2026-09-22
 
 **The `repo` parameter now has a default. With several repositories, a call without `repo` used to fail with a deserialization error and the client spent a turn retrying. The server now fills in the alias from the new `[mcp].default_repo` setting in `daemon.toml`, or the only repository when there is just one. When there is nothing to fill in, the rejection is the same for every tool and lists the available aliases.**
