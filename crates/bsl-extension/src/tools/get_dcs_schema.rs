@@ -428,7 +428,13 @@ fn load_datasets(
         }
     };
     let mut used = vec![false; rows.len()];
-    json!(build_sets(&rows, None, &mut used, include_query, with_fields))
+    json!(build_sets(
+        &rows,
+        None,
+        &mut used,
+        include_query,
+        with_fields
+    ))
 }
 
 /// Рекурсивно собрать наборы под родителем `parent` (индекс строки; `None` —
