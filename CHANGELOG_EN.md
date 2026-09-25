@@ -5,7 +5,9 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.6.0] — 2026-09-25
+
+**This release ships `code-index-guard` — a `PreToolUse` hook for Claude Code and Codex CLI that steers the model to read code through the index. It denies only where the index actually serves the same file and points to the right tool. Prebuilt binaries for Windows, Linux and macOS are in the release archives.**
 
 ### Added
 
@@ -13,6 +15,15 @@ Versioning — [SemVer](https://semver.org/).
 - **Hook event database via the `events_db` key** in `code-index-guard.toml`: one row per decision in the `hook_events` table. Without the key no events are written; there is no default path.
 - **Path case follows the build target** (`PATHS_CASE_INSENSITIVE`): on Windows and macOS paths are compared case-insensitively, as before; on Linux — exactly. Command names and flags (`cat`, `Get-Content`, `-Path`) are case-insensitive everywhere. Checked on a Linux VM: the previous logic gave 4 false denials out of 20 probes on files and folders differing only in case (`README.md` / `readme.md`, `repo` / `Repo`), the new one — 20 of 20; on Windows 74 of 74 probes, as before.
 - **Prebuilt guard archives in releases:** `code-index-guard-windows-x64.zip`, `code-index-guard-linux-x64.tar.gz`, `code-index-guard-macos-arm64.tar.gz` next to the `code-index` and `bsl-indexer` archives.
+
+### Compatibility
+
+- `code-index` and `bsl-indexer` are unchanged in this release: no reindexing needed, the response format is the same, federation nodes need not be updated.
+
+### Verification
+
+- `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features` — clean.
+- Guard on Windows: 74 of 74 probes on a working config, decisions are written to the event database. On Linux (static musl build, VM): unit tests 19 of 19, probes 20 of 20, 6 of them on name case.
 
 ## [1.5.1] — 2026-09-23
 
