@@ -77,6 +77,36 @@ enum Decision {
     Allow,
 }
 
+/// Различает ли файловая система регистр в путях: Windows и macOS (по умолчанию) — нет,
+/// Linux — да. Выбирается при сборке: исходник один, правило у каждой системы своё.
+///
+/// ⚠️ На Linux `README.md` и `readme.md`, `repo` и `Repo` — разные файлы и каталоги. Сравнение
+/// без учёта регистра находило в индексе «двойника» и отказывало по файлу, которого там нет
+/// (проверено на ВМ 25.09.2026: 2 ложных отказа из 19 проб).
+const PATHS_CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// Путь в виде для сравнения: без учёта регистра — нижний регистр, иначе как есть.
+fn fold_path_with(s: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        s.to_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Путь в виде для сравнения по правилу системы сборки. Имена команд и расширения
+/// сюда не относятся: они сравниваются без учёта регистра всегда.
+fn fold_path(s: &str) -> String {
+    fold_path_with(s, PATHS_CASE_INSENSITIVE)
+}
+
+/// `strip_prefix` без учёта регистра — для ключей команд (`-Path`, `/D`).
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
 /// Префикс имён инструментов code-index в этом клиенте (`--mcp-prefix`). У Codex они
 /// называются `mcp__code_index__read_file`, у Claude Code — `read_file`. Файл
 /// code-index-guard.toml общий для обоих клиентов, поэтому префикс задаётся ключом
@@ -267,12 +297,12 @@ fn target_repo(tool: &str, ti: &Value, cwd: Option<&str>) -> Option<String> {
         return Some(alias);
     }
     // Bash/PowerShell: путь внутри команды, поэтому ищем индексированный корень в ней
-    let norm_lower = normalize_msys_drives(&field("command").replace('\\', "/")).to_lowercase();
+    let norm = fold_path(&normalize_msys_drives(&field("command").replace('\\', "/")));
     let mut sorted: Vec<&(String, String)> = paths.iter().collect();
     sorted.sort_by_key(|запись| std::cmp::Reverse(запись.0.len()));
     sorted
         .into_iter()
-        .find(|(prefix, _)| norm_lower.contains(prefix.as_str()))
+        .find(|(prefix, _)| norm.contains(prefix.as_str()))
         .map(|(_, alias)| alias.clone())
 }
 
@@ -410,11 +440,17 @@ fn serveability(db: &str, rel: &str) -> Option<(Serve, Option<i64>)> {
     } else {
         "(SELECT 1 FROM text_files t WHERE t.file_id = f.id LIMIT 1)"
     };
+    // Регистр — по правилу системы: на Linux `README.md` не находит `readme.md`.
+    let collate = if PATHS_CASE_INSENSITIVE {
+        " COLLATE NOCASE"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT {text_subq}, \
                 (SELECT c.oversize FROM file_contents c WHERE c.file_id = f.id LIMIT 1), \
                 f.mtime \
-         FROM files f WHERE f.path = ?1 COLLATE NOCASE LIMIT 1"
+         FROM files f WHERE f.path = ?1{collate} LIMIT 1"
     );
     let row = match conn
         .query_row(&sql, rusqlite::params![rel], |r| {
@@ -519,7 +555,9 @@ fn decide_bash(ti: &Value, cwd: Option<&str>) -> Option<Decision> {
     if cmd.is_empty() {
         return None;
     }
-    let lower = normalize_msys_drives(&cmd.replace('\\', "/").to_lowercase());
+    // Пути в команде — по правилу регистра системы; имена команд сверяются отдельно,
+    // на копии звена в нижнем регистре (`head` ниже).
+    let lower = fold_path(&normalize_msys_drives(&cmd.replace('\\', "/")));
 
     // Пер-файловое чтение: cat / head / tail <файл> по индексированному файлу →
     // перенаправить в read_file (с той же проверкой serveable+свежесть, что у Read).
@@ -555,15 +593,16 @@ fn decide_bash(ti: &Value, cwd: Option<&str>) -> Option<Decision> {
             base = b;
             continue;
         }
+        let head = part.to_lowercase();
         // git grep / git log -S — история и содержимое коммитов, индексом не покрыты.
-        if part.starts_with("git ") {
+        if head.starts_with("git ") {
             continue;
         }
-        if BASH_READ_UTILS.iter().any(|u| part.starts_with(u)) {
+        if BASH_READ_UTILS.iter().any(|u| head.starts_with(u)) {
             // `ls` перехватывается в любом виде — список каталога заменяет list_files.
             // Единственное исключение: `ls -la <файл>` по СУЩЕСТВУЮЩИМ файлам — это взгляд
             // на размер и дату, list_files такого не даёт, и запрет был бы дед-эндом.
-            if part.starts_with("ls ") && ls_targets_are_files(&part, &base) {
+            if head.starts_with("ls ") && ls_targets_are_files(&part, &base) {
                 continue;
             }
             link = Some(part);
@@ -612,8 +651,9 @@ fn parse_assignment(part: &str, ps: bool) -> Option<(String, String)> {
 /// Some("") — каталог стал неизвестен (popd, cd -, нераскрытая $-подстановка):
 /// дальше воздерживаемся, а не судим по прежнему cwd.
 ///
-/// `part` уже в нижнем регистре, `\` заменены на `/`, MSYS-диски приведены (так его
-/// отдают циклы звеньев). Окружение функция не читает: домашний каталог передаёт
+/// В `part` пути уже приведены по правилу регистра системы (`fold_path`), `\` заменены на
+/// `/`, MSYS-диски приведены (так его отдают циклы звеньев); имя команды и ключи сверяются
+/// без учёта регистра. Окружение функция не читает: домашний каталог передаёт
 /// вызывающий, иначе модульные тесты зависели бы от переменных окружения машины.
 fn dir_change(part: &str, base: &str, home: Option<&str>) -> Option<String> {
     let base = base.replace('\\', "/");
@@ -629,7 +669,7 @@ fn dir_change(part: &str, base: &str, home: Option<&str>) -> Option<String> {
         None => (part, ""),
     };
     // Совпадение по слову целиком: `cdx foo` — не смена каталога.
-    let (ps_no_arg, is_pop) = match cmd {
+    let (ps_no_arg, is_pop) = match cmd.to_lowercase().as_str() {
         "cd" | "pushd" => (false, false),
         // PowerShell без аргумента каталог не меняет: `sl` печатает текущий.
         "set-location" | "sl" | "push-location" => (true, false),
@@ -643,7 +683,7 @@ fn dir_change(part: &str, base: &str, home: Option<&str>) -> Option<String> {
     // Ведущие ключи: у Set-Location это -Path/-LiteralPath, у cmd-шного cd — /d.
     let arg = ["-path ", "-literalpath ", "/d "]
         .iter()
-        .find_map(|k| arg.strip_prefix(k))
+        .find_map(|k| strip_prefix_ci(arg, k))
         .unwrap_or(arg)
         .trim()
         .trim_matches('"')
@@ -715,14 +755,14 @@ fn normalize_dir(path: &str) -> String {
 }
 
 /// Домашний каталог для раскрытия `cd ~`: USERPROFILE, иначе HOME, приведённый так же,
-/// как сама команда (нижний регистр, `\`→`/`, MSYS-диски). Читает окружение только он.
+/// как сама команда (регистр по правилу системы, `\`→`/`, MSYS-диски). Читает окружение только он.
 fn home_dir() -> Option<String> {
     let raw = std::env::var("USERPROFILE")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| std::env::var("HOME").ok().filter(|s| !s.trim().is_empty()))?;
     let norm = normalize_msys_drives(&raw.replace('\\', "/"));
-    Some(norm.trim_end_matches('/').to_lowercase())
+    Some(fold_path(norm.trim_end_matches('/')))
 }
 
 /// Подставляет known-переменные в звено: `$root` и `${root}`. Длинные имена первыми,
@@ -755,7 +795,8 @@ fn redirect_for_link(link: &str, base: &str, tool_label: &str) -> Option<Decisio
         return None;
     }
     // Команда трогает бинарь → воздержаться (его в индексе нет, дед-энд недопустим).
-    if BINARY_EXT.iter().any(|e| link.contains(e)) {
+    let link_lc = link.to_lowercase();
+    if BINARY_EXT.iter().any(|e| link_lc.contains(e)) {
         return None;
     }
     let paths = indexed_paths();
@@ -822,7 +863,7 @@ fn redirect_for_link(link: &str, base: &str, tool_label: &str) -> Option<Decisio
 /// несколько файлов, неизвестные флаги, -f (tail follow), -c (байты), а также
 /// если файл не индексирован или индекс отстал (read_is_blockable=false).
 fn decide_bash_file_read(cmd: &str, lower: &str, cwd: Option<&str>) -> Option<Decision> {
-    let s = lower.trim_start();
+    let s = lower.trim_start().to_lowercase();
     let util = if s.starts_with("cat ") {
         "cat"
     } else if s.starts_with("head ") {
@@ -933,7 +974,8 @@ fn decide_powershell(ti: &Value, cwd: Option<&str>) -> Option<Decision> {
         return None;
     }
     let cmd = strip_here_strings(cmd);
-    let lower = normalize_msys_drives(&cmd.replace('\\', "/").to_lowercase());
+    // Как у Bash: пути — по правилу регистра системы, командлеты — без учёта регистра.
+    let lower = fold_path(&normalize_msys_drives(&cmd.replace('\\', "/")));
 
     if let Some(d) = decide_ps_file_read(&cmd, &lower, cwd) {
         return Some(d);
@@ -962,16 +1004,17 @@ fn decide_powershell(ti: &Value, cwd: Option<&str>) -> Option<Decision> {
             base = b;
             continue;
         }
+        let head = part.to_lowercase();
         // git grep / git log -S — история, индексом не покрыта.
-        if part.starts_with("git ") {
+        if head.starts_with("git ") {
             continue;
         }
-        if PS_READ_UTILS.iter().any(|u| part.starts_with(u)) {
+        if PS_READ_UTILS.iter().any(|u| head.starts_with(u)) {
             // Список каталога заменяет list_files, но взгляд на размер/дату конкретных
             // существующих файлов MCP не отдаёт — там запрет был бы дед-эндом.
             let is_listing = ["ls ", "dir ", "gci ", "get-childitem "]
                 .iter()
-                .any(|u| part.starts_with(u));
+                .any(|u| head.starts_with(u));
             if is_listing && ls_targets_are_files(&part, &base) {
                 continue;
             }
@@ -987,7 +1030,7 @@ fn decide_powershell(ti: &Value, cwd: Option<&str>) -> Option<Decision> {
 /// чтения: конвейеры, перенаправления, подстановки, маски, несколько файлов,
 /// неизвестные флаги, а также когда файл не индексирован или индекс отстал.
 fn decide_ps_file_read(cmd: &str, lower: &str, cwd: Option<&str>) -> Option<Decision> {
-    let s = lower.trim_start();
+    let s = lower.trim_start().to_lowercase();
     let util = ["get-content ", "gc ", "cat ", "type "]
         .iter()
         .find(|u| s.starts_with(**u))?
@@ -1230,7 +1273,7 @@ fn daemon_toml_path(cfg: &GuardConfig) -> Option<String> {
         .or_else(|| cfg.daemon_toml.clone())
 }
 
-/// Возвращает [(prefix_lower_noslash, alias)]. prefix — forward-slash, lower.
+/// Возвращает [(prefix_noslash, alias)]. prefix — forward-slash, регистр по `fold_path`.
 /// Список = репо из daemon.toml + [[local]] из конфига, с дедупликацией по пути:
 /// daemon.toml приоритетен, [[local]] добавляет лишь отсутствующие в нём пути.
 fn indexed_paths() -> Vec<(String, String)> {
@@ -1259,7 +1302,7 @@ fn indexed_paths() -> Vec<(String, String)> {
 }
 
 fn norm_prefix(p: &str) -> String {
-    p.replace('\\', "/").trim_end_matches('/').to_lowercase()
+    fold_path(p.replace('\\', "/").trim_end_matches('/'))
 }
 
 /// Выбрасывает тела heredoc'ов (`… <<'TAG'` … строка `TAG`): это ДАННЫЕ, а не команды.
@@ -1367,7 +1410,7 @@ fn split_chain(cmd: &str) -> Vec<String> {
 /// Сравнение — ПО СЕГМЕНТАМ, а не подстрокой: встроенный список задан как `/.venv/`, а в командах
 /// путь обычно относительный (`.venv/Lib`), и подстрока с ведущим слешем не находилась.
 fn excluded_from_index(root: &str, rel: &str) -> bool {
-    let rel_l = rel.replace('\\', "/").to_lowercase();
+    let rel_l = fold_path(&rel.replace('\\', "/"));
     let segments: Vec<&str> = rel_l.split('/').filter(|s| !s.is_empty()).collect();
 
     // Встроенные — то, что walker code-index не обходит никогда.
@@ -1406,7 +1449,7 @@ fn excluded_from_index(root: &str, rel: &str) -> bool {
     };
     if let Some(dirs) = cfg.get("exclude_dirs").and_then(|v| v.as_array()) {
         for d in dirs.iter().filter_map(|v| v.as_str()) {
-            let d = d.to_lowercase();
+            let d = fold_path(d);
             if segments.iter().any(|s| *s == d) {
                 return true;
             }
@@ -1415,7 +1458,7 @@ fn excluded_from_index(root: &str, rel: &str) -> bool {
     if let Some(pats) = cfg.get("exclude_file_patterns").and_then(|v| v.as_array()) {
         // Образец сверяем с КАЖДЫМ сегментом: цель бывает и файлом, и маской (`tests/*_run_*.json`).
         for p in pats.iter().filter_map(|v| v.as_str()) {
-            let p = p.to_lowercase();
+            let p = fold_path(p);
             if segments.iter().any(|s| glob_match(&p, s)) {
                 return true;
             }
@@ -1489,7 +1532,7 @@ fn match_indexed(raw: &str, paths: &[(String, String)]) -> Option<(String, Strin
         return None;
     }
     let norm = normalize_msys_drives(&raw.replace('\\', "/"));
-    let norm_lower = norm.to_lowercase();
+    let norm_lower = fold_path(&norm);
     // Длинные префиксы первыми: C:/Projects/app/core выигрывает над C:/Projects/app.
     let mut sorted: Vec<&(String, String)> = paths.iter().collect();
     sorted.sort_by_key(|запись| std::cmp::Reverse(запись.0.len()));
@@ -1789,5 +1832,73 @@ mod dir_change_tests {
     fn tool_without_prefix_is_bare_name() {
         // Без --mcp-prefix тексты для модели обязаны остаться прежними побайтно.
         assert_eq!(tool("read_file"), "read_file");
+    }
+
+    #[test]
+    fn command_and_keys_are_case_insensitive_path_keeps_case() {
+        // Имя команды и ключ PowerShell — без учёта регистра; путь приходит как есть.
+        assert_eq!(
+            dir_change("Set-Location -Path /srv/Repo", "/", None).as_deref(),
+            Some("/srv/Repo")
+        );
+        assert_eq!(
+            dir_change("CD /D C:/Temp", "c:/repo", None).as_deref(),
+            Some("C:/Temp")
+        );
+        assert_eq!(
+            dir_change("cd Src", "/srv/Repo", None).as_deref(),
+            Some("/srv/Repo/Src")
+        );
+    }
+}
+
+#[cfg(test)]
+mod case_tests {
+    use super::{fold_path_with, match_indexed, norm_prefix, strip_prefix_ci};
+
+    #[test]
+    fn fold_both_rules() {
+        assert_eq!(
+            fold_path_with("C:/Repo/README.md", true),
+            "c:/repo/readme.md"
+        );
+        assert_eq!(
+            fold_path_with("/srv/Repo/README.md", false),
+            "/srv/Repo/README.md"
+        );
+    }
+
+    #[test]
+    fn strip_prefix_ignores_case() {
+        assert_eq!(strip_prefix_ci("-Path x", "-path "), Some("x"));
+        assert_eq!(
+            strip_prefix_ci("-LITERALPATH x", "-literalpath "),
+            Some("x")
+        );
+        assert_eq!(strip_prefix_ci("-P", "-path "), None);
+        // Граница многобайтного символа не должна ронять разбор.
+        assert_eq!(strip_prefix_ci("Путь", "-path "), None);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn case_insensitive_system() {
+        let paths = vec![(norm_prefix("C:/Projects/App"), "app".to_string())];
+        let m = match_indexed("c:/projects/app/SRC/main.rs", &paths).expect("тот же каталог");
+        assert_eq!(m.0, "app");
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn case_sensitive_system() {
+        let paths = vec![(norm_prefix("/srv/repo"), "repo".to_string())];
+        // Соседний каталог, отличающийся регистром, — ДРУГОЙ каталог.
+        assert!(match_indexed("/srv/Repo/src/lib.rs", &paths).is_none());
+        let m = match_indexed("/srv/repo/src/Lib.rs", &paths).expect("свой каталог");
+        assert_eq!(m.1, "src/Lib.rs"); // относительный путь сохраняет регистр
+                                       // Индексированный каталог с заглавными буквами узнаётся как есть.
+        let upper = vec![(norm_prefix("/data/MyRepo"), "my".to_string())];
+        assert!(match_indexed("/data/MyRepo/x.bsl", &upper).is_some());
+        assert!(match_indexed("/data/myrepo/x.bsl", &upper).is_none());
     }
 }

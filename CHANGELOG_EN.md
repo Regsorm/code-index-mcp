@@ -11,6 +11,7 @@ Versioning — [SemVer](https://semver.org/).
 
 - **`code-index-guard` in the workspace (`crates/code-index-guard`).** A `PreToolUse` hook for Claude Code and Codex CLI: denies native reads, searches and directory walks only for files the index serves, and points to the code-index tool; a new, not yet reindexed, excluded or oversized file passes through. The `--list-roots` mode injects the list of indexed folders into the session context (`SessionStart`); the `--mcp-prefix` flag sets tool names for Codex. The hook used to be built separately and was not part of releases.
 - **Hook event database via the `events_db` key** in `code-index-guard.toml`: one row per decision in the `hook_events` table. Without the key no events are written; there is no default path.
+- **Path case follows the build target** (`PATHS_CASE_INSENSITIVE`): on Windows and macOS paths are compared case-insensitively, as before; on Linux — exactly. Command names and flags (`cat`, `Get-Content`, `-Path`) are case-insensitive everywhere. Checked on a Linux VM: the previous logic gave 4 false denials out of 20 probes on files and folders differing only in case (`README.md` / `readme.md`, `repo` / `Repo`), the new one — 20 of 20; on Windows 74 of 74 probes, as before.
 - **Prebuilt guard archives in releases:** `code-index-guard-windows-x64.zip`, `code-index-guard-linux-x64.tar.gz`, `code-index-guard-macos-arm64.tar.gz` next to the `code-index` and `bsl-indexer` archives.
 
 ## [1.5.1] — 2026-09-23
