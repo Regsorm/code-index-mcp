@@ -57,6 +57,27 @@ jobs:
             artifact: bsl-indexer
             archive: bsl-indexer-macos-arm64.tar.gz
 
+          # code-index-guard — хук PreToolUse для Claude Code и Codex CLI:
+          # отдельный маленький бинарник, от ядра не зависит.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            crate: code-index-guard
+            features: ''
+            artifact: code-index-guard.exe
+            archive: code-index-guard-windows-x64.zip
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            crate: code-index-guard
+            features: ''
+            artifact: code-index-guard
+            archive: code-index-guard-linux-x64.tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            crate: code-index-guard
+            features: ''
+            artifact: code-index-guard
+            archive: code-index-guard-macos-arm64.tar.gz
+
     runs-on: ${{ matrix.os }}
 
     steps:

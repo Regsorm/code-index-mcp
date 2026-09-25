@@ -11,6 +11,7 @@ Versioning — [SemVer](https://semver.org/).
 
 - **`code-index-guard` in the workspace (`crates/code-index-guard`).** A `PreToolUse` hook for Claude Code and Codex CLI: denies native reads, searches and directory walks only for files the index serves, and points to the code-index tool; a new, not yet reindexed, excluded or oversized file passes through. The `--list-roots` mode injects the list of indexed folders into the session context (`SessionStart`); the `--mcp-prefix` flag sets tool names for Codex. The hook used to be built separately and was not part of releases.
 - **Hook event database via the `events_db` key** in `code-index-guard.toml`: one row per decision in the `hook_events` table. Without the key no events are written; there is no default path.
+- **Prebuilt guard archives in releases:** `code-index-guard-windows-x64.zip`, `code-index-guard-linux-x64.tar.gz`, `code-index-guard-macos-arm64.tar.gz` next to the `code-index` and `bsl-indexer` archives.
 
 ## [1.5.1] — 2026-09-23
 

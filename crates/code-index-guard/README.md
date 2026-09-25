@@ -36,7 +36,9 @@
 
 ## Сборка
 
-Из корня репозитория code-index:
+Готовый бинарник — в [выпусках code-index](https://github.com/Regsorm/code-index-mcp/releases): `code-index-guard-windows-x64.zip`, `code-index-guard-linux-x64.tar.gz`, `code-index-guard-macos-arm64.tar.gz`.
+
+Сборка из исходников — из корня репозитория code-index:
 
 ```bash
 cargo build --release -p code-index-guard
