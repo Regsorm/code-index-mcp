@@ -6,6 +6,7 @@ members = [
     "crates/bsl-extension",
     "crates/bsl-indexer",
     "crates/bsl-parse",
+    "crates/code-index-guard",
 ]
 
 # Общие метаданные пакетов воркспейса. Каждый крейт может переопределить.

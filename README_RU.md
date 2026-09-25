@@ -315,6 +315,17 @@ code-index serve --transport http --port 8011 --config /etc/code-index/daemon.to
 }
 ```
 
+### Гард: чтение через индекс (необязательно)
+
+`code-index-guard` — хук `PreToolUse` для Claude Code и Codex CLI из этой же рабочей области
+(`crates/code-index-guard`). Он отклоняет обычные `Read`/`Grep`/`Glob` и чтение командами
+оболочки (`cat`, `rg`, `Get-Content`, …) только по файлам, которые индекс действительно отдаёт,
+и подсказывает инструмент code-index. Новый, ещё не проиндексированный, исключённый или
+слишком большой файл читается как обычно. Каталоги берутся из `daemon.toml`, события хука
+по желанию пишутся в базу SQLite (ключ `events_db`). Сборка:
+`cargo build --release -p code-index-guard`; установка и настройка —
+[crates/code-index-guard/README.md](crates/code-index-guard/README.md).
+
 ## MCP-инструменты
 
 | Инструмент | Описание |

@@ -1,0 +1,16 @@
+[package]
+name = "code-index-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PreToolUse hook for Claude Code and Codex CLI: redirects native reads of files that code-index serves to its MCP tools, and only for those files."
+
+# Отдельный маленький бинарник: запускается на каждый вызов инструмента
+# клиента, поэтому от ядра code-index не зависит — читает index.db напрямую.
+[[bin]]
+name = "code-index-guard"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+rusqlite = { workspace = true }

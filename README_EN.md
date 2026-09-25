@@ -313,6 +313,16 @@ For a shared HTTP process:
 }
 ```
 
+### Guard: reading through the index (optional)
+
+`code-index-guard` is a `PreToolUse` hook for Claude Code and Codex CLI from the same workspace
+(`crates/code-index-guard`). It denies native `Read`/`Grep`/`Glob` and shell reads (`cat`, `rg`,
+`Get-Content`, …) only for files the index actually serves, and points the model to the
+code-index tool instead. A new, not yet indexed, excluded or oversized file is read as usual.
+Indexed folders come from `daemon.toml`; hook events can optionally be written to an SQLite
+database (the `events_db` key). Build: `cargo build --release -p code-index-guard`; install and
+configuration — [crates/code-index-guard/README.md](crates/code-index-guard/README.md) (in Russian).
+
 ## MCP Tools
 
 | Tool | Description |

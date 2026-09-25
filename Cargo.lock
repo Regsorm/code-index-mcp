@@ -406,6 +406,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "code-index-guard"
+version = "1.5.1"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

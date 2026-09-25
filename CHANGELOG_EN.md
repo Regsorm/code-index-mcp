@@ -5,6 +5,13 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`code-index-guard` in the workspace (`crates/code-index-guard`).** A `PreToolUse` hook for Claude Code and Codex CLI: denies native reads, searches and directory walks only for files the index serves, and points to the code-index tool; a new, not yet reindexed, excluded or oversized file passes through. The `--list-roots` mode injects the list of indexed folders into the session context (`SessionStart`); the `--mcp-prefix` flag sets tool names for Codex. The hook used to be built separately and was not part of releases.
+- **Hook event database via the `events_db` key** in `code-index-guard.toml`: one row per decision in the `hook_events` table. Without the key no events are written; there is no default path.
+
 ## [1.5.1] — 2026-09-23
 
 **`get_dcs_schema` no longer crashes the server. A nested data set of a union may have the same name as the union itself — on such a schema building the data set tree recursed forever, and the serving process died of a stack overflow (Windows: `0xC00000FD`). Every connected client lost its connection.**
