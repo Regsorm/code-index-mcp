@@ -63,6 +63,13 @@ pub struct ServeCache {
     /// `_meta.dependent_files` при `insert`). Позволяет инвалидировать ТОЛЬКО
     /// зависящие от изменённого файла ключи, а не весь репо.
     reverse: RwLock<HashMap<(String, String), HashSet<String>>>,
+    /// Ключи ответов БЕЗ зависимых файлов по репозиториям (пустой результат,
+    /// обход графа). Обратным индексом их не вытеснить, поэтому точечная
+    /// инвалидация репо сносит их все: после правки «вызывающих нет» или
+    /// «ничего не найдено» могли стать неправдой, а пересчёт таких ответов
+    /// дешёв. Без этого пустой ответ графа до своего короткого срока (15 с)
+    /// отдавался и после того, как вызов появился.
+    depless: RwLock<HashMap<String, HashSet<String>>>,
     ttl: Duration,
     /// Страховка: «грязная» пометка файла протухает через этот срок, если
     /// post-commit `/invalidate` не пришёл (демон упал в переразборе).
@@ -94,6 +101,7 @@ impl ServeCache {
             store: RwLock::new(HashMap::new()),
             dirty: RwLock::new(HashMap::new()),
             reverse: RwLock::new(HashMap::new()),
+            depless: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(ttl_secs.max(1)),
             // Страховка: если post-commit `/invalidate` не пришёл (демон упал в
             // переразборе), «грязная» пометка файла протухает через 120с.
@@ -185,7 +193,12 @@ impl ServeCache {
             expires: Instant::now() + ttl,
         };
         lock_w(&self.store).insert(key.clone(), entry);
-        if !deps.is_empty() {
+        if deps.is_empty() {
+            lock_w(&self.depless)
+                .entry(repo.to_string())
+                .or_default()
+                .insert(key.clone());
+        } else {
             let mut rev = lock_w(&self.reverse);
             for d in deps {
                 rev.entry((repo.to_string(), d.clone()))
@@ -221,6 +234,11 @@ impl ServeCache {
             let store = lock_r(&self.store);
             let mut rev = lock_w(&self.reverse);
             rev.retain(|_, keys| {
+                keys.retain(|k| store.contains_key(k));
+                !keys.is_empty()
+            });
+            let mut depless = lock_w(&self.depless);
+            depless.retain(|_, keys| {
                 keys.retain(|k| store.contains_key(k));
                 !keys.is_empty()
             });
@@ -261,6 +279,7 @@ impl ServeCache {
         drop(guard);
         // Обратный индекс этого репо больше не нужен.
         lock_w(&self.reverse).retain(|(r, _), _| r != scope);
+        lock_w(&self.depless).remove(scope);
         // «Грязные» пометки репо снимаем здесь же. Полный сброс их чистит, а
         // сброс по одному репо — нет: пометки жили до dirty_max_age и всё это
         // время подавляли кэширование ответов репо, хотя индекс уже пересобран
@@ -284,6 +303,7 @@ impl ServeCache {
         guard.clear();
         drop(guard);
         lock_w(&self.reverse).clear();
+        lock_w(&self.depless).clear();
         lock_w(&self.dirty).clear();
         self.invalidations
             .fetch_add(removed as u64, Ordering::Relaxed);
@@ -298,10 +318,34 @@ impl ServeCache {
         }
         self.bump_epoch(repo);
         let now = Instant::now();
-        let mut d = lock_w(&self.dirty);
-        for (path, mtime) in files {
-            d.insert((repo.to_string(), path.clone()), (*mtime, now));
+        {
+            let mut d = lock_w(&self.dirty);
+            for (path, mtime) in files {
+                d.insert((repo.to_string(), path.clone()), (*mtime, now));
+            }
         }
+        // Ответы репо без зависимых файлов сносим уже здесь, в начале пачки:
+        // «грязные» пометки их не защищают (у них нет `file_mtimes`), а точечная
+        // инвалидация приходит только после надстройки — на крупной
+        // конфигурации 1С это секунды, и всё это время старый «вызывающих нет»
+        // отдавался бы из кэша раньше, чем инструмент дождётся готовности.
+        self.drop_depless(repo);
+    }
+
+    /// Снести из кэша ответы репо без зависимых файлов. Возвращает число
+    /// удалённых записей.
+    fn drop_depless(&self, repo: &str) -> usize {
+        let Some(keys) = lock_w(&self.depless).remove(repo) else {
+            return 0;
+        };
+        let mut store = lock_w(&self.store);
+        let removed = keys.iter().filter(|k| store.remove(*k).is_some()).count();
+        drop(store);
+        if removed > 0 {
+            self.invalidations
+                .fetch_add(removed as u64, Ordering::Relaxed);
+        }
+        removed
     }
 
     /// Файл «грязный» относительно `index_mtime` (из `_meta.file_mtimes` ответа)?
@@ -352,6 +396,12 @@ impl ServeCache {
                     keys.extend(set);
                 }
             }
+        }
+        // 2а) ответы репо без зависимых файлов: правка могла сделать неправдой
+        // и их («вызывающих нет», «ничего не найдено») — сносим все. Основной
+        // сброс идёт ещё в `mark_dirty`; здесь добиваем посчитанные за пачку.
+        if let Some(set) = lock_w(&self.depless).remove(repo) {
+            keys.extend(set);
         }
         if keys.is_empty() {
             return 0;
@@ -478,6 +528,56 @@ mod tests {
         assert!(c.get(&long).is_some(), "базовый срок не истёк");
         assert_eq!(c.invalidate_files("ut", &["src/X.bsl".to_string()]), 1);
         assert!(c.get(&long).is_none(), "вытеснена точечной инвалидацией");
+    }
+
+    /// Пустой ответ (без зависимых файлов), закэшированный ДО правки, не должен
+    /// отдаваться после неё: точечная инвалидация репо сносит такие ответы,
+    /// не трогая чужие репозитории.
+    #[test]
+    fn invalidate_files_drops_depless_entries_of_repo() {
+        let c = ServeCache::new(3600, true);
+        let empty_ut = ServeCache::key("ut", "get_callers", &json!({"function_name": "Новая"}));
+        let empty_bp = ServeCache::key("bp", "get_callers", &json!({"function_name": "Новая"}));
+        for (k, r) in [(&empty_ut, "ut"), (&empty_bp, "bp")] {
+            c.insert_with_ttl(
+                k.clone(),
+                Arc::new("{\"result\":[]}".into()),
+                r,
+                &[],
+                std::time::Duration::from_secs(15),
+            );
+        }
+        assert!(c.get(&empty_ut).is_some());
+        assert_eq!(c.invalidate_files("ut", &["src/Модуль.bsl".to_string()]), 1);
+        assert!(
+            c.get(&empty_ut).is_none(),
+            "пустой ответ репо сброшен правкой"
+        );
+        assert!(c.get(&empty_bp).is_some(), "чужой репозиторий не задет");
+    }
+
+    /// Пометка «файлы изменились» (начало пачки) сразу сносит ответы репо без
+    /// зависимых файлов: точечная инвалидация придёт лишь после надстройки.
+    #[test]
+    fn mark_dirty_drops_depless_entries_of_repo() {
+        let c = ServeCache::new(3600, true);
+        let empty_ut = ServeCache::key("ut", "get_callers", &json!({"function_name": "Новая"}));
+        let empty_bp = ServeCache::key("bp", "get_callers", &json!({"function_name": "Новая"}));
+        for (k, r) in [(&empty_ut, "ut"), (&empty_bp, "bp")] {
+            c.insert_with_ttl(
+                k.clone(),
+                Arc::new("{\"result\":[]}".into()),
+                r,
+                &[],
+                std::time::Duration::from_secs(15),
+            );
+        }
+        c.mark_dirty("ut", &[("src/Модуль.bsl".to_string(), 42)]);
+        assert!(
+            c.get(&empty_ut).is_none(),
+            "пустой ответ репо сброшен в начале пачки"
+        );
+        assert!(c.get(&empty_bp).is_some(), "чужой репозиторий не задет");
     }
 
     #[test]
