@@ -460,7 +460,12 @@ fn process_batch_full_pass(
         .resolved_processor
         .and_then(|proc| proc.parse_collector());
     let core_ok = {
-        let mut indexer = Indexer::with_config(storage, ctx.index_config.clone());
+        // Откладывать полнотекст здесь незачем: папка закрыта до конца прохода,
+        // а отложенная сборка переписывает указатель по всем текстовым файлам
+        // (замер на 57 тыс. файлов: 27,5 с против 19,8 с синхронно).
+        let mut index_config = ctx.index_config.clone();
+        index_config.defer_fts = false;
+        let mut indexer = Indexer::with_config(storage, index_config);
         match indexer.full_reindex_with_collector_and_stop(
             ctx.path,
             false,
@@ -496,9 +501,9 @@ fn process_batch_full_pass(
         return BatchStep::Stop;
     }
 
-    // Пакетный режим с отложенным полнотекстом оставил отметку «не собран»:
-    // дособираем до надстройки, как на старте, иначе `search_*` закрыты до
-    // перезапуска демона.
+    // Отметка «не собран» осталась от оборванной досборки на старте — проход её
+    // не снимает (хранилище по ней пропускает полнотекст). Дособираем до
+    // надстройки, иначе `search_*` закрыты до перезапуска демона.
     if core_ok && storage.fts_build_pending() {
         build_deferred_fts(storage, ctx.path);
     }
@@ -1916,28 +1921,42 @@ mod tests {
     }
 
     /// Регресс: демон индексирует с отложенным полнотекстом (`defer_fts`), а
-    /// дособирал его только при старте. Крупная пачка во время работы идёт
-    /// полным проходом в пакетном режиме, ставит отметку «полнотекст не
+    /// дособирал его только при старте. Крупная пачка во время работы шла
+    /// полным проходом в пакетном режиме, ставила отметку «полнотекст не
     /// собран» — и `search_*` оставались закрытыми до перезапуска демона.
+    /// Теперь проход пачки полнотекст не откладывает, а отметку, оставшуюся
+    /// от оборванной досборки на старте, дособирает.
     #[test]
-    fn полный_проход_пачки_дособирает_отложенный_полнотекст() {
+    fn полный_проход_пачки_оставляет_полнотекст_собранным() {
+        for leftover in [false, true] {
+            полный_проход_пачки_с_отметкой(leftover);
+        }
+    }
+
+    fn полный_проход_пачки_с_отметкой(leftover: bool) {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("main.py");
+        let text = root.join("readme.md");
         std::fs::write(&file, "def before_edit():\n    return 1\n").unwrap();
+        std::fs::write(&text, "прежний текст").unwrap();
 
         let mut storage = Storage::open_file(&tmp.path().join("index.db")).unwrap();
         Indexer::with_config(&mut storage, IndexConfig::default())
             .full_reindex(&root, true)
             .unwrap();
         assert!(!storage.fts_build_pending());
+        if leftover {
+            storage.set_fts_build_pending(true).unwrap();
+        }
 
         std::fs::write(
             &file,
             "def after_edit_function():\n    return 2\n\n\ndef second():\n    pass\n",
         )
         .unwrap();
+        std::fs::write(&text, "складской резерв").unwrap();
 
         let entry = crate::daemon_core::config::parse_str(&format!(
             "[[paths]]\npath = '{}'\n",
@@ -1974,21 +1993,35 @@ mod tests {
         process_batch_full_pass(
             &ctx,
             &mut storage,
-            &[FileEvent::Modified(file.clone())],
+            &[
+                FileEvent::Modified(file.clone()),
+                FileEvent::Modified(text.clone()),
+            ],
             std::time::Instant::now(),
             String::new(),
         );
 
         assert!(
             !storage.fts_build_pending(),
-            "после полного прохода пачки полнотекст обязан быть собран"
+            "после полного прохода пачки полнотекст обязан быть собран (leftover={leftover})"
         );
         assert!(
             !storage
                 .search_functions("after_edit_function", 10, None)
                 .unwrap()
                 .is_empty(),
-            "поиск находит функцию из пачки без перезапуска демона"
+            "поиск находит функцию из пачки без перезапуска демона (leftover={leftover})"
+        );
+        assert!(
+            !storage
+                .search_text("складской", 10, None)
+                .unwrap()
+                .is_empty(),
+            "текстовый поиск видит новый текст (leftover={leftover})"
+        );
+        assert!(
+            storage.search_text("прежний", 10, None).unwrap().is_empty(),
+            "прежний текст из полнотекста снят (leftover={leftover})"
         );
     }
 
