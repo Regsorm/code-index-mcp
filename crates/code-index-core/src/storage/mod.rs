@@ -3138,14 +3138,23 @@ impl Storage {
     /// `0` ставят процессоры-расширения на время своей работы; успешное
     /// завершение снова пишет `1`.
     pub fn extras_build_complete(&self) -> bool {
-        self.conn
-            .query_row(
-                "SELECT value FROM index_state WHERE key = ?1",
-                params![Self::EXTRAS_BUILD_COMPLETE_KEY],
-                |r| r.get::<_, String>(0),
-            )
-            .map(|v| v.trim() != "0")
-            .unwrap_or(true)
+        !matches!(self.extras_build_complete_state(), Ok(Some(false)))
+    }
+
+    /// Прочитать отметку без подмены ошибки «да»: `Ok(None)` — ключа нет (база
+    /// прежней версии или репозиторий без надстройки), `Err` — прочитать не
+    /// удалось. Нужен гейту инструментов: при сбое чтения он обязан закрыться,
+    /// а не открыть неполный слой.
+    pub fn extras_build_complete_state(&self) -> Result<Option<bool>> {
+        match self.conn.query_row(
+            "SELECT value FROM index_state WHERE key = ?1",
+            params![Self::EXTRAS_BUILD_COMPLETE_KEY],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(v) => Ok(Some(v.trim() != "0")),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("extras_build_complete: не удалось прочитать отметку"),
+        }
     }
 
     /// Поставить отметку о завершённости (или незавершённости) надстройки.
@@ -3283,21 +3292,31 @@ impl Storage {
 
         // 2. Текст: чистый contentless-указатель + проход по сжатым содержимым.
         // DROP+CREATE одной транзакцией: читатели видят либо старую таблицу,
-        // либо новую, но не «пропавшую».
+        // либо новую, но не «пропавшую». Ошибку внутри (например, откат
+        // `CREATE VIRTUAL TABLE`) снимаем сами: `execute_batch` останавливается
+        // на первом сбое, оставляя транзакцию открытой.
         let t = std::time::Instant::now();
-        self.conn
-            .execute_batch(
-                "BEGIN;
-                 DROP TABLE IF EXISTS fts_text_files;
-                 CREATE VIRTUAL TABLE fts_text_files USING fts5(content, content='');
-                 COMMIT;",
-            )
-            .context("build_fts_deferred: пересоздание fts_text_files")?;
+        let recreate = self.conn.execute_batch(
+            "BEGIN;
+             DROP TABLE IF EXISTS fts_text_files;
+             CREATE VIRTUAL TABLE fts_text_files USING fts5(content, content='');
+             COMMIT;",
+        );
+        if let Err(e) = recreate {
+            if let Err(rb) = self.rollback_batch() {
+                tracing::warn!("отложенный FTS: откат пересоздания не удался: {}", rb);
+            }
+            return Err(e).context("build_fts_deferred: пересоздание fts_text_files");
+        }
 
         let mut scanned = 0usize;
         let mut written = 0usize;
+        // Откатываем только СВОЮ транзакцию: если `begin_batch` не прошёл
+        // (например, чужой открытый батч), чужие изменения трогать нельзя.
+        let mut begun = false;
         let fill = (|| -> Result<()> {
             self.begin_batch()?;
+            begun = true;
             let mut ins = self
                 .conn
                 .prepare_cached("INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)")?;
@@ -3346,8 +3365,10 @@ impl Storage {
             // Открытая транзакция не должна пережить ошибку: для in-memory она
             // ломает последующий `flush_to_disk`, для файла — следующий BEGIN
             // (watcher / инкремент). Флаг pending остаётся — сборка повторится.
-            if let Err(rb) = self.rollback_batch() {
-                tracing::warn!("отложенный FTS: откат после ошибки не удался: {}", rb);
+            if begun {
+                if let Err(rb) = self.rollback_batch() {
+                    tracing::warn!("отложенный FTS: откат после ошибки не удался: {}", rb);
+                }
             }
             return Err(e);
         }
@@ -3775,6 +3796,16 @@ pub struct WriteAccum {
     variables: Vec<VariableRecord>,
 }
 
+/// Размеры буферов [`WriteAccum`] на момент [`WriteAccum::checkpoint`].
+#[derive(Clone, Copy)]
+pub struct WriteAccumCheckpoint {
+    functions: usize,
+    classes: usize,
+    imports: usize,
+    calls: usize,
+    variables: usize,
+}
+
 impl WriteAccum {
     /// Порог сброса в строках: подобран так, чтобы уложиться в лимит
     /// параметров SQLite (обычно 32 766) с запасом, но не мельчить: чем
@@ -3833,6 +3864,30 @@ impl WriteAccum {
         self.flush_calls(storage)?;
         self.flush_variables(storage)?;
         Ok(())
+    }
+
+    /// Запомнить текущие размеры буферов — до записи очередного файла.
+    /// Используется вместе с [`Self::truncate`] на пути ошибки.
+    pub fn checkpoint(&self) -> WriteAccumCheckpoint {
+        WriteAccumCheckpoint {
+            functions: self.functions.len(),
+            classes: self.classes.len(),
+            imports: self.imports.len(),
+            calls: self.calls.len(),
+            variables: self.variables.len(),
+        }
+    }
+
+    /// Откатить накопленное до позиции `checkpoint`. Нужен, когда запись файла
+    /// упала после части `push_*`: без этого его строки уехали бы в ближайший
+    /// коммит, а сам файл остался бы помечен проиндексированным (mtime+hash) —
+    /// resume пропустил бы его, и символы потерялись бы навсегда.
+    pub fn truncate(&mut self, checkpoint: WriteAccumCheckpoint) {
+        self.functions.truncate(checkpoint.functions);
+        self.classes.truncate(checkpoint.classes);
+        self.imports.truncate(checkpoint.imports);
+        self.calls.truncate(checkpoint.calls);
+        self.variables.truncate(checkpoint.variables);
     }
 
     fn flush_functions(&mut self, storage: &Storage) -> Result<()> {
@@ -4022,6 +4077,30 @@ mod tests {
         // на «cannot start a transaction within a transaction».
         storage.begin_batch().unwrap();
         storage.rollback_batch().unwrap();
+    }
+
+    #[test]
+    fn write_accum_truncate_откатывает_только_новые_строки() {
+        let storage = Storage::open_in_memory().unwrap();
+        let record = |name: &str| VariableRecord {
+            id: None,
+            file_id: 1,
+            name: name.to_string(),
+            value: Some("1".to_string()),
+            line: 1,
+        };
+        let mut accum = WriteAccum::default();
+        accum.push_variable(&storage, record("до")).unwrap();
+        let checkpoint = accum.checkpoint();
+        accum.push_variable(&storage, record("после-1")).unwrap();
+        accum.push_variable(&storage, record("после-2")).unwrap();
+        accum.truncate(checkpoint);
+        assert_eq!(
+            accum.variables.len(),
+            1,
+            "осталась только строка до отметки"
+        );
+        assert_eq!(accum.variables[0].name, "до");
     }
 
     #[test]

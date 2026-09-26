@@ -115,14 +115,20 @@ impl RepoScan {
                 Some(ext) if ext.eq_ignore_ascii_case("bsl") => bsl_files.push(path.to_path_buf()),
                 _ => {}
             }
-            let name = entry.file_name().to_str().unwrap_or("");
             let parent_is_ext = path
                 .parent()
                 .and_then(|p| p.file_name())
                 .and_then(|s| s.to_str())
-                == Some("Ext");
-            if parent_is_ext && (name == "Predefined.xml" || name.starts_with("Template.")) {
-                content_files.push(path.to_path_buf());
+                .is_some_and(|p| p.eq_ignore_ascii_case("Ext"));
+            if parent_is_ext {
+                let name = entry
+                    .file_name()
+                    .to_str()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if name == "predefined.xml" || name == "template" || name.starts_with("template.") {
+                    content_files.push(path.to_path_buf());
+                }
             }
         }
 
@@ -379,6 +385,15 @@ mod tests {
                 .join("Module.bsl"),
             "",
         );
+        write(
+            &repo
+                .join("base")
+                .join("CommonModules")
+                .join("Заглавный")
+                .join("Ext")
+                .join("Module.BSL"),
+            "",
+        );
 
         let scan = RepoScan::build(&repo);
 
@@ -398,7 +413,11 @@ mod tests {
         assert_eq!(scan.defined_types.len(), 1);
         assert_eq!(scan.functional_options.len(), 1);
         assert_eq!(scan.exchange_content.len(), 1);
-        assert_eq!(scan.bsl_files.len(), 1);
+        assert_eq!(
+            scan.bsl_files.len(),
+            2,
+            "Module.bsl и Module.BSL — расширение матчится регистронезависимо"
+        );
         assert_eq!(scan.dump_info_files.len(), 1);
         assert_eq!(
             scan.content_files.len(),

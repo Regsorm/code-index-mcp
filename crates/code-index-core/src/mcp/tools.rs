@@ -220,7 +220,17 @@ pub async fn extras_building_response(
     storage: &std::sync::Arc<crate::storage::StoragePool>,
 ) -> Option<serde_json::Value> {
     let conn = storage.get().await.ok()?;
-    if conn.extras_build_complete() {
+    let building = match conn.extras_build_complete_state() {
+        Ok(Some(false)) => true,
+        Ok(_) => false,
+        Err(e) => {
+            // Не знаем состояние слоя — считаем, что он ещё строится: отдать
+            // неполные метаданные хуже, чем попросить повторить вызов.
+            tracing::warn!("отметка завершённости надстройки не прочитана: {}", e);
+            true
+        }
+    };
+    if !building {
         return None;
     }
     Some(serde_json::json!({

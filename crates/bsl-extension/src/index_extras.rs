@@ -124,27 +124,32 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // прерванный проход продолжается с последней собранной фазы.
     let scan = RepoScan::build(repo_root);
     let resume = ExtrasResume::load(conn, scan_fingerprint(conn, &scan));
-    if resume.done() > 0 && resume.done() < EXTRAS_PHASE_COUNT {
-        tracing::info!(
-            "надстройка: прошлый проход оборвался — продолжаю с фазы {} из {}",
-            resume.done() + 1,
-            EXTRAS_PHASE_COUNT
-        );
-    }
 
-    // Раскладка 1C:EDT: отпечаток входа строится по .bsl/.xml и не видит правок
-    // .mdo/форм/макетов. Резюмировать по нему нельзя — после правки формы или
-    // объекта термы/граф остались бы от прошлого прохода. Для EDT слой всегда
-    // собирается целиком (metadata-слой и так работает без возобновления).
-    let layer_resume = if crate::xml::edt_mdo::detect_edt_src(repo_root).is_some() {
+    // Раскладка 1C:EDT определяется один раз на проход (обход в глубину до 4;
+    // ниже результат прокидывается в metadata-слой и фазу СКД). Отпечаток
+    // входа строится по .bsl/.xml и не видит правок .mdo/форм/макетов:
+    // резюмировать по нему нельзя — после правки формы или объекта термы/граф
+    // остались бы от прошлого прохода. Для EDT слой всегда собирается целиком
+    // (metadata-слой и так работает без возобновления).
+    let edt_src = crate::xml::edt_mdo::detect_edt_src(repo_root);
+    let layer_resume = if edt_src.is_some() {
         None
     } else {
         Some(&resume)
     };
+    if let Some(resume) = layer_resume {
+        if resume.done() > 0 && resume.done() < EXTRAS_PHASE_COUNT {
+            tracing::info!(
+                "надстройка: прошлый проход оборвался — продолжаю с фазы {} из {}",
+                resume.done() + 1,
+                EXTRAS_PHASE_COUNT
+            );
+        }
+    }
 
     // XML-слой обогащения (перечень, структура, связи, права, формы, подписки,
     // модули) — обход XML выгрузки, дёшево.
-    run_index_extras_metadata_layer(repo_root, &scan, conn, layer_resume)?;
+    run_index_extras_metadata_layer(repo_root, edt_src.as_deref(), &scan, conn, layer_resume)?;
 
     // КОД-слой (тяжёлый: обратный индекс использований по всему .bsl, термы по
     // сотням тысяч процедур, полный граф вызовов). На инкрементальном пути НЕ
@@ -230,25 +235,26 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
 /// входа не строится, поэтому там возобновление выключено.
 fn run_index_extras_metadata_layer(
     repo_root: &Path,
+    edt_src: Option<&Path>,
     scan: &RepoScan,
     conn: &rusqlite::Connection,
     resume: Option<&ExtrasResume>,
 ) -> Result<()> {
     // Формат 1C:EDT (`.mdo`) — отдельный путь разбора. Заполняет ТЕ ЖЕ таблицы
     // (metadata_objects / data_links), поэтому downstream-инструменты не меняются.
-    let resume = if let Some(src_root) = crate::xml::edt_mdo::detect_edt_src(repo_root) {
+    let resume = if let Some(src_root) = edt_src {
         phase("объекты (EDT)", "edt metadata layer", || {
-            run_edt_metadata_layer(repo_root, &src_root, conn)
+            run_edt_metadata_layer(repo_root, src_root, conn)
         });
         // Права ролей EDT лежат отдельными файлами и в общий проход по `.mdo`
         // не попадают — своя фаза, как у формата Конфигуратора (E-1).
         phase("права ролей (EDT)", "edt role_rights", || {
-            run_edt_role_rights(&src_root, conn)
+            run_edt_role_rights(src_root, conn)
         });
         // Перечень модулей: своя раскладка путей и свои источники
         // идентификаторов, поэтому отдельная фаза (E-1).
         phase("модули (EDT)", "edt metadata_modules", || {
-            index_metadata_modules_edt(repo_root, &src_root, conn)
+            index_metadata_modules_edt(repo_root, src_root, conn)
         });
         None
     } else {
@@ -266,7 +272,7 @@ fn run_index_extras_metadata_layer(
         PH_DCS,
         "схемы компоновки",
         "dcs_schemas",
-        || index_dcs_schemas(repo_root, conn),
+        || index_dcs_schemas(repo_root, edt_src, conn),
     );
     Ok(())
 }

@@ -5915,3 +5915,57 @@ fn resume_пропускает_собранные_фазы_и_повторяет
         .unwrap();
     assert_eq!(rights, 2, "изменившийся вход — фаза собрана заново");
 }
+
+#[test]
+fn сбой_фазы_не_перепрыгивается_успехом_следующей() {
+    let tmp = TempDir::new().unwrap();
+    let storage = fresh_storage(&tmp);
+    let conn = storage.conn();
+    let resume = ExtrasResume::load(conn, 7);
+
+    // Фаза 0 падает — отметки нет.
+    resumable_phase(Some(&resume), conn, 0, "тест-0", "t0", || {
+        anyhow::bail!("boom")
+    });
+    // Фаза 1 успешна, но двигать цепочку нельзя: фаза 0 не собрана.
+    resumable_phase(Some(&resume), conn, 1, "тест-1", "t1", || Ok(()));
+    assert_eq!(resume.done(), 0, "отметка не перескочила проваленную фазу");
+
+    // Повтор: фазы идут строго по порядку, отметка растёт на единицу.
+    resumable_phase(Some(&resume), conn, 0, "тест-0", "t0", || Ok(()));
+    assert_eq!(resume.done(), 1, "повторный успех фазы 0 сдвинул цепочку");
+    resumable_phase(Some(&resume), conn, 1, "тест-1", "t1", || Ok(()));
+    assert_eq!(resume.done(), 2, "фаза 1 сдвинула цепочку следом за 0");
+}
+
+#[test]
+fn edt_не_пишет_отметку_возобновления() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(
+        &repo
+            .join("src")
+            .join("Configuration")
+            .join("Configuration.mdo"),
+        r#"<?xml version="1.0"?><mdclass:Configuration xmlns:mdclass="x"/>"#,
+    );
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    let marker = |st: &Storage| -> i64 {
+        st.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM index_state WHERE key = 'extras_resume_done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        marker(&storage),
+        0,
+        "EDT: отпечаток не покрывает .mdo — возобновление выключено"
+    );
+    // Повторный полный проход не падает и снова не ставит отметку.
+    run_index_extras(&repo, &mut storage).unwrap();
+    assert_eq!(marker(&storage), 0, "повторный проход EDT — тоже целиком");
+}

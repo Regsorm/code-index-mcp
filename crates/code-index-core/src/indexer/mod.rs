@@ -1814,6 +1814,34 @@ struct WriteJob<'p> {
     tag: String,
 }
 
+/// Записать один файл под `SAVEPOINT`: ошибка внутри не должна оставить в
+/// батче половину его строк (`upsert_file` прошёл, символы — нет). Накопленные
+/// в [`crate::storage::WriteAccum`] строки откатывает вызывающий — по
+/// [`crate::storage::WriteAccumCheckpoint`].
+fn with_file_savepoint<T>(
+    storage: &crate::storage::Storage,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    storage.conn().execute_batch("SAVEPOINT write_file")?;
+    match f() {
+        Ok(value) => {
+            storage.conn().execute_batch("RELEASE write_file")?;
+            Ok(value)
+        }
+        Err(e) => {
+            // Снятие точки важнее собственной ошибки отката: исходная причина
+            // уходит наверх, откат лишь логируется.
+            if let Err(rb) = storage
+                .conn()
+                .execute_batch("ROLLBACK TO write_file; RELEASE write_file")
+            {
+                tracing::warn!("откат savepoint файла не удался: {}", rb);
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Записать разобранную порцию в SQLite (I/O-bound, один поток).
 ///
 /// SQLite не поддерживает параллельную запись, поэтому порции пишутся строго
@@ -1877,24 +1905,32 @@ fn write_parsed_chunk(
                 raw_content: _,
             } => {
                 let t = std::time::Instant::now();
-                let write_outcome = indexer.write_code_to_db_accum(
-                    CodeWriteParams {
-                        rel_path,
-                        content_hash,
-                        language,
-                        lines_total: *lines_total,
-                        parse_result,
-                        skip_delete: policy.skip_delete_for(rel_path),
-                        mtime: Some(*mtime),
-                        file_size: Some(*file_size),
-                        text_for_fts: text_for_fts.as_deref(),
-                        content: match content_blob {
-                            Some(b) => ContentInput::Blob(b),
-                            None => ContentInput::Oversize,
+                let checkpoint = accum.checkpoint();
+                let write_outcome = with_file_savepoint(indexer.storage, || {
+                    indexer.write_code_to_db_accum(
+                        CodeWriteParams {
+                            rel_path,
+                            content_hash,
+                            language,
+                            lines_total: *lines_total,
+                            parse_result,
+                            skip_delete: policy.skip_delete_for(rel_path),
+                            mtime: Some(*mtime),
+                            file_size: Some(*file_size),
+                            text_for_fts: text_for_fts.as_deref(),
+                            content: match content_blob {
+                                Some(b) => ContentInput::Blob(b),
+                                None => ContentInput::Oversize,
+                            },
                         },
-                    },
-                    &mut accum,
-                );
+                        &mut accum,
+                    )
+                });
+                if write_outcome.is_err() {
+                    // Половина строк файла не должна уехать в коммит: файл
+                    // посчитается ошибочным, символы не запишутся вовсе.
+                    accum.truncate(checkpoint);
+                }
                 code_ns += t.elapsed().as_nanos();
                 match write_outcome {
                     Ok(_) => {
@@ -1917,7 +1953,7 @@ fn write_parsed_chunk(
                 content_blob,
             } => {
                 let t = std::time::Instant::now();
-                let write_outcome = match content_blob {
+                let write_outcome = with_file_savepoint(indexer.storage, || match content_blob {
                     Some(blob) => indexer.write_text_to_db_blob(
                         TextWriteParams {
                             rel_path,
@@ -1939,7 +1975,7 @@ fn write_parsed_chunk(
                         mtime: Some(*mtime),
                         file_size: Some(*file_size),
                     }),
-                };
+                });
                 text_ns += t.elapsed().as_nanos();
                 match write_outcome {
                     Ok(_) => {
@@ -2725,6 +2761,54 @@ class App:
             !found_19.is_empty(),
             "FTS должен находить batch_func_19 (последний батч)"
         );
+    }
+
+    #[test]
+    fn savepoint_файла_откатывает_частичную_запись() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.begin_batch().unwrap();
+        storage
+            .conn()
+            .execute(
+                "INSERT INTO index_state (key, value) VALUES ('keep', '1')",
+                [],
+            )
+            .unwrap();
+
+        // Внутри «записи файла» одна строка успевает пройти, затем сбой:
+        // откат savepoint обязан снять её, а соединение — остаться рабочим.
+        let failed = with_file_savepoint(&storage, || -> Result<()> {
+            storage.conn().execute(
+                "INSERT INTO index_state (key, value) VALUES ('failed', '1')",
+                [],
+            )?;
+            Err(anyhow::anyhow!("boom"))
+        });
+        assert!(failed.is_err());
+
+        with_file_savepoint(&storage, || -> Result<()> {
+            storage.conn().execute(
+                "INSERT INTO index_state (key, value) VALUES ('ok', '1')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        storage.commit_batch().unwrap();
+
+        let count = |key: &str| -> i64 {
+            storage
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM index_state WHERE key = ?1",
+                    [key],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("keep"), 1, "запись до savepoint сохранена");
+        assert_eq!(count("failed"), 0, "частичная запись файла откачена");
+        assert_eq!(count("ok"), 1, "следующий файл записан");
     }
 
     #[test]
