@@ -180,10 +180,8 @@ impl RepoScan {
             match name {
                 "Form.xml" => scan.form_xmls.push(path.clone()),
                 "Rights.xml" => scan.rights_files.push(path.clone()),
-                "Content.xml" => {
-                    if is_exchange_content(path, &scan.sub_root_set) {
-                        scan.exchange_content.push(path.clone());
-                    }
+                "Content.xml" if is_exchange_content(path, &scan.sub_root_set) => {
+                    scan.exchange_content.push(path.clone())
                 }
                 _ => {}
             }

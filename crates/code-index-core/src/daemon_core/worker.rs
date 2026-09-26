@@ -496,6 +496,13 @@ fn process_batch_full_pass(
         return BatchStep::Stop;
     }
 
+    // Пакетный режим с отложенным полнотекстом оставил отметку «не собран»:
+    // дособираем до надстройки, как на старте, иначе `search_*` закрыты до
+    // перезапуска демона.
+    if core_ok && storage.fts_build_pending() {
+        build_deferred_fts(storage, ctx.path);
+    }
+
     let mut extras_ok = true;
     let mut extras_ms: u128 = 0;
     if core_ok {
@@ -1124,23 +1131,7 @@ pub(crate) fn run_worker(
                 path.display()
             );
         }
-        let t0 = std::time::Instant::now();
-        crate::logging::stage_begin("полнотекстовый поиск");
-        let outcome = storage.build_fts_deferred();
-        crate::logging::stage_done("полнотекстовый поиск", t0.elapsed());
-        match outcome {
-            Ok(()) => tracing::info!(
-                "[{}] отложенный полнотекстовый поиск собран за {} мс",
-                path.display(),
-                t0.elapsed().as_millis()
-            ),
-            Err(e) => tracing::warn!(
-                "[{}] сборка отложенного полнотекста упала: {}. \
-                 Поиск останется закрытым до следующего запуска демона.",
-                path.display(),
-                e
-            ),
-        }
+        build_deferred_fts(&storage, &path);
     }
 
     // 6a. index_extras процессора — для BSL это парсинг Configuration.xml /
@@ -1924,6 +1915,83 @@ mod tests {
         );
     }
 
+    /// Регресс: демон индексирует с отложенным полнотекстом (`defer_fts`), а
+    /// дособирал его только при старте. Крупная пачка во время работы идёт
+    /// полным проходом в пакетном режиме, ставит отметку «полнотекст не
+    /// собран» — и `search_*` оставались закрытыми до перезапуска демона.
+    #[test]
+    fn полный_проход_пачки_дособирает_отложенный_полнотекст() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("main.py");
+        std::fs::write(&file, "def before_edit():\n    return 1\n").unwrap();
+
+        let mut storage = Storage::open_file(&tmp.path().join("index.db")).unwrap();
+        Indexer::with_config(&mut storage, IndexConfig::default())
+            .full_reindex(&root, true)
+            .unwrap();
+        assert!(!storage.fts_build_pending());
+
+        std::fs::write(
+            &file,
+            "def after_edit_function():\n    return 2\n\n\ndef second():\n    pass\n",
+        )
+        .unwrap();
+
+        let entry = crate::daemon_core::config::parse_str(&format!(
+            "[[paths]]\npath = '{}'\n",
+            root.display()
+        ))
+        .unwrap()
+        .paths
+        .remove(0);
+        let state = DaemonState::new();
+        let registry = ParserRegistry::new_all();
+        // Порог 0 — пакетный режим на любом числе файлов, как у крупной пачки.
+        let index_config = IndexConfig {
+            bulk_threshold: 0,
+            defer_fts: true,
+            ..Default::default()
+        };
+        let wal_warned_at = std::cell::Cell::new(None);
+        let stop = AtomicBool::new(false);
+        let ctx = BatchContext {
+            path: &root,
+            entry: &entry,
+            state: &state,
+            registry: &registry,
+            max_code_file_size: 5 * 1024 * 1024,
+            repo_language: None,
+            extra_text_extensions: &[],
+            resolved_processor: None,
+            cache_client: None,
+            index_config: &index_config,
+            wal_warned_at: &wal_warned_at,
+            stop: &stop,
+        };
+
+        process_batch_full_pass(
+            &ctx,
+            &mut storage,
+            &[FileEvent::Modified(file.clone())],
+            std::time::Instant::now(),
+            String::new(),
+        );
+
+        assert!(
+            !storage.fts_build_pending(),
+            "после полного прохода пачки полнотекст обязан быть собран"
+        );
+        assert!(
+            !storage
+                .search_functions("after_edit_function", 10, None)
+                .unwrap()
+                .is_empty(),
+            "поиск находит функцию из пачки без перезапуска демона"
+        );
+    }
+
     /// Регресс: раскрытие созданной/переименованной папки пропускало только
     /// встроенный `EXCLUDE_DIRS`, а пользовательские `exclude_dirs` из
     /// `.code-index/config.json` игнорировало — и исключённая папка попадала
@@ -2321,6 +2389,29 @@ fn collect_dirty_paths(root: &PathBuf, batch: &[FileEvent]) -> Vec<(String, i64)
             .or_insert(mtime);
     }
     map.into_iter().collect()
+}
+
+/// Дособрать отложенный полнотекст (см. `IndexConfig::defer_fts`). Провал папку
+/// не роняет: `search_*` остаются закрытыми отметкой `fts_build_pending`, сборку
+/// повторит следующий полный проход или запуск демона.
+fn build_deferred_fts(storage: &Storage, path: &Path) {
+    let t0 = std::time::Instant::now();
+    crate::logging::stage_begin("полнотекстовый поиск");
+    let outcome = storage.build_fts_deferred();
+    crate::logging::stage_done("полнотекстовый поиск", t0.elapsed());
+    match outcome {
+        Ok(()) => tracing::info!(
+            "[{}] отложенный полнотекстовый поиск собран за {} мс",
+            path.display(),
+            t0.elapsed().as_millis()
+        ),
+        Err(e) => tracing::warn!(
+            "[{}] сборка отложенного полнотекста упала: {}. \
+             Поиск останется закрытым до следующего полного прохода или запуска демона.",
+            path.display(),
+            e
+        ),
+    }
 }
 
 fn tokio_block_on<F: std::future::Future<Output = ()>>(fut: F) {
