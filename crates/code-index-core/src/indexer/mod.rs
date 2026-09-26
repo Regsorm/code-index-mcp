@@ -170,6 +170,9 @@ pub enum ParsedFile {
         content_hash: String,
         lines_total: usize,
         content: String,
+        /// Сжатый content для `text_contents` — считается параллельно в фазе
+        /// сжатия (как у кода), чтобы поток-писатель не тратил время на zstd.
+        content_blob: Option<Vec<u8>>,
         mtime: i64,
         file_size: i64,
     },
@@ -949,7 +952,24 @@ impl<'a> Indexer<'a> {
     /// `Blob` — content уже сжат в фазе параллельного парсинга (v0.47.0),
     /// `Oversize` — файл крупнее `config.max_code_file_size_bytes`,
     /// `None` — не сохранять содержимое (тесты и места, где content недоступен).
+    ///
+    /// Одиночный путь: строки символов пишутся сразу (накопитель сбрасывается
+    /// на выходе). Массовый путь использует [`Self::write_code_to_db_accum`] и
+    /// копит строки разных файлов до порога — см. [`crate::storage::WriteAccum`].
     pub fn write_code_to_db(&self, params: CodeWriteParams<'_>) -> Result<()> {
+        let mut accum = crate::storage::WriteAccum::default();
+        self.write_code_to_db_accum(params, &mut accum)?;
+        accum.flush(self.storage)
+    }
+
+    /// То же, что [`Self::write_code_to_db`], но строки символов (функции,
+    /// классы, импорты, вызовы, переменные) кладутся в общий накопитель.
+    /// Содержимое и текстовые записи пишутся сразу, как и раньше.
+    pub fn write_code_to_db_accum(
+        &self,
+        params: CodeWriteParams<'_>,
+        accum: &mut crate::storage::WriteAccum,
+    ) -> Result<()> {
         let CodeWriteParams {
             rel_path,
             content_hash,
@@ -990,7 +1010,7 @@ impl<'a> Indexer<'a> {
             }
         }
 
-        // Конвертируем и сохраняем функции
+        // Конвертируем и складываем функции в накопитель
         let functions: Vec<FunctionRecord> = parse_result
             .functions
             .iter()
@@ -1012,7 +1032,9 @@ impl<'a> Indexer<'a> {
                 override_target: f.override_target.clone(),
             })
             .collect();
-        self.storage.insert_functions(&functions)?;
+        for record in functions {
+            accum.push_function(self.storage, record)?;
+        }
 
         // Конвертируем и сохраняем классы
         let classes: Vec<ClassRecord> = parse_result
@@ -1030,7 +1052,9 @@ impl<'a> Indexer<'a> {
                 node_hash: c.node_hash.clone(),
             })
             .collect();
-        self.storage.insert_classes(&classes)?;
+        for record in classes {
+            accum.push_class(self.storage, record)?;
+        }
 
         // Конвертируем и сохраняем импорты
         let imports: Vec<ImportRecord> = parse_result
@@ -1046,7 +1070,9 @@ impl<'a> Indexer<'a> {
                 kind: i.kind.clone(),
             })
             .collect();
-        self.storage.insert_imports(&imports)?;
+        for record in imports {
+            accum.push_import(self.storage, record)?;
+        }
 
         // Конвертируем и сохраняем вызовы функций
         let calls: Vec<CallRecord> = parse_result
@@ -1060,7 +1086,9 @@ impl<'a> Indexer<'a> {
                 line: c.line,
             })
             .collect();
-        self.storage.insert_calls(&calls)?;
+        for record in calls {
+            accum.push_call(self.storage, record)?;
+        }
 
         // Конвертируем и сохраняем переменные
         let variables: Vec<VariableRecord> = parse_result
@@ -1074,7 +1102,9 @@ impl<'a> Indexer<'a> {
                 line: v.line,
             })
             .collect();
-        self.storage.insert_variables(&variables)?;
+        for record in variables {
+            accum.push_variable(self.storage, record)?;
+        }
 
         // Двойная индексация: для html (и других языков из is_dual_indexed_language)
         // дополнительно сохраняем сырой контент в text_files, чтобы продолжали
@@ -1148,6 +1178,44 @@ impl<'a> Indexer<'a> {
         };
         self.storage.insert_text_file(&text_record)?;
 
+        Ok(())
+    }
+
+    /// То же, что [`Self::write_text_to_db`], но content УЖЕ сжат (blob из
+    /// фазы параллельного сжатия): поток-писатель не тратит время на zstd,
+    /// для contentless-указателя передаётся сырой текст.
+    pub fn write_text_to_db_blob(
+        &self,
+        params: TextWriteParams<'_>,
+        content_blob: &[u8],
+    ) -> Result<()> {
+        let TextWriteParams {
+            rel_path,
+            content_hash,
+            lines_total,
+            content,
+            skip_delete,
+            mtime,
+            file_size,
+        } = params;
+        let file_record = FileRecord {
+            id: None,
+            path: rel_path.to_string(),
+            content_hash: content_hash.to_string(),
+            language: "text".to_string(),
+            lines_total,
+            indexed_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            mtime,
+            file_size,
+        };
+        let file_id = self.storage.upsert_file(&file_record)?;
+
+        if !skip_delete {
+            self.storage.delete_text_file_by_file(file_id)?;
+        }
+
+        self.storage
+            .insert_text_file_blob(file_id, content_blob, content)?;
         Ok(())
     }
 
@@ -1562,6 +1630,7 @@ fn parse_candidates(
                         content_hash: hash,
                         lines_total: text_result.lines_total,
                         content: text_result.content,
+                        content_blob: None,
                         mtime,
                         file_size,
                     }
@@ -1637,22 +1706,36 @@ fn parse_candidates(
     parse_results.par_iter_mut().for_each_init(
         || zstd::bulk::Compressor::new(Storage::FILE_CONTENTS_ZSTD_LEVEL).ok(),
         |compressor, pf| {
-            if let ParsedFile::Code {
-                raw_content,
-                content_blob,
-                ..
-            } = pf
-            {
-                *content_blob = if raw_content.len() > max_code_size {
-                    None
-                } else {
-                    match compressor {
-                        Some(c) => c.compress(raw_content.as_bytes()).ok(),
-                        None => Storage::compress_content(raw_content).ok(),
-                    }
-                };
-                raw_content.clear();
-                raw_content.shrink_to_fit();
+            match pf {
+                ParsedFile::Code {
+                    raw_content,
+                    content_blob,
+                    ..
+                } => {
+                    *content_blob = if raw_content.len() > max_code_size {
+                        None
+                    } else {
+                        match compressor {
+                            Some(c) => c.compress(raw_content.as_bytes()).ok(),
+                            None => Storage::compress_content(raw_content).ok(),
+                        }
+                    };
+                    raw_content.clear();
+                    raw_content.shrink_to_fit();
+                }
+                // Текст сжимается здесь же: поток-писатель и так занят
+                // FTS-токенизацией, а zstd раскладывается на все ядра.
+                ParsedFile::Text {
+                    content,
+                    content_blob,
+                    ..
+                } => {
+                    *content_blob = match compressor {
+                        Some(c) => c.compress(content.as_bytes()).ok(),
+                        None => Storage::compress_content(content).ok(),
+                    };
+                }
+                ParsedFile::Error { .. } => {}
             }
         },
     );
@@ -1746,11 +1829,19 @@ fn write_parsed_chunk(
 
     // Открываем первую транзакцию перед началом цикла
     indexer.storage.begin_batch()?;
+    // Строки символов копятся здесь и уходят многострочными INSERT — см.
+    // `storage::WriteAccum`. Сбрасываем перед коммитом (в конце порции).
+    let mut accum = crate::storage::WriteAccum::default();
 
     // Прогресс — по времени, а не по размеру транзакции: шаг в файлах на
     // лёгких файлах сыплет строками, на тяжёлых молчит минутами, а на
     // репозитории меньше batch_size файлов не печатает ничего.
     let mut progress = crate::logging::Heartbeat::every_secs(5);
+    // Разбивка времени записи: код (символы+содержимое) и текст (сжатие+FTS-
+    // токенизация contentless-указателя). Нужна, чтобы видеть, что именно
+    // держит порцию, не гадая по общей строке этапа.
+    let mut code_ns: u128 = 0;
+    let mut text_ns: u128 = 0;
     for parsed in &parse_results {
         let total_processed = outcome.files_indexed + outcome.errors.len();
         if total_processed > 0 && progress.due() {
@@ -1775,21 +1866,27 @@ fn write_parsed_chunk(
                 content_blob,
                 raw_content: _,
             } => {
-                match indexer.write_code_to_db(CodeWriteParams {
-                    rel_path,
-                    content_hash,
-                    language,
-                    lines_total: *lines_total,
-                    parse_result,
-                    skip_delete: policy.skip_delete_for(rel_path),
-                    mtime: Some(*mtime),
-                    file_size: Some(*file_size),
-                    text_for_fts: text_for_fts.as_deref(),
-                    content: match content_blob {
-                        Some(b) => ContentInput::Blob(b),
-                        None => ContentInput::Oversize,
+                let t = std::time::Instant::now();
+                let write_outcome = indexer.write_code_to_db_accum(
+                    CodeWriteParams {
+                        rel_path,
+                        content_hash,
+                        language,
+                        lines_total: *lines_total,
+                        parse_result,
+                        skip_delete: policy.skip_delete_for(rel_path),
+                        mtime: Some(*mtime),
+                        file_size: Some(*file_size),
+                        text_for_fts: text_for_fts.as_deref(),
+                        content: match content_blob {
+                            Some(b) => ContentInput::Blob(b),
+                            None => ContentInput::Oversize,
+                        },
                     },
-                }) {
+                    &mut accum,
+                );
+                code_ns += t.elapsed().as_nanos();
+                match write_outcome {
                     Ok(_) => {
                         outcome.files_indexed += 1;
                         outcome.note_changed(rel_path);
@@ -1807,16 +1904,34 @@ fn write_parsed_chunk(
                 content,
                 mtime,
                 file_size,
+                content_blob,
             } => {
-                match indexer.write_text_to_db(TextWriteParams {
-                    rel_path,
-                    content_hash,
-                    lines_total: *lines_total,
-                    content,
-                    skip_delete: policy.skip_delete_for(rel_path),
-                    mtime: Some(*mtime),
-                    file_size: Some(*file_size),
-                }) {
+                let t = std::time::Instant::now();
+                let write_outcome = match content_blob {
+                    Some(blob) => indexer.write_text_to_db_blob(
+                        TextWriteParams {
+                            rel_path,
+                            content_hash,
+                            lines_total: *lines_total,
+                            content,
+                            skip_delete: policy.skip_delete_for(rel_path),
+                            mtime: Some(*mtime),
+                            file_size: Some(*file_size),
+                        },
+                        blob,
+                    ),
+                    None => indexer.write_text_to_db(TextWriteParams {
+                        rel_path,
+                        content_hash,
+                        lines_total: *lines_total,
+                        content,
+                        skip_delete: policy.skip_delete_for(rel_path),
+                        mtime: Some(*mtime),
+                        file_size: Some(*file_size),
+                    }),
+                };
+                text_ns += t.elapsed().as_nanos();
+                match write_outcome {
                     Ok(_) => {
                         outcome.files_indexed += 1;
                         outcome.note_changed(rel_path);
@@ -1839,6 +1954,16 @@ fn write_parsed_chunk(
             batch_count = 0;
         }
     }
+
+    // Остаток накопленных строк символов — в текущую транзакцию, затем коммит.
+    accum.flush(indexer.storage)?;
+
+    tracing::debug!(
+        "{}разбивка записи: код {} мс, текст {} мс",
+        tag,
+        code_ns / 1_000_000,
+        text_ns / 1_000_000
+    );
 
     // Коммитим оставшиеся записи последнего неполного батча
     indexer.storage.commit_batch()?;

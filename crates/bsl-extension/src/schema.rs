@@ -214,10 +214,15 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
         UNIQUE(repo, caller_proc_key, callee_proc_name, call_type)
     );
     ",
-    "CREATE INDEX IF NOT EXISTS idx_pcg_repo ON proc_call_graph(repo);",
+    // Отдельный индекс по `repo` не заводим: он — префикс idx_pcg_caller,
+    // а лишнее дерево на миллионе рёбер стоит секунды на каждом пересборе.
     "CREATE INDEX IF NOT EXISTS idx_pcg_caller ON proc_call_graph(repo, caller_proc_key);",
     "CREATE INDEX IF NOT EXISTS idx_pcg_callee_name ON proc_call_graph(repo, callee_proc_name);",
-    "CREATE INDEX IF NOT EXISTS idx_pcg_call_type ON proc_call_graph(repo, call_type);",
+    // Тип ребра нужен только НЕ-direct слоям: их срезают и пересобирают по
+    // `call_type` (subscription/form_event/extension_override). Сами direct-рёбра
+    // (миллионы) в этот индекс не попадают — он в разы меньше и строится за
+    // миллисекунды; запросы по direct идут через idx_pcg_caller/callee.
+    "CREATE INDEX IF NOT EXISTS idx_pcg_call_type_nd ON proc_call_graph(repo, call_type) WHERE call_type <> 'direct';",
     // Индекс по адресу цели — частичный: рёбер с пустым адресом в типовой
     // торговой конфигурации ~112 тыс. при статистике «5 строк на значение», и
     // полный индекс планировщик брал для условия `callee_proc_key IS NULL`
@@ -698,6 +703,24 @@ pub fn migrate_extensions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     )?;
     backfill_metadata_object_keys(conn)?;
     ensure_trigram_tokenizer(conn)?;
+    // Индекс по `call_type` раньше покрывал ВСЕ рёбра (миллионы на большой
+    // конфигурации) и строился секунды на каждом пересборе графа. Он нужен
+    // только НЕ-direct слоям — те удаляются и пересобираются по `call_type`.
+    // Заменяем частичным индексом; старый (база прежней версии) убираем.
+    // Таблицы может не быть (тесты на частичную схему) — тогда пропускаем.
+    let pcg_exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='proc_call_graph'",
+        [],
+        |r| r.get(0),
+    )?;
+    if pcg_exists > 0 {
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_pcg_call_type;
+             DROP INDEX IF EXISTS idx_pcg_repo;
+             CREATE INDEX IF NOT EXISTS idx_pcg_call_type_nd ON proc_call_graph(repo, call_type) \
+               WHERE call_type <> 'direct';",
+        )?;
+    }
     Ok(())
 }
 

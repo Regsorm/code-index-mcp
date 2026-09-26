@@ -564,22 +564,41 @@ pub fn drop_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Resul
 /// 2. Пересоздаём FTS-триггеры для будущих изменений.
 /// 3. Rebuild FTS-индексов из уже загруженных данных (команда 'rebuild').
 pub fn rebuild_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    // Пересоздаём обычные индексы
-    conn.execute_batch(INDEXES_SQL)?;
+    // Массовая фаза: построение всех индексов и перестройка полнотекста. Кеш
+    // страниц на время фазы поднимаем (на больших базах 64 МБ мало: дерево
+    // индексов и FTS не помещается, работа уходит в случайные чтения), после —
+    // возвращаем прежний, чтобы не занимать память у демона.
+    let prev_cache: i64 = conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?;
+    conn.execute_batch("PRAGMA cache_size=-262144;")?;
 
-    // Пересоздаём FTS-триггеры
+    let t = std::time::Instant::now();
+    // Создаём индексы
+    conn.execute_batch(INDEXES_SQL)?;
+    tracing::debug!(
+        "массовая загрузка: индексы созданы за {} мс",
+        t.elapsed().as_millis()
+    );
+
+    // Создаём FTS-триггеры
     conn.execute_batch(TRIGGERS_SQL)?;
 
-    // Перестраиваем FTS-индексы из данных основных таблиц
-    // fts_text_files НЕ перестраиваем через 'rebuild' — он contentless, таблицы-
-    // источника для rebuild у него нет. Его наполняет Rust-путь записи
-    // text_contents (в т.ч. при bulk-load), поэтому к этому моменту он уже полон.
-    conn.execute_batch(
-        "
-        INSERT INTO fts_functions(fts_functions) VALUES('rebuild');
-        INSERT INTO fts_classes(fts_classes) VALUES('rebuild');
-    ",
-    )?;
+    // Перестраиваем FTS-индексы из данных основных таблиц (команда 'rebuild').
+    // fts_text_files не перестраивается через 'rebuild' — он contentless, таблицы-
+    // источника для rebuild у него нет. Для него слова подаёт Rust-код через
+    // text_contents (в т.ч. на bulk-load), поэтому в этой функции он уже наполнен.
+    let t = std::time::Instant::now();
+    conn.execute_batch("INSERT INTO fts_functions(fts_functions) VALUES('rebuild');")?;
+    tracing::debug!(
+        "массовая загрузка: полнотекст функций перестроен за {} мс",
+        t.elapsed().as_millis()
+    );
+    let t = std::time::Instant::now();
+    conn.execute_batch("INSERT INTO fts_classes(fts_classes) VALUES('rebuild');")?;
+    tracing::debug!(
+        "массовая загрузка: полнотекст классов перестроен за {} мс",
+        t.elapsed().as_millis()
+    );
 
+    conn.execute_batch(&format!("PRAGMA cache_size={};", prev_cache))?;
     Ok(())
 }
