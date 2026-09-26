@@ -214,10 +214,12 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
         UNIQUE(repo, caller_proc_key, callee_proc_name, call_type)
     );
     ",
-    // Отдельный индекс по `repo` не заводим: он — префикс idx_pcg_caller,
-    // а лишнее дерево на миллионе рёбер стоит секунды на каждом пересборе.
+    // Отдельные индексы по `repo` и по `callee_proc_name` не заводим:
+    // первый — префикс idx_pcg_caller, второй обслуживал только произвольные
+    // запросы bsl_sql (именованные инструменты ищут по caller/callee_key;
+    // реверс «кто вызывает» закрывает core-таблица calls). Лишние деревья на
+    // миллионе рёбер стоят секунды на каждом пересборе.
     "CREATE INDEX IF NOT EXISTS idx_pcg_caller ON proc_call_graph(repo, caller_proc_key);",
-    "CREATE INDEX IF NOT EXISTS idx_pcg_callee_name ON proc_call_graph(repo, callee_proc_name);",
     // Тип ребра нужен только НЕ-direct слоям: их срезают и пересобирают по
     // `call_type` (subscription/form_event/extension_override). Сами direct-рёбра
     // (миллионы) в этот индекс не попадают — он в разы меньше и строится за
@@ -717,6 +719,7 @@ pub fn migrate_extensions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_pcg_call_type;
              DROP INDEX IF EXISTS idx_pcg_repo;
+             DROP INDEX IF EXISTS idx_pcg_callee_name;
              CREATE INDEX IF NOT EXISTS idx_pcg_call_type_nd ON proc_call_graph(repo, call_type) \
                WHERE call_type <> 'direct';",
         )?;

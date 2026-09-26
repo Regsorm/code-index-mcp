@@ -247,7 +247,6 @@ pub(crate) fn rebuild_call_graph_extension_override(conn: &rusqlite::Connection)
 /// пересбора часть индексов не вернётся, и выдача просядет молча.
 const GRAPH_INDEX_NAMES: &[&str] = &[
     "idx_pcg_caller",
-    "idx_pcg_callee_name",
     "idx_pcg_call_type_nd",
     "idx_pcg_callee_key",
     "idx_def_source",
@@ -255,7 +254,6 @@ const GRAPH_INDEX_NAMES: &[&str] = &[
 
 const GRAPH_INDEX_DDL: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_pcg_caller ON proc_call_graph(repo, caller_proc_key);",
-    "CREATE INDEX IF NOT EXISTS idx_pcg_callee_name ON proc_call_graph(repo, callee_proc_name);",
     // Частичный — см. комментарий в schema.rs: тип ребра нужен только не-direct
     // слоям, а direct-рёбра (миллионы) в индекс не попадают.
     "CREATE INDEX IF NOT EXISTS idx_pcg_call_type_nd ON proc_call_graph(repo, call_type) WHERE call_type <> 'direct';",
@@ -554,15 +552,9 @@ pub(crate) fn resolve_and_prune_direct_edges(
         t.elapsed().as_millis()
     );
     let t = std::time::Instant::now();
-    prune_platform_balast(conn, scope, edges)?;
+    prune_null_direct_edges(conn, scope, edges)?;
     tracing::debug!(
-        "отсев: платформенный балласт — {} мс",
-        t.elapsed().as_millis()
-    );
-    let t = std::time::Instant::now();
-    prune_object_method_calls(conn, scope, edges)?;
-    tracing::debug!(
-        "отсев: вызовы методов объектов — {} мс",
+        "отсев: балласт и объектные вызовы одним проходом — {} мс",
         t.elapsed().as_millis()
     );
     Ok(())
@@ -897,35 +889,35 @@ pub(crate) const PLATFORM_BALAST: &[&str] = &[
     "СписокЗначений",
 ];
 
-/// Удалить direct-рёбра-балласт (см. [`PLATFORM_BALAST`]). Две защиты от потери
-/// реальных рёбер: (1) удаляются только рёбра с `callee_proc_key IS NULL` —
-/// резолвленные в реальную процедуру сохраняются; (2) имя, экспортное где-либо
-/// в конфигурации, не трогается вовсе (адаптивно к размеру конфигурации). `file_scope=
-/// Some(rel)` ограничивает удаление рёбрами одного файла (инкремент), `None` —
-/// весь граф (полный пересбор).
-pub(crate) fn prune_platform_balast(
+/// Один проход отсева NULL-рёбер `direct`: платформенный балласт + объектные
+/// вызовы.
+///
+/// Раньше это были два отдельных DELETE по одной и той же временной таблице —
+/// два полных прохода по 2,3 млн строк. Условия независимы и все удаляют только
+/// `callee_proc_key IS NULL`, поэтому объединены в один DELETE с `OR`.
+///
+/// Защиты от потери реальных рёбер (те же, что были у половин):
+///   * удаляются только рёбра с `callee_proc_key IS NULL` — резолвленные
+///     в реальную процедуру сохраняются;
+///   * имя, экспортное где-либо в конфигурации, не трогается вовсе:
+///     подмножество экспортных имён из списка балласта считается ОДНИМ
+///     запросом (построчный `NOT IN (SELECT name FROM exported_procs)` на
+///     2,3 млн рёбер стоил секунды);
+///   * одноточечные и многоточечные объектные вызовы щадят имена общих модулей
+///     (их резолвит Tier C) и коллекции метаданных (Tier D).
+pub(crate) fn prune_null_direct_edges(
     conn: &rusqlite::Connection,
     scope: EdgeScope,
     edges: &str,
 ) -> Result<()> {
-    // Имена — статические кириллические идентификаторы без SQL-метасимволов,
-    // поэтому инлайн в IN(...) безопасен (не пользовательский ввод).
-    //
-    // Защита от коллизий имён, адаптивная под конфигурацию: НЕ трогаем имя,
-    // которое где-либо в конфигурации экспортно (`Записать`/`Удалить`/`Получить`
-    // и т.п. могут быть и методом объекта платформы, и реальной экспортной
-    // процедурой). Список балласта короткий (~70 имён), а `exported_procs`
-    // большой (сотни тысяч строк) — поэтому подмножество экспортных имён из
-    // балласта считаем ОДНИМ запросом, а не подзапросом на каждое удаляемое
-    // ребро: построчная проверка `NOT IN (SELECT name FROM exported_procs)`
-    // на 2,3 млн рёбер стоила несколько секунд.
-    let in_list = PLATFORM_BALAST
+    // 1. Эффективный список балласта: PLATFORM_BALAST минус экспортные-в-конфиге.
+    let balast_all = PLATFORM_BALAST
         .iter()
         .map(|n| format!("'{}'", n))
         .collect::<Vec<_>>()
         .join(",");
     let mut st = conn.prepare(&format!(
-        "SELECT DISTINCT name FROM exported_procs WHERE repo = ?1 AND name IN ({in_list})"
+        "SELECT DISTINCT name FROM exported_procs WHERE repo = ?1 AND name IN ({balast_all})"
     ))?;
     let exported_in_balast: std::collections::HashSet<String> = st
         .query_map(params![REPO_DEFAULT], |r| r.get::<_, String>(0))?
@@ -935,27 +927,65 @@ pub(crate) fn prune_platform_balast(
         .copied()
         .filter(|n| !exported_in_balast.contains(*n))
         .collect();
-    if effective.is_empty() {
-        return Ok(());
+
+    // 2. Защиты объектных условий: имена общих модулей и коллекции метаданных.
+    // tmp_pmods — имена общих модулей (сегмент пути после CommonModules/).
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS tmp_pmods;\n\
+         CREATE TEMP TABLE tmp_pmods AS\n\
+           SELECT DISTINCT substr(seg,1,instr(seg,'/')-1) AS q FROM (\n\
+             SELECT substr(path, instr(path,'CommonModules/')+length('CommonModules/')) AS seg\n\
+             FROM files WHERE path LIKE '%CommonModules/%/Module.bsl') WHERE instr(seg,'/')>0;\n\
+         CREATE INDEX tmp_pmods_idx ON tmp_pmods(q);",
+    )?;
+    // tmp_pcolls — коллекции метаданных (защита одноточечных менеджер-вызовов).
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcolls; CREATE TEMP TABLE tmp_pcolls(q TEXT);")?;
+    {
+        let mut ins = conn.prepare("INSERT INTO tmp_pcolls(q) VALUES (?1)")?;
+        for c in METADATA_COLLECTIONS {
+            ins.execute(params![c])?;
+        }
     }
-    let in_list = effective
-        .iter()
-        .map(|n| format!("'{}'", n))
-        .collect::<Vec<_>>()
-        .join(",");
+    conn.execute_batch("CREATE INDEX tmp_pcolls_idx ON tmp_pcolls(q);")?;
+
+    // 3. Один DELETE: балласт ИЛИ одноточечный объектный ИЛИ многоточечный.
     // Имя метода для сопоставления с балластом: callee хранится склеенным
-    // (`Объект.Записать`), поэтому берём часть ПОСЛЕ точки (`Записать`); у голых
-    // имён (точки нет) — имя целиком. По первой точке — для одноточечных вызовов
-    // это и есть метод; многоточечные цепочки в балласт не попадут (не страшно).
+    // (`Объект.Записать`), поэтому берём часть ПОСЛЕ точки; у голых имён — имя
+    // целиком.
     let meth = "substr(callee_proc_name, CASE WHEN instr(callee_proc_name,'.')>0 \
                 THEN instr(callee_proc_name,'.')+1 ELSE 1 END)";
+    let first = "substr(callee_proc_name, 1, instr(callee_proc_name,'.')-1)";
+    let single_dot = "instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') = 0";
+    let mut ors: Vec<String> = Vec::new();
+    if !effective.is_empty() {
+        let list = effective
+            .iter()
+            .map(|n| format!("'{}'", n))
+            .collect::<Vec<_>>()
+            .join(",");
+        ors.push(format!("{meth} IN ({list})"));
+    }
+    // Одноточечные `Объект.Метод`: первый сегмент не общий модуль и не коллекция.
+    ors.push(format!(
+        "(instr(callee_proc_name,'.') > 0 AND {single_dot} \
+          AND {first} NOT IN (SELECT q FROM tmp_pmods) \
+          AND {first} NOT IN (SELECT q FROM tmp_pcolls))"
+    ));
+    // Многоточечные `X.Y.Метод`: первый сегмент не общий модуль (объектная
+    // цепочка или платформенный метод менеджера, не найденный Tier D).
+    ors.push(format!(
+        "(instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') > 0 \
+          AND {first} NOT IN (SELECT q FROM tmp_pmods))"
+    ));
     let mut sql = format!(
         "DELETE FROM {edges} \
          WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
-           AND {meth} IN ({in_list})"
+           AND ({})",
+        ors.join(" OR ")
     );
     sql.push_str(scope.clause());
     conn.execute(&sql, params![REPO_DEFAULT])?;
+    conn.execute_batch("DROP TABLE IF EXISTS tmp_pmods; DROP TABLE IF EXISTS tmp_pcolls;")?;
     Ok(())
 }
 
@@ -1004,73 +1034,6 @@ pub(crate) const METADATA_COLLECTIONS: &[&str] = &[
     "Constants",
     "Sequences",
 ];
-
-/// Прун объектных вызовов (CORE B): удалить склеенные ОДНОТОЧЕЧНЫЕ рёбра
-/// `Объект.Метод`, где квалификатор — локальная переменная / объект платформы
-/// (`Запрос.Выполнить`, `Выборка.Следующий`, `НаборЗаписей.Записать`), цель
-/// которых вне кода конфигурации. Квалификатор-driven — точнее списочного
-/// балласта: знаем, что приёмник не модуль, поэтому режем даже коллизионные
-/// имена методов. ТРИ ЗАЩИТЫ, чтобы не снести реальные вызовы:
-///   1) только ОДНА точка — цепочки `Справочники.X.Метод` (менеджеры) не трогаем;
-///   2) квалификатор НЕ имя общего модуля (его резолвит Tier C);
-///   3) квалификатор НЕ коллекция метаданных (`Справочники`/`Документы`/… —
-///      вызовы менеджеров, резолв отложен).
-///
-/// Удаляются только рёбра с `callee_proc_key IS NULL`. `file_scope=Some(rel)` —
-/// в области одного файла (инкремент).
-pub(crate) fn prune_object_method_calls(
-    conn: &rusqlite::Connection,
-    scope: EdgeScope,
-    edges: &str,
-) -> Result<()> {
-    // tmp_pmods — имена общих модулей (сегмент пути после CommonModules/).
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS tmp_pmods;\n\
-         CREATE TEMP TABLE tmp_pmods AS\n\
-           SELECT DISTINCT substr(seg,1,instr(seg,'/')-1) AS q FROM (\n\
-             SELECT substr(path, instr(path,'CommonModules/')+length('CommonModules/')) AS seg\n\
-             FROM files WHERE path LIKE '%CommonModules/%/Module.bsl') WHERE instr(seg,'/')>0;\n\
-         CREATE INDEX tmp_pmods_idx ON tmp_pmods(q);",
-    )?;
-    // tmp_pcolls — коллекции метаданных (защита одноточечных менеджер-вызовов).
-    conn.execute_batch("DROP TABLE IF EXISTS tmp_pcolls; CREATE TEMP TABLE tmp_pcolls(q TEXT);")?;
-    {
-        let mut ins = conn.prepare("INSERT INTO tmp_pcolls(q) VALUES (?1)")?;
-        for c in METADATA_COLLECTIONS {
-            ins.execute(params![c])?;
-        }
-    }
-    conn.execute_batch("CREATE INDEX tmp_pcolls_idx ON tmp_pcolls(q);")?;
-
-    let first = "substr(callee_proc_name, 1, instr(callee_proc_name,'.')-1)";
-    let single_dot = "instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') = 0";
-    // (1) ОДНОТОЧЕЧНЫЕ объектные вызовы `Объект.Метод`: первый сегмент НЕ общий
-    //     модуль и НЕ коллекция метаданных → это метод локального объекта.
-    let mut sql1 = format!(
-        "DELETE FROM {edges} \
-         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
-           AND instr(callee_proc_name,'.') > 0 AND {single_dot} \
-           AND {first} NOT IN (SELECT q FROM tmp_pmods) \
-           AND {first} NOT IN (SELECT q FROM tmp_pcolls)"
-    );
-    // (2) МНОГОТОЧЕЧНЫЕ цепочки `X.Y.Метод`, оставшиеся NULL после Tier C/D:
-    //     первый сегмент НЕ общий модуль → объектная цепочка (`Запрос.Поле.Метод`)
-    //     либо платформенный метод менеджера (`Справочники.Объект.ПустаяСсылка` —
-    //     Tier D его уже проверил и не нашёл юзер-экспорт). Цепочки общих модулей
-    //     (first = модуль) щадим. Резолвленные менеджер-вызовы тут не NULL.
-    let mut sql2 = format!(
-        "DELETE FROM {edges} \
-         WHERE repo = ?1 AND call_type = 'direct' AND callee_proc_key IS NULL \
-           AND instr(substr(callee_proc_name, instr(callee_proc_name,'.')+1), '.') > 0 \
-           AND {first} NOT IN (SELECT q FROM tmp_pmods)"
-    );
-    sql1.push_str(scope.clause());
-    sql2.push_str(scope.clause());
-    conn.execute(&sql1, params![REPO_DEFAULT])?;
-    conn.execute(&sql2, params![REPO_DEFAULT])?;
-    conn.execute_batch("DROP TABLE IF EXISTS tmp_pmods; DROP TABLE IF EXISTS tmp_pcolls;")?;
-    Ok(())
-}
 
 /// Построить temp-таблицу `tmp_pcg_mmeth` экспортных методов менеджер-модулей:
 /// `(folder, object, method, path)`. folder/object извлекаем из пути
