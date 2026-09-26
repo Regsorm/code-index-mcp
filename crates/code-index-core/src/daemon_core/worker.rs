@@ -871,9 +871,21 @@ pub(crate) fn run_worker(
 
     // Паспорт папки: по присланному журналу должно быть видно, с чем работали
     // и при каких настройках, иначе времена не с чем соотнести.
+    // Окно одиночной правки в паспорт папки: при нуле режим выключен, и это
+    // лучше сказать словами, а не «окно 0 мс».
+    let quick_window_note = {
+        let quick = entry
+            .quick_window_ms
+            .unwrap_or(index_config.quick_window_ms);
+        if quick == 0 {
+            "одиночный режим выключен".to_string()
+        } else {
+            format!("окно одиночной правки {} мс", quick)
+        }
+    };
     tracing::info!(
         "[{}] размер базы {}, настройки: порог перехода с пофайловой обработки на пакетную — \
-         {} файлов, пауза после события {} мс, потолок сбора {} мс, транзакция записи {} файлов",
+         {} файлов, пауза после события {} мс, потолок сбора {} мс, {}, транзакция записи {} файлов",
         path.display(),
         match std::fs::metadata(&db_path) {
             Ok(m) => format!("{} МБ", m.len() / (1024 * 1024)),
@@ -882,6 +894,7 @@ pub(crate) fn run_worker(
         index_config.bulk_batch_threshold,
         entry.debounce_ms.unwrap_or(index_config.debounce_ms),
         entry.batch_ms.unwrap_or(index_config.batch_ms),
+        quick_window_note,
         index_config.batch_size
     );
 
@@ -1357,9 +1370,13 @@ pub(crate) fn run_worker(
 
     // 8. Watcher-цикл
     let debounce_ms = entry.debounce_ms.unwrap_or(index_config.debounce_ms);
+    let quick_ms = entry
+        .quick_window_ms
+        .unwrap_or(index_config.quick_window_ms);
     let batch_ms = entry.batch_ms.unwrap_or(index_config.batch_ms);
     let watcher_config = WatcherConfig {
         debounce_ms,
+        quick_window_ms: quick_ms,
         batch_ms,
         exclude_dirs: index_config.exclude_dirs.clone(),
         exclude_file_patterns: index_config.exclude_file_patterns.clone(),
@@ -1376,11 +1393,18 @@ pub(crate) fn run_worker(
     // Держим watcher на стеке — при drop watcher остановится.
     let _watcher = watcher;
 
+    // Окно одиночной правки для строки журнала: при нуле режим выключен.
+    let quick_note = if quick_ms == 0 {
+        "одиночный режим выключен".to_string()
+    } else {
+        format!("окно одиночной правки {} мс", quick_ms)
+    };
     tracing::info!(
-        "[{}] слежение за файлами включено (пауза после события {} мс, окно пакета {} мс)",
+        "[{}] слежение за файлами включено (пауза после события {} мс, окно пакета {} мс, {})",
         path.display(),
         debounce_ms,
-        batch_ms
+        batch_ms,
+        quick_note
     );
 
     let registry = ParserRegistry::from_languages(&index_config.languages);
@@ -1424,7 +1448,7 @@ pub(crate) fn run_worker(
             break;
         }
 
-        let collected = match poll_batch(&rx, IDLE_POLL_MS, debounce_ms, batch_ms) {
+        let collected = match poll_batch(&rx, IDLE_POLL_MS, quick_ms, debounce_ms, batch_ms) {
             Ok(Some(b)) => {
                 // Число изменившихся файлов точное только когда сбор закончился
                 // тишиной. Упёрлись в потолок — поток ещё идёт, и в очереди

@@ -35,6 +35,9 @@ pub enum FileEvent {
 pub struct WatcherConfig {
     /// Задержка debounce в миллисекундах (по умолчанию 1500 мс)
     pub debounce_ms: u64,
+    /// Окно одиночной правки в миллисекундах (по умолчанию 50 мс).
+    /// 0 — одиночный режим выключен, всегда пауза `debounce_ms`.
+    pub quick_window_ms: u64,
     /// Максимальное время ожидания батча в миллисекундах (по умолчанию 2000 мс)
     pub batch_ms: u64,
     /// Дополнительные директории для исключения
@@ -51,6 +54,7 @@ impl Default for WatcherConfig {
     fn default() -> Self {
         Self {
             debounce_ms: 1500,
+            quick_window_ms: 50,
             batch_ms: 2000,
             exclude_dirs: vec![],
             exclude_file_patterns: vec![],
@@ -327,10 +331,26 @@ pub(crate) fn event_path(event: &FileEvent) -> &PathBuf {
 /// последующие события с debounce/batch лимитами и отдаёт дедуплицированный
 /// список.
 ///
+/// Режимов сбора два, и различает их `quick_ms` — окно одиночной правки:
+///
+/// * одиночный: после первого события ждём короткое окно `quick_ms`. Если за
+///   него не пришло событие по ДРУГОМУ пути — пачка закрывается сразу, не
+///   дожидаясь полной тишины `debounce_ms`. Обычная правка одного файла видна
+///   почти мгновенно вместо полусекундной задержки.
+/// * пакетный: как только в окне появился НОВЫЙ путь, одиночный режим уступает
+///   обычному циклу — тишина `debounce_ms` и потолок `batch_ms`. Массовые
+///   изменения обрабатываются как прежде.
+///
+/// Повторные события по тому же пути (одно сохранение файла ОС шлёт 2–3
+/// события: данные, метаданные) режим не переключают — только новый путь.
+/// При `quick_ms == 0`, а также когда окно не короче `debounce_ms`, одиночный
+/// режим выключен и работает прежний алгоритм.
+///
 /// `Err` возвращается только при закрытом канале (watcher умер).
 pub fn poll_batch(
     rx: &mpsc::Receiver<FileEvent>,
     idle_ms: u64,
+    quick_ms: u64,
     debounce_ms: u64,
     batch_ms: u64,
 ) -> Result<Option<Batch>, mpsc::RecvError> {
@@ -350,6 +370,52 @@ pub fn poll_batch(
 
     let batch_start = Instant::now();
     let mut last_event = Instant::now();
+
+    // Фаза окна одиночной правки. Нужна только когда включена и короче паузы
+    // тишины — иначе поведение прежнее.
+    if quick_ms != 0 && quick_ms < debounce_ms {
+        let quick = Duration::from_millis(quick_ms);
+        loop {
+            // Потолок окна пачки действует и здесь: файл, который пишется без
+            // перерыва (журнал внутри папки), продлевал бы окно бесконечно.
+            if batch_start.elapsed() >= batch_timeout {
+                return Ok(Some(Batch {
+                    events: pending.into_values().collect(),
+                    settled: false,
+                }));
+            }
+            let elapsed_since_last = last_event.elapsed();
+            if elapsed_since_last >= quick {
+                // Тишина до конца окна — это одиночная правка, список полон.
+                return Ok(Some(Batch {
+                    events: pending.into_values().collect(),
+                    settled: true,
+                }));
+            }
+            let wait = quick.saturating_sub(elapsed_since_last);
+            match rx.recv_timeout(wait) {
+                Ok(event) => {
+                    let path = event_path(&event).clone();
+                    let known = pending.contains_key(&path);
+                    pending.insert(path, event);
+                    last_event = Instant::now();
+                    if !known {
+                        // Событие по новому пути — дальше обычный цикл тишины.
+                        break;
+                    }
+                }
+                // Тишина или закрытый канал — отдаём собранное сразу.
+                Err(mpsc::RecvTimeoutError::Timeout)
+                | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(Some(Batch {
+                        events: pending.into_values().collect(),
+                        settled: true,
+                    }));
+                }
+            }
+        }
+    }
+
     // Дождались тишины (список полон) или упёрлись в потолок времени
     // (поток событий продолжается, и часть изменений осталась в очереди).
     let mut settled = true;
@@ -620,5 +686,131 @@ mod tests {
 
         let batch = collect_batch(&rx, 100, 200);
         assert!(batch.is_empty(), "Пустой батч при закрытом канале");
+    }
+
+    /// Одиночная правка закрывается коротким окном `quick_ms`, а не полной
+    /// тишиной `debounce_ms`: одно событие — пачка возвращается быстро.
+    #[test]
+    fn test_poll_batch_quick_window_single_event() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(FileEvent::Modified(PathBuf::from("/tmp/a.py")))
+                .unwrap();
+            // Держим канал живым, чтобы окно истекло тишиной, а не обрывом.
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let started = Instant::now();
+        let batch = poll_batch(&rx, 100, 50, 2000, 2000)
+            .unwrap()
+            .expect("должна вернуться пачка");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "одиночная правка не должна ждать debounce_ms"
+        );
+        assert!(batch.settled, "пачка закрыта тишиной окна");
+        assert_eq!(batch.events.len(), 1, "один файл");
+    }
+
+    /// Два события по одному пути (данные + метаданные) — по-прежнему один
+    /// файл, и на пакетный режим они не переключают.
+    #[test]
+    fn test_poll_batch_quick_window_same_path_twice() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let p = PathBuf::from("/tmp/a.py");
+            tx.send(FileEvent::Created(p.clone())).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            tx.send(FileEvent::Modified(p)).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let started = Instant::now();
+        let batch = poll_batch(&rx, 100, 50, 2000, 2000)
+            .unwrap()
+            .expect("должна вернуться пачка");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "повтор по тому же пути не включает пакетный режим"
+        );
+        assert!(batch.settled);
+        assert_eq!(batch.events.len(), 1, "дедупликация по пути");
+    }
+
+    /// Файл, который пишется без перерыва, не держит окно одиночной правки
+    /// бесконечно: срабатывает потолок `batch_ms`, пачка помечена неполной.
+    #[test]
+    fn test_poll_batch_quick_window_respects_batch_ceiling() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let p = PathBuf::from("/tmp/log.txt");
+            for _ in 0..100 {
+                if tx.send(FileEvent::Modified(p.clone())).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let started = Instant::now();
+        let batch = poll_batch(&rx, 100, 50, 2000, 300)
+            .unwrap()
+            .expect("должна вернуться пачка");
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_millis(900),
+            "потолок batch_ms должен закрыть пачку, прошло {:?}",
+            took
+        );
+        assert!(!batch.settled, "поток не утих — пачка неполная");
+        assert_eq!(batch.events.len(), 1);
+    }
+
+    /// Событие по второму файлу переключает в пакетный режим: пачка ждёт
+    /// тишины `debounce_ms`.
+    #[test]
+    fn test_poll_batch_new_path_switches_to_batch_mode() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(FileEvent::Modified(PathBuf::from("/tmp/a.py")))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            tx.send(FileEvent::Modified(PathBuf::from("/tmp/b.py")))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let started = Instant::now();
+        let batch = poll_batch(&rx, 100, 50, 300, 2000)
+            .unwrap()
+            .expect("должна вернуться пачка");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "новый путь обязан доехать до тишины debounce_ms"
+        );
+        assert!(batch.settled);
+        assert_eq!(batch.events.len(), 2, "оба файла в пачке");
+    }
+
+    /// `quick_ms = 0` — одиночный режим выключен, пауза прежняя.
+    #[test]
+    fn test_poll_batch_quick_zero_uses_debounce() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(FileEvent::Modified(PathBuf::from("/tmp/a.py")))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let started = Instant::now();
+        let batch = poll_batch(&rx, 100, 0, 300, 2000)
+            .unwrap()
+            .expect("должна вернуться пачка");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "при quick_ms = 0 пауза прежняя — debounce_ms"
+        );
+        assert!(batch.settled);
+        assert_eq!(batch.events.len(), 1);
     }
 }

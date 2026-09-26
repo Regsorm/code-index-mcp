@@ -149,6 +149,7 @@ mod tests {
                 .map(|(path, alias)| PathEntry {
                     path: PathBuf::from(path),
                     debounce_ms: None,
+                    quick_window_ms: None,
                     batch_ms: None,
                     alias: if alias.is_empty() {
                         None

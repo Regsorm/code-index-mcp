@@ -509,6 +509,11 @@ pub struct PathEntry {
     #[serde(default)]
     pub debounce_ms: Option<u64>,
 
+    /// Переопределение окна одиночной правки для этой папки. `None` —
+    /// использовать значение из `.code-index/config.json` проекта.
+    #[serde(default)]
+    pub quick_window_ms: Option<u64>,
+
     /// Переопределение batch_ms для этой папки.
     #[serde(default)]
     pub batch_ms: Option<u64>,
@@ -636,6 +641,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_quick_window_override() {
+        let text = r#"
+            [[paths]]
+            path = "/tmp/a"
+
+            [[paths]]
+            path = "/tmp/b"
+            quick_window_ms = 0
+        "#;
+        let cfg = parse_str(text).unwrap();
+        // Без поля — переопределения нет, берётся значение проекта.
+        assert_eq!(cfg.paths[0].quick_window_ms, None);
+        assert_eq!(cfg.paths[1].quick_window_ms, Some(0));
+    }
+
+    #[test]
     fn parses_explicit_alias() {
         let text = r#"
             [[paths]]
@@ -659,6 +680,7 @@ mod tests {
         let entry = PathEntry {
             path: PathBuf::from("C:/Some Folder Name"),
             debounce_ms: None,
+            quick_window_ms: None,
             batch_ms: None,
             alias: None,
             language: None,
@@ -753,6 +775,7 @@ mod tests {
         let entry_with_override = PathEntry {
             path: PathBuf::from("/x"),
             debounce_ms: None,
+            quick_window_ms: None,
             batch_ms: None,
             alias: None,
             language: None,
@@ -774,6 +797,7 @@ mod tests {
         let entry_no_override = PathEntry {
             path: PathBuf::from("/x"),
             debounce_ms: None,
+            quick_window_ms: None,
             batch_ms: None,
             alias: None,
             language: None,

@@ -153,6 +153,15 @@ pub struct IndexConfig {
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
 
+    /// Окно одиночной правки наблюдателя в миллисекундах.
+    ///
+    /// После первого события watcher ждёт `quick_window_ms` тишины: если за
+    /// это время не пришло событие по другому файлу — пачка закрывается сразу,
+    /// не дожидаясь полной тишины `debounce_ms`. По умолчанию 50 мс. 0 —
+    /// одиночный режим выключен, всегда пауза `debounce_ms`.
+    #[serde(default = "default_quick_window_ms")]
+    pub quick_window_ms: u64,
+
     /// Потолок накопления пачки изменений для наблюдателя, в миллисекундах.
     ///
     /// Обычно сбор заканчивается тишиной (`debounce_ms`) — тогда число
@@ -205,6 +214,10 @@ fn default_memory_estimate_factor() -> f32 {
 
 fn default_debounce_ms() -> u64 {
     1500
+}
+
+fn default_quick_window_ms() -> u64 {
+    50
 }
 
 fn default_batch_ms() -> u64 {
@@ -278,6 +291,7 @@ impl Default for IndexConfig {
             memory_max_percent: default_memory_max_percent(),
             memory_estimate_factor: default_memory_estimate_factor(),
             debounce_ms: default_debounce_ms(),
+            quick_window_ms: default_quick_window_ms(),
             batch_ms: default_batch_ms(),
             bulk_batch_threshold: default_bulk_batch_threshold(),
             flush_interval_sec: default_flush_interval(),
