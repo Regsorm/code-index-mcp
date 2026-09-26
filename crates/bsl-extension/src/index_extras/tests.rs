@@ -738,7 +738,8 @@ fn fills_config_manifest_from_all_areas() {
 
     let storage = fresh_storage(&tmp);
     let conn = storage.conn();
-    index_config_manifest(&repo, conn).unwrap();
+    let scan = RepoScan::build(&repo);
+    index_config_manifest(&scan, conn).unwrap();
 
     // Всего 5 строк: base(3) + ext(2).
     let total: i64 = conn
@@ -5846,4 +5847,71 @@ fn qualified_callers_common_manager_and_form() {
 
     assert!(crate::qualified_callers::qualified_callers(&st, "").is_empty());
     assert!(crate::qualified_callers::qualified_callers(&st, "Общий.Проц").is_empty());
+}
+
+#[test]
+fn resume_пропускает_собранные_фазы_и_повторяет_после_изменения() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    write_config_level_fixture(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    assert!(storage.extras_build_complete(), "слой дошёл до конца");
+
+    let done: u32 = storage
+        .conn()
+        .query_row(
+            "SELECT value FROM index_state WHERE key = 'extras_resume_done'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(done, EXTRAS_PHASE_COUNT, "отмечены все фазы слоя");
+
+    // Имитируем обрыв после фазы прав: сдвигаем отметку назад, чистим таблицу
+    // прав. Повторный проход обязан ДОБРАТЬ права с точки возобновления, а не
+    // начать с нуля и не пропустить фазу.
+    storage
+        .conn()
+        .execute("DELETE FROM role_rights", [])
+        .unwrap();
+    storage
+        .conn()
+        .execute(
+            "INSERT OR REPLACE INTO index_state (key, value) VALUES ('extras_resume_done', ?1)",
+            params![PH_ROLE_RIGHTS.to_string()],
+        )
+        .unwrap();
+    run_index_extras(&repo, &mut storage).unwrap();
+    let rr: i64 = storage
+        .conn()
+        .query_row("SELECT COUNT(*) FROM role_rights", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rr, 1, "права пересобраны с точки возобновления");
+
+    // Изменение входа сбрасывает прогресс: правим Rights.xml — фаза обязана
+    // собраться заново, а не остаться пропущенной по старому отпечатку.
+    write(
+        &repo
+            .join("Roles")
+            .join("Роль1")
+            .join("Ext")
+            .join("Rights.xml"),
+        r#"<?xml version="1.0"?>
+<Rights xmlns="r"><object>
+  <name>Document.РеализацияТоваровУслуг</name>
+  <right><name>Read</name><value>true</value></right>
+  <right><name>Posting</name><value>true</value></right>
+</object></Rights>"#,
+    );
+    run_index_extras(&repo, &mut storage).unwrap();
+    let rights: i64 = storage
+        .conn()
+        .query_row("SELECT COUNT(*) FROM role_rights", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rights, 2, "изменившийся вход — фаза собрана заново");
 }

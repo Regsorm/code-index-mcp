@@ -1057,6 +1057,7 @@ pub(crate) fn run_worker(
             && db_has_rows
             && reindex.files_indexed == 0
             && reindex.files_deleted == 0
+            && storage.extras_build_complete()
             && proc.extras_present(&storage);
 
         // Между «ничего не менялось» и «полный пересбор» есть третий случай:
@@ -1069,6 +1070,7 @@ pub(crate) fn run_worker(
             && !skip_extras
             && db_has_rows
             && !reindex.paths_overflow
+            && storage.extras_build_complete()
             && proc.extras_present(&storage);
 
         let mut need_full = !skip_extras;
@@ -1114,6 +1116,33 @@ pub(crate) fn run_worker(
             }
         }
 
+        // Прогрессивная готовность: полный пересбор надстройки идёт минутами,
+        // а базовое ядро уже записано в готовую базу. Если база на диске —
+        // объявляем папку Ready сейчас: инструменты ядра начинают отвечать
+        // сразу, а tools расширения отдают структурированное «слой ещё
+        // строится», пока не выставлен флаг завершённости надстройки.
+        // Для базы в памяти это не делаем: на диске её ещё нет, читать серверу
+        // выдачи нечего.
+        if need_full && !worked_in_memory && !stop.load(Ordering::Acquire) {
+            if let Err(e) = storage.set_extras_build_complete(false) {
+                tracing::warn!(
+                    "[{}] не снята отметка завершённости надстройки: {}",
+                    path.display(),
+                    e
+                );
+            }
+            tokio_block_on(async {
+                state.set_status(&path, PathStatus::Ready).await;
+            });
+            tracing::info!(
+                "[{}] базовая индексация готова — папка объявлена доступной; \
+                 надстройка процессора «{}» досчитывается в фоне, \
+                 1С-инструменты включатся по её завершении",
+                path.display(),
+                proc.name()
+            );
+        }
+
         if need_full && !stop.load(Ordering::Acquire) {
             let t0 = std::time::Instant::now();
             // Сообщаем о НАЧАЛЕ: на больших конфигурациях полный пересбор идёт
@@ -1136,6 +1165,16 @@ pub(crate) fn run_worker(
                     proc.name(),
                     e
                 );
+                // Не держим инструменты расширения закрытыми навсегда: слой
+                // не собрался, но данные — ровно те, что есть. Ближайший
+                // полный проход (или рестарт демона) повторит его.
+                if let Err(e) = storage.set_extras_build_complete(true) {
+                    tracing::warn!(
+                        "[{}] не выставлена отметка завершённости надстройки: {}",
+                        path.display(),
+                        e
+                    );
+                }
             } else {
                 tracing::info!(
                     "[{}] полный пересбор надстройки процессора «{}» выполнен за {} мс",

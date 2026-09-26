@@ -13,8 +13,7 @@ use crate::xml::metadata_refs::{
     parse_role_rights_file, parse_subsystem_content_file,
 };
 use crate::xml::object_attributes::{
-    parse_object_attributes_file, parse_object_header_xml, parse_object_structure_file,
-    parse_template_type, ObjectStructure,
+    parse_object_header_xml, parse_template_type, ObjectStructure,
 };
 use anyhow::Result;
 use rusqlite::params;
@@ -30,8 +29,8 @@ use super::*;
 /// `metadata_objects.sub_config` (дом объекта), поэтому Фаза 2 отличит
 /// пропажу строки у дома (реальное удаление) от пропажи у заимствователя.
 /// Дёшево: читает только текст описей, объектные XML не трогает.
-pub(crate) fn index_config_manifest(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    let roots = sub_config_roots(repo_root); // base-first
+pub(crate) fn index_config_manifest(scan: &RepoScan, conn: &rusqlite::Connection) -> Result<()> {
+    let roots = &scan.sub_roots; // base-first
 
     // Защита от cascade-ошибки (см. index_metadata_objects): закрыть
     // возможную открытую транзакцию предыдущей фазы перед своей.
@@ -46,8 +45,8 @@ pub(crate) fn index_config_manifest(repo_root: &Path, conn: &rusqlite::Connectio
          VALUES (?, ?, ?, ?)",
     )?;
     let mut total = 0usize;
-    for sub_root in &roots {
-        let area = compute_extension_name(repo_root, sub_root);
+    for sub_root in roots {
+        let area = compute_extension_name(&scan.repo_root, sub_root);
         let rows = match parse_config_dump_info_rows(sub_root) {
             Ok(r) => r,
             Err(e) => {
@@ -96,28 +95,12 @@ pub(crate) fn build_id_map(
     out
 }
 
-pub(crate) fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    // Сначала собираем все Configuration.xml в репо (multi-config layout):
-    //   * <root>/Configuration.xml — классическая выгрузка одной конфигурации;
-    //   * <root>/<sub>/Configuration.xml — типичный git-репо с base/ + extensions/<EF_X>/;
-    //   * глубина ограничена 3 уровнями (см. processor::detects()).
-    //
-    // Для каждого Configuration.xml парсим объекты и пишем в общий
-    // `metadata_objects` (UNIQUE по `(repo, full_name)`, INSERT OR IGNORE
-    // — заимствованные в расширениях объекты с тем же full_name просто
-    // пропускаются, в выдаче остаётся base-версия).
-    let mut config_paths: Vec<std::path::PathBuf> = Vec::new();
-    let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(repo_root)
-        .max_depth(3)
-        .into_iter()
-        .filter_entry(|e| filter.allows(e))
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() && entry.file_name().to_str() == Some("Configuration.xml") {
-            config_paths.push(entry.path().to_path_buf());
-        }
-    }
+pub(crate) fn index_metadata_objects(scan: &RepoScan, conn: &rusqlite::Connection) -> Result<()> {
+    // Список Configuration.xml уже собран единым обходом (`scan.rs`) с той же
+    // глубиной и в том же порядке, что у прежнего отдельного обхода. Собираем
+    // объекты для реестра: base-first порядок гарантирует, что заимствованный
+    // объект не перетрёт базовый (INSERT OR IGNORE — первая запись побеждает).
+    let config_paths = &scan.config_paths;
 
     if config_paths.is_empty() {
         return Ok(());
@@ -142,7 +125,7 @@ pub(crate) fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connecti
     )?;
     let mut total = 0usize;
     let mut sources: Vec<(String, usize)> = Vec::with_capacity(config_paths.len());
-    for cfg_path in &config_paths {
+    for cfg_path in config_paths {
         let objects = match parse_configuration_file(cfg_path) {
             Ok(o) => o,
             Err(e) => {
@@ -168,7 +151,7 @@ pub(crate) fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connecti
     // и раньше в реестр не попадали: состав их разбирался, рёбра писались, а
     // сам объект найти было нельзя (get_object_structure отвечал «не найден»).
     let mut nested_subsystems = 0usize;
-    for cfg_path in &config_paths {
+    for cfg_path in config_paths {
         let root = match cfg_path.parent() {
             Some(p) => p,
             None => continue,
@@ -177,27 +160,13 @@ pub(crate) fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connecti
         if !sub_dir.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&sub_dir)
-            .into_iter()
-            .filter_entry(|e| filter.allows(e))
-            .filter_map(|e| e.ok())
+        // Файлы подсистем уже отобраны обходом (родитель — каталог
+        // `Subsystems`); остаётся взять те, что принадлежат ЭТОЙ области.
+        for path in scan
+            .nested_subsystems
+            .iter()
+            .filter(|p| p.starts_with(&sub_dir))
         {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("xml") {
-                continue;
-            }
-            // Только файлы-определения подсистем (Ext/Forms и прочее — мимо).
-            if path
-                .parent()
-                .and_then(|d| d.file_name())
-                .and_then(|s| s.to_str())
-                != Some("Subsystems")
-            {
-                continue;
-            }
             let stem = match path.file_stem().and_then(|s| s.to_str()) {
                 Some(s) => s,
                 None => continue,
@@ -245,22 +214,13 @@ pub(crate) fn index_metadata_objects(repo_root: &Path, conn: &rusqlite::Connecti
 /// Полный пересбор (DELETE+INSERT всего репо) — идемпотентно, как остальной
 /// `index_extras`. Объём IO невелик (для УТ ~1900 XML / ~68 МБ, ~1-3 сек),
 /// поэтому инкрементальность здесь не нужна.
-pub(crate) fn index_data_links(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    // Корни sub-config — родители найденных Configuration.xml.
-    let mut sub_roots: Vec<std::path::PathBuf> = Vec::new();
-    let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(repo_root)
-        .max_depth(3)
-        .into_iter()
-        .filter_entry(|e| filter.allows(e))
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() && entry.file_name().to_str() == Some("Configuration.xml") {
-            if let Some(parent) = entry.path().parent() {
-                sub_roots.push(parent.to_path_buf());
-            }
-        }
-    }
+pub(crate) fn index_data_links(
+    scan: &RepoScan,
+    harvest: &XmlHarvest,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    // Корни sub-config уже найдены единым обходом, base-first.
+    let sub_roots = &scan.sub_roots;
     if sub_roots.is_empty() {
         return Ok(());
     }
@@ -279,40 +239,23 @@ pub(crate) fn index_data_links(repo_root: &Path, conn: &rusqlite::Connection) ->
 
     let mut total: usize = 0;
     let mut objects: usize = 0;
-    for sub_root in &sub_roots {
+    for sub_root in sub_roots {
         for (folder, meta_type) in OBJECT_FOLDERS {
             let dir = sub_root.join(folder);
             if !dir.is_dir() {
                 continue;
             }
-            // Только файлы верхнего уровня (Catalogs/<Имя>.xml), не подпапки
-            // (Catalogs/<Имя>/Forms/... — это формы, не структура объекта).
-            let read = match std::fs::read_dir(&dir) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("data_links: read_dir({}): {}", dir.display(), e);
+            // Рёбра уже разобраны единым чтением корневых XML (`harvest.rs`);
+            // берём объекты этой папки этой области в порядке обхода.
+            for obj in harvest.objects.iter().filter(|o| {
+                o.structured && o.folder == *folder && o.path.parent() == Some(dir.as_path())
+            }) {
+                if obj.stem.is_empty() {
                     continue;
                 }
-            };
-            for entry in read.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if !path.is_file() || path.extension().and_then(|x| x.to_str()) != Some("xml") {
-                    continue;
-                }
-                let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let owner_full = format!("{}.{}", meta_type, stem);
-                let edges = match parse_object_attributes_file(&path, &owner_full) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::warn!("data_links: {}: {}", path.display(), e);
-                        continue;
-                    }
-                };
+                let owner_full = format!("{}.{}", meta_type, obj.stem);
                 objects += 1;
-                for edge in edges {
+                for edge in &obj.edges {
                     stmt.execute(params![
                         REPO_DEFAULT,
                         &owner_full,
@@ -355,8 +298,8 @@ pub(crate) fn index_data_links(repo_root: &Path, conn: &rusqlite::Connection) ->
 /// ВАЖНО: вызывать ПОСЛЕ `index_data_links` — она wipe-ит все рёбра repo и
 /// пишет объектные. Эта функция сносит только СВОИ `link_kind` (идемпотентность
 /// + корректность инкрементального пути, где `index_data_links` не вызывается).
-pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    let roots = sub_config_roots(repo_root);
+pub(crate) fn index_metadata_refs(scan: &RepoScan, conn: &rusqlite::Connection) -> Result<()> {
+    let roots = &scan.sub_roots;
     if roots.is_empty() {
         return Ok(());
     }
@@ -380,33 +323,17 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
     // нужна только если в составе подсистемы встретился идентификатор вместо
     // имени, а это бывает лишь в выгрузках расширений.
     let mut id_map: Option<std::collections::HashMap<String, String>> = None;
-    let filter = DirFilter::load(repo_root);
-    for root in &roots {
+    for root in roots {
         // ── Подсистемы: Subsystems/**.xml ──────────────────────────────────
         // Файл-определение подсистемы лежит прямо в папке "Subsystems"
         // (вложенные — в <Parent>/Subsystems/<Child>.xml). Ext/Forms — пропуск.
         let sub_dir = root.join("Subsystems");
         if sub_dir.is_dir() {
-            for entry in WalkDir::new(&sub_dir)
-                .into_iter()
-                .filter_entry(|e| filter.allows(e))
-                .filter_map(|e| e.ok())
+            for path in scan
+                .nested_subsystems
+                .iter()
+                .filter(|p| p.starts_with(&sub_dir))
             {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("xml") {
-                    continue;
-                }
-                if path
-                    .parent()
-                    .and_then(|d| d.file_name())
-                    .and_then(|s| s.to_str())
-                    != Some("Subsystems")
-                {
-                    continue;
-                }
                 let stem = match path.file_stem().and_then(|s| s.to_str()) {
                     Some(s) => s,
                     None => continue,
@@ -422,7 +349,7 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
                             let to_object = if to_object.contains('.') {
                                 to_object
                             } else {
-                                let map = id_map.get_or_insert_with(|| build_id_map(&roots));
+                                let map = id_map.get_or_insert_with(|| build_id_map(roots));
                                 match map.get(&to_object) {
                                     Some(name) => name.clone(),
                                     None => {
@@ -455,16 +382,11 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
         // ── Планы обмена: ExchangePlans/<Имя>/Ext/Content.xml ───────────────
         let ep_dir = root.join("ExchangePlans");
         if ep_dir.is_dir() {
-            for entry in WalkDir::new(&ep_dir)
-                .into_iter()
-                .filter_entry(|e| filter.allows(e))
-                .filter_map(|e| e.ok())
+            for path in scan
+                .exchange_content
+                .iter()
+                .filter(|p| p.starts_with(&ep_dir))
             {
-                if !entry.file_type().is_file() || entry.file_name().to_str() != Some("Content.xml")
-                {
-                    continue;
-                }
-                let path = entry.path();
                 // <Имя> = папка на два уровня выше (…/<Имя>/Ext/Content.xml).
                 let name = path
                     .parent()
@@ -499,35 +421,33 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
         // ── Определяемые типы: DefinedTypes/<Имя>.xml ───────────────────────
         let dt_dir = root.join("DefinedTypes");
         if dt_dir.is_dir() {
-            if let Ok(read) = std::fs::read_dir(&dt_dir) {
-                for entry in read.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("xml") {
-                        continue;
-                    }
-                    let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let from_object = format!("DefinedType.{}", stem);
-                    match parse_defined_type_targets_file(&path) {
-                        Ok(targets) => {
-                            let is_composite = targets.len() > 1;
-                            for (to_object, is_universal) in targets {
-                                stmt.execute(params![
-                                    REPO_DEFAULT,
-                                    &from_object,
-                                    "",
-                                    &to_object,
-                                    "defined_type_content",
-                                    is_composite as i64,
-                                    is_universal as i64
-                                ])?;
-                                total += 1;
-                            }
+            for path in scan
+                .defined_types
+                .iter()
+                .filter(|p| p.parent() == Some(dt_dir.as_path()))
+            {
+                let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let from_object = format!("DefinedType.{}", stem);
+                match parse_defined_type_targets_file(path) {
+                    Ok(targets) => {
+                        let is_composite = targets.len() > 1;
+                        for (to_object, is_universal) in targets {
+                            stmt.execute(params![
+                                REPO_DEFAULT,
+                                &from_object,
+                                "",
+                                &to_object,
+                                "defined_type_content",
+                                is_composite as i64,
+                                is_universal as i64
+                            ])?;
+                            total += 1;
                         }
-                        Err(e) => tracing::warn!("defined_type_content {}: {}", path.display(), e),
                     }
+                    Err(e) => tracing::warn!("defined_type_content {}: {}", path.display(), e),
                 }
             }
         }
@@ -535,55 +455,53 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
         // ── Функциональные опции: FunctionalOptions/<Имя>.xml (<Location>) ──
         let fo_dir = root.join("FunctionalOptions");
         if fo_dir.is_dir() {
-            if let Ok(read) = std::fs::read_dir(&fo_dir) {
-                for entry in read.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("xml") {
-                        continue;
+            for path in scan
+                .functional_options
+                .iter()
+                .filter(|p| p.parent() == Some(fo_dir.as_path()))
+            {
+                let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let from_object = format!("FunctionalOption.{}", stem);
+                match parse_functional_option_location_file(path) {
+                    Ok(Some((to_object, raw_location))) => {
+                        stmt.execute(params![
+                            REPO_DEFAULT,
+                            &from_object,
+                            &raw_location,
+                            &to_object,
+                            "functional_option_location",
+                            0_i64,
+                            0_i64
+                        ])?;
+                        total += 1;
                     }
-                    let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let from_object = format!("FunctionalOption.{}", stem);
-                    match parse_functional_option_location_file(&path) {
-                        Ok(Some((to_object, raw_location))) => {
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("functional_option_location {}: {}", path.display(), e)
+                    }
+                }
+                // W1: состав опции (<Content>) → рёбра functional_option_content
+                // (ФО → включаемый объект/реквизит).
+                match parse_functional_option_content_file(path) {
+                    Ok(items) => {
+                        for to_object in items {
                             stmt.execute(params![
                                 REPO_DEFAULT,
                                 &from_object,
-                                &raw_location,
+                                "",
                                 &to_object,
-                                "functional_option_location",
+                                "functional_option_content",
                                 0_i64,
                                 0_i64
                             ])?;
                             total += 1;
                         }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!("functional_option_location {}: {}", path.display(), e)
-                        }
                     }
-                    // W1: состав опции (<Content>) → рёбра functional_option_content
-                    // (ФО → включаемый объект/реквизит).
-                    match parse_functional_option_content_file(&path) {
-                        Ok(items) => {
-                            for to_object in items {
-                                stmt.execute(params![
-                                    REPO_DEFAULT,
-                                    &from_object,
-                                    "",
-                                    &to_object,
-                                    "functional_option_content",
-                                    0_i64,
-                                    0_i64
-                                ])?;
-                                total += 1;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("functional_option_content {}: {}", path.display(), e)
-                        }
+                    Err(e) => {
+                        tracing::warn!("functional_option_content {}: {}", path.display(), e)
                     }
                 }
             }
@@ -610,8 +528,8 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
 /// Заполнить `role_rights` из `Roles/<Имя>/Ext/Rights.xml` по всем sub-config.
 /// Полный wipe+rebuild одной таблицы — идемпотентно. Хранятся только granted-
 /// права (`<value>true</value>`). Имя роли = папка на два уровня выше Rights.xml.
-pub(crate) fn index_role_rights(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    let roots = sub_config_roots(repo_root);
+pub(crate) fn index_role_rights(scan: &RepoScan, conn: &rusqlite::Connection) -> Result<()> {
+    let roots = &scan.sub_roots;
     if roots.is_empty() {
         return Ok(());
     }
@@ -629,21 +547,17 @@ pub(crate) fn index_role_rights(repo_root: &Path, conn: &rusqlite::Connection) -
 
     let mut total: usize = 0;
     let mut roles: usize = 0;
-    let filter = DirFilter::load(repo_root);
-    for root in &roots {
+    for root in roots {
         let roles_dir = root.join("Roles");
         if !roles_dir.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&roles_dir)
-            .into_iter()
-            .filter_entry(|e| filter.allows(e))
-            .filter_map(|e| e.ok())
+        // Файлы `Rights.xml` отобраны обходом; берём принадлежащие этой области.
+        for path in scan
+            .rights_files
+            .iter()
+            .filter(|p| p.starts_with(&roles_dir))
         {
-            if !entry.file_type().is_file() || entry.file_name().to_str() != Some("Rights.xml") {
-                continue;
-            }
-            let path = entry.path();
             let role_name = path
                 .parent()
                 .and_then(|ext| ext.parent())
@@ -779,54 +693,42 @@ pub(crate) fn index_metadata_code_usages(
 /// расширения). Затем UPDATE строки `metadata_objects` по `full_name` (строки
 /// уже созданы `index_metadata_objects`). Объекты без структуры остаются с
 /// `attributes_json = NULL`.
-pub(crate) fn index_object_attributes(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    let sub_roots = sub_config_roots(repo_root);
+pub(crate) fn index_object_attributes(
+    scan: &RepoScan,
+    harvest: &XmlHarvest,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    let sub_roots = &scan.sub_roots;
     if sub_roots.is_empty() {
         return Ok(());
     }
 
-    // Аккумулируем структуру каждого объекта по всем sub-config'ам. Каждый XML
-    // парсится один раз; merge_from добавляет только новые поля расширений.
+    // Аккумулируем структуру каждого объекта по всем sub-config'ам. Структуры
+    // уже разобраны единым чтением корневых XML (`harvest.rs`);
+    // merge_from добавляет только новые поля расширений.
     let mut acc: std::collections::HashMap<String, ObjectStructure> =
         std::collections::HashMap::new();
-    for sub_root in &sub_roots {
+    for sub_root in sub_roots {
         for (folder, meta_type) in OBJECT_FOLDERS {
             let dir = sub_root.join(folder);
             if !dir.is_dir() {
                 continue;
             }
-            let read = match std::fs::read_dir(&dir) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("object_attributes: read_dir({}): {}", dir.display(), e);
+            for obj in harvest.objects.iter().filter(|o| {
+                o.structured && o.folder == *folder && o.path.parent() == Some(dir.as_path())
+            }) {
+                if obj.stem.is_empty() {
                     continue;
                 }
-            };
-            for entry in read.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if !path.is_file() || path.extension().and_then(|x| x.to_str()) != Some("xml") {
-                    continue;
-                }
-                let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                    Some(s) => s,
-                    None => continue,
+                let structure = match &obj.structure {
+                    Some(s) if !s.is_empty() => s,
+                    _ => continue,
                 };
-                let structure = match parse_object_structure_file(&path) {
-                    Ok(Some(s)) => s,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::warn!("object_attributes: {}: {}", path.display(), e);
-                        continue;
-                    }
-                };
-                if structure.is_empty() {
-                    continue;
-                }
-                let full_name = format!("{}.{}", meta_type, stem);
+                let full_name = format!("{}.{}", meta_type, obj.stem);
                 match acc.get_mut(&full_name) {
-                    Some(existing) => existing.merge_from(&structure),
+                    Some(existing) => existing.merge_from(structure),
                     None => {
-                        acc.insert(full_name, structure);
+                        acc.insert(full_name, structure.clone());
                     }
                 }
             }
@@ -875,39 +777,29 @@ pub(crate) fn index_object_attributes(repo_root: &Path, conn: &rusqlite::Connect
 /// `<ChildObjects>`, поэтому дёшев. UPDATE по full_name: записи уже созданы
 /// `index_metadata_objects`; для отсутствующих UPDATE — no-op. base-приоритет
 /// (sub_roots: base первым → его synonym не перетирается расширением).
-pub(crate) fn index_object_synonyms(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    let sub_roots = sub_config_roots(repo_root);
+pub(crate) fn index_object_synonyms(
+    scan: &RepoScan,
+    harvest: &XmlHarvest,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    let sub_roots = &scan.sub_roots;
     if sub_roots.is_empty() {
         return Ok(());
     }
     let mut syn: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let filter = DirFilter::load(repo_root);
-    for sub_root in &sub_roots {
-        let type_dirs = match std::fs::read_dir(sub_root) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for td in type_dirs.filter_map(|e| e.ok()) {
-            let tdir = td.path();
-            if !tdir.is_dir() {
-                continue;
-            }
-            let files = match std::fs::read_dir(&tdir) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            for f in files.filter_map(|e| e.ok()) {
-                let p = f.path();
-                if !p.is_file() || p.extension().and_then(|x| x.to_str()) != Some("xml") {
-                    continue;
-                }
-                let content = match std::fs::read_to_string(&p) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                if let Some((mt, nm, Some(s))) = parse_object_header_xml(&content) {
+    for sub_root in sub_roots {
+        // Шапки корневых XML всех папок типов области уже разобраны единым
+        // чтением (`harvest.rs`) — берём готовые (meta_type, name, synonym).
+        for obj in harvest
+            .objects
+            .iter()
+            .filter(|o| scan.sub_root_of(&o.path) == Some(sub_root.as_path()))
+        {
+            if let Some((mt, nm)) = &obj.header {
+                if let Some(s) = &obj.synonym {
                     if !s.is_empty() {
-                        syn.entry(format!("{}.{}", mt, nm)).or_insert(s);
+                        syn.entry(format!("{}.{}", mt, nm))
+                            .or_insert_with(|| s.clone());
                     }
                 }
             }
@@ -920,26 +812,11 @@ pub(crate) fn index_object_synonyms(repo_root: &Path, conn: &rusqlite::Connectio
         // объектов. Верхнеуровневые повторно не перетираются: `or_insert`.
         let subsystems_dir = sub_root.join("Subsystems");
         if subsystems_dir.is_dir() {
-            for entry in WalkDir::new(&subsystems_dir)
-                .into_iter()
-                .filter_entry(|e| filter.allows(e))
-                .filter_map(|e| e.ok())
+            for p in scan
+                .nested_subsystems
+                .iter()
+                .filter(|p| p.starts_with(&subsystems_dir))
             {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let p = entry.path();
-                if p.extension().and_then(|x| x.to_str()) != Some("xml") {
-                    continue;
-                }
-                // Только файлы-определения подсистем (Ext/Forms и прочее — мимо).
-                if p.parent()
-                    .and_then(|d| d.file_name())
-                    .and_then(|s| s.to_str())
-                    != Some("Subsystems")
-                {
-                    continue;
-                }
                 let content = match std::fs::read_to_string(p) {
                     Ok(c) => c,
                     Err(_) => continue,
@@ -1184,10 +1061,12 @@ pub(crate) fn build_procedure_terms_from_staging(conn: &rusqlite::Connection) ->
     result.and(recreated)
 }
 
-pub(crate) fn index_metadata_forms(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+pub(crate) fn index_metadata_forms(scan: &RepoScan, conn: &rusqlite::Connection) -> Result<()> {
     // Ищем `Form.xml` в любом дочернем `Forms/<Name>/[Ext/]Form.xml`.
     // Имя владельца восстанавливается из пути: ищем сегмент под
     // `Forms/`, значит путь выглядит как `<...>/<MetaType>/<OwnerName>/Forms/<FormName>/...Form.xml`.
+    // Список файлов уже собран единым обходом (`scan.rs`).
+    let repo_root = &scan.repo_root;
     let mut count = 0usize;
     let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
     conn.execute("BEGIN", [])?;
@@ -1204,21 +1083,7 @@ pub(crate) fn index_metadata_forms(repo_root: &Path, conn: &rusqlite::Connection
          VALUES (?, ?, ?, ?)",
     )?;
 
-    let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(repo_root)
-        .into_iter()
-        .filter_entry(|e| filter.allows(e))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let path = entry.path();
-        let file_name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        if file_name != "Form.xml" {
-            continue;
-        }
+    for path in &scan.form_xmls {
         // Path: .../<MetaType>/<OwnerName>/Forms/<FormName>/[Ext/]Form.xml
         let (owner_full, form_name) = match decode_form_path(repo_root, path) {
             Some(t) => t,
@@ -1268,30 +1133,14 @@ pub(crate) fn index_metadata_forms(repo_root: &Path, conn: &rusqlite::Connection
 ///
 /// Идемпотентно: DELETE своих строк репо + INSERT. Обязана идти ПОСЛЕ
 /// `index_metadata_objects` — та чистит весь перечень репо целиком.
-pub(crate) fn index_object_templates(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+pub(crate) fn index_object_templates(scan: &RepoScan, conn: &rusqlite::Connection) -> Result<()> {
+    let repo_root = &scan.repo_root;
     let mut rows: Vec<TemplateRow> = Vec::new();
-    let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(repo_root)
-        .into_iter()
-        .filter_entry(|e| filter.allows(e))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("xml") {
-            continue;
-        }
-        // Описание макета лежит ПРЯМО в папке `Templates` объекта:
-        // `<...>/<ПапкаВида>/<Объект>/Templates/<Имя>.xml`. Всё остальное
-        // внутри (`<Имя>/Ext/Template.xml` — само содержимое) пропускаем.
-        if path
-            .parent()
-            .and_then(|d| d.file_name())
-            .and_then(|s| s.to_str())
-            != Some("Templates")
-        {
-            continue;
-        }
+    // Список описаний макетов уже собран единым обходом: это XML, лежащий
+    // ПРЯМО в папке `Templates` (`<...>/<ПапкаВида>/<Объект>/Templates/<Имя>.xml`).
+    // Всё остальное внутри (`<Имя>/Ext/Template.xml` — само содержимое) обход
+    // в эту категорию не относит.
+    for path in &scan.template_descriptors {
         if let Some(row) = template_row_from_path(repo_root, path) {
             rows.push(row);
         }
@@ -1518,13 +1367,13 @@ pub(crate) fn template_owner_from_path(path: &Path) -> Option<String> {
 }
 
 pub(crate) fn index_event_subscriptions(
-    repo_root: &Path,
+    scan: &RepoScan,
     conn: &rusqlite::Connection,
 ) -> Result<()> {
     // Подписки на события могут быть в нескольких sub-config'ах
     // (base/EventSubscriptions/, extensions/<EF_X>/EventSubscriptions/...).
-    // Обходим всё дерево рекурсивно (max_depth защищает от случайных
-    // глубоко вложенных fixture-файлов, как и в index_metadata_objects).
+    // Список файлов уже собран единым обходом с прежним ограничением глубины
+    // и проверкой каталога-родителя.
     let mut count = 0usize;
     let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
     conn.execute("BEGIN", [])?;
@@ -1537,29 +1386,7 @@ pub(crate) fn index_event_subscriptions(
          VALUES (?, ?, ?, ?, ?, ?)",
     )?;
 
-    let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(repo_root)
-        .max_depth(4) // root/<sub>/EventSubscriptions/<file>.xml = depth 3, +запас
-        .into_iter()
-        .filter_entry(|e| filter.allows(e))
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("xml") {
-            continue;
-        }
-        // Должен лежать внутри директории `EventSubscriptions/`.
-        let in_event_subs_dir = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            == Some("EventSubscriptions");
-        if !in_event_subs_dir {
-            continue;
-        }
+    for path in &scan.event_sub_xmls {
         match parse_event_subscription_file(path) {
             Ok(Some(sub)) => {
                 let sources_json = serde_json::to_string(&sub.sources)?;

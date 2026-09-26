@@ -65,22 +65,23 @@ pub(crate) fn migrate_metadata_modules_key_tx(conn: &rusqlite::Connection) -> Re
 ///      * Обходим .bsl-файлы под этой sub-root, классифицируем тип модуля
 ///        по имени файла + сегментам пути, находим XML-владельца, извлекаем
 ///        его UUID и записываем тройку `(object_id, property_id, config_version)`.
-pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    // Находим все Configuration.xml — каждая определяет область sub-config.
-    let mut sub_configs: Vec<std::path::PathBuf> = Vec::new();
-    let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(repo_root)
-        .max_depth(3)
-        .into_iter()
-        .filter_entry(|e| filter.allows(e))
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() && entry.file_name().to_str() == Some("Configuration.xml") {
-            if let Some(parent) = entry.path().parent() {
-                sub_configs.push(parent.to_path_buf());
-            }
-        }
-    }
+pub(crate) fn index_metadata_modules(
+    scan: &RepoScan,
+    harvest: &XmlHarvest,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    let repo_root = &scan.repo_root;
+    // Идентификаторы владельцев уже разобраны единым чтением XML (`harvest.rs`):
+    // объектный XML читается один раз на всю конфигурацию, а не на каждый .bsl
+    // (для модулей команд — не на каждую команду).
+    let ids = harvest.id_cache();
+    // Области выгрузки — родители Configuration.xml в порядке обхода; тот же
+    // набор, что у прежнего отдельного обхода `max_depth(3)`.
+    let sub_configs: Vec<std::path::PathBuf> = scan
+        .config_paths
+        .iter()
+        .filter_map(|p| p.parent().map(std::path::Path::to_path_buf))
+        .collect();
     if sub_configs.is_empty() {
         return Ok(());
     }
@@ -102,21 +103,14 @@ pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connecti
     > = std::collections::HashMap::new();
 
     for sub_root in &sub_configs {
-        for entry in WalkDir::new(sub_root)
-            .into_iter()
-            .filter_entry(|e| filter.allows(e))
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
+        // Модули области уже отобраны единым обходом (`scan.rs`).
+        for path in scan.files_of(&scan.bsl_files, sub_root) {
             // Строку собирает тот же хелпер, что и пофайловая ветка инкремента.
             // Раньше здесь лежала своя копия той же логики (классификация типа,
             // поиск владельца, чтение идентификатора), и правка одной стороны не
             // действовала во второй — так модули команд объектов остались бы вне
             // перечня даже после исправления разбора их пути (E-7).
-            let row = match build_module_row(repo_root, path, &mut cfgver_cache) {
+            let row = match build_module_row(repo_root, path, &mut cfgver_cache, Some(&ids)) {
                 Some(r) => r,
                 None => {
                     skipped += 1;
@@ -172,6 +166,7 @@ pub(crate) fn build_module_row(
         std::path::PathBuf,
         std::collections::HashMap<String, String>,
     >,
+    ids: Option<&XmlIdCache>,
 ) -> Option<ModuleRow> {
     let file_name = bsl_path.file_name().and_then(|n| n.to_str())?;
     let module_type = module_type_by_filename(file_name)?;
@@ -189,9 +184,13 @@ pub(crate) fn build_module_row(
     };
     let (object_name, uuid_opt) = match command_owner {
         Some((owner_xml_path, object_name, command_name)) => {
-            let uuid = extract_command_uuid_from_file(&owner_xml_path, &command_name)
-                .ok()
-                .flatten();
+            // UUID команды уже мог быть извлечён единым разбором объектного XML.
+            let uuid = match ids.and_then(|c| c.command_uuid(&owner_xml_path, &command_name)) {
+                Some(uuid) => Some(uuid.to_string()),
+                None => extract_command_uuid_from_file(&owner_xml_path, &command_name)
+                    .ok()
+                    .flatten(),
+            };
             (object_name, uuid)
         }
         None => {
@@ -200,13 +199,18 @@ pub(crate) fn build_module_row(
                 OwnerKind::Object => find_object_owner(bsl_path),
             };
             let (owner_xml_path, object_name) = owner_info?;
-            let uuid = match owner_xml_kind {
-                OwnerKind::Form => extract_form_uuid_any_from_file(&owner_xml_path)
-                    .ok()
-                    .flatten(),
-                OwnerKind::Object => extract_object_uuid_from_file(&owner_xml_path)
-                    .ok()
-                    .flatten(),
+            // UUID владельца из единого разбора (если он там был) — иначе
+            // читаем XML с диска, как раньше.
+            let uuid = match ids.and_then(|c| c.file_uuid(&owner_xml_path)) {
+                Some(uuid) => Some(uuid.to_string()),
+                None => match owner_xml_kind {
+                    OwnerKind::Form => extract_form_uuid_any_from_file(&owner_xml_path)
+                        .ok()
+                        .flatten(),
+                    OwnerKind::Object => extract_object_uuid_from_file(&owner_xml_path)
+                        .ok()
+                        .flatten(),
+                },
             };
             (object_name, uuid)
         }
@@ -468,7 +472,7 @@ pub(crate) fn update_metadata_module_for_file(
         params![REPO_DEFAULT, &rel],
     )?;
     if bsl_path.is_file() {
-        if let Some(row) = build_module_row(repo_root, bsl_path, cfgver_cache) {
+        if let Some(row) = build_module_row(repo_root, bsl_path, cfgver_cache, None) {
             insert_module_row(conn, &row)?;
         }
     }
@@ -533,7 +537,7 @@ pub(crate) fn update_metadata_modules_for_object(
             if !entry.file_type().is_file() {
                 continue;
             }
-            if let Some(row) = build_module_row(repo_root, entry.path(), cfgver_cache) {
+            if let Some(row) = build_module_row(repo_root, entry.path(), cfgver_cache, None) {
                 insert_module_row(conn, &row)?;
             }
         }

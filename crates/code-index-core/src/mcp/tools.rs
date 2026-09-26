@@ -209,6 +209,30 @@ pub fn format_unavailable(value: ToolUnavailable) -> String {
     }
 }
 
+/// Тяжёлый слой надстройки репо ещё строится? Тогда extension-tools отдают
+/// структурированное «слой в работе» вместо неполных метаданных/термов/графа.
+///
+/// Нужен из-за прогрессивной готовности: демон объявляет папку `Ready` сразу
+/// после базовой индексации, пока надстройка досчитывается минутами. Флаг
+/// `extras_build_complete` лежит в самой базе репо; отсутствие ключа — «слой
+/// завершён» (база прежней версии или репозиторий без надстройки).
+pub async fn extras_building_response(
+    storage: &std::sync::Arc<crate::storage::StoragePool>,
+) -> Option<serde_json::Value> {
+    let conn = storage.get().await.ok()?;
+    if conn.extras_build_complete() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "status": "indexing",
+        "layer": "extras",
+        "message": "Досчитывается слой надстройки (метаданные/термы/граф). \
+            Инструменты ядра (search_function, get_function, grep_code и др.) \
+            уже доступны; этот инструмент заработает после завершения слоя — \
+            повторите вызов через минуту или проверьте health.",
+    }))
+}
+
 /// Проверить у демона статус папки репо. `None` — папка Ready, можно продолжать.
 /// `Some(json)` — нужно отдать клиенту этот ToolUnavailable-ответ вместо данных.
 pub async fn check_path_status(entry: &RepoEntry) -> Option<String> {
@@ -2693,6 +2717,28 @@ mod tests {
     use super::*;
     use crate::storage::{PoolConfig, Storage, StoragePool};
     use std::time::{Duration, Instant};
+
+    /// Прогрессивная готовность: пока флаг завершённости надстройки снят,
+    /// extension-tools получают структурированное «слой в работе», а не данные.
+    #[tokio::test]
+    async fn extras_building_response_закрывает_незавершённый_слой() {
+        let pending = Storage::open_in_memory().unwrap();
+        pending.set_extras_build_complete(false).unwrap();
+        let pool = StoragePool::single(pending);
+        let value = extras_building_response(&pool)
+            .await
+            .expect("незавершённый слой должен закрывать инструмент");
+        assert_eq!(value["status"], serde_json::json!("indexing"));
+        assert_eq!(value["layer"], serde_json::json!("extras"));
+
+        let ready = Storage::open_in_memory().unwrap();
+        ready.set_extras_build_complete(true).unwrap();
+        let pool = StoragePool::single(ready);
+        assert!(
+            extras_building_response(&pool).await.is_none(),
+            "завершённый слой инструменты не закрывает"
+        );
+    }
 
     /// Готовая команда идёт человеку в терминал, поэтому расширенного префикса
     /// Windows в ней быть не должно; обычный путь остаётся как есть.

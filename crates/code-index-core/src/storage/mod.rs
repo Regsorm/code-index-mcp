@@ -3115,6 +3115,43 @@ impl Storage {
         schema::bulk_load_in_progress(&self.conn)
     }
 
+    /// Ключ отметки «слой надстройки дошёл до конца».
+    pub const EXTRAS_BUILD_COMPLETE_KEY: &'static str = schema::EXTRAS_BUILD_COMPLETE_KEY;
+
+    /// Достроена ли надстройка до конца в прошлом проходе.
+    ///
+    /// Отсутствие ключа — «да»: база прежней версии или репозиторий без
+    /// надстройки не должны гонять полный пересбор на каждом старте. Значение
+    /// `0` ставят процессоры-расширения на время своей работы; успешное
+    /// завершение снова пишет `1`.
+    pub fn extras_build_complete(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT value FROM index_state WHERE key = ?1",
+                params![Self::EXTRAS_BUILD_COMPLETE_KEY],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    }
+
+    /// Поставить отметку о завершённости (или незавершённости) надстройки.
+    ///
+    /// Пишется отдельной транзакцией, как и [`Self::set_bulk_in_progress`]:
+    /// отметка обязана пережить убийство процесса.
+    pub fn set_extras_build_complete(&self, complete: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO index_state (key, value) VALUES (?1, ?2)",
+                params![
+                    Self::EXTRAS_BUILD_COMPLETE_KEY,
+                    if complete { "1" } else { "0" }
+                ],
+            )
+            .context("set_extras_build_complete: не удалось записать отметку")?;
+        Ok(())
+    }
+
     /// Номер версии данных, который собирает ТЕКУЩИЙ бинарник.
     pub const INDEX_DATA_VERSION: u32 = schema::INDEX_DATA_VERSION;
 
@@ -6256,5 +6293,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(storage.data_version(), 0);
+    }
+
+    /// Флаг завершённости надстройки: отсутствие ключа — «завершена» (базы
+    /// прежних версий и репо без надстройки), записанный `0` — «строится»
+    /// (прогрессивная готовность закрывает extension-tools), `1` — снова готово.
+    #[test]
+    fn extras_build_complete_по_умолчанию_истина_и_переключается() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert!(
+            storage.extras_build_complete(),
+            "без ключа слой считается завершённым"
+        );
+
+        storage.set_extras_build_complete(false).unwrap();
+        assert!(!storage.extras_build_complete(), "снятый флаг виден");
+
+        let rows: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM index_state WHERE key = ?1",
+                params![Storage::EXTRAS_BUILD_COMPLETE_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "флаг не плодит строк");
+
+        storage.set_extras_build_complete(true).unwrap();
+        assert!(storage.extras_build_complete(), "флаг возвращается");
     }
 }
