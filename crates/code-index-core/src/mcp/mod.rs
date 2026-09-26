@@ -2212,7 +2212,13 @@ impl ServerHandler for CodeIndexServer {
         // 1. Сначала core-tools — они есть всегда.
         if self.tool_router.has_route(request.name.as_ref()) {
             let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-            let r = self.tool_router.call(tcc).await;
+            // Метка выдачи — «инструмент|репо»: пул ведёт по ней учёт и называет
+            // виновника затянувшегося соединения в журнале.
+            let r = crate::storage::pool::CHECKOUT_LABEL
+                .scope(dedup_scope.clone(), async {
+                    self.tool_router.call(tcc).await
+                })
+                .await;
             self.maybe_cache(
                 &cache_key,
                 repo_opt.as_deref().unwrap_or(""),
@@ -2308,8 +2314,14 @@ impl ServerHandler for CodeIndexServer {
         // Единственная общая точка всех extension-tools: ответ с ошибкой
         // дополняется подсказкой о расхождении версий данных (ни один инструмент
         // по отдельности не правится). Успешные ответы подсказку не получают.
-        let value = ext.execute(args, ctx).await;
-        let value = crate::mcp::tools::annotate_stale_index(value, storage, root_path).await;
+        // Один scope на оба обращения к пулу: и `execute`, и `annotate_stale_index`
+        // ходят в хранилище, поэтому метка выдачи должна охватывать их оба.
+        let value = crate::storage::pool::CHECKOUT_LABEL
+            .scope(dedup_scope.clone(), async {
+                let value = ext.execute(args, ctx).await;
+                crate::mcp::tools::annotate_stale_index(value, storage, root_path).await
+            })
+            .await;
         let r = Ok(CallToolResult::structured(value));
         self.maybe_cache(
             &cache_key,

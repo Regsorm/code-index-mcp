@@ -12,8 +12,11 @@
 // ограничивает число одновременно выданных соединений. Возврат соединения в
 // пул — по Drop guard'а (`PooledStorage`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -28,6 +31,23 @@ pub const DEFAULT_PER_CONN_CACHE_KIB: usize = 16_384;
 /// busy_timeout: краткая блокировка при checkpoint/backup демоном переждётся,
 /// а не превратится в `SQLITE_BUSY` (по умолчанию busy_timeout=0 — без ожидания).
 pub const DEFAULT_BUSY_TIMEOUT_MS: u32 = 5_000;
+
+tokio::task_local! {
+    /// Метка текущей выдачи соединения — «инструмент|репо».
+    ///
+    /// Ставит обработчик вызова инструмента (`CodeIndexServer::call_tool`), чтобы
+    /// предупреждение о затянувшейся выдаче называло виновника по имени, а не
+    /// оставалось безымянным. Вне области видимости (тесты, служебные пути) метки
+    /// нет — учёт покажет «без метки».
+    pub static CHECKOUT_LABEL: String;
+}
+
+/// Порог, после которого выдача соединения считается затянувшейся, — 60 секунд.
+///
+/// Самые долгие законные запросы ограничены 8 секундами (`bsl_sql`,
+/// `find_references`, `get_data_links`, `get_object_profile`) — порог взят с
+/// большим запасом.
+pub const LONG_CHECKOUT_WARN: Duration = Duration::from_secs(60);
 
 /// Параметры пула на репозиторий.
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +84,16 @@ impl PoolConfig {
     }
 }
 
+/// Учёт одной выдачи соединения: кто держит и с какого момента.
+struct Checkout {
+    /// Метка вызова — «инструмент|репо» (см. [`CHECKOUT_LABEL`]).
+    label: String,
+    /// Момент, когда соединение выдали.
+    since: Instant,
+    /// Предупреждение о затянувшейся выдаче уже записано (пишем один раз на выдачу).
+    reported: bool,
+}
+
 /// Пул соединений к одной БД индекса.
 pub struct StoragePool {
     /// Путь к `index.db`. `None` — режим единственного предзагруженного
@@ -72,6 +102,10 @@ pub struct StoragePool {
     /// Свободные соединения. `std::sync::Mutex` — держим микросекунды (pop/push),
     /// across-await не блокируется.
     idle: Mutex<Vec<Storage>>,
+    /// Учёт выданных соединений: номер выдачи → кто и когда держит.
+    checkouts: Mutex<HashMap<u64, Checkout>>,
+    /// Источник номеров выдач (ключи `checkouts`).
+    next_checkout: AtomicU64,
     /// Ограничивает число одновременно выданных соединений = `cfg.max_size`.
     sem: Arc<Semaphore>,
     cfg: PoolConfig,
@@ -87,6 +121,8 @@ impl StoragePool {
         Ok(Arc::new(Self {
             db_path: Some(db_path.to_path_buf()),
             idle: Mutex::new(vec![first]),
+            checkouts: Mutex::new(HashMap::new()),
+            next_checkout: AtomicU64::new(0),
             sem: Arc::new(Semaphore::new(cfg.max_size)),
             cfg,
         }))
@@ -99,6 +135,8 @@ impl StoragePool {
         Arc::new(Self {
             db_path: None,
             idle: Mutex::new(vec![storage]),
+            checkouts: Mutex::new(HashMap::new()),
+            next_checkout: AtomicU64::new(0),
             sem: Arc::new(Semaphore::new(1)),
             cfg: PoolConfig {
                 max_size: 1,
@@ -124,10 +162,31 @@ impl StoragePool {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Захватить замок учёта выданных соединений — той же политикой, что
+    /// `lock_idle` (отравление переживаем).
+    fn lock_checkouts(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Checkout>> {
+        self.checkouts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// База для сообщений журнала: путь к `index.db` либо «в памяти».
+    fn db_label(&self) -> String {
+        match &self.db_path {
+            Some(p) => p.display().to_string(),
+            None => "в памяти".to_string(),
+        }
+    }
+
     /// Взять соединение. Ждёт свободный permit (одновременно не более
     /// `max_size`), переиспользует idle-соединение либо лениво открывает новое
     /// (только если задан `db_path`). Гость возвращает соединение в пул по Drop.
     pub async fn get(self: &Arc<Self>) -> Result<PooledStorage> {
+        // Долгие выдачи проверяем ДО ожидания семафора: если все соединения
+        // выданы и зависли, ожидание здесь бесконечно, и предупреждение должно
+        // прозвучать раньше.
+        self.report_long_checkouts();
+
         // Семафор закрывается только при остановке сервера выдачи. Это штатное
         // завершение, а не нарушенный инвариант: отдаём ошибку вызывающему,
         // паника здесь маскировала бы настоящие аварии в журнале.
@@ -148,11 +207,64 @@ impl StoragePool {
             }
         };
 
+        // Номер выдачи — ключ учёта «кто держит соединение».
+        let checkout_id = self.next_checkout.fetch_add(1, Ordering::Relaxed);
+        let label = CHECKOUT_LABEL
+            .try_with(|l| l.clone())
+            .unwrap_or_else(|_| "без метки".to_string());
+        self.lock_checkouts().insert(
+            checkout_id,
+            Checkout {
+                label,
+                since: Instant::now(),
+                reported: false,
+            },
+        );
+
         Ok(PooledStorage {
             storage: Some(storage),
             pool: Arc::clone(self),
+            checkout_id,
             _permit: permit,
         })
+    }
+
+    /// Записать в журнал выдачи, которые держат соединение дольше
+    /// [`LONG_CHECKOUT_WARN`]. Про каждую выдачу — ровно один раз, иначе журнал
+    /// забьётся повторами на каждом `get`.
+    fn report_long_checkouts(&self) {
+        let db = self.db_label();
+        let mut checkouts = self.lock_checkouts();
+        for c in checkouts.values_mut() {
+            if c.reported {
+                continue;
+            }
+            let age = c.since.elapsed();
+            if age < LONG_CHECKOUT_WARN {
+                continue;
+            }
+            c.reported = true;
+            tracing::warn!(
+                "соединение выдано {}с назад (база: {}, метка «{}»): пока соединение держит \
+                 незакрытое чтение, демон не может схлопнуть журнал WAL этой базы",
+                age.as_secs(),
+                db,
+                c.label
+            );
+        }
+    }
+
+    /// Выдачи, которые держат соединение дольше `older_than`: метка и возраст.
+    /// Для тестов и диагностики (в журнал пишет `report_long_checkouts`).
+    pub fn long_checkouts(&self, older_than: Duration) -> Vec<(String, Duration)> {
+        let checkouts = self.lock_checkouts();
+        checkouts
+            .values()
+            .filter_map(|c| {
+                let age = c.since.elapsed();
+                (age >= older_than).then(|| (c.label.clone(), age))
+            })
+            .collect()
     }
 }
 
@@ -161,6 +273,8 @@ impl StoragePool {
 pub struct PooledStorage {
     storage: Option<Storage>,
     pool: Arc<StoragePool>,
+    /// Номер выдачи — ключ записи в учёте пула (`StoragePool::checkouts`).
+    checkout_id: u64,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -173,13 +287,69 @@ impl std::ops::Deref for PooledStorage {
     }
 }
 
+/// Чисто ли соединение перед возвратом в пул: не в транзакции и без незакрытого
+/// запроса. Всё прочее — незакрытое чтение, из-за которого демон не может
+/// схлопнуть журнал WAL этой базы.
+fn conn_is_clean(storage: &Storage) -> bool {
+    storage.conn().is_autocommit() && !storage.conn().is_busy()
+}
+
 impl Drop for PooledStorage {
     fn drop(&mut self) {
+        // Снять запись учёта и, если соединение держали дольше порога, записать
+        // в журнал — именно эта строка назовёт виновника незакрытого чтения.
+        let checkout = self.pool.lock_checkouts().remove(&self.checkout_id);
+        let label = match checkout {
+            Some(c) => {
+                let held = c.since.elapsed();
+                if held >= LONG_CHECKOUT_WARN {
+                    tracing::warn!(
+                        "затянувшаяся выдача соединения: база {}, метка «{}», держали {}с",
+                        self.pool.db_label(),
+                        c.label,
+                        held.as_secs()
+                    );
+                }
+                c.label
+            }
+            None => "без метки".to_string(),
+        };
+
         if let Some(s) = self.storage.take() {
-            // Вернуть соединение в пул. Отравление замка переживаем той же
-            // политикой, что и при взятии (см. `lock_idle`): соединение
-            // возвращается в список, а не теряется.
-            self.pool.lock_idle().push(s);
+            // Соединение с незакрытым чтением в пул не возвращаем: оно не даст
+            // демону схлопнуть журнал WAL. Сначала пробуем вылечить.
+            if !conn_is_clean(&s) {
+                tracing::warn!(
+                    "соединение вернули с незакрытым чтением (база: {}, метка «{}») — \
+                     сбрасываю кэш запросов и откатываю транзакцию",
+                    self.pool.db_label(),
+                    label
+                );
+                s.conn().flush_prepared_statement_cache();
+                if !s.conn().is_autocommit() {
+                    // Откат — последняя попытка вылечить соединение, а не
+                    // самостоятельная операция: ошибку не поднимаем.
+                    let _ = s.conn().execute_batch("ROLLBACK");
+                }
+            }
+            if !conn_is_clean(&s) && self.pool.db_path.is_some() {
+                // Файловый пул: грязное соединение НЕ возвращаем — оно закроется
+                // на выходе из функции, а пул откроет новое лениво.
+                tracing::warn!(
+                    "соединение всё ещё держит незакрытое чтение (база: {}, метка «{}») — \
+                     закрываю его, пул откроет новое",
+                    self.pool.db_label(),
+                    label
+                );
+            } else {
+                // Вернуть соединение в пул. Отравление замка переживаем той же
+                // политикой, что и при взятии (см. `lock_idle`): соединение
+                // возвращается в список, а не теряется.
+                //
+                // Пул единственного соединения (`db_path` не задан) отдаёт
+                // соединение как есть: выбросив его, пул опустеет навсегда.
+                self.pool.lock_idle().push(s);
+            }
         }
         // permit освобождается автоматически при Drop _permit.
     }
@@ -405,5 +575,128 @@ mod tests {
         );
 
         holder.await.unwrap();
+    }
+
+    /// Метка выдачи: `CHECKOUT_LABEL` (её ставит `call_tool`) попадает в учёт
+    /// пула, а вне области видимости выдача видна как «без метки».
+    #[tokio::test]
+    async fn метка_выдачи_попадает_в_учёт() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        Storage::open_file(&db_path).unwrap();
+
+        let pool = StoragePool::open_file_readonly(&db_path, PoolConfig::default()).unwrap();
+
+        CHECKOUT_LABEL
+            .scope("grep_code|demo".to_string(), async {
+                let s = pool.get().await.unwrap();
+                let held = pool.long_checkouts(Duration::ZERO);
+                assert_eq!(held.len(), 1, "выдача одна");
+                assert_eq!(held[0].0, "grep_code|demo", "метка — инструмент|репо");
+                drop(s);
+                assert!(
+                    pool.long_checkouts(Duration::ZERO).is_empty(),
+                    "после освобождения учёт пуст"
+                );
+            })
+            .await;
+
+        // Вне области видимости метки нет — учёт показывает заглушку.
+        let s = pool.get().await.unwrap();
+        let held = pool.long_checkouts(Duration::ZERO);
+        assert_eq!(held.len(), 1, "выдача одна");
+        assert_eq!(held[0].0, "без метки");
+        drop(s);
+    }
+
+    /// Незакрытая транзакция не должна уезжать обратно в пул: соединение в
+    /// транзакции не даст демону схлопнуть журнал WAL.
+    #[tokio::test]
+    async fn транзакция_не_уезжает_в_пул() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        Storage::open_file(&db_path).unwrap();
+
+        let cfg = PoolConfig {
+            max_size: 1,
+            cache_kib: 4096,
+            busy_timeout_ms: 1000,
+        };
+        let pool = StoragePool::open_file_readonly(&db_path, cfg).unwrap();
+
+        let s = pool.get().await.unwrap();
+        s.conn().execute_batch("BEGIN").unwrap();
+        let n: i64 = s
+            .conn()
+            .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "база пуста");
+        assert!(!s.conn().is_autocommit(), "внутри транзакции");
+        drop(s);
+
+        let s = pool.get().await.unwrap();
+        assert!(
+            s.conn().is_autocommit(),
+            "соединение вернулось в пул внутри незакрытой транзакции"
+        );
+    }
+
+    /// Главный сценарий утечки: запрос, возвращённый в кэш соединения
+    /// несброшенным (`prepare_cached` не сбрасывает запрос), держит открытое
+    /// чтение — журнал WAL базы не схлопывается.
+    #[tokio::test]
+    async fn несброшенный_запрос_не_держит_wal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // Засеять ≥2 строки в `files` до открытия пула: запросу нужно отдать
+        // строку и остаться в полёте.
+        {
+            let storage = Storage::open_file(&db_path).unwrap();
+            for name in ["a.txt", "b.txt"] {
+                storage
+                    .conn()
+                    .execute(
+                        "INSERT INTO files (path, content_hash, language) VALUES (?1, 'h', 'text')",
+                        rusqlite::params![name],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let cfg = PoolConfig {
+            max_size: 1,
+            cache_kib: 4096,
+            busy_timeout_ms: 1000,
+        };
+        let pool = StoragePool::open_file_readonly(&db_path, cfg).unwrap();
+
+        let s = pool.get().await.unwrap();
+        let mut stmt = s.conn().prepare_cached("SELECT path FROM files").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let first: String = rows.next().unwrap().unwrap().get(0).unwrap();
+        assert!(first == "a.txt" || first == "b.txt", "прочитали: {first}");
+        // Строки НЕ закрываем (`std::mem::forget` пропускает сброс запроса):
+        // запрос остаётся несброшенным и уходит в кэш соединения в том же виде.
+        std::mem::forget(rows);
+        drop(stmt);
+        drop(s);
+
+        // Соединение вернулось в пул чистым — незакрытого чтения в нём нет.
+        let s = pool.get().await.unwrap();
+        assert!(
+            !s.conn().is_busy(),
+            "соединение вернулось в пул с несброшенным запросом"
+        );
+        drop(s);
+
+        // Пишущее соединение к тому же файлу с нулевым ожиданием: checkpoint
+        // проходит сразу — чтение действительно закрыто.
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        let busy: i64 = writer
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 0, "журнал WAL не схлопнулся: чтение всё ещё открыто");
     }
 }

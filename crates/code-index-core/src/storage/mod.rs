@@ -390,6 +390,40 @@ impl Storage {
             .context("PRAGMA wal_checkpoint(TRUNCATE) failed")
     }
 
+    /// Схлопнуть журнал WAL, не дожидаясь освобождения базы читателями.
+    ///
+    /// Штатный `checkpoint_truncate` ждёт до `busy_timeout` соединения
+    /// (умолчание rusqlite — 5 с), и это ожидание уходит в простой: сервер
+    /// выдачи держит открытое чтение, а на рабочей машине каждая правка файла
+    /// стоила 5,3 с. Данные читателям видны сразу после COMMIT, поэтому
+    /// схлопывание — обслуживание, и ждать в нём нечего: переносим в базу всё,
+    /// что можно прямо сейчас, и сразу возвращаемся.
+    ///
+    /// busy=1 в ответе означает, что перенос не завершён: журнал не схлопнут,
+    /// потому что кто-то держит чтение. Это не ошибка, а признак — страницы
+    /// останутся в WAL и уедут в базу при следующем схлопывании.
+    ///
+    /// Прежнее ожидание занятой базы возвращается на место ВСЕГДА, даже если
+    /// схлопывание не удалось: иначе сбитая настройка осталась бы заниженной
+    /// для всех последующих операций этого соединения.
+    pub fn checkpoint_truncate_nowait(&self) -> Result<(i64, i64, i64)> {
+        let saved: i64 = self
+            .conn
+            .query_row("PRAGMA busy_timeout;", [], |row| row.get(0))
+            .context("PRAGMA busy_timeout failed")?;
+        self.conn
+            .busy_timeout(std::time::Duration::ZERO)
+            .context("не удалось снять ожидание занятой базы")?;
+        let outcome = self.checkpoint_truncate();
+        let restored = self
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(saved.max(0) as u64))
+            .context("не удалось вернуть прежнее ожидание занятой базы");
+        // Причину сбоя схлопывания не подменяем: ошибку возврата настройки
+        // отдаём только тогда, когда само схлопывание прошло.
+        outcome.and_then(|triple| restored.map(|()| triple))
+    }
+
     // ── Files ────────────────────────────────────────────────────────────────
 
     /// Вставить или обновить запись файла; возвращает id строки
@@ -4577,6 +4611,55 @@ mod tests {
         );
         // Релевантная функция всплывает первой (bm25 + совпадения по словам).
         assert_eq!(r[0].name, "РассчитатьЦенуПродажи");
+    }
+
+    /// Схлопывание WAL без ожидания: чужое открытое чтение не должно стоить
+    /// демону секунд простоя. Пока читатель держит снимок, перенос не
+    /// завершается — метод обязан вернуться быстро и сказать об этом busy=1.
+    #[test]
+    fn checkpoint_truncate_nowait_не_ждёт_читателя() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let storage = Storage::open_file(&db_path).unwrap();
+        storage.upsert_file(&make_file("/one.py")).unwrap();
+
+        // Второе соединение держит чтение до самого COMMIT.
+        let reader = rusqlite::Connection::open(&db_path).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let seen: i64 = reader
+            .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(seen, 1);
+
+        // Запись новее снимка читателя: в журнале гарантированно есть
+        // страницы, которые перенести нельзя.
+        storage.upsert_file(&make_file("/two.py")).unwrap();
+
+        let before: i64 = storage
+            .conn()
+            .query_row("PRAGMA busy_timeout;", [], |row| row.get(0))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let (busy, _log, _done) = storage.checkpoint_truncate_nowait().unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "схлопывание ждало читателя {:?}",
+            started.elapsed()
+        );
+        assert_eq!(busy, 1, "чужое чтение должно быть видно как busy=1");
+
+        // Читатель отпустил базу — повтор проходит начисто.
+        reader.execute_batch("COMMIT;").unwrap();
+        let (busy2, _log2, _done2) = storage.checkpoint_truncate_nowait().unwrap();
+        assert_eq!(busy2, 0, "без читателей журнал схлопывается целиком");
+
+        // Прежнее ожидание занятой базы вернулось на место.
+        let after: i64 = storage
+            .conn()
+            .query_row("PRAGMA busy_timeout;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]

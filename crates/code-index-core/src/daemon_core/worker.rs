@@ -88,6 +88,10 @@ struct BatchContext<'a> {
     /// Настройки индексации папки — нужны, когда пачка велика и её выгоднее
     /// обработать полным проходом, а не по одному файлу.
     index_config: &'a IndexConfig,
+    /// Когда последний раз предупреждали о не схлопнутом журнале WAL. Чужое
+    /// чтение может держаться часами, а предупреждение — на каждую пачку: без
+    /// этой отметки журнал демона утонул бы в одинаковых строках.
+    wal_warned_at: &'a std::cell::Cell<Option<std::time::Instant>>,
     stop: &'a AtomicBool,
 }
 
@@ -550,8 +554,12 @@ struct BatchResult {
     started_local: String,
 }
 
-/// Завершить обработку пачки: схлопнуть журнал WAL, сбросить кэш выдачи,
-/// напечатать сводку и выставить статус папки.
+/// Завершить обработку пачки: сбросить кэш выдачи, выставить статус папки,
+/// схлопнуть журнал WAL и напечатать сводку.
+///
+/// Порядок важнее содержания: пока статус не «готово», сервер выдачи на любой
+/// запрос к папке отвечает «применяется батч изменений». Схлопывание WAL этого
+/// ожидания не стоит — данные видны сразу после COMMIT.
 ///
 /// Общий хвост для обоих путей — пофайлового и полного прохода: различаются
 /// они только тем, как применяли изменения, а заканчиваются одинаково.
@@ -571,21 +579,6 @@ fn finish_batch(
         started: batch_started,
         started_local: batch_started_local,
     } = res;
-
-    // В disk-режиме (а worker сюда попадает всегда в disk после reopen на шаге 7)
-    // flush_to_disk через Connection::backup() — бесполезное копирование БД самой
-    // в себя, WAL не уменьшает. checkpoint_truncate реально схлопывает WAL.
-    let wal_started = std::time::Instant::now();
-    if let Err(e) = storage.checkpoint_truncate() {
-        tracing::warn!(
-            "[{}] схлопывание журнала WAL не удалось: {}",
-            ctx.path.display(),
-            e
-        );
-    }
-    // Схлопывание журнала WAL — то же самое, что «сброс на диск» у полной
-    // индексации: отдельным этапом не выносим, показываем в итоговой строке.
-    let flush_ms = wal_started.elapsed().as_millis();
 
     // Event-based cache invalidation (v0.9.1+): после успешного commit
     // отправляем cache-ci список затронутых относительных путей. Если
@@ -611,6 +604,52 @@ fn finish_batch(
     // Провал любого из них означает неполный срез, а Ready на нём — ложное
     // «готово»: сервер выдачи начал бы отдавать устаревшее как актуальное.
     let outcome = batch_outcome(commit_ok, failed, busy, batch_len, extras_ok);
+
+    // Статус — ДО схлопывания журнала. Данные читателям видны сразу после
+    // COMMIT, а схлопывание чужого чтения может и не дождаться: держать на
+    // нём клиента, который до этого видел «применяется батч изменений», не за
+    // что. `outcome` разбираем по ссылке — для сводки он нужен и ниже, а текст
+    // ошибки уходит в состояние копией.
+    tokio_block_on(async {
+        match &outcome {
+            Ok(()) => ctx.state.set_status(ctx.path, PathStatus::Ready).await,
+            Err(msg) => ctx.state.set_error(ctx.path, msg.clone()).await,
+        }
+    });
+
+    // В disk-режиме (а worker сюда попадает всегда в disk после reopen на шаге 7)
+    // flush_to_disk через Connection::backup() — бесполезное копирование БД самой
+    // в себя, WAL не уменьшает. checkpoint_truncate реально схлопывает WAL.
+    // Зовём его без ожидания: сервер выдачи обычно держит открытое чтение, и
+    // штатный checkpoint простаивал бы до busy_timeout (5 с) на каждой правке,
+    // задерживая «готово». Переносим в базу всё, что пускают сейчас, и уходим —
+    // оставшиеся страницы доедут следующим схлопыванием.
+    let wal_started = std::time::Instant::now();
+    match storage.checkpoint_truncate_nowait() {
+        Err(e) => tracing::warn!(
+            "[{}] схлопывание журнала WAL не удалось: {}",
+            ctx.path.display(),
+            e
+        ),
+        Ok((wal_busy, log_frames, done_frames)) => {
+            let now = std::time::Instant::now();
+            if wal_warning_due(wal_busy, log_frames, ctx.wal_warned_at.get(), now) {
+                tracing::warn!(
+                    "[{}] журнал WAL не схлопнут: в журнале {} страниц, перенесено в базу {} — \
+                     базу держит чужое незакрытое чтение (обычно сервер выдачи); на статус \
+                     папки это не влияет, журнал схлопнется, когда чтение закроют",
+                    ctx.path.display(),
+                    log_frames,
+                    done_frames
+                );
+                ctx.wal_warned_at.set(Some(now));
+            }
+        }
+    }
+    // Схлопывание журнала WAL — то же самое, что «сброс на диск» у полной
+    // индексации: отдельным этапом не выносим, показываем в итоговой строке.
+    let flush_ms = wal_started.elapsed().as_millis();
+
     // Сводка того же вида, что у первичной индексации: начало, этапы, конец.
     // Печатается при любой настройке подробности.
     let stages = crate::logging::stages_take();
@@ -664,12 +703,6 @@ fn finish_batch(
     }
 
     crate::logging::stage_idle();
-    tokio_block_on(async {
-        match outcome {
-            Ok(()) => ctx.state.set_status(ctx.path, PathStatus::Ready).await,
-            Err(msg) => ctx.state.set_error(ctx.path, msg).await,
-        }
-    });
 
     BatchStep::Continue
 }
@@ -1361,6 +1394,8 @@ pub(crate) fn run_worker(
     // shutdown-сигнал даже если файлов давно не меняли.
     const IDLE_POLL_MS: u64 = 500;
     // Обвязка для обработки пакетов — собирается один раз на весь цикл.
+    // Отметка о предупреждении по WAL живёт здесь же: она одна на поток папки.
+    let wal_warned_at = std::cell::Cell::new(None);
     let ctx = BatchContext {
         path: &path,
         entry: &entry,
@@ -1372,6 +1407,7 @@ pub(crate) fn run_worker(
         resolved_processor: resolved_processor.as_ref(),
         cache_client: cache_client.as_ref(),
         index_config: &index_config,
+        wal_warned_at: &wal_warned_at,
         stop: &stop,
     };
 
@@ -1560,6 +1596,35 @@ fn batch_outcome(
     Ok(())
 }
 
+/// С какого числа страниц журнала WAL схлопывание считается застрявшим. Порог
+/// около 16 МБ при странице 4 КБ: меньше — обычная короткая помеха от чужого
+/// чтения, она разойдётся сама, и предупреждать о ней незачем.
+const WAL_STUCK_WARN_FRAMES: i64 = 4096;
+
+/// Как часто повторять предупреждение, пока чужое чтение не отпустит журнал.
+/// Десять минут: чаще — значит засорять журнал демона одной и той же строкой,
+/// реже — легко пропустить затянувшуюся беду.
+const WAL_STUCK_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Пора ли предупредить о не схлопнутом журнале WAL.
+///
+/// Вынесено чистой функцией ради модульного теста — тем же приёмом, что
+/// `batch_outcome`.
+fn wal_warning_due(
+    busy: i64,
+    log_frames: i64,
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    if busy == 0 || log_frames < WAL_STUCK_WARN_FRAMES {
+        return false;
+    }
+    match last {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= WAL_STUCK_WARN_EVERY,
+    }
+}
+
 /// Запомнить имя не применённого файла для сводки по пакету — но не больше
 /// `STUCK_NAMES_IN_SUMMARY` штук.
 fn remember_stuck(names: &mut Vec<String>, root: &PathBuf, event: &FileEvent, why: &str) {
@@ -1655,6 +1720,33 @@ mod tests {
     #[test]
     fn готово_только_когда_прошли_все_три_шага() {
         assert!(batch_outcome(true, 0, 0, 5, true).is_ok());
+    }
+
+    /// Предупреждение о застрявшем журнале WAL: только когда есть незакрытое
+    /// чтение и журнал распух, и не чаще раза в десять минут.
+    #[test]
+    fn предупреждение_о_wal_только_по_делу_и_не_чаще_раза_в_десять_минут() {
+        let now = std::time::Instant::now();
+        assert!(!wal_warning_due(0, 100_000, None, now), "без busy молчим");
+        assert!(
+            !wal_warning_due(1, WAL_STUCK_WARN_FRAMES - 1, None, now),
+            "мелкая помеха от читателя предупреждения не стоит"
+        );
+        assert!(wal_warning_due(1, WAL_STUCK_WARN_FRAMES, None, now));
+
+        let warned = Some(now);
+        assert!(!wal_warning_due(
+            1,
+            100_000,
+            warned,
+            now + std::time::Duration::from_secs(60)
+        ));
+        assert!(wal_warning_due(
+            1,
+            100_000,
+            warned,
+            now + WAL_STUCK_WARN_EVERY
+        ));
     }
 
     /// Регресс: слежение за файлами писало в индекс текстовый файл любого
