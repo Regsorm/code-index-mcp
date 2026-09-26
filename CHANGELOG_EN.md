@@ -5,6 +5,34 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+**Fresh indexing of a 100,780-file export got faster: 463 → 377 s (-18.6 %), a repeat pass over an unchanged folder — 454 → 30 s (-93.4 %). The daemon opens non-search tools in 92 s instead of 467, `search_*` — in 179 s instead of 467. Along the way, integrity and resume bugs found by an audit of the branch were fixed.**
+
+### Changed
+
+- **Indexing core — a pipeline instead of sequential phases.** The XML add-on is walked in a single pass; parsing and content compression run in parallel on all cores, SQLite writes go through a serial writer; symbols (functions, classes, calls, variables) are buffered and written with multi-row `INSERT`s; platform ballast and object method edges of the graph are pruned in a single `DELETE`. Result: fresh indexing 462.8 → 376.7 s, add-on 256.2 → 174.3 s.
+- **Deferred full-text build in the daemon.** Right after the core the folder is declared `Ready`: non-search tools work while the FTS is being built; `search_*` answer `{"status":"indexing","layer":"fts"}` until it finishes. Tools are ready in 92 s instead of 467, search — in 179 s instead of 467. The CLI finishes the FTS build if the database is left with the flag after an interruption.
+- **The repeat pass no longer rebuilds the add-on needlessly.** A complete layer is skipped when nothing changed, and changed files are updated per-file; repeat pass 454.2 → 29.9 s.
+- **Add-on phases resume by input fingerprint:** an interruption in the middle of the layer continues from the last completed phase; the fingerprint covers `.bsl`/`.xml`, template contents (`Ext/Template.*`) and `Ext/Predefined.xml`; extensions are matched case-insensitively.
+
+### Fixed
+
+- **File symbols are no longer lost on an indexing interruption.** The symbol buffer is flushed before every intermediate commit, and each file write runs under a `SAVEPOINT`: previously a crash after a commit left the file marked as indexed without its symbols, and resume skipped it by mtime+hash.
+- **An error in the deferred FTS build rolls back the transaction**, search stays closed until a successful build; in in-memory mode this no longer breaks flushing the database to disk.
+- **Extension tools stay closed while the add-on layer is being built** — on a fresh database from the very start of the core pass, and on the federated entry point; if the completion flag cannot be read, the gate closes rather than opens.
+- **Add-on resume no longer skips phases:** the watermark never decreases and never jumps over a failed phase; for 1C:EDT the layer is always rebuilt in full, because a `.bsl`/`.xml` fingerprint does not see `.mdo`/form edits.
+
+### Compatibility
+
+- The data and response formats are unchanged, no reindexing is required; the schema and indexes are updated in place. The first daemon pass after the upgrade may finish the full-text and add-on build in the background.
+
+### Verification
+
+- `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo test --workspace --all-targets`, doc tests — clean.
+- The `tests/perf_compare.py` harness (v1.5.1 vs this branch, medians of 2 runs, 100,780-file export): fresh indexing 462.8 → 376.7 s, core 206.7 → 202.4 s, add-on 256.2 → 174.3 s, repeat 454.2 → 29.9 s; daemon: non-search tools 467.0 → 92.0 s, `search_function` 467.0 → 178.7 s.
+- The diff went through two audit rounds (core and bsl add-on), all findings are closed; tests added: `SAVEPOINT`/buffer, resume phase chain, EDT without a watermark, fingerprint sensitivity to `Template.dcs`, case-insensitive extensions.
+
 ## [1.6.0] — 2026-09-25
 
 **This release ships `code-index-guard` — a `PreToolUse` hook for Claude Code and Codex CLI that steers the model to read code through the index. It denies only where the index actually serves the same file and points to the right tool. Prebuilt binaries for Windows, Linux and macOS are in the release archives.**
