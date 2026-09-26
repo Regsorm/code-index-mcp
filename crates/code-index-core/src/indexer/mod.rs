@@ -1838,7 +1838,9 @@ fn write_parsed_chunk(
     // Открываем первую транзакцию перед началом цикла
     indexer.storage.begin_batch()?;
     // Строки символов копятся здесь и уходят многострочными INSERT — см.
-    // `storage::WriteAccum`. Сбрасываем перед коммитом (в конце порции).
+    // `storage::WriteAccum`. Сбрасываем перед каждым коммитом: и промежуточным,
+    // и финальным. Иначе обрыв после промежуточного коммита оставит `files`
+    // зафиксированными без символов, а resume пропустит их по mtime+hash.
     let mut accum = crate::storage::WriteAccum::default();
 
     // Прогресс — по времени, а не по размеру транзакции: шаг в файлах на
@@ -1955,8 +1957,10 @@ fn write_parsed_chunk(
             }
         }
 
-        // Коммитим накопленный батч и открываем новую транзакцию
+        // Коммитим накопленный батч и открываем новую транзакцию. Символы
+        // обязаны уйти в ту же транзакцию ДО коммита — см. `accum`.
         if batch_count >= batch_size {
+            accum.flush(indexer.storage)?;
             indexer.storage.commit_batch()?;
             indexer.storage.begin_batch()?;
             batch_count = 0;

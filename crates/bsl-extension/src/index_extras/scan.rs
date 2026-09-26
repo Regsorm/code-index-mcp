@@ -58,6 +58,12 @@ pub(crate) struct RepoScan {
     pub(crate) template_descriptors: Vec<PathBuf>,
     /// Все `.bsl` файлы репозитория.
     pub(crate) bsl_files: Vec<PathBuf>,
+    /// Содержимое макетов (`<...>/Ext/Template.*`) и предопределённые элементы
+    /// (`<Объект>/Ext/Predefined.xml`) — вход фаз надстройки, который не попадает
+    /// в XML/BSL-категории выше (например, `Template.dcs`), но обязан входить в
+    /// отпечаток возобновления: иначе правка только содержимого макета или
+    /// предопределённых не сдвинула бы отпечаток и фаза была бы пропущена.
+    pub(crate) content_files: Vec<PathBuf>,
     /// Все `ConfigDumpInfo.xml` (по одному на область выгрузки).
     pub(crate) dump_info_files: Vec<PathBuf>,
 }
@@ -94,6 +100,7 @@ impl RepoScan {
         // 3. Один полный обход: собираем только нужные расширения.
         let mut xml_all: Vec<PathBuf> = Vec::new();
         let mut bsl_files: Vec<PathBuf> = Vec::new();
+        let mut content_files: Vec<PathBuf> = Vec::new();
         for entry in WalkDir::new(repo_root)
             .into_iter()
             .filter_entry(|e| filter.allows(e))
@@ -104,9 +111,18 @@ impl RepoScan {
             }
             let path = entry.path();
             match path.extension().and_then(|e| e.to_str()) {
-                Some("xml") => xml_all.push(path.to_path_buf()),
-                Some("bsl") => bsl_files.push(path.to_path_buf()),
+                Some(ext) if ext.eq_ignore_ascii_case("xml") => xml_all.push(path.to_path_buf()),
+                Some(ext) if ext.eq_ignore_ascii_case("bsl") => bsl_files.push(path.to_path_buf()),
                 _ => {}
+            }
+            let name = entry.file_name().to_str().unwrap_or("");
+            let parent_is_ext = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                == Some("Ext");
+            if parent_is_ext && (name == "Predefined.xml" || name.starts_with("Template.")) {
+                content_files.push(path.to_path_buf());
             }
         }
 
@@ -129,6 +145,7 @@ impl RepoScan {
             event_sub_xmls: Vec::new(),
             template_descriptors: Vec::new(),
             bsl_files,
+            content_files,
             dump_info_files: Vec::new(),
         };
 
@@ -291,6 +308,26 @@ mod tests {
         write(
             &repo
                 .join("base")
+                .join("Catalogs")
+                .join("Товары")
+                .join("Templates")
+                .join("Печать")
+                .join("Ext")
+                .join("Template.dcs"),
+            "<x/>",
+        );
+        write(
+            &repo
+                .join("base")
+                .join("Catalogs")
+                .join("Товары")
+                .join("Ext")
+                .join("Predefined.xml"),
+            "<x/>",
+        );
+        write(
+            &repo
+                .join("base")
                 .join("Subsystems")
                 .join("Продажи")
                 .join("Subsystems")
@@ -363,6 +400,12 @@ mod tests {
         assert_eq!(scan.exchange_content.len(), 1);
         assert_eq!(scan.bsl_files.len(), 1);
         assert_eq!(scan.dump_info_files.len(), 1);
+        assert_eq!(
+            scan.content_files.len(),
+            2,
+            "содержимое макета (Template.dcs) и предопределённые — вход фаз, \
+             не попавший в XML/BSL-категории"
+        );
     }
 
     #[test]

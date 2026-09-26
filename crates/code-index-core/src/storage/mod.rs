@@ -3296,7 +3296,7 @@ impl Storage {
 
         let mut scanned = 0usize;
         let mut written = 0usize;
-        {
+        let fill = (|| -> Result<()> {
             self.begin_batch()?;
             let mut ins = self
                 .conn
@@ -3340,6 +3340,16 @@ impl Storage {
             drop(sel);
             drop(ins);
             self.commit_batch()?;
+            Ok(())
+        })();
+        if let Err(e) = fill {
+            // Открытая транзакция не должна пережить ошибку: для in-memory она
+            // ломает последующий `flush_to_disk`, для файла — следующий BEGIN
+            // (watcher / инкремент). Флаг pending остаётся — сборка повторится.
+            if let Err(rb) = self.rollback_batch() {
+                tracing::warn!("отложенный FTS: откат после ошибки не удался: {}", rb);
+            }
+            return Err(e);
         }
         tracing::debug!(
             "отложенный FTS: текстовые файлы — {} из {} за {} мс",

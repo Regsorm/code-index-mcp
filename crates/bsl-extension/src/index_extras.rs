@@ -95,10 +95,16 @@ fn resumable_phase(
 /// Отметить фазу собранной. Провал записи отметки не фатален: это лишь потеря
 /// возобновляемости на следующем обрыве.
 fn mark_phase(resume: Option<&ExtrasResume>, conn: &rusqlite::Connection, idx: u32, name: &str) {
-    if let Some(resume) = resume {
-        if let Err(e) = resume.mark(conn, idx + 1) {
-            tracing::warn!("надстройка: не сохранена отметка фазы «{}»: {}", name, e);
-        }
+    let Some(resume) = resume else { return };
+    // Цепочка: отметка двигается, только если пройдено ровно до этой фазы.
+    // Успех поздней фазы после сбоя ранней иначе перепрыгнул бы несобранную —
+    // и та не выполнилась бы уже никогда. Вызов из parse-collector-ветки на
+    // уже пройденной цепочке — тихий no-op (см. монотонность в `mark`).
+    if resume.done() != idx {
+        return;
+    }
+    if let Err(e) = resume.mark(conn, idx + 1) {
+        tracing::warn!("надстройка: не сохранена отметка фазы «{}»: {}", name, e);
     }
 }
 
@@ -126,9 +132,19 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
         );
     }
 
+    // Раскладка 1C:EDT: отпечаток входа строится по .bsl/.xml и не видит правок
+    // .mdo/форм/макетов. Резюмировать по нему нельзя — после правки формы или
+    // объекта термы/граф остались бы от прошлого прохода. Для EDT слой всегда
+    // собирается целиком (metadata-слой и так работает без возобновления).
+    let layer_resume = if crate::xml::edt_mdo::detect_edt_src(repo_root).is_some() {
+        None
+    } else {
+        Some(&resume)
+    };
+
     // XML-слой обогащения (перечень, структура, связи, права, формы, подписки,
     // модули) — обход XML выгрузки, дёшево.
-    run_index_extras_metadata_layer(repo_root, &scan, conn, Some(&resume))?;
+    run_index_extras_metadata_layer(repo_root, &scan, conn, layer_resume)?;
 
     // КОД-слой (тяжёлый: обратный индекс использований по всему .bsl, термы по
     // сотням тысяч процедур, полный граф вызовов). На инкрементальном пути НЕ
@@ -138,10 +154,10 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // bsl-indexer), повторный disk-rebuild пропускаем — данные идентичны.
     if crate::parse_collector::collector_did(conn, crate::parse_collector::MARK_CODE_USAGES) {
         tracing::info!("metadata_code_usages: наполнено parse-collector'ом, disk-rebuild пропущен");
-        mark_phase(Some(&resume), conn, PH_CODE_USAGES, "использования в коде");
+        mark_phase(layer_resume, conn, PH_CODE_USAGES, "использования в коде");
     } else {
         resumable_phase(
-            Some(&resume),
+            layer_resume,
             conn,
             PH_CODE_USAGES,
             "использования в коде",
@@ -156,7 +172,7 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // иначе полный disk-rebuild (инкремент / публичный путь).
     if crate::parse_collector::collector_did(conn, crate::parse_collector::MARK_PROC_TERMS) {
         resumable_phase(
-            Some(&resume),
+            layer_resume,
             conn,
             PH_PROC_TERMS,
             "термины процедур",
@@ -165,7 +181,7 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
         );
     } else {
         resumable_phase(
-            Some(&resume),
+            layer_resume,
             conn,
             PH_PROC_TERMS,
             "термины процедур",
@@ -176,7 +192,7 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // Граф вызовов строится ПОСЛЕ заполнения metadata_forms и event_subscriptions
     // (они в XML-слое выше) — он опирается на их содержимое.
     resumable_phase(
-        Some(&resume),
+        layer_resume,
         conn,
         PH_CALL_GRAPH,
         "граф вызовов",

@@ -52,7 +52,9 @@ const DONE_KEY: &str = "extras_resume_done";
 /// Состояние возобновления на текущий проход.
 pub(crate) struct ExtrasResume {
     fingerprint: u64,
-    done: u32,
+    /// `Cell`, а не `u32`: отметку двигают `&ExtrasResume`-ссылки в ходе фаз, и
+    /// последующие фазы того же прохода должны видеть уже сдвинутую цепочку.
+    done: std::cell::Cell<u32>,
 }
 
 impl ExtrasResume {
@@ -80,24 +82,26 @@ impl ExtrasResume {
             == Some(fingerprint);
         Self {
             fingerprint,
-            done: if same_input { stored_done } else { 0 },
+            done: std::cell::Cell::new(if same_input { stored_done } else { 0 }),
         }
     }
 
     /// Собрана ли фаза с номером `phase` (её результат актуален для входа).
     pub(crate) fn is_done(&self, phase: u32) -> bool {
-        phase < self.done
+        phase < self.done.get()
     }
 
     /// Сколько фаз уже собрано (для журнала).
     pub(crate) fn done(&self) -> u32 {
-        self.done
+        self.done.get()
     }
 
     /// Записать «собраны фазы до `done` включительно» одним куском: отпечаток
     /// и число фаз. Обрыв между двумя записями сделал бы отметку неверной,
-    /// поэтому обе — в одной транзакции.
+    /// поэтому обе — в одной транзакции. Отметка монотонна: меньше уже
+    /// записанной она не станет.
     pub(crate) fn mark(&self, conn: &Connection, done: u32) -> Result<()> {
+        let done = done.max(self.done.get());
         let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
         conn.execute("BEGIN", [])?;
         let write = (|| -> Result<()> {
@@ -114,6 +118,7 @@ impl ExtrasResume {
         match write {
             Ok(()) => {
                 conn.execute("COMMIT", [])?;
+                self.done.set(done);
                 Ok(())
             }
             Err(e) => {
@@ -161,6 +166,7 @@ pub(crate) fn scan_fingerprint(conn: &Connection, scan: &RepoScan) -> u64 {
         &scan.template_descriptors,
         &scan.dump_info_files,
         &scan.bsl_files,
+        &scan.content_files,
     ] {
         for path in list {
             path.hash(&mut hasher);
@@ -203,7 +209,7 @@ mod tests {
         let (_tmp, conn) = storage_with_state();
         let resume = ExtrasResume {
             fingerprint: 42,
-            done: 0,
+            done: std::cell::Cell::new(0),
         };
         resume.mark(&conn, 5).unwrap();
 
@@ -221,5 +227,48 @@ mod tests {
         let conn = rusqlite::Connection::open(tmp.path().join("db.sqlite")).unwrap();
         let resume = ExtrasResume::load(&conn, 1);
         assert_eq!(resume.done(), 0);
+    }
+
+    #[test]
+    fn отметка_монотонна_и_видна_в_памяти_сразу() {
+        let (_tmp, conn) = storage_with_state();
+        let resume = ExtrasResume {
+            fingerprint: 7,
+            done: std::cell::Cell::new(0),
+        };
+        resume.mark(&conn, 5).unwrap();
+        assert_eq!(resume.done(), 5, "отметка обновилась в памяти");
+        resume.mark(&conn, 3).unwrap();
+        assert_eq!(resume.done(), 5, "понизить отметку нельзя");
+        assert_eq!(
+            ExtrasResume::load(&conn, 7).done(),
+            5,
+            "в базе отметка тоже не понизилась"
+        );
+    }
+
+    #[test]
+    fn отпечаток_видит_правку_содержимого_макета() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let write = |path: &std::path::Path, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(&repo.join("base").join("Configuration.xml"), "<x/>");
+        let dcs = repo
+            .join("base")
+            .join("Reports")
+            .join("Отчёт")
+            .join("Templates")
+            .join("Схема")
+            .join("Ext")
+            .join("Template.dcs");
+        write(&dcs, "first");
+        let (_tmp2, conn) = storage_with_state();
+        let fp1 = scan_fingerprint(&conn, &crate::index_extras::RepoScan::build(&repo));
+        write(&dcs, "second-longer");
+        let fp2 = scan_fingerprint(&conn, &crate::index_extras::RepoScan::build(&repo));
+        assert_ne!(fp1, fp2, "правка Template.dcs обязана менять отпечаток");
     }
 }

@@ -956,6 +956,25 @@ pub(crate) fn run_worker(
         }
     }
 
+    // На новой базе (и при неполной надстройке) закрываем инструменты
+    // расширения с самого начала ядра: ключа `extras_build_complete` в базе ещё
+    // нет, а его отсутствие читается как «готово». Без явного снятия
+    // extension-tools отвечали бы пустыми данными весь проход ядра, пока
+    // отметка не будет выставлена перед фазой надстройки.
+    if let Some(proc) = resolved_processor.as_ref() {
+        let extras_incomplete =
+            !db_has_rows || !storage.extras_build_complete() || !proc.extras_present(&storage);
+        if extras_incomplete {
+            if let Err(e) = storage.set_extras_build_complete(false) {
+                tracing::warn!(
+                    "[{}] не снята отметка завершённости надстройки: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
     // Называем вещи своими именами: на существующей базе это НЕ первичная
     // индексация, а сверка при старте — время и размер каждого файла
     // сравниваются с записанным, переиндексируются только разошедшиеся.
