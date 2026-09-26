@@ -695,12 +695,15 @@ Before chunked parsing the same folders ranged from 1.7 to 3.2 and the default w
 Zero, negative or non-numeric values are treated as a typo — the default is used, and the log shows which multiplier was actually applied.
 - **debounce_ms** — milliseconds to wait after a file change before triggering re-indexing (collects burst edits into one pass)
 - **batch_ms** — upper bound on how long the watcher keeps accumulating events after the first one in a batch
+- **quick_window_ms** — single-edit window (ms, default 50): if no event for another file arrives within this window after the first event, the batch is processed right away instead of waiting for `debounce_ms`; `0` disables single-edit mode
 - **batch_size** — number of records per SQLite transaction during indexing (higher = faster bulk inserts, higher peak memory)
 - **bulk_threshold** — minimum number of files that triggers bulk mode (drop indexes, insert, rebuild indexes); faster for large batches
 
 ### Tuning watcher latency (`debounce_ms`, `batch_ms`)
 
 Defaults are 1500 ms / 2000 ms — good for typical IDE save + formatter + linter bursts and for git operations that touch many files at once. For a lively single-user IDE session you can lower the debounce and trade throughput for responsiveness.
+
+**Single-edit window (`quick_window_ms`, 1.6.1).** Editing one file no longer waits for `debounce_ms`: after the first event the daemon waits a short window (50 ms by default). If no event for another file arrives, the one-file batch is processed immediately and the edit shows up in the index in about 50–80 ms instead of ~0.55 s with `debounce_ms = 500`. Repeated events for the same file (one save produces 2–3 events) do not switch modes. An event for another file switches to the regular collection — `debounce_ms` of silence capped by `batch_ms` — so bulk changes (git pull, a 1C configuration dump) are handled as before; at most the first file goes as a separate batch. Set it per folder in `[[paths]]` of `daemon.toml` or in the project's `.code-index/config.json`; `0` restores the old behaviour. A new value for an already watched folder takes effect after a daemon restart.
 
 The daemon resolves these values in this order (first match wins):
 
