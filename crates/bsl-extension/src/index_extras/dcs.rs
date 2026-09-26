@@ -65,7 +65,11 @@ pub(crate) fn split_template_full_name(full: &str) -> (String, String) {
 }
 
 /// Собрать все макеты-схемы компоновки репо: где лежит содержимое каждого.
-pub(crate) fn dcs_targets(repo_root: &Path, conn: &rusqlite::Connection) -> Vec<DcsTarget> {
+pub(crate) fn dcs_targets(
+    repo_root: &Path,
+    edt_src: Option<&Path>,
+    conn: &rusqlite::Connection,
+) -> Vec<DcsTarget> {
     let mut out: Vec<DcsTarget> = Vec::new();
 
     // (а) макеты объектов: у строки перечня есть паспорт с видом макета и
@@ -142,11 +146,10 @@ pub(crate) fn dcs_targets(repo_root: &Path, conn: &rusqlite::Connection) -> Vec<
     }
 
     if !common.is_empty() {
-        let edt_src = crate::xml::edt_mdo::detect_edt_src(repo_root);
         let roots = sub_config_roots(repo_root);
         for (full_name, name) in common {
             let mut candidates: Vec<PathBuf> = Vec::new();
-            if let Some(src) = &edt_src {
+            if let Some(src) = edt_src {
                 candidates.push(src.join("CommonTemplates").join(&name));
             }
             for root in &roots {
@@ -420,7 +423,11 @@ pub(crate) fn delete_dcs_for_owner(
 
 /// Фаза полного прохода: пересобрать `dcs_schemas` / `dcs_datasets` и рёбра
 /// `dcs_query` всего репо. Идемпотентно (DELETE repo + полный пересбор).
-pub(crate) fn index_dcs_schemas(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+pub(crate) fn index_dcs_schemas(
+    repo_root: &Path,
+    edt_src: Option<&Path>,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
     conn.execute(
@@ -436,7 +443,7 @@ pub(crate) fn index_dcs_schemas(repo_root: &Path, conn: &rusqlite::Connection) -
         params![REPO_DEFAULT],
     )?;
 
-    let targets = dcs_targets(repo_root, conn);
+    let targets = dcs_targets(repo_root, edt_src, conn);
     let mut sets = 0usize;
     let mut edges = 0usize;
     for t in &targets {

@@ -151,6 +151,80 @@ pub fn extract_command_uuid_from_file(path: &Path, command_name: &str) -> Result
     Ok(extract_command_uuid_from_str(&content, command_name))
 }
 
+/// Собрать UUID всех команд объекта из XML владельца: имя команды → uuid.
+///
+/// Тот же разбор, что у [`extract_command_uuid_from_str`], но за один проход
+/// отдаёт сразу все команды — перечню модулей (`metadata_modules`) нужны
+/// идентификаторы всех `CommandModule` объекта, а читать ради каждой команды
+/// один и тот же XML заново незачем.
+pub fn extract_all_command_uuids_from_str(xml: &str) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let local = |raw: &[u8]| -> Vec<u8> {
+        match raw.iter().rposition(|c| *c == b':') {
+            Some(i) => raw[i + 1..].to_vec(),
+            None => raw.to_vec(),
+        }
+    };
+
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut buf = Vec::new();
+    let mut cur_uuid: Option<String> = None;
+    // Имя команды — ПЕРВЫЙ <Name> внутри <Command>; вложенные элементы команды
+    // (например, параметры) имеют свои <Name>, их не смотрим.
+    let mut expect_name = false;
+    let mut acc = String::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = local(e.name().as_ref());
+                if name == b"Command" {
+                    cur_uuid = e
+                        .attributes()
+                        .flatten()
+                        .find(|a| a.key.as_ref() == b"uuid")
+                        .and_then(|a| {
+                            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .ok()
+                                .map(|c| c.to_string())
+                        });
+                    expect_name = cur_uuid.is_some();
+                } else if expect_name && name == b"Name" {
+                    // следующий текстовый узел — имя команды
+                }
+            }
+            Ok(Event::Text(t)) if expect_name => {
+                let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                acc.push_str(&txt);
+            }
+            Ok(Event::GeneralRef(r)) if expect_name => {
+                acc.push_str(&general_ref_text(&r));
+            }
+            Ok(Event::End(_)) if expect_name => {
+                let txt = std::mem::take(&mut acc).trim().to_string();
+                if !txt.is_empty() {
+                    if let Some(uuid) = cur_uuid.take() {
+                        out.insert(txt, uuid);
+                    }
+                }
+                expect_name = false;
+            }
+            Ok(Event::Empty(_)) => {
+                expect_name = false;
+                acc.clear();
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return out,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
 /// Извлечь UUID формы из `Form.xml` (`Forms/<FormName>/[Ext/]Form.xml`).
 /// У форм uuid — атрибут самого корневого элемента `<Form>`, а не
 /// дочернего как у обычных объектов.
@@ -236,6 +310,24 @@ mod tests {
             extract_command_uuid_from_str(xml, "Печать & Продажа").as_deref(),
             Some("command-uuid")
         );
+    }
+
+    /// Все команды объекта собираются за один проход: перечень модулей читает
+    /// объектный XML один раз, а не по разу на каждую команду.
+    #[test]
+    fn extract_all_command_uuids_collects_every_command() {
+        let xml = r#"<MetaDataObject><Catalog><ChildObjects>
+          <Command uuid="cmd-1"><Properties><Name>Печать</Name></Properties></Command>
+          <Command uuid="cmd-2"><Properties>
+            <Name>Провести</Name>
+            <Parameter><Name>НеИмяКоманды</Name></Parameter>
+          </Properties></Command>
+        </ChildObjects></Catalog></MetaDataObject>"#;
+        let all = extract_all_command_uuids_from_str(xml);
+        assert_eq!(all.get("Печать").map(String::as_str), Some("cmd-1"));
+        assert_eq!(all.get("Провести").map(String::as_str), Some("cmd-2"));
+        assert!(!all.contains_key("НеИмяКоманды"));
+        assert_eq!(all.len(), 2);
     }
 
     #[test]

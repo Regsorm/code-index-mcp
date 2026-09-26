@@ -480,6 +480,16 @@ async fn handle_extension_tool(
     drop(snapshot);
 
     let storage = entry.storage_pool();
+    // Тот же гейт, что и в штатном `call_tool`: пока надстройка репо
+    // досчитывается, extension-tool отдаёт структурированное «слой в работе»,
+    // а не неполные метаданные/термы/граф. Без него федеративный вход обходил
+    // прогрессивную готовность.
+    if let Some(value) = crate::mcp::tools::extras_building_response(storage).await {
+        let body = serde_json::to_string(&value).unwrap_or_else(|e| {
+            federation_error(&p.tool_name, &server.own_ip, format!("serialize: {}", e))
+        });
+        return ok_json(body);
+    }
     let root_path: Option<&std::path::Path> = entry.root_path.as_deref();
     let language: Option<&str> = entry.language.as_deref();
     let ctx = crate::extension::ToolContext {

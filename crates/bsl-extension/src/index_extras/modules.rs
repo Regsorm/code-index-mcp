@@ -65,22 +65,23 @@ pub(crate) fn migrate_metadata_modules_key_tx(conn: &rusqlite::Connection) -> Re
 ///      * Обходим .bsl-файлы под этой sub-root, классифицируем тип модуля
 ///        по имени файла + сегментам пути, находим XML-владельца, извлекаем
 ///        его UUID и записываем тройку `(object_id, property_id, config_version)`.
-pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    // Находим все Configuration.xml — каждая определяет область sub-config.
-    let mut sub_configs: Vec<std::path::PathBuf> = Vec::new();
-    let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(repo_root)
-        .max_depth(3)
-        .into_iter()
-        .filter_entry(|e| filter.allows(e))
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() && entry.file_name().to_str() == Some("Configuration.xml") {
-            if let Some(parent) = entry.path().parent() {
-                sub_configs.push(parent.to_path_buf());
-            }
-        }
-    }
+pub(crate) fn index_metadata_modules(
+    scan: &RepoScan,
+    harvest: &XmlHarvest,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    let repo_root = &scan.repo_root;
+    // Идентификаторы владельцев уже разобраны единым чтением XML (`harvest.rs`):
+    // объектный XML читается один раз на всю конфигурацию, а не на каждый .bsl
+    // (для модулей команд — не на каждую команду).
+    let ids = harvest.id_cache();
+    // Области выгрузки — родители Configuration.xml в порядке обхода; тот же
+    // набор, что у прежнего отдельного обхода `max_depth(3)`.
+    let sub_configs: Vec<std::path::PathBuf> = scan
+        .config_paths
+        .iter()
+        .filter_map(|p| p.parent().map(std::path::Path::to_path_buf))
+        .collect();
     if sub_configs.is_empty() {
         return Ok(());
     }
@@ -93,39 +94,53 @@ pub(crate) fn index_metadata_modules(repo_root: &Path, conn: &rusqlite::Connecti
         params![REPO_DEFAULT],
     )?;
     let mut total: usize = 0;
-    let mut skipped: usize = 0;
-    // Кэш описей выгрузки на весь проход: `build_module_row` берёт из него
-    // версию модуля, не перечитывая опись для каждого .bsl.
-    let mut cfgver_cache: std::collections::HashMap<
+    // Версии модулей: по одному разбору ConfigDumpInfo.xml на область ЗАРАНЕЕ.
+    // Так параллельный проход не делит общий изменяемый кэш: каждый поток
+    // читает готовую карту своей области.
+    let mut versions_by_sub_root: std::collections::HashMap<
         std::path::PathBuf,
         std::collections::HashMap<String, String>,
     > = std::collections::HashMap::new();
-
     for sub_root in &sub_configs {
-        for entry in WalkDir::new(sub_root)
-            .into_iter()
-            .filter_entry(|e| filter.allows(e))
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
+        let versions = parse_config_dump_info(sub_root).unwrap_or_else(|e| {
+            tracing::warn!(
+                "ConfigDumpInfo {}: {} — версия модуля не определена",
+                sub_root.display(),
+                e
+            );
+            Default::default()
+        });
+        versions_by_sub_root.insert(sub_root.clone(), versions);
+    }
+
+    // Файлы всех областей — плоский список пар (область, путь): строки
+    // собираются параллельно, вставка серийная (SQLite — один писатель).
+    let pairs: Vec<(&std::path::PathBuf, &std::path::PathBuf)> = sub_configs
+        .iter()
+        .flat_map(|sub_root| {
+            scan.files_of(&scan.bsl_files, sub_root)
+                .map(move |path| (sub_root, path))
+        })
+        .collect();
+    use rayon::prelude::*;
+    let empty_versions = std::collections::HashMap::new();
+    let rows: Vec<Option<ModuleRow>> = pairs
+        .par_iter()
+        .map(|(sub_root, path)| {
+            let versions = versions_by_sub_root
+                .get(*sub_root)
+                .unwrap_or(&empty_versions);
             // Строку собирает тот же хелпер, что и пофайловая ветка инкремента.
-            // Раньше здесь лежала своя копия той же логики (классификация типа,
-            // поиск владельца, чтение идентификатора), и правка одной стороны не
-            // действовала во второй — так модули команд объектов остались бы вне
-            // перечня даже после исправления разбора их пути (E-7).
-            let row = match build_module_row(repo_root, path, &mut cfgver_cache) {
-                Some(r) => r,
-                None => {
-                    skipped += 1;
-                    continue;
-                }
-            };
-            insert_module_row(conn, &row)?;
-            total += 1;
-        }
+            // Раньше здесь лежала своя копия той же логики, и правка одной
+            // стороны не действовала во второй (E-7).
+            build_module_row_prefilled(repo_root, path, versions, Some(&ids))
+        })
+        .collect();
+
+    let skipped = rows.iter().filter(|r| r.is_none()).count();
+    for row in rows.into_iter().flatten() {
+        insert_module_row(conn, &row)?;
+        total += 1;
     }
     conn.execute("COMMIT", [])?;
 
@@ -172,6 +187,34 @@ pub(crate) fn build_module_row(
         std::path::PathBuf,
         std::collections::HashMap<String, String>,
     >,
+    ids: Option<&XmlIdCache>,
+) -> Option<ModuleRow> {
+    build_module_row_with(repo_root, bsl_path, ids, None, Some(cfgver_cache))
+}
+
+/// Как [`build_module_row`], но версии берутся из ГОТОВОЙ карты области
+/// (`versions` — уже разобранный `ConfigDumpInfo.xml`): нужно параллельному
+/// проходу полной индексации, где общий изменяемый кэш невозможен.
+pub(crate) fn build_module_row_prefilled(
+    repo_root: &Path,
+    bsl_path: &Path,
+    versions: &std::collections::HashMap<String, String>,
+    ids: Option<&XmlIdCache>,
+) -> Option<ModuleRow> {
+    build_module_row_with(repo_root, bsl_path, ids, Some(versions), None)
+}
+
+fn build_module_row_with(
+    repo_root: &Path,
+    bsl_path: &Path,
+    ids: Option<&XmlIdCache>,
+    versions_ready: Option<&std::collections::HashMap<String, String>>,
+    cfgver_cache: Option<
+        &mut std::collections::HashMap<
+            std::path::PathBuf,
+            std::collections::HashMap<String, String>,
+        >,
+    >,
 ) -> Option<ModuleRow> {
     let file_name = bsl_path.file_name().and_then(|n| n.to_str())?;
     let module_type = module_type_by_filename(file_name)?;
@@ -189,9 +232,13 @@ pub(crate) fn build_module_row(
     };
     let (object_name, uuid_opt) = match command_owner {
         Some((owner_xml_path, object_name, command_name)) => {
-            let uuid = extract_command_uuid_from_file(&owner_xml_path, &command_name)
-                .ok()
-                .flatten();
+            // UUID команды уже мог быть извлечён единым разбором объектного XML.
+            let uuid = match ids.and_then(|c| c.command_uuid(&owner_xml_path, &command_name)) {
+                Some(uuid) => Some(uuid.to_string()),
+                None => extract_command_uuid_from_file(&owner_xml_path, &command_name)
+                    .ok()
+                    .flatten(),
+            };
             (object_name, uuid)
         }
         None => {
@@ -200,13 +247,18 @@ pub(crate) fn build_module_row(
                 OwnerKind::Object => find_object_owner(bsl_path),
             };
             let (owner_xml_path, object_name) = owner_info?;
-            let uuid = match owner_xml_kind {
-                OwnerKind::Form => extract_form_uuid_any_from_file(&owner_xml_path)
-                    .ok()
-                    .flatten(),
-                OwnerKind::Object => extract_object_uuid_from_file(&owner_xml_path)
-                    .ok()
-                    .flatten(),
+            // UUID владельца из единого разбора (если он там был) — иначе
+            // читаем XML с диска, как раньше.
+            let uuid = match ids.and_then(|c| c.file_uuid(&owner_xml_path)) {
+                Some(uuid) => Some(uuid.to_string()),
+                None => match owner_xml_kind {
+                    OwnerKind::Form => extract_form_uuid_any_from_file(&owner_xml_path)
+                        .ok()
+                        .flatten(),
+                    OwnerKind::Object => extract_object_uuid_from_file(&owner_xml_path)
+                        .ok()
+                        .flatten(),
+                },
             };
             (object_name, uuid)
         }
@@ -218,17 +270,23 @@ pub(crate) fn build_module_row(
     let sub_root =
         sub_root_for_path(repo_root, bsl_path).unwrap_or_else(|| repo_root.to_path_buf());
     let extension_name = compute_extension_name(repo_root, &sub_root);
-    let config_versions = cfgver_cache.entry(sub_root.clone()).or_insert_with(|| {
-        parse_config_dump_info(&sub_root).unwrap_or_else(|e| {
-            tracing::warn!(
-                "ConfigDumpInfo {}: {} — версия модуля не определена",
-                sub_root.display(),
-                e
-            );
-            Default::default()
-        })
-    });
-    let config_version = config_versions.get(&object_id).cloned();
+    let config_version = match versions_ready {
+        Some(v) => v.get(&object_id).cloned(),
+        None => {
+            let cache = cfgver_cache.expect("build_module_row_with: versions или cache");
+            let map = cache.entry(sub_root.clone()).or_insert_with(|| {
+                parse_config_dump_info(&sub_root).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "ConfigDumpInfo {}: {} — версия модуля не определена",
+                        sub_root.display(),
+                        e
+                    );
+                    Default::default()
+                })
+            });
+            map.get(&object_id).cloned()
+        }
+    };
     let full_name = format!("{}.{}", object_name, effective_type);
     let code_path = bsl_path
         .strip_prefix(repo_root)
@@ -468,7 +526,7 @@ pub(crate) fn update_metadata_module_for_file(
         params![REPO_DEFAULT, &rel],
     )?;
     if bsl_path.is_file() {
-        if let Some(row) = build_module_row(repo_root, bsl_path, cfgver_cache) {
+        if let Some(row) = build_module_row(repo_root, bsl_path, cfgver_cache, None) {
             insert_module_row(conn, &row)?;
         }
     }
@@ -533,7 +591,7 @@ pub(crate) fn update_metadata_modules_for_object(
             if !entry.file_type().is_file() {
                 continue;
             }
-            if let Some(row) = build_module_row(repo_root, entry.path(), cfgver_cache) {
+            if let Some(row) = build_module_row(repo_root, entry.path(), cfgver_cache, None) {
                 insert_module_row(conn, &row)?;
             }
         }

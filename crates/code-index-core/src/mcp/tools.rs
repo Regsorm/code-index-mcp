@@ -212,6 +212,40 @@ pub fn format_unavailable(value: ToolUnavailable) -> String {
     }
 }
 
+/// Тяжёлый слой надстройки репо ещё строится? Тогда extension-tools отдают
+/// структурированное «слой в работе» вместо неполных метаданных/термов/графа.
+///
+/// Нужен из-за прогрессивной готовности: демон объявляет папку `Ready` сразу
+/// после базовой индексации, пока надстройка досчитывается минутами. Флаг
+/// `extras_build_complete` лежит в самой базе репо; отсутствие ключа — «слой
+/// завершён» (база прежней версии или репозиторий без надстройки).
+pub async fn extras_building_response(
+    storage: &std::sync::Arc<crate::storage::StoragePool>,
+) -> Option<serde_json::Value> {
+    let conn = storage.get().await.ok()?;
+    let building = match conn.extras_build_complete_state() {
+        Ok(Some(false)) => true,
+        Ok(_) => false,
+        Err(e) => {
+            // Не знаем состояние слоя — считаем, что он ещё строится: отдать
+            // неполные метаданные хуже, чем попросить повторить вызов.
+            tracing::warn!("отметка завершённости надстройки не прочитана: {}", e);
+            true
+        }
+    };
+    if !building {
+        return None;
+    }
+    Some(serde_json::json!({
+        "status": "indexing",
+        "layer": "extras",
+        "message": "Досчитывается слой надстройки (метаданные/термы/граф). \
+            Инструменты ядра (search_function, get_function, grep_code и др.) \
+            уже доступны; этот инструмент заработает после завершения слоя — \
+            повторите вызов через минуту или проверьте health.",
+    }))
+}
+
 // ── Ожидание двух ступеней готовности папки ──────────────────────────────────
 //
 // Текстовым инструментам хватает зафиксированного ядра (`ReindexingExtras`),
@@ -359,6 +393,24 @@ macro_rules! bail_if_text_not_ready {
     ($entry:expr) => {{
         if let Some(json) = crate::mcp::tools::check_path_status_text($entry).await {
             return json;
+        }
+    }};
+}
+
+/// Макрос-хелпер: полнотекст ещё собирается (отложенная сборка демона) —
+/// `search_*` закрыты, остальные инструменты работают. `$storage` — уже взятое
+/// соединение из пула, чтобы не проверять флаг лишним checkout'ом.
+macro_rules! bail_if_fts_building {
+    ($storage:expr) => {{
+        if $storage.fts_build_pending() {
+            return serde_json::json!({
+                "status": "indexing",
+                "layer": "fts",
+                "message": "Полнотекстовый поиск ещё собирается после первичной индексации. \
+                    Остальные инструменты (get_*, grep_*, read_file, list_files) уже работают; \
+                    повторите вызов через минуту или проверьте health.",
+            })
+            .to_string();
         }
     }};
 }
@@ -832,6 +884,7 @@ pub async fn search_function(
 ) -> String {
     bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    bail_if_fts_building!(storage);
     let want = limit.unwrap_or(20);
     // Если path_glob задан — берём с запасом (5×, до 500), потом фильтруем по пути,
     // потом обрезаем до want. Это компромисс между точностью и нагрузкой.
@@ -893,6 +946,7 @@ pub async fn search_class(
 ) -> String {
     bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    bail_if_fts_building!(storage);
     let want = limit.unwrap_or(20);
     let sql_limit = if path_glob.is_some() {
         (want.saturating_mul(5)).min(500)
@@ -2288,6 +2342,7 @@ pub async fn search_text(
 ) -> String {
     bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    bail_if_fts_building!(storage);
     let want = limit.unwrap_or(20);
     let sql_limit = if path_glob.is_some() {
         (want.saturating_mul(5)).min(500)
@@ -2929,6 +2984,28 @@ mod tests {
             &PathStatus::ReindexingExtras,
             ReadyStage::default()
         ));
+    }
+
+    /// Прогрессивная готовность: пока флаг завершённости надстройки снят,
+    /// extension-tools получают структурированное «слой в работе», а не данные.
+    #[tokio::test]
+    async fn extras_building_response_закрывает_незавершённый_слой() {
+        let pending = Storage::open_in_memory().unwrap();
+        pending.set_extras_build_complete(false).unwrap();
+        let pool = StoragePool::single(pending);
+        let value = extras_building_response(&pool)
+            .await
+            .expect("незавершённый слой должен закрывать инструмент");
+        assert_eq!(value["status"], serde_json::json!("indexing"));
+        assert_eq!(value["layer"], serde_json::json!("extras"));
+
+        let ready = Storage::open_in_memory().unwrap();
+        ready.set_extras_build_complete(true).unwrap();
+        let pool = StoragePool::single(ready);
+        assert!(
+            extras_building_response(&pool).await.is_none(),
+            "завершённый слой инструменты не закрывает"
+        );
     }
 
     /// Готовая команда идёт человеку в терминал, поэтому расширенного префикса

@@ -738,7 +738,8 @@ fn fills_config_manifest_from_all_areas() {
 
     let storage = fresh_storage(&tmp);
     let conn = storage.conn();
-    index_config_manifest(&repo, conn).unwrap();
+    let scan = RepoScan::build(&repo);
+    index_config_manifest(&scan, conn).unwrap();
 
     // Всего 5 строк: base(3) + ext(2).
     let total: i64 = conn
@@ -5846,4 +5847,125 @@ fn qualified_callers_common_manager_and_form() {
 
     assert!(crate::qualified_callers::qualified_callers(&st, "").is_empty());
     assert!(crate::qualified_callers::qualified_callers(&st, "Общий.Проц").is_empty());
+}
+
+#[test]
+fn resume_пропускает_собранные_фазы_и_повторяет_после_изменения() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    write_config_level_fixture(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    assert!(storage.extras_build_complete(), "слой дошёл до конца");
+
+    let done: u32 = storage
+        .conn()
+        .query_row(
+            "SELECT value FROM index_state WHERE key = 'extras_resume_done'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(done, EXTRAS_PHASE_COUNT, "отмечены все фазы слоя");
+
+    // Имитируем обрыв после фазы прав: сдвигаем отметку назад, чистим таблицу
+    // прав. Повторный проход обязан ДОБРАТЬ права с точки возобновления, а не
+    // начать с нуля и не пропустить фазу.
+    storage
+        .conn()
+        .execute("DELETE FROM role_rights", [])
+        .unwrap();
+    storage
+        .conn()
+        .execute(
+            "INSERT OR REPLACE INTO index_state (key, value) VALUES ('extras_resume_done', ?1)",
+            params![PH_ROLE_RIGHTS.to_string()],
+        )
+        .unwrap();
+    run_index_extras(&repo, &mut storage).unwrap();
+    let rr: i64 = storage
+        .conn()
+        .query_row("SELECT COUNT(*) FROM role_rights", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rr, 1, "права пересобраны с точки возобновления");
+
+    // Изменение входа сбрасывает прогресс: правим Rights.xml — фаза обязана
+    // собраться заново, а не остаться пропущенной по старому отпечатку.
+    write(
+        &repo
+            .join("Roles")
+            .join("Роль1")
+            .join("Ext")
+            .join("Rights.xml"),
+        r#"<?xml version="1.0"?>
+<Rights xmlns="r"><object>
+  <name>Document.РеализацияТоваровУслуг</name>
+  <right><name>Read</name><value>true</value></right>
+  <right><name>Posting</name><value>true</value></right>
+</object></Rights>"#,
+    );
+    run_index_extras(&repo, &mut storage).unwrap();
+    let rights: i64 = storage
+        .conn()
+        .query_row("SELECT COUNT(*) FROM role_rights", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rights, 2, "изменившийся вход — фаза собрана заново");
+}
+
+#[test]
+fn сбой_фазы_не_перепрыгивается_успехом_следующей() {
+    let tmp = TempDir::new().unwrap();
+    let storage = fresh_storage(&tmp);
+    let conn = storage.conn();
+    let resume = ExtrasResume::load(conn, 7);
+
+    // Фаза 0 падает — отметки нет.
+    resumable_phase(Some(&resume), conn, 0, "тест-0", "t0", || {
+        anyhow::bail!("boom")
+    });
+    // Фаза 1 успешна, но двигать цепочку нельзя: фаза 0 не собрана.
+    resumable_phase(Some(&resume), conn, 1, "тест-1", "t1", || Ok(()));
+    assert_eq!(resume.done(), 0, "отметка не перескочила проваленную фазу");
+
+    // Повтор: фазы идут строго по порядку, отметка растёт на единицу.
+    resumable_phase(Some(&resume), conn, 0, "тест-0", "t0", || Ok(()));
+    assert_eq!(resume.done(), 1, "повторный успех фазы 0 сдвинул цепочку");
+    resumable_phase(Some(&resume), conn, 1, "тест-1", "t1", || Ok(()));
+    assert_eq!(resume.done(), 2, "фаза 1 сдвинула цепочку следом за 0");
+}
+
+#[test]
+fn edt_не_пишет_отметку_возобновления() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    write(
+        &repo
+            .join("src")
+            .join("Configuration")
+            .join("Configuration.mdo"),
+        r#"<?xml version="1.0"?><mdclass:Configuration xmlns:mdclass="x"/>"#,
+    );
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    let marker = |st: &Storage| -> i64 {
+        st.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM index_state WHERE key = 'extras_resume_done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        marker(&storage),
+        0,
+        "EDT: отпечаток не покрывает .mdo — возобновление выключено"
+    );
+    // Повторный полный проход не падает и снова не ставит отметку.
+    run_index_extras(&repo, &mut storage).unwrap();
+    assert_eq!(marker(&storage), 0, "повторный проход EDT — тоже целиком");
 }

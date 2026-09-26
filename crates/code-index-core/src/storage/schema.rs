@@ -254,6 +254,21 @@ fn migrate_v7(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
 /// Ключ отметки «массовая загрузка не завершена» в таблице `index_state`.
 pub const BULK_IN_PROGRESS_KEY: &str = "bulk_load_in_progress";
 
+/// Ключ отметки «слой надстройки дошёл до конца» в `index_state`.
+///
+/// Снимается на время полного пересбора надстройки расширением и выставляется
+/// после его завершения. Отсутствие ключа читается как «завершён»: базы
+/// прежних версий и репозитории без надстройки не должны считаться оборванными.
+pub const EXTRAS_BUILD_COMPLETE_KEY: &str = "extras_build_complete";
+
+/// Ключ отметки «полнотекстовый поиск ещё не собран» в `index_state`.
+///
+/// Ставится массовой загрузкой, когда ядро намеренно отложило наполнение FTS
+/// (`IndexConfig::defer_fts`) ради ранней готовности: остальные инструменты
+/// отвечают, а `search_function`/`search_class`/`search_text` закрыты до конца
+/// сборки. Снимается в [`crate::storage::Storage::build_fts_deferred`].
+pub const FTS_BUILD_PENDING_KEY: &str = "fts_build_pending";
+
 /// Осталась ли в базе отметка о незавершённой массовой загрузке.
 ///
 /// Отсутствие таблицы (база от прежней версии) читается как «отметки нет»:
@@ -550,29 +565,59 @@ pub fn drop_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Resul
     Ok(())
 }
 
-/// Пересоздать индексы и FTS-триггеры, затем перестроить FTS-индексы (после bulk-load).
+/// Пересоздать индексы и FTS-триггеры, затем (если `skip_fts = false`)
+/// перестроить FTS-индексы (после bulk-load).
 ///
 /// Последовательность:
 /// 1. Пересоздаём обычные индексы (один проход по данным — дешевле инкрементальных обновлений).
 /// 2. Пересоздаём FTS-триггеры для будущих изменений.
 /// 3. Rebuild FTS-индексов из уже загруженных данных (команда 'rebuild').
-pub fn rebuild_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    // Пересоздаём обычные индексы
-    conn.execute_batch(INDEXES_SQL)?;
+///
+/// `skip_fts = true` — отложенная сборка полнотекста (`defer_fts`): триггеры
+/// создаются (инкремент после сборки работает), а FTS оставляется пустым/старым
+/// до [`crate::storage::Storage::build_fts_deferred`]. Поиск в это время закрыт
+/// флагом `fts_build_pending`.
+pub fn rebuild_indexes_and_triggers(
+    conn: &rusqlite::Connection,
+    skip_fts: bool,
+) -> rusqlite::Result<()> {
+    // Массовая фаза: построение всех индексов и перестройка полнотекста. Кеш
+    // страниц на время фазы поднимаем (на больших базах 64 МБ мало: дерево
+    // индексов и FTS не помещается, работа уходит в случайные чтения), после —
+    // возвращаем прежний, чтобы не занимать память у демона.
+    let prev_cache: i64 = conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?;
+    conn.execute_batch("PRAGMA cache_size=-262144;")?;
 
-    // Пересоздаём FTS-триггеры
+    let t = std::time::Instant::now();
+    // Создаём индексы
+    conn.execute_batch(INDEXES_SQL)?;
+    tracing::debug!(
+        "массовая загрузка: индексы созданы за {} мс",
+        t.elapsed().as_millis()
+    );
+
+    // Создаём FTS-триггеры
     conn.execute_batch(TRIGGERS_SQL)?;
 
-    // Перестраиваем FTS-индексы из данных основных таблиц
-    // fts_text_files НЕ перестраиваем через 'rebuild' — он contentless, таблицы-
-    // источника для rebuild у него нет. Его наполняет Rust-путь записи
-    // text_contents (в т.ч. при bulk-load), поэтому к этому моменту он уже полон.
-    conn.execute_batch(
-        "
-        INSERT INTO fts_functions(fts_functions) VALUES('rebuild');
-        INSERT INTO fts_classes(fts_classes) VALUES('rebuild');
-    ",
-    )?;
+    if !skip_fts {
+        // Перестраиваем FTS-индексы из данных основных таблиц (команда 'rebuild').
+        // fts_text_files не перестраивается через 'rebuild' — он contentless, таблицы-
+        // источника для rebuild у него нет. Для него слова подаёт Rust-код через
+        // text_contents (в т.ч. на bulk-load), поэтому в этой функции он уже наполнен.
+        let t = std::time::Instant::now();
+        conn.execute_batch("INSERT INTO fts_functions(fts_functions) VALUES('rebuild');")?;
+        tracing::debug!(
+            "массовая загрузка: полнотекст функций перестроен за {} мс",
+            t.elapsed().as_millis()
+        );
+        let t = std::time::Instant::now();
+        conn.execute_batch("INSERT INTO fts_classes(fts_classes) VALUES('rebuild');")?;
+        tracing::debug!(
+            "массовая загрузка: полнотекст классов перестроен за {} мс",
+            t.elapsed().as_millis()
+        );
+    }
 
+    conn.execute_batch(&format!("PRAGMA cache_size={};", prev_cache))?;
     Ok(())
 }

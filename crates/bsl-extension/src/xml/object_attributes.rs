@@ -749,7 +749,17 @@ pub fn parse_object_structure_file(path: &Path) -> Result<Option<ObjectStructure
     }
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Не удалось прочитать {}", path.display()))?;
-    let mut structure = parse_object_structure_xml(&content)?;
+    Ok(Some(parse_object_structure_content(path, &content)?))
+}
+
+/// Распарсить структуру объекта по УЖЕ прочитанному содержимому, дополнив
+/// предопределёнными элементами из соседнего `<Объект>/Ext/Predefined.xml`.
+///
+/// Отделено от [`parse_object_structure_file`], чтобы единый обход XML-слоя
+/// (`index_extras/harvest.rs`) читал каждый объектный XML один раз и получал
+/// структуру без повторного обращения к диску.
+pub fn parse_object_structure_content(path: &Path, content: &str) -> Result<ObjectStructure> {
+    let mut structure = parse_object_structure_xml(content)?;
 
     // C2: предопределённые элементы — в соседнем `<Объект>/Ext/Predefined.xml`
     // (Catalog/ChartOfAccounts/ChartOf*). path `<...>/Catalogs/Качество.xml`
@@ -761,7 +771,7 @@ pub fn parse_object_structure_file(path: &Path) -> Result<Option<ObjectStructure
         }
     }
 
-    Ok(Some(structure))
+    Ok(structure)
 }
 
 /// Распарсить `Predefined.xml` объекта в список имён предопределённых

@@ -817,6 +817,10 @@ pub(crate) fn run_worker(
     // расширения (`.h`: заголовок C или C++). Демон заполняет это поле на
     // старте автоопределением, если в конфиге его не указали.
     index_config.repo_language = entry.language.clone();
+    // Полнотекст в демоне собирается после объявления готовности: папка
+    // становится доступной сразу после ядра, `search_*` закрыты флагом
+    // `fts_build_pending` до конца сборки (см. `Storage::build_fts_deferred`).
+    index_config.defer_fts = true;
     let mut storage_config = StorageConfig {
         mode: index_config.storage_mode.clone(),
         memory_max_percent: index_config.memory_max_percent,
@@ -1006,6 +1010,25 @@ pub(crate) fn run_worker(
         }
     }
 
+    // На новой базе (и при неполной надстройке) закрываем инструменты
+    // расширения с самого начала ядра: ключа `extras_build_complete` в базе ещё
+    // нет, а его отсутствие читается как «готово». Без явного снятия
+    // extension-tools отвечали бы пустыми данными весь проход ядра, пока
+    // отметка не будет выставлена перед фазой надстройки.
+    if let Some(proc) = resolved_processor.as_ref() {
+        let extras_incomplete =
+            !db_has_rows || !storage.extras_build_complete() || !proc.extras_present(&storage);
+        if extras_incomplete {
+            if let Err(e) = storage.set_extras_build_complete(false) {
+                tracing::warn!(
+                    "[{}] не снята отметка завершённости надстройки: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
     // Называем вещи своими именами: на существующей базе это НЕ первичная
     // индексация, а сверка при старте — время и размер каждого файла
     // сравниваются с записанным, переиндексируются только разошедшиеся.
@@ -1081,6 +1104,45 @@ pub(crate) fn run_worker(
         return;
     }
 
+    // 6. Отложенный полнотекст (см. `IndexConfig::defer_fts`) — ДО надстройки.
+    //    Порядок принципиален: `search_*` нуждаются только в FTS ядра, а не в
+    //    metadata/графе, и собираются раньше на время полного пересбора
+    //    надстройки (десятки минут на больших конфигурациях). Соединение всё
+    //    равно одно — фазы сериализуются, но поиск открывается раньше.
+    //    На время сборки папка уже Ready для остальных инструментов, `search_*`
+    //    закрыты флагом `fts_build_pending`. Для базы в памяти раннее Ready
+    //    бессмысленно (на диске её ещё нет), но собрать FTS нужно ДО
+    //    flush_to_disk — позже он в снимок не попадёт.
+    if storage.fts_build_pending() {
+        if !worked_in_memory && !stop.load(Ordering::Acquire) {
+            tokio_block_on(async {
+                state.set_status(&path, PathStatus::Ready).await;
+            });
+            tracing::info!(
+                "[{}] папка объявлена доступной — полнотекстовый поиск досчитывается; \
+                 инструменты search_* включатся по её завершении, остальные уже работают",
+                path.display()
+            );
+        }
+        let t0 = std::time::Instant::now();
+        crate::logging::stage_begin("полнотекстовый поиск");
+        let outcome = storage.build_fts_deferred();
+        crate::logging::stage_done("полнотекстовый поиск", t0.elapsed());
+        match outcome {
+            Ok(()) => tracing::info!(
+                "[{}] отложенный полнотекстовый поиск собран за {} мс",
+                path.display(),
+                t0.elapsed().as_millis()
+            ),
+            Err(e) => tracing::warn!(
+                "[{}] сборка отложенного полнотекста упала: {}. \
+                 Поиск останется закрытым до следующего запуска демона.",
+                path.display(),
+                e
+            ),
+        }
+    }
+
     // 6a. index_extras процессора — для BSL это парсинг Configuration.xml /
     //     Forms / EventSubscriptions и заполнение metadata_*-таблиц.
     //
@@ -1111,6 +1173,7 @@ pub(crate) fn run_worker(
             && db_has_rows
             && reindex.files_indexed == 0
             && reindex.files_deleted == 0
+            && storage.extras_build_complete()
             && proc.extras_present(&storage);
 
         // Между «ничего не менялось» и «полный пересбор» есть третий случай:
@@ -1123,6 +1186,7 @@ pub(crate) fn run_worker(
             && !skip_extras
             && db_has_rows
             && !reindex.paths_overflow
+            && storage.extras_build_complete()
             && proc.extras_present(&storage);
 
         let mut need_full = !skip_extras;
@@ -1168,6 +1232,33 @@ pub(crate) fn run_worker(
             }
         }
 
+        // Прогрессивная готовность: полный пересбор надстройки идёт минутами,
+        // а базовое ядро уже записано в готовую базу. Если база на диске —
+        // объявляем папку Ready сейчас: инструменты ядра начинают отвечать
+        // сразу, а tools расширения отдают структурированное «слой ещё
+        // строится», пока не выставлен флаг завершённости надстройки.
+        // Для базы в памяти это не делаем: на диске её ещё нет, читать серверу
+        // выдачи нечего.
+        if need_full && !worked_in_memory && !stop.load(Ordering::Acquire) {
+            if let Err(e) = storage.set_extras_build_complete(false) {
+                tracing::warn!(
+                    "[{}] не снята отметка завершённости надстройки: {}",
+                    path.display(),
+                    e
+                );
+            }
+            tokio_block_on(async {
+                state.set_status(&path, PathStatus::Ready).await;
+            });
+            tracing::info!(
+                "[{}] базовая индексация готова — папка объявлена доступной; \
+                 надстройка процессора «{}» досчитывается в фоне, \
+                 1С-инструменты включатся по её завершении",
+                path.display(),
+                proc.name()
+            );
+        }
+
         if need_full && !stop.load(Ordering::Acquire) {
             let t0 = std::time::Instant::now();
             // Сообщаем о НАЧАЛЕ: на больших конфигурациях полный пересбор идёт
@@ -1190,6 +1281,16 @@ pub(crate) fn run_worker(
                     proc.name(),
                     e
                 );
+                // Не держим инструменты расширения закрытыми навсегда: слой
+                // не собрался, но данные — ровно те, что есть. Ближайший
+                // полный проход (или рестарт демона) повторит его.
+                if let Err(e) = storage.set_extras_build_complete(true) {
+                    tracing::warn!(
+                        "[{}] не выставлена отметка завершённости надстройки: {}",
+                        path.display(),
+                        e
+                    );
+                }
             } else {
                 tracing::info!(
                     "[{}] полный пересбор надстройки процессора «{}» выполнен за {} мс",

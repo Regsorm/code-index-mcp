@@ -198,6 +198,18 @@ pub struct IndexConfig {
     /// По умолчанию 30 секунд.
     #[serde(default = "default_flush_interval")]
     pub flush_interval_sec: u64,
+
+    /// Отложить сборку полнотекстового поиска на конец массовой загрузки.
+    ///
+    /// Демон ставит `true`: ядро не тратит время на токенизацию текста внутри
+    /// фазы записи и на rebuild FTS функций/классов в `finish_bulk_load`, а
+    /// объявляет папку готовой раньше; полнотекст собирается после надстройки
+    /// (`Storage::build_fts_deferred`), и до тех пор `search_*` закрыты флагом
+    /// `fts_build_pending`. Инструменты ядра (`get_*`, `grep_*`, `read_file`)
+    /// работают всё это время. По умолчанию `false` — CLI и тесты собирают
+    /// полнотекст синхронно, как раньше.
+    #[serde(default)]
+    pub defer_fts: bool,
 }
 
 fn default_storage_mode() -> String {
@@ -295,6 +307,7 @@ impl Default for IndexConfig {
             batch_ms: default_batch_ms(),
             bulk_batch_threshold: default_bulk_batch_threshold(),
             flush_interval_sec: default_flush_interval(),
+            defer_fts: false,
         }
     }
 }

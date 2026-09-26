@@ -428,6 +428,9 @@ impl Storage {
 
     /// Вставить или обновить запись файла; возвращает id строки
     pub fn upsert_file(&self, record: &FileRecord) -> Result<i64> {
+        // `RETURNING id` — и вставка, и обновление, и чтение id одним запросом.
+        // Раньше следом шёл отдельный `SELECT id FROM files WHERE path = ?`:
+        // на 100 тыс. файлов это лишний проход по индексу на каждый.
         let mut stmt = self.conn.prepare_cached(
             "INSERT INTO files (path, content_hash, language, lines_total, indexed_at, mtime, file_size)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -437,24 +440,23 @@ impl Storage {
                  lines_total  = excluded.lines_total,
                  indexed_at   = excluded.indexed_at,
                  mtime        = COALESCE(excluded.mtime, files.mtime),
-                 file_size    = COALESCE(excluded.file_size, files.file_size)",
+                 file_size    = COALESCE(excluded.file_size, files.file_size)
+             RETURNING id",
         )?;
-        stmt.execute(params![
-            record.path,
-            record.content_hash,
-            record.language,
-            record.lines_total as i64,
-            record.indexed_at,
-            record.mtime,
-            record.file_size,
-        ])
-        .context("upsert_file: ошибка выполнения запроса")?;
-
-        // Получаем id — либо только что вставленной, либо существующей строки
-        let mut id_stmt = self
-            .conn
-            .prepare_cached("SELECT id FROM files WHERE path = ?1")?;
-        let id: i64 = id_stmt.query_row(params![record.path], |row| row.get(0))?;
+        let id: i64 = stmt
+            .query_row(
+                params![
+                    record.path,
+                    record.content_hash,
+                    record.language,
+                    record.lines_total as i64,
+                    record.indexed_at,
+                    record.mtime,
+                    record.file_size,
+                ],
+                |row| row.get(0),
+            )
+            .context("upsert_file: ошибка выполнения запроса")?;
         Ok(id)
     }
 
@@ -771,8 +773,15 @@ impl Storage {
     /// парсинга, писатель только пишет. `fts_text` — сырой текст для FTS5
     /// (contentless-индексу нужен разжатый текст, blob для него не годится).
     pub fn insert_text_file_blob(&self, file_id: i64, blob: &[u8], fts_text: &str) -> Result<()> {
-        // Снять старый FTS-токен, если запись существовала (повтор без delete).
-        self.fts_text_delete(file_id)?;
+        // При отложенной сборке полнотекста (`defer_fts`) старые токены не
+        // снимаем и новые не пишем: весь указатель будет пересобран из
+        // `text_contents` в `build_fts_deferred`. Это убирает токенизацию
+        // 52 тыс. текстовых файлов с критического пути записи.
+        let deferred = self.fts_build_pending();
+        if !deferred {
+            // Снять старый FTS-токен, если запись существовала (повтор без delete).
+            self.fts_text_delete(file_id)?;
+        }
         self.conn
             .prepare_cached(
                 "INSERT OR REPLACE INTO text_contents (file_id, content_blob, oversize) \
@@ -780,17 +789,21 @@ impl Storage {
             )?
             .execute(params![file_id, blob])
             .context("insert_text_file_blob: INSERT text_contents")?;
-        self.conn
-            .prepare_cached("INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)")?
-            .execute(params![file_id, fts_text])
-            .context("insert_text_file_blob: FTS insert")?;
+        if !deferred {
+            self.conn
+                .prepare_cached("INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)")?
+                .execute(params![file_id, fts_text])
+                .context("insert_text_file_blob: FTS insert")?;
+        }
         Ok(())
     }
 
     /// Удалить запись текстового файла: снимает токен contentless-указателя
     /// (по разжатому старому тексту) и удаляет строку `text_contents`.
     pub fn delete_text_file_by_file(&self, file_id: i64) -> Result<()> {
-        self.fts_text_delete(file_id)?;
+        if !self.fts_build_pending() {
+            self.fts_text_delete(file_id)?;
+        }
         self.conn
             .execute(
                 "DELETE FROM text_contents WHERE file_id = ?1",
@@ -3149,6 +3162,52 @@ impl Storage {
         schema::bulk_load_in_progress(&self.conn)
     }
 
+    /// Ключ отметки «слой надстройки дошёл до конца».
+    pub const EXTRAS_BUILD_COMPLETE_KEY: &'static str = schema::EXTRAS_BUILD_COMPLETE_KEY;
+
+    /// Достроена ли надстройка до конца в прошлом проходе.
+    ///
+    /// Отсутствие ключа — «да»: база прежней версии или репозиторий без
+    /// надстройки не должны гонять полный пересбор на каждом старте. Значение
+    /// `0` ставят процессоры-расширения на время своей работы; успешное
+    /// завершение снова пишет `1`.
+    pub fn extras_build_complete(&self) -> bool {
+        !matches!(self.extras_build_complete_state(), Ok(Some(false)))
+    }
+
+    /// Прочитать отметку без подмены ошибки «да»: `Ok(None)` — ключа нет (база
+    /// прежней версии или репозиторий без надстройки), `Err` — прочитать не
+    /// удалось. Нужен гейту инструментов: при сбое чтения он обязан закрыться,
+    /// а не открыть неполный слой.
+    pub fn extras_build_complete_state(&self) -> Result<Option<bool>> {
+        match self.conn.query_row(
+            "SELECT value FROM index_state WHERE key = ?1",
+            params![Self::EXTRAS_BUILD_COMPLETE_KEY],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(v) => Ok(Some(v.trim() != "0")),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("extras_build_complete: не удалось прочитать отметку"),
+        }
+    }
+
+    /// Поставить отметку о завершённости (или незавершённости) надстройки.
+    ///
+    /// Пишется отдельной транзакцией, как и [`Self::set_bulk_in_progress`]:
+    /// отметка обязана пережить убийство процесса.
+    pub fn set_extras_build_complete(&self, complete: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO index_state (key, value) VALUES (?1, ?2)",
+                params![
+                    Self::EXTRAS_BUILD_COMPLETE_KEY,
+                    if complete { "1" } else { "0" }
+                ],
+            )
+            .context("set_extras_build_complete: не удалось записать отметку")?;
+        Ok(())
+    }
+
     /// Номер версии данных, который собирает ТЕКУЩИЙ бинарник.
     pub const INDEX_DATA_VERSION: u32 = schema::INDEX_DATA_VERSION;
 
@@ -3198,8 +3257,163 @@ impl Storage {
     /// Вызывать после завершения bulk-load. Пересоздание индексов одним проходом
     /// дешевле, чем инкрементальное обновление на каждый INSERT.
     pub fn finish_bulk_load(&self) -> Result<()> {
-        schema::rebuild_indexes_and_triggers(&self.conn)
+        // Отложенная сборка (`defer_fts`): FTS не перестраиваем сейчас, только
+        // триггеры и индексы. Поиск закрыт флагом `fts_build_pending` до
+        // `build_fts_deferred`.
+        let skip_fts = self.fts_build_pending();
+        schema::rebuild_indexes_and_triggers(&self.conn, skip_fts)
             .context("finish_bulk_load: ошибка пересоздания индексов и триггеров")?;
+        Ok(())
+    }
+
+    /// Ключ отметки «полнотекстовый поиск ещё не собран».
+    pub const FTS_BUILD_PENDING_KEY: &'static str = schema::FTS_BUILD_PENDING_KEY;
+
+    /// Идёт ли отложенная сборка полнотекста: пока да, `search_*` закрыты.
+    ///
+    /// Отсутствие ключа/таблицы читается как «собран» — базы прежних версий не
+    /// должны закрывать поиск.
+    pub fn fts_build_pending(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT value FROM index_state WHERE key = ?1",
+                params![Self::FTS_BUILD_PENDING_KEY],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    }
+
+    /// Поставить/снять отметку «полнотекст ещё не собран». Отдельная
+    /// транзакция: отметка должна пережить убийство процесса, иначе поиск
+    /// откроется на несобранном FTS.
+    pub fn set_fts_build_pending(&self, on: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO index_state (key, value) VALUES (?1, ?2)",
+                params![Self::FTS_BUILD_PENDING_KEY, if on { "1" } else { "0" }],
+            )
+            .context("set_fts_build_pending: не удалось записать отметку")?;
+        Ok(())
+    }
+
+    /// Собрать отложенный полнотекст: `fts_functions`, `fts_classes` и (заново)
+    /// `fts_text_files` из `text_contents`. Снимает флаг `fts_build_pending`.
+    ///
+    /// Вызывается вызывающим ПОСЛЕ объявления папки готовой (ранняя готовность):
+    /// пока функция не вернулась, `search_*` закрыты флагом. `fts_text_files`
+    /// пересобирается с нуля — при отложенной загрузке токены текстовых файлов
+    /// не писались вовсе, а старые (при обновлении существующей базы) подлежат
+    /// замене.
+    pub fn build_fts_deferred(&self) -> Result<()> {
+        // 1. Функции и классы: источники — основные таблицы, одна команда rebuild.
+        let t = std::time::Instant::now();
+        self.conn
+            .execute_batch("INSERT INTO fts_functions(fts_functions) VALUES('rebuild');")
+            .context("build_fts_deferred: rebuild fts_functions")?;
+        tracing::debug!(
+            "отложенный FTS: функции перестроены за {} мс",
+            t.elapsed().as_millis()
+        );
+        let t = std::time::Instant::now();
+        self.conn
+            .execute_batch("INSERT INTO fts_classes(fts_classes) VALUES('rebuild');")
+            .context("build_fts_deferred: rebuild fts_classes")?;
+        tracing::debug!(
+            "отложенный FTS: классы перестроены за {} мс",
+            t.elapsed().as_millis()
+        );
+
+        // 2. Текст: чистый contentless-указатель + проход по сжатым содержимым.
+        // DROP+CREATE одной транзакцией: читатели видят либо старую таблицу,
+        // либо новую, но не «пропавшую». Ошибку внутри (например, откат
+        // `CREATE VIRTUAL TABLE`) снимаем сами: `execute_batch` останавливается
+        // на первом сбое, оставляя транзакцию открытой.
+        let t = std::time::Instant::now();
+        let recreate = self.conn.execute_batch(
+            "BEGIN;
+             DROP TABLE IF EXISTS fts_text_files;
+             CREATE VIRTUAL TABLE fts_text_files USING fts5(content, content='');
+             COMMIT;",
+        );
+        if let Err(e) = recreate {
+            if let Err(rb) = self.rollback_batch() {
+                tracing::warn!("отложенный FTS: откат пересоздания не удался: {}", rb);
+            }
+            return Err(e).context("build_fts_deferred: пересоздание fts_text_files");
+        }
+
+        let mut scanned = 0usize;
+        let mut written = 0usize;
+        // Откатываем только СВОЮ транзакцию: если `begin_batch` не прошёл
+        // (например, чужой открытый батч), чужие изменения трогать нельзя.
+        let mut begun = false;
+        let fill = (|| -> Result<()> {
+            self.begin_batch()?;
+            begun = true;
+            let mut ins = self
+                .conn
+                .prepare_cached("INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)")?;
+            let mut sel = self.conn.prepare(
+                "SELECT file_id, content_blob FROM text_contents WHERE content_blob IS NOT NULL",
+            )?;
+            let rows = sel.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
+            })?;
+            let mut in_batch = 0usize;
+            for row in rows {
+                let (file_id, blob) = row?;
+                let Some(blob) = blob else { continue };
+                scanned += 1;
+                let bytes = match Self::decode_zstd_safe(&blob) {
+                    Ok(b) => b,
+                    // Как и в `fts_text_delete`: битый/вредоносный blob не должен
+                    // ронять сборку. Слова файла просто не попадут в указатель.
+                    Err(e) => {
+                        tracing::warn!(
+                            "отложенный FTS: разжатие file_id={} не удалось: {}",
+                            file_id,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                let Ok(text) = String::from_utf8(bytes) else {
+                    continue;
+                };
+                ins.execute(params![file_id, text])?;
+                written += 1;
+                in_batch += 1;
+                if in_batch >= 2000 {
+                    self.commit_batch()?;
+                    self.begin_batch()?;
+                    in_batch = 0;
+                }
+            }
+            drop(sel);
+            drop(ins);
+            self.commit_batch()?;
+            Ok(())
+        })();
+        if let Err(e) = fill {
+            // Открытая транзакция не должна пережить ошибку: для in-memory она
+            // ломает последующий `flush_to_disk`, для файла — следующий BEGIN
+            // (watcher / инкремент). Флаг pending остаётся — сборка повторится.
+            if begun {
+                if let Err(rb) = self.rollback_batch() {
+                    tracing::warn!("отложенный FTS: откат после ошибки не удался: {}", rb);
+                }
+            }
+            return Err(e);
+        }
+        tracing::debug!(
+            "отложенный FTS: текстовые файлы — {} из {} за {} мс",
+            written,
+            scanned,
+            t.elapsed().as_millis()
+        );
+
+        self.set_fts_build_pending(false)?;
         Ok(())
     }
 
@@ -3594,6 +3808,293 @@ fn row_to_variable(row: &rusqlite::Row<'_>) -> rusqlite::Result<VariableRecord> 
 
 // ── Тесты ────────────────────────────────────────────────────────────────────
 
+// ── Массовая запись: накопитель многострочных INSERT ─────────────────────
+
+/// Накопитель строк символов для массовой записи.
+///
+/// Одна строка — один `execute` подготовленного выражения: на выгрузке УТ
+/// это ~4 млн вызовов только для `calls`, и массовая запись упирается в
+/// число вызовов SQLite, а не в объём данных. Здесь строки копятся и
+/// сбрасываются многострочными `INSERT ... VALUES (…),(…)`: тот же объём
+/// пишется тысячами запросов вместо миллионов.
+///
+/// Записи разных файлов сбрасываются вместе — это безопасно: построчные
+/// `DELETE` прежних строк файла идут ДО накопления его записей
+/// (см. `Indexer::write_code_to_db_accum`), а между файлами конфликтов нет.
+#[derive(Default)]
+pub struct WriteAccum {
+    functions: Vec<FunctionRecord>,
+    classes: Vec<ClassRecord>,
+    imports: Vec<ImportRecord>,
+    calls: Vec<CallRecord>,
+    variables: Vec<VariableRecord>,
+}
+
+/// Размеры буферов [`WriteAccum`] на момент [`WriteAccum::checkpoint`].
+#[derive(Clone, Copy)]
+pub struct WriteAccumCheckpoint {
+    functions: usize,
+    classes: usize,
+    imports: usize,
+    calls: usize,
+    variables: usize,
+}
+
+impl WriteAccum {
+    /// Порог сброса в строках: подобран так, чтобы уложиться в лимит
+    /// параметров SQLite (обычно 32 766) с запасом, но не мельчить: чем
+    /// крупнее пачка, тем меньше накладных расходов на запрос.
+    const FUNCTION_ROWS: usize = 800; // 13 колонок → 10 400 параметров
+    const CLASS_ROWS: usize = 1500; // 8 → 12 000
+    const IMPORT_ROWS: usize = 3000; // 6 → 18 000
+    const CALL_ROWS: usize = 4000; // 4 → 16 000
+    const VARIABLE_ROWS: usize = 3000; // 4 → 12 000
+
+    pub fn push_function(&mut self, storage: &Storage, record: FunctionRecord) -> Result<()> {
+        self.functions.push(record);
+        if self.functions.len() >= Self::FUNCTION_ROWS {
+            self.flush_functions(storage)?;
+        }
+        Ok(())
+    }
+
+    pub fn push_class(&mut self, storage: &Storage, record: ClassRecord) -> Result<()> {
+        self.classes.push(record);
+        if self.classes.len() >= Self::CLASS_ROWS {
+            self.flush_classes(storage)?;
+        }
+        Ok(())
+    }
+
+    pub fn push_import(&mut self, storage: &Storage, record: ImportRecord) -> Result<()> {
+        self.imports.push(record);
+        if self.imports.len() >= Self::IMPORT_ROWS {
+            self.flush_imports(storage)?;
+        }
+        Ok(())
+    }
+
+    pub fn push_call(&mut self, storage: &Storage, record: CallRecord) -> Result<()> {
+        self.calls.push(record);
+        if self.calls.len() >= Self::CALL_ROWS {
+            self.flush_calls(storage)?;
+        }
+        Ok(())
+    }
+
+    pub fn push_variable(&mut self, storage: &Storage, record: VariableRecord) -> Result<()> {
+        self.variables.push(record);
+        if self.variables.len() >= Self::VARIABLE_ROWS {
+            self.flush_variables(storage)?;
+        }
+        Ok(())
+    }
+
+    /// Сбросить все остатки. Вызывать перед `commit_batch` порции.
+    pub fn flush(&mut self, storage: &Storage) -> Result<()> {
+        self.flush_functions(storage)?;
+        self.flush_classes(storage)?;
+        self.flush_imports(storage)?;
+        self.flush_calls(storage)?;
+        self.flush_variables(storage)?;
+        Ok(())
+    }
+
+    /// Запомнить текущие размеры буферов — до записи очередного файла.
+    /// Используется вместе с [`Self::truncate`] на пути ошибки.
+    pub fn checkpoint(&self) -> WriteAccumCheckpoint {
+        WriteAccumCheckpoint {
+            functions: self.functions.len(),
+            classes: self.classes.len(),
+            imports: self.imports.len(),
+            calls: self.calls.len(),
+            variables: self.variables.len(),
+        }
+    }
+
+    /// Откатить накопленное до позиции `checkpoint`. Нужен, когда запись файла
+    /// упала после части `push_*`: без этого его строки уехали бы в ближайший
+    /// коммит, а сам файл остался бы помечен проиндексированным (mtime+hash) —
+    /// resume пропустил бы его, и символы потерялись бы навсегда.
+    pub fn truncate(&mut self, checkpoint: WriteAccumCheckpoint) {
+        self.functions.truncate(checkpoint.functions);
+        self.classes.truncate(checkpoint.classes);
+        self.imports.truncate(checkpoint.imports);
+        self.calls.truncate(checkpoint.calls);
+        self.variables.truncate(checkpoint.variables);
+    }
+
+    fn flush_functions(&mut self, storage: &Storage) -> Result<()> {
+        if self.functions.is_empty() {
+            return Ok(());
+        }
+        const HEAD: &str = "functions (file_id, name, qualified_name, line_start, \
+             line_end, args, return_type, docstring, body, is_async, node_hash, \
+             override_type, override_target)";
+        let starts: Vec<i64> = self.functions.iter().map(|r| r.line_start as i64).collect();
+        let ends: Vec<i64> = self.functions.iter().map(|r| r.line_end as i64).collect();
+        let async_flags: Vec<i32> = self.functions.iter().map(|r| r.is_async as i32).collect();
+        for chunk_start in (0..self.functions.len()).step_by(Self::FUNCTION_ROWS) {
+            let chunk_end = (chunk_start + Self::FUNCTION_ROWS).min(self.functions.len());
+            let sql = multi_row_insert_sql(HEAD, 13, chunk_end - chunk_start);
+            let mut args: Vec<&dyn rusqlite::ToSql> =
+                Vec::with_capacity((chunk_end - chunk_start) * 13);
+            for i in chunk_start..chunk_end {
+                let r = &self.functions[i];
+                args.push(&r.file_id);
+                args.push(&r.name);
+                args.push(&r.qualified_name);
+                args.push(&starts[i]);
+                args.push(&ends[i]);
+                args.push(&r.args);
+                args.push(&r.return_type);
+                args.push(&r.docstring);
+                args.push(&r.body);
+                args.push(&async_flags[i]);
+                args.push(&r.node_hash);
+                args.push(&r.override_type);
+                args.push(&r.override_target);
+            }
+            exec_multi(storage, &sql, &args)?;
+        }
+        self.functions.clear();
+        Ok(())
+    }
+
+    fn flush_classes(&mut self, storage: &Storage) -> Result<()> {
+        if self.classes.is_empty() {
+            return Ok(());
+        }
+        const HEAD: &str = "classes (file_id, name, line_start, line_end, bases, \
+             docstring, body, node_hash)";
+        let starts: Vec<i64> = self.classes.iter().map(|r| r.line_start as i64).collect();
+        let ends: Vec<i64> = self.classes.iter().map(|r| r.line_end as i64).collect();
+        for chunk_start in (0..self.classes.len()).step_by(Self::CLASS_ROWS) {
+            let chunk_end = (chunk_start + Self::CLASS_ROWS).min(self.classes.len());
+            let sql = multi_row_insert_sql(HEAD, 8, chunk_end - chunk_start);
+            let mut args: Vec<&dyn rusqlite::ToSql> =
+                Vec::with_capacity((chunk_end - chunk_start) * 8);
+            for i in chunk_start..chunk_end {
+                let r = &self.classes[i];
+                args.push(&r.file_id);
+                args.push(&r.name);
+                args.push(&starts[i]);
+                args.push(&ends[i]);
+                args.push(&r.bases);
+                args.push(&r.docstring);
+                args.push(&r.body);
+                args.push(&r.node_hash);
+            }
+            exec_multi(storage, &sql, &args)?;
+        }
+        self.classes.clear();
+        Ok(())
+    }
+
+    fn flush_imports(&mut self, storage: &Storage) -> Result<()> {
+        if self.imports.is_empty() {
+            return Ok(());
+        }
+        const HEAD: &str = "imports (file_id, module, name, alias, line, kind)";
+        let lines: Vec<i64> = self.imports.iter().map(|r| r.line as i64).collect();
+        for chunk_start in (0..self.imports.len()).step_by(Self::IMPORT_ROWS) {
+            let chunk_end = (chunk_start + Self::IMPORT_ROWS).min(self.imports.len());
+            let chunk = &self.imports[chunk_start..chunk_end];
+            let sql = multi_row_insert_sql(HEAD, 6, chunk.len());
+            let mut args: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 6);
+            for (r, line) in chunk.iter().zip(lines[chunk_start..chunk_end].iter()) {
+                args.push(&r.file_id);
+                args.push(&r.module);
+                args.push(&r.name);
+                args.push(&r.alias);
+                args.push(line);
+                args.push(&r.kind);
+            }
+            exec_multi(storage, &sql, &args)?;
+        }
+        self.imports.clear();
+        Ok(())
+    }
+
+    fn flush_calls(&mut self, storage: &Storage) -> Result<()> {
+        if self.calls.is_empty() {
+            return Ok(());
+        }
+        const HEAD: &str = "calls (file_id, caller, callee, line)";
+        let lines: Vec<i64> = self.calls.iter().map(|r| r.line as i64).collect();
+        for chunk_start in (0..self.calls.len()).step_by(Self::CALL_ROWS) {
+            let chunk_end = (chunk_start + Self::CALL_ROWS).min(self.calls.len());
+            let chunk = &self.calls[chunk_start..chunk_end];
+            let sql = multi_row_insert_sql(HEAD, 4, chunk.len());
+            let mut args: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
+            for (r, line) in chunk.iter().zip(lines[chunk_start..chunk_end].iter()) {
+                args.push(&r.file_id);
+                args.push(&r.caller);
+                args.push(&r.callee);
+                args.push(line);
+            }
+            exec_multi(storage, &sql, &args)?;
+        }
+        self.calls.clear();
+        Ok(())
+    }
+
+    fn flush_variables(&mut self, storage: &Storage) -> Result<()> {
+        if self.variables.is_empty() {
+            return Ok(());
+        }
+        const HEAD: &str = "variables (file_id, name, value, line)";
+        let lines: Vec<i64> = self.variables.iter().map(|r| r.line as i64).collect();
+        for chunk_start in (0..self.variables.len()).step_by(Self::VARIABLE_ROWS) {
+            let chunk_end = (chunk_start + Self::VARIABLE_ROWS).min(self.variables.len());
+            let chunk = &self.variables[chunk_start..chunk_end];
+            let sql = multi_row_insert_sql(HEAD, 4, chunk.len());
+            let mut args: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() * 4);
+            for (r, line) in chunk.iter().zip(lines[chunk_start..chunk_end].iter()) {
+                args.push(&r.file_id);
+                args.push(&r.name);
+                args.push(&r.value);
+                args.push(line);
+            }
+            exec_multi(storage, &sql, &args)?;
+        }
+        self.variables.clear();
+        Ok(())
+    }
+}
+
+/// SQL многострочного `INSERT`: `<head> VALUES (?,…),(?,…),…`.
+fn multi_row_insert_sql(head: &str, cols: usize, rows: usize) -> String {
+    let mut group = String::with_capacity(cols * 2 + 2);
+    group.push('(');
+    for i in 0..cols {
+        if i > 0 {
+            group.push(',');
+        }
+        group.push('?');
+    }
+    group.push(')');
+    let mut sql = String::with_capacity(head.len() + rows * (group.len() + 1));
+    sql.push_str("INSERT INTO ");
+    sql.push_str(head);
+    sql.push_str(" VALUES ");
+    for i in 0..rows {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&group);
+    }
+    sql
+}
+
+/// Выполнить многострочный INSERT с плоским списком параметров.
+fn exec_multi(storage: &Storage, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<()> {
+    let mut stmt = storage.conn.prepare_cached(sql)?;
+    stmt.execute(rusqlite::params_from_iter(args.iter().copied()))
+        .context("exec_multi: многострочный INSERT")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3610,6 +4111,30 @@ mod tests {
         // на «cannot start a transaction within a transaction».
         storage.begin_batch().unwrap();
         storage.rollback_batch().unwrap();
+    }
+
+    #[test]
+    fn write_accum_truncate_откатывает_только_новые_строки() {
+        let storage = Storage::open_in_memory().unwrap();
+        let record = |name: &str| VariableRecord {
+            id: None,
+            file_id: 1,
+            name: name.to_string(),
+            value: Some("1".to_string()),
+            line: 1,
+        };
+        let mut accum = WriteAccum::default();
+        accum.push_variable(&storage, record("до")).unwrap();
+        let checkpoint = accum.checkpoint();
+        accum.push_variable(&storage, record("после-1")).unwrap();
+        accum.push_variable(&storage, record("после-2")).unwrap();
+        accum.truncate(checkpoint);
+        assert_eq!(
+            accum.variables.len(),
+            1,
+            "осталась только строка до отметки"
+        );
+        assert_eq!(accum.variables[0].name, "до");
     }
 
     #[test]
@@ -6339,5 +6864,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!(storage.data_version(), 0);
+    }
+
+    /// Флаг завершённости надстройки: отсутствие ключа — «завершена» (базы
+    /// прежних версий и репо без надстройки), записанный `0` — «строится»
+    /// (прогрессивная готовность закрывает extension-tools), `1` — снова готово.
+    #[test]
+    fn extras_build_complete_по_умолчанию_истина_и_переключается() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert!(
+            storage.extras_build_complete(),
+            "без ключа слой считается завершённым"
+        );
+
+        storage.set_extras_build_complete(false).unwrap();
+        assert!(!storage.extras_build_complete(), "снятый флаг виден");
+
+        let rows: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM index_state WHERE key = ?1",
+                params![Storage::EXTRAS_BUILD_COMPLETE_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "флаг не плодит строк");
+
+        storage.set_extras_build_complete(true).unwrap();
+        assert!(storage.extras_build_complete(), "флаг возвращается");
+    }
+
+    /// Накопитель массовой записи: строки больше порога уходят несколькими
+    /// многострочными INSERT, всё читается обратно целиком.
+    #[test]
+    fn write_accum_пишет_и_читает_многострочные_вставки() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage
+            .upsert_file(&FileRecord {
+                id: None,
+                path: "m.bsl".to_string(),
+                content_hash: "h".to_string(),
+                language: "bsl".to_string(),
+                lines_total: 1,
+                indexed_at: "now".to_string(),
+                mtime: None,
+                file_size: None,
+            })
+            .unwrap();
+
+        let mut accum = WriteAccum::default();
+        storage.begin_batch().unwrap();
+        for i in 0..600usize {
+            accum
+                .push_call(
+                    &storage,
+                    CallRecord {
+                        id: None,
+                        file_id,
+                        caller: format!("caller{}", i),
+                        callee: format!("callee{}", i),
+                        line: i,
+                    },
+                )
+                .unwrap();
+        }
+        for i in 0..160usize {
+            accum
+                .push_function(
+                    &storage,
+                    FunctionRecord {
+                        id: None,
+                        file_id,
+                        name: format!("fn{}", i),
+                        qualified_name: None,
+                        line_start: i,
+                        line_end: i,
+                        args: Some("()".to_string()),
+                        return_type: None,
+                        docstring: None,
+                        body: format!("body{}", i),
+                        is_async: i % 2 == 0,
+                        node_hash: "n".to_string(),
+                        override_type: None,
+                        override_target: None,
+                    },
+                )
+                .unwrap();
+        }
+        accum.flush(&storage).unwrap();
+        storage.commit_batch().unwrap();
+
+        let calls: i64 = storage
+            .conn()
+            .query_row("SELECT COUNT(*) FROM calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(calls, 600);
+        let funcs: i64 = storage
+            .conn()
+            .query_row("SELECT COUNT(*) FROM functions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(funcs, 160);
+        let async_flags: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM functions WHERE is_async = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(async_flags, 80, "флаг is_async не потерялся");
     }
 }

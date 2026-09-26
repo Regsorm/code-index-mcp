@@ -806,16 +806,20 @@ pub fn run_incremental_extras(
     code_index_core::logging::stage_add("граф вызовов", t.elapsed());
     // Конфиг-уровневые источники: полный пересбор затронутой таблицы. Каждая
     // функция сносит только свои строки (data_links config link_kind / всю
-    // role_rights), не трогая объектные рёбра графа данных.
-    if refs_dirty {
-        let t = std::time::Instant::now();
-        index_metadata_refs(repo_root, conn)?;
-        code_index_core::logging::stage_add("связи конфигурации", t.elapsed());
-    }
-    if roles_dirty {
-        let t = std::time::Instant::now();
-        index_role_rights(repo_root, conn)?;
-        code_index_core::logging::stage_add("права ролей", t.elapsed());
+    // role_rights), не трогая объектные рёбра графа данных. Обход дерева —
+    // один на обе фазы, и только если хотя бы одна из них реально нужна.
+    if refs_dirty || roles_dirty {
+        let scan = RepoScan::build(repo_root);
+        if refs_dirty {
+            let t = std::time::Instant::now();
+            index_metadata_refs(&scan, conn)?;
+            code_index_core::logging::stage_add("связи конфигурации", t.elapsed());
+        }
+        if roles_dirty {
+            let t = std::time::Instant::now();
+            index_role_rights(&scan, conn)?;
+            code_index_core::logging::stage_add("права ролей", t.elapsed());
+        }
     }
     // Освежить статистику планировщика, если графовые таблицы (data_links /
     // proc_call_graph) разъехались со статистикой в ≥1.5× (например, bulk-залив

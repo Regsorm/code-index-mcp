@@ -25,24 +25,32 @@ mod common;
 mod dcs;
 mod exported;
 mod full_scan;
+mod harvest;
 mod incremental;
 mod modules;
+mod resume;
+mod scan;
 
 pub(crate) use call_graph::*;
 pub(crate) use common::*;
 pub(crate) use dcs::*;
 pub(crate) use exported::*;
 pub(crate) use full_scan::*;
+pub(crate) use harvest::*;
 pub(crate) use incremental::*;
 pub(crate) use modules::*;
+pub(crate) use resume::*;
+pub(crate) use scan::*;
 
 /// Выполнить одну фазу надстройки, отметив её длительность для итоговой
 /// строки по папке. Ошибка фазы не фатальна: базовая индексация уже сохранена,
 /// поэтому журналируем предупреждение и идём дальше — как было и до отметок.
+/// Возвращает `true`, если фаза отработала без ошибки (тогда её можно считать
+/// собранной при возобновлении).
 ///
 /// `name` — короткое имя для раскладки в итоге, `label` — прежняя метка
 /// предупреждения (по ней ищут в журнале, менять нельзя).
-fn phase(name: &'static str, label: &str, f: impl FnOnce() -> Result<()>) {
+fn phase(name: &'static str, label: &str, f: impl FnOnce() -> Result<()>) -> bool {
     let started = std::time::Instant::now();
     // Отметка «занят этим» — по ней строка состояния демона отвечает, чем
     // папка занята сейчас: слои надстройки идут минутами, и без отметки
@@ -50,8 +58,53 @@ fn phase(name: &'static str, label: &str, f: impl FnOnce() -> Result<()>) {
     code_index_core::logging::stage_begin(name);
     let outcome = f();
     code_index_core::logging::stage_done(name, started.elapsed());
-    if let Err(e) = outcome {
-        tracing::warn!("{}: {}", label, e);
+    match outcome {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("{}: {}", label, e);
+            false
+        }
+    }
+}
+
+/// Фаза с поддержкой возобновления: если её результат уже собран для текущего
+/// входа (см. `resume.rs`) — пропускается, иначе выполняется, и при успехе
+/// отметка сдвигается. Ошибка фазы не фатальна (как и у [`phase`]).
+fn resumable_phase(
+    resume: Option<&ExtrasResume>,
+    conn: &rusqlite::Connection,
+    idx: u32,
+    name: &'static str,
+    label: &str,
+    f: impl FnOnce() -> Result<()>,
+) {
+    if let Some(resume) = resume {
+        if resume.is_done(idx) {
+            tracing::info!(
+                "надстройка: фаза «{}» уже собрана в прошлом проходе — пропускаю",
+                name
+            );
+            return;
+        }
+    }
+    if phase(name, label, f) {
+        mark_phase(resume, conn, idx, name);
+    }
+}
+
+/// Отметить фазу собранной. Провал записи отметки не фатален: это лишь потеря
+/// возобновляемости на следующем обрыве.
+fn mark_phase(resume: Option<&ExtrasResume>, conn: &rusqlite::Connection, idx: u32, name: &str) {
+    let Some(resume) = resume else { return };
+    // Цепочка: отметка двигается, только если пройдено ровно до этой фазы.
+    // Успех поздней фазы после сбоя ранней иначе перепрыгнул бы несобранную —
+    // и та не выполнилась бы уже никогда. Вызов из parse-collector-ветки на
+    // уже пройденной цепочке — тихий no-op (см. монотонность в `mark`).
+    if resume.done() != idx {
+        return;
+    }
+    if let Err(e) = resume.mark(conn, idx + 1) {
+        tracing::warn!("надстройка: не сохранена отметка фазы «{}»: {}", name, e);
     }
 }
 
@@ -60,11 +113,43 @@ fn phase(name: &'static str, label: &str, f: impl FnOnce() -> Result<()>) {
 pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     let conn = storage.conn();
 
+    // Отметка «слой дошёл до конца» снимается на время работы: если процесс
+    // убьют посередине, демон на следующем старте увидит оборванную надстройку
+    // и повторит полный проход, а не отдаст неполные данные как готовые.
+    if let Err(e) = storage.set_extras_build_complete(false) {
+        tracing::warn!("не снята отметка завершённости надстройки: {}", e);
+    }
+
+    // Один обход дерева на весь слой и отпечаток входа для возобновления:
+    // прерванный проход продолжается с последней собранной фазы.
+    let scan = RepoScan::build(repo_root);
+    let resume = ExtrasResume::load(conn, scan_fingerprint(conn, &scan));
+
+    // Раскладка 1C:EDT определяется один раз на проход (обход в глубину до 4;
+    // ниже результат прокидывается в metadata-слой и фазу СКД). Отпечаток
+    // входа строится по .bsl/.xml и не видит правок .mdo/форм/макетов:
+    // резюмировать по нему нельзя — после правки формы или объекта термы/граф
+    // остались бы от прошлого прохода. Для EDT слой всегда собирается целиком
+    // (metadata-слой и так работает без возобновления).
+    let edt_src = crate::xml::edt_mdo::detect_edt_src(repo_root);
+    let layer_resume = if edt_src.is_some() {
+        None
+    } else {
+        Some(&resume)
+    };
+    if let Some(resume) = layer_resume {
+        if resume.done() > 0 && resume.done() < EXTRAS_PHASE_COUNT {
+            tracing::info!(
+                "надстройка: прошлый проход оборвался — продолжаю с фазы {} из {}",
+                resume.done() + 1,
+                EXTRAS_PHASE_COUNT
+            );
+        }
+    }
+
     // XML-слой обогащения (перечень, структура, связи, права, формы, подписки,
-    // модули) — обход XML выгрузки, дёшево. Вынесен в отдельную функцию, чтобы
-    // инкрементальный путь при изменении состава (Configuration.xml) пересобирал
-    // ТОЛЬКО его, не трогая тяжёлый код-слой ниже.
-    run_index_extras_metadata_layer(repo_root, conn)?;
+    // модули) — обход XML выгрузки, дёшево.
+    run_index_extras_metadata_layer(repo_root, edt_src.as_deref(), &scan, conn, layer_resume)?;
 
     // КОД-слой (тяжёлый: обратный индекс использований по всему .bsl, термы по
     // сотням тысяч процедур, полный граф вызовов). На инкрементальном пути НЕ
@@ -74,8 +159,12 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // bsl-indexer), повторный disk-rebuild пропускаем — данные идентичны.
     if crate::parse_collector::collector_did(conn, crate::parse_collector::MARK_CODE_USAGES) {
         tracing::info!("metadata_code_usages: наполнено parse-collector'ом, disk-rebuild пропущен");
+        mark_phase(layer_resume, conn, PH_CODE_USAGES, "использования в коде");
     } else {
-        phase(
+        resumable_phase(
+            layer_resume,
+            conn,
+            PH_CODE_USAGES,
             "использования в коде",
             "metadata_code_usages",
             || index_metadata_code_usages(repo_root, conn),
@@ -87,21 +176,34 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // bsl-indexer) — строим из него, без повторного чтения .bsl с диска;
     // иначе полный disk-rebuild (инкремент / публичный путь).
     if crate::parse_collector::collector_did(conn, crate::parse_collector::MARK_PROC_TERMS) {
-        phase(
+        resumable_phase(
+            layer_resume,
+            conn,
+            PH_PROC_TERMS,
             "термины процедур",
             "procedure_terms (staging)",
             || build_procedure_terms_from_staging(conn),
         );
     } else {
-        phase("термины процедур", "procedure_terms", || {
-            index_procedure_terms(repo_root, conn)
-        });
+        resumable_phase(
+            layer_resume,
+            conn,
+            PH_PROC_TERMS,
+            "термины процедур",
+            "procedure_terms",
+            || index_procedure_terms(repo_root, conn),
+        );
     }
     // Граф вызовов строится ПОСЛЕ заполнения metadata_forms и event_subscriptions
     // (они в XML-слое выше) — он опирается на их содержимое.
-    phase("граф вызовов", "proc_call_graph", || {
-        build_call_graph(conn)
-    });
+    resumable_phase(
+        layer_resume,
+        conn,
+        PH_CALL_GRAPH,
+        "граф вызовов",
+        "proc_call_graph",
+        || build_call_graph(conn),
+    );
     // ANALYZE: без статистики SQLite в рекурсивном шаге find_path_bsl/
     // find_data_path использует лишь префикс индекса (repo=) и сканирует
     // все рёбра repo на каждой итерации (depth=3 ~240с на КА1.1). После
@@ -110,9 +212,15 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
     // INDEXED BY это НЕ чинит — решает только статистика. Графы строятся
     // заново при каждом reindex (DELETE+INSERT), поэтому ANALYZE здесь, в
     // конце прохода, освежает статистику синхронно с ними (~0.6с на 2.4ГБ).
-    phase("статистика", "ANALYZE", || {
+    // Фаза не резюмируется намеренно: она дешёвая, а устаревшая статистика
+    // после обрыва стоит секунд поиска.
+    let _ = phase("статистика", "ANALYZE", || {
         conn.execute_batch("ANALYZE;").map_err(Into::into)
     });
+
+    if let Err(e) = storage.set_extras_build_complete(true) {
+        tracing::warn!("не выставлена отметка завершённости надстройки: {}", e);
+    }
     Ok(())
 }
 
@@ -121,38 +229,51 @@ pub fn run_index_extras(repo_root: &Path, storage: &mut Storage) -> Result<()> {
 /// подписки, модули. Всё это — обход XML выгрузки (дёшево, секунды даже на УТ),
 /// без тяжёлого КОД-слоя (code_usages / procedure_terms / call_graph).
 ///
-/// Вызывается из полного `run_index_extras` (следом идёт код-слой) и из
-/// инкрементального пути при изменении состава (`config_changed`), где код-слой
-/// держится точечно по .bsl батча. Идемпотентен (каждая фаза DELETE+INSERT либо
-/// UPDATE по full_name). Каждая фаза независима: ошибка → warning, идём дальше.
-fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+/// Идемпотентен (каждая фаза DELETE+INSERT либо UPDATE по full_name). Каждая
+/// фаза независима: ошибка → warning, идём дальше. При возобновлении
+/// (`resume`) уже собранные фазы пропускаются; для раскладки 1C:EDT отпечаток
+/// входа не строится, поэтому там возобновление выключено.
+fn run_index_extras_metadata_layer(
+    repo_root: &Path,
+    edt_src: Option<&Path>,
+    scan: &RepoScan,
+    conn: &rusqlite::Connection,
+    resume: Option<&ExtrasResume>,
+) -> Result<()> {
     // Формат 1C:EDT (`.mdo`) — отдельный путь разбора. Заполняет ТЕ ЖЕ таблицы
     // (metadata_objects / data_links), поэтому downstream-инструменты не меняются.
-    if let Some(src_root) = crate::xml::edt_mdo::detect_edt_src(repo_root) {
+    let resume = if let Some(src_root) = edt_src {
         phase("объекты (EDT)", "edt metadata layer", || {
-            run_edt_metadata_layer(repo_root, &src_root, conn)
+            run_edt_metadata_layer(repo_root, src_root, conn)
         });
         // Права ролей EDT лежат отдельными файлами и в общий проход по `.mdo`
         // не попадают — своя фаза, как у формата Конфигуратора (E-1).
         phase("права ролей (EDT)", "edt role_rights", || {
-            run_edt_role_rights(&src_root, conn)
+            run_edt_role_rights(src_root, conn)
         });
         // Перечень модулей: своя раскладка путей и свои источники
         // идентификаторов, поэтому отдельная фаза (E-1).
         phase("модули (EDT)", "edt metadata_modules", || {
-            index_metadata_modules_edt(repo_root, &src_root, conn)
+            index_metadata_modules_edt(repo_root, src_root, conn)
         });
+        None
     } else {
-        run_metadata_layer_configurator(repo_root, conn)?;
-    }
+        run_metadata_layer_configurator(scan, conn, resume)?;
+        resume
+    };
     // Схемы компоновки данных — ПОСЛЕДНЯЯ фаза слоя, и это обязательно: и
     // `index_data_links` (Конфигуратор), и `run_edt_metadata_layer` (EDT) сносят
     // ВСЕ рёбра репо целиком, а паспорта макетов появляются в
     // `index_object_templates` / `run_edt_metadata_layer`. Рёбра `dcs_query` и
     // строки `dcs_*` обязаны лечь поверх уже собранного.
-    phase("схемы компоновки", "dcs_schemas", || {
-        index_dcs_schemas(repo_root, conn)
-    });
+    resumable_phase(
+        resume,
+        conn,
+        PH_DCS,
+        "схемы компоновки",
+        "dcs_schemas",
+        || index_dcs_schemas(repo_root, edt_src, conn),
+    );
     Ok(())
 }
 
@@ -161,68 +282,137 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
 /// синонимы, макеты, формы, подписки, модули, опись состава. Вынесен из
 /// `run_index_extras_metadata_layer` отдельной функцией, чтобы ветки EDT и
 /// Конфигуратора читались как два равноправных пути одного слоя.
-fn run_metadata_layer_configurator(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
-    phase("объекты", "metadata_objects", || {
-        index_metadata_objects(repo_root, conn)
+fn run_metadata_layer_configurator(
+    scan: &RepoScan,
+    conn: &rusqlite::Connection,
+    resume: Option<&ExtrasResume>,
+) -> Result<()> {
+    // Разбор корневых XML нужен только фазам надстройки, которые ещё не
+    // собраны: на полностью готовом слое он не строится (иначе холостой
+    // повторный запуск `index` читал бы десятки тысяч XML впустую).
+    let need_harvest = resume.is_none_or(|r| {
+        !r.is_done(PH_DATA_LINKS)
+            || !r.is_done(PH_OBJECT_ATTRIBUTES)
+            || !r.is_done(PH_OBJECT_SYNONYMS)
+            || !r.is_done(PH_METADATA_MODULES)
     });
+    let harvest = need_harvest.then(|| XmlHarvest::build(scan));
+    let harvest_of = || {
+        harvest
+            .as_ref()
+            .expect("harvest строится, когда хоть одна фаза, его использующая, не собрана")
+    };
+    resumable_phase(
+        resume,
+        conn,
+        PH_METADATA_OBJECTS,
+        "объекты",
+        "metadata_objects",
+        || index_metadata_objects(scan, conn),
+    );
     // Граф связей данных: ссылочные реквизиты/измерения → рёбра data_links.
-    // Открывает XML отдельных объектов (которые остальные проходы не читают).
-    phase("связи данных", "data_links", || {
-        index_data_links(repo_root, conn)
-    });
+    resumable_phase(
+        resume,
+        conn,
+        PH_DATA_LINKS,
+        "связи данных",
+        "data_links",
+        || index_data_links(scan, harvest_of(), conn),
+    );
     // Рёбра data_links КОНФИГУРАЦИОННОГО уровня (подсистемы, планы обмена,
     // определяемые типы, расположение ФО). Строго ПОСЛЕ index_data_links —
     // та wipe-ит все рёбра repo и пишет объектные; эта добавляет свои link_kind.
-    phase(
+    resumable_phase(
+        resume,
+        conn,
+        PH_DATA_LINKS_CONFIG,
         "связи конфигурации",
         "data_links(config-level)",
-        || index_metadata_refs(repo_root, conn),
+        || index_metadata_refs(scan, conn),
     );
     // Права ролей → отдельная таблица role_rights.
-    phase("права ролей", "role_rights", || {
-        index_role_rights(repo_root, conn)
-    });
+    resumable_phase(
+        resume,
+        conn,
+        PH_ROLE_RIGHTS,
+        "права ролей",
+        "role_rights",
+        || index_role_rights(scan, conn),
+    );
     // Полная структура объектов (реквизиты+типы, ТЧ, измерения, ресурсы)
     // → metadata_objects.attributes_json. Зависит от строк, созданных
     // index_metadata_objects (выше), — делает UPDATE по full_name.
-    phase(
+    resumable_phase(
+        resume,
+        conn,
+        PH_OBJECT_ATTRIBUTES,
         "структура объектов",
         "object_attributes",
-        || index_object_attributes(repo_root, conn),
+        || index_object_attributes(scan, harvest_of(), conn),
     );
     // Синонимы (русские представления) ВСЕХ объектов — отдельный лёгкий проход
     // по корневым XML всех папок типов. Покрывает и объекты без структуры
     // реквизитов (CommonModule/Constant/CommonPicture/FunctionalOption/…),
     // которых нет в OBJECT_FOLDERS. UPDATE по full_name; зависит от строк,
     // созданных index_metadata_objects.
-    phase("синонимы", "object_synonyms", || {
-        index_object_synonyms(repo_root, conn)
-    });
+    resumable_phase(
+        resume,
+        conn,
+        PH_OBJECT_SYNONYMS,
+        "синонимы",
+        "object_synonyms",
+        || index_object_synonyms(scan, harvest_of(), conn),
+    );
     // Макеты объектов — своими строками перечня. Строго ПОСЛЕ
     // index_metadata_objects (та сносит перечень репо целиком) и после
     // синонимов (те делают UPDATE по перечню и макетов не касаются).
-    phase("макеты", "object_templates", || {
-        index_object_templates(repo_root, conn)
-    });
-    phase("формы", "metadata_forms", || {
-        index_metadata_forms(repo_root, conn)
-    });
-    phase("подписки", "event_subscriptions", || {
-        index_event_subscriptions(repo_root, conn)
-    });
+    resumable_phase(
+        resume,
+        conn,
+        PH_OBJECT_TEMPLATES,
+        "макеты",
+        "object_templates",
+        || index_object_templates(scan, conn),
+    );
+    resumable_phase(
+        resume,
+        conn,
+        PH_METADATA_FORMS,
+        "формы",
+        "metadata_forms",
+        || index_metadata_forms(scan, conn),
+    );
+    resumable_phase(
+        resume,
+        conn,
+        PH_EVENT_SUBSCRIPTIONS,
+        "подписки",
+        "event_subscriptions",
+        || index_event_subscriptions(scan, conn),
+    );
     // metadata_modules зависят от UUID объектов (читают XML-файлы напрямую)
     // и от ConfigDumpInfo.xml каждой sub-config. Не зависят от других
     // *_index_extras-функций; порядок не критичен. После `DumpConfigToFiles`
     // платформа 1С перезаписывает всю выгрузку, поэтому полный пересбор оправдан.
-    phase("модули", "metadata_modules", || {
-        index_metadata_modules(repo_root, conn)
-    });
+    resumable_phase(
+        resume,
+        conn,
+        PH_METADATA_MODULES,
+        "модули",
+        "metadata_modules",
+        || index_metadata_modules(scan, harvest_of(), conn),
+    );
     // Реестр строк ConfigDumpInfo.xml всех областей (base + расширения) —
     // плоский снимок состава для diff-сверки Фазы 2. Только текст описей,
     // объектные XML не читает. Идемпотентно (DELETE repo + reinsert).
-    phase("опись состава", "config_manifest", || {
-        index_config_manifest(repo_root, conn)
-    });
+    resumable_phase(
+        resume,
+        conn,
+        PH_CONFIG_MANIFEST,
+        "опись состава",
+        "config_manifest",
+        || index_config_manifest(scan, conn),
+    );
     Ok(())
 }
 

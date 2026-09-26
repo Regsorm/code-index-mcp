@@ -54,6 +54,10 @@ rusqlite = { workspace = true }
 # Обход дерева репо при index_extras (этап 4c).
 walkdir = { workspace = true }
 
+# Параллельный разбор XML-слоя (объектные XML, формы, макеты): файлы
+# независимы, порядок результатов сохраняется par_iter/collect.
+rayon = { workspace = true }
+
 # CLI-парсинг для подкоманды `bsl-indexer enrich` (этап 5a).
 # Не под feature, потому что вход в подкоманду ловится в bsl-indexer/main.rs
 # через intercept argv[1] до core::cli::run, и это нужно в любой сборке —

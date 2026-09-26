@@ -2381,6 +2381,18 @@ impl ServerHandler for CodeIndexServer {
             );
         }
         let storage = entry.storage_pool();
+        // Тяжёлый слой надстройки ещё строится: extension-tools не должны
+        // отдавать неполные данные. При прогрессивной готовности папка уже
+        // Ready, поэтому одной проверки статуса демона мало — спрашиваем флаг
+        // в самой базе репо. Отсутствие флага = слой завершён: база прежней
+        // версии или репозиторий без надстройки.
+        if let Some(value) = crate::mcp::tools::extras_building_response(storage).await {
+            return self.finish(
+                &session_id,
+                &dedup_scope,
+                Ok(CallToolResult::structured(value)),
+            );
+        }
         let root_path: Option<&Path> = entry.root_path.as_deref();
         let language: Option<&str> = entry.language.as_deref();
 
