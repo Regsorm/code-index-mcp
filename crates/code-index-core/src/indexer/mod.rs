@@ -459,6 +459,14 @@ impl<'a> Indexer<'a> {
             self.storage.set_bulk_in_progress(true)?;
         }
 
+        // Отложенная сборка полнотекста (демон): ставим флаг ДО записи порций,
+        // чтобы `insert_text_file_blob` не токенизировал тексты, а
+        // `finish_bulk_load` пропустил rebuild функций/классов. Соберётся после
+        // надстройки (`Storage::build_fts_deferred`), поиск до тех пор закрыт.
+        if bulk_mode && self.config.defer_fts {
+            self.storage.set_fts_build_pending(true)?;
+        }
+
         if bulk_mode && (is_fresh_db || resume) {
             // Первичная индексация: таблицы уже созданы через initialize(),
             // дропаем индексы которые были созданы вместе со схемой
@@ -3022,6 +3030,96 @@ class App:
         let forced = Indexer::new(&mut storage)
             .full_reindex(tmp.path(), true)
             .unwrap();
-        assert!(forced.full_rebuild, "--force разбирает каждый файл");
+        assert!(forced.full_rebuild, "--force разобрал каждый файл");
+    }
+
+    /// Отложенная сборка полнотекста: ядро не наполняет FTS, поиск пуст, после
+    /// `build_fts_deferred` результат совпадает с обычной сборкой.
+    #[test]
+    fn deferred_fts_собирается_после_и_совпадает_с_обычной() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.py"), "def hello_world():\n    return 1\n").unwrap();
+        fs::write(repo.join("readme.md"), "товар склад резерв").unwrap();
+
+        // Обычная сборка — эталон.
+        let mut normal = Storage::open_file(&tmp.path().join("normal.db")).unwrap();
+        let cfg_normal = IndexConfig {
+            bulk_threshold: 0,
+            ..Default::default()
+        };
+        Indexer::with_config(&mut normal, cfg_normal)
+            .full_reindex(&repo, true)
+            .unwrap();
+
+        // Отложенная сборка (bulk-режим + defer_fts).
+        let mut deferred = Storage::open_file(&tmp.path().join("deferred.db")).unwrap();
+        let cfg = IndexConfig {
+            bulk_threshold: 0,
+            defer_fts: true,
+            ..Default::default()
+        };
+        let res = Indexer::with_config(&mut deferred, cfg)
+            .full_reindex(&repo, true)
+            .unwrap();
+        assert_eq!(res.files_indexed, 2);
+        assert!(
+            deferred.fts_build_pending(),
+            "флаг отложенной сборки выставлен"
+        );
+        assert!(
+            deferred
+                .search_functions("hello", 10, None)
+                .unwrap()
+                .is_empty(),
+            "до сборки полнотекст пуст"
+        );
+        assert!(
+            deferred.search_text("товар", 10, None).unwrap().is_empty(),
+            "до сборки текстовый поиск пуст"
+        );
+
+        deferred.build_fts_deferred().unwrap();
+        assert!(!deferred.fts_build_pending(), "после сборки флаг снят");
+
+        let a = deferred.search_functions("hello", 10, None).unwrap();
+        let b = normal.search_functions("hello", 10, None).unwrap();
+        assert!(!a.is_empty(), "после сборки функция находится");
+        assert_eq!(a.len(), b.len(), "число попаданий совпадает");
+        assert_eq!(a[0].name, b[0].name);
+
+        let ta = deferred.search_text("товар", 10, None).unwrap();
+        let tb = normal.search_text("товар", 10, None).unwrap();
+        assert!(!ta.is_empty(), "текстовый поиск работает после сборки");
+        assert_eq!(ta.len(), tb.len(), "текстовый поиск совпадает");
+    }
+
+    /// Маленький репозиторий не идёт в bulk-режим — откладывать нечего,
+    /// полнотекст собирается синхронно, несмотря на `defer_fts`.
+    #[test]
+    fn defer_fts_не_действует_вне_bulk() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("main.py"), "def hello():\n    pass\n").unwrap();
+
+        let mut storage = Storage::open_file(&tmp.path().join("index.db")).unwrap();
+        let cfg = IndexConfig {
+            bulk_threshold: 100, // один файл bulk не включает
+            defer_fts: true,
+            ..Default::default()
+        };
+        Indexer::with_config(&mut storage, cfg)
+            .full_reindex(&repo, true)
+            .unwrap();
+        assert!(!storage.fts_build_pending(), "вне bulk флаг не ставится");
+        assert!(
+            !storage
+                .search_functions("hello", 10, None)
+                .unwrap()
+                .is_empty(),
+            "поиск работает сразу"
+        );
     }
 }

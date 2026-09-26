@@ -279,6 +279,24 @@ macro_rules! bail_if_not_ready {
     }};
 }
 
+/// Макрос-хелпер: полнотекст ещё собирается (отложенная сборка демона) —
+/// `search_*` закрыты, остальные инструменты работают. `$storage` — уже взятое
+/// соединение из пула, чтобы не проверять флаг лишним checkout'ом.
+macro_rules! bail_if_fts_building {
+    ($storage:expr) => {{
+        if $storage.fts_build_pending() {
+            return serde_json::json!({
+                "status": "indexing",
+                "layer": "fts",
+                "message": "Полнотекстовый поиск ещё собирается после первичной индексации. \
+                    Остальные инструменты (get_*, grep_*, read_file, list_files) уже работают; \
+                    повторите вызов через минуту или проверьте health.",
+            })
+            .to_string();
+        }
+    }};
+}
+
 /// Макрос-хелпер: взять read-only соединение из пула репо. При ошибке открытия
 /// (битый/недоступный файл индекса) — немедленно вернуть error-JSON. Заменяет
 /// прежний `entry.local_storage().lock().await` (один мьютекс → пул соединений).
@@ -748,6 +766,7 @@ pub async fn search_function(
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    bail_if_fts_building!(storage);
     let want = limit.unwrap_or(20);
     // Если path_glob задан — берём с запасом (5×, до 500), потом фильтруем по пути,
     // потом обрезаем до want. Это компромисс между точностью и нагрузкой.
@@ -809,6 +828,7 @@ pub async fn search_class(
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    bail_if_fts_building!(storage);
     let want = limit.unwrap_or(20);
     let sql_limit = if path_glob.is_some() {
         (want.saturating_mul(5)).min(500)
@@ -2204,6 +2224,7 @@ pub async fn search_text(
 ) -> String {
     bail_if_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    bail_if_fts_building!(storage);
     let want = limit.unwrap_or(20);
     let sql_limit = if path_glob.is_some() {
         (want.saturating_mul(5)).min(500)

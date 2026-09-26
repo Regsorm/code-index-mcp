@@ -1276,6 +1276,23 @@ fn cmd_index(path: String, force: bool, registry: Option<ProcessorRegistry>) -> 
     }
     let extras_ms = extras_start.elapsed().as_millis();
 
+    // 6a2. Отложенный полнотекст: CLI собирает его синхронно (`defer_fts` у
+    // разовой команды выключен). Сюда попадаем, если в базе остался флаг от
+    // прерванной сборки демона — тогда дособираем до записи версии данных.
+    if storage.fts_build_pending() {
+        let t0 = std::time::Instant::now();
+        crate::logging::stage_begin("полнотекстовый поиск");
+        let outcome = storage.build_fts_deferred();
+        crate::logging::stage_done("полнотекстовый поиск", t0.elapsed());
+        match outcome {
+            Ok(()) => tracing::info!(
+                "отложенный полнотекстовый поиск собран за {} мс",
+                t0.elapsed().as_millis()
+            ),
+            Err(e) => tracing::warn!("сборка отложенного полнотекста упала: {}", e),
+        }
+    }
+
     // 6b. Номер версии данных. Пишется только после прохода, разобравшего КАЖДЫЙ
     // файл (`--force` или пустая база) и успешной надстройки: иначе номер
     // объявил бы текущей версией данные, собранные прежней. Провал записи не

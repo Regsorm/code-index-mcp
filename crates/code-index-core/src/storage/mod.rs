@@ -739,8 +739,15 @@ impl Storage {
     /// парсинга, писатель только пишет. `fts_text` — сырой текст для FTS5
     /// (contentless-индексу нужен разжатый текст, blob для него не годится).
     pub fn insert_text_file_blob(&self, file_id: i64, blob: &[u8], fts_text: &str) -> Result<()> {
-        // Снять старый FTS-токен, если запись существовала (повтор без delete).
-        self.fts_text_delete(file_id)?;
+        // При отложенной сборке полнотекста (`defer_fts`) старые токены не
+        // снимаем и новые не пишем: весь указатель будет пересобран из
+        // `text_contents` в `build_fts_deferred`. Это убирает токенизацию
+        // 52 тыс. текстовых файлов с критического пути записи.
+        let deferred = self.fts_build_pending();
+        if !deferred {
+            // Снять старый FTS-токен, если запись существовала (повтор без delete).
+            self.fts_text_delete(file_id)?;
+        }
         self.conn
             .prepare_cached(
                 "INSERT OR REPLACE INTO text_contents (file_id, content_blob, oversize) \
@@ -748,17 +755,21 @@ impl Storage {
             )?
             .execute(params![file_id, blob])
             .context("insert_text_file_blob: INSERT text_contents")?;
-        self.conn
-            .prepare_cached("INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)")?
-            .execute(params![file_id, fts_text])
-            .context("insert_text_file_blob: FTS insert")?;
+        if !deferred {
+            self.conn
+                .prepare_cached("INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)")?
+                .execute(params![file_id, fts_text])
+                .context("insert_text_file_blob: FTS insert")?;
+        }
         Ok(())
     }
 
     /// Удалить запись текстового файла: снимает токен contentless-указателя
     /// (по разжатому старому тексту) и удаляет строку `text_contents`.
     pub fn delete_text_file_by_file(&self, file_id: i64) -> Result<()> {
-        self.fts_text_delete(file_id)?;
+        if !self.fts_build_pending() {
+            self.fts_text_delete(file_id)?;
+        }
         self.conn
             .execute(
                 "DELETE FROM text_contents WHERE file_id = ?1",
@@ -3203,8 +3214,141 @@ impl Storage {
     /// Вызывать после завершения bulk-load. Пересоздание индексов одним проходом
     /// дешевле, чем инкрементальное обновление на каждый INSERT.
     pub fn finish_bulk_load(&self) -> Result<()> {
-        schema::rebuild_indexes_and_triggers(&self.conn)
+        // Отложенная сборка (`defer_fts`): FTS не перестраиваем сейчас, только
+        // триггеры и индексы. Поиск закрыт флагом `fts_build_pending` до
+        // `build_fts_deferred`.
+        let skip_fts = self.fts_build_pending();
+        schema::rebuild_indexes_and_triggers(&self.conn, skip_fts)
             .context("finish_bulk_load: ошибка пересоздания индексов и триггеров")?;
+        Ok(())
+    }
+
+    /// Ключ отметки «полнотекстовый поиск ещё не собран».
+    pub const FTS_BUILD_PENDING_KEY: &'static str = schema::FTS_BUILD_PENDING_KEY;
+
+    /// Идёт ли отложенная сборка полнотекста: пока да, `search_*` закрыты.
+    ///
+    /// Отсутствие ключа/таблицы читается как «собран» — базы прежних версий не
+    /// должны закрывать поиск.
+    pub fn fts_build_pending(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT value FROM index_state WHERE key = ?1",
+                params![Self::FTS_BUILD_PENDING_KEY],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    }
+
+    /// Поставить/снять отметку «полнотекст ещё не собран». Отдельная
+    /// транзакция: отметка должна пережить убийство процесса, иначе поиск
+    /// откроется на несобранном FTS.
+    pub fn set_fts_build_pending(&self, on: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO index_state (key, value) VALUES (?1, ?2)",
+                params![Self::FTS_BUILD_PENDING_KEY, if on { "1" } else { "0" }],
+            )
+            .context("set_fts_build_pending: не удалось записать отметку")?;
+        Ok(())
+    }
+
+    /// Собрать отложенный полнотекст: `fts_functions`, `fts_classes` и (заново)
+    /// `fts_text_files` из `text_contents`. Снимает флаг `fts_build_pending`.
+    ///
+    /// Вызывается вызывающим ПОСЛЕ объявления папки готовой (ранняя готовность):
+    /// пока функция не вернулась, `search_*` закрыты флагом. `fts_text_files`
+    /// пересобирается с нуля — при отложенной загрузке токены текстовых файлов
+    /// не писались вовсе, а старые (при обновлении существующей базы) подлежат
+    /// замене.
+    pub fn build_fts_deferred(&self) -> Result<()> {
+        // 1. Функции и классы: источники — основные таблицы, одна команда rebuild.
+        let t = std::time::Instant::now();
+        self.conn
+            .execute_batch("INSERT INTO fts_functions(fts_functions) VALUES('rebuild');")
+            .context("build_fts_deferred: rebuild fts_functions")?;
+        tracing::debug!(
+            "отложенный FTS: функции перестроены за {} мс",
+            t.elapsed().as_millis()
+        );
+        let t = std::time::Instant::now();
+        self.conn
+            .execute_batch("INSERT INTO fts_classes(fts_classes) VALUES('rebuild');")
+            .context("build_fts_deferred: rebuild fts_classes")?;
+        tracing::debug!(
+            "отложенный FTS: классы перестроены за {} мс",
+            t.elapsed().as_millis()
+        );
+
+        // 2. Текст: чистый contentless-указатель + проход по сжатым содержимым.
+        // DROP+CREATE одной транзакцией: читатели видят либо старую таблицу,
+        // либо новую, но не «пропавшую».
+        let t = std::time::Instant::now();
+        self.conn
+            .execute_batch(
+                "BEGIN;
+                 DROP TABLE IF EXISTS fts_text_files;
+                 CREATE VIRTUAL TABLE fts_text_files USING fts5(content, content='');
+                 COMMIT;",
+            )
+            .context("build_fts_deferred: пересоздание fts_text_files")?;
+
+        let mut scanned = 0usize;
+        let mut written = 0usize;
+        {
+            self.begin_batch()?;
+            let mut ins = self
+                .conn
+                .prepare_cached("INSERT INTO fts_text_files(rowid, content) VALUES (?1, ?2)")?;
+            let mut sel = self.conn.prepare(
+                "SELECT file_id, content_blob FROM text_contents WHERE content_blob IS NOT NULL",
+            )?;
+            let rows = sel.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
+            })?;
+            let mut in_batch = 0usize;
+            for row in rows {
+                let (file_id, blob) = row?;
+                let Some(blob) = blob else { continue };
+                scanned += 1;
+                let bytes = match Self::decode_zstd_safe(&blob) {
+                    Ok(b) => b,
+                    // Как и в `fts_text_delete`: битый/вредоносный blob не должен
+                    // ронять сборку. Слова файла просто не попадут в указатель.
+                    Err(e) => {
+                        tracing::warn!(
+                            "отложенный FTS: разжатие file_id={} не удалось: {}",
+                            file_id,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                let Ok(text) = String::from_utf8(bytes) else {
+                    continue;
+                };
+                ins.execute(params![file_id, text])?;
+                written += 1;
+                in_batch += 1;
+                if in_batch >= 2000 {
+                    self.commit_batch()?;
+                    self.begin_batch()?;
+                    in_batch = 0;
+                }
+            }
+            drop(sel);
+            drop(ins);
+            self.commit_batch()?;
+        }
+        tracing::debug!(
+            "отложенный FTS: текстовые файлы — {} из {} за {} мс",
+            written,
+            scanned,
+            t.elapsed().as_millis()
+        );
+
+        self.set_fts_build_pending(false)?;
         Ok(())
     }
 

@@ -261,6 +261,14 @@ pub const BULK_IN_PROGRESS_KEY: &str = "bulk_load_in_progress";
 /// прежних версий и репозитории без надстройки не должны считаться оборванными.
 pub const EXTRAS_BUILD_COMPLETE_KEY: &str = "extras_build_complete";
 
+/// Ключ отметки «полнотекстовый поиск ещё не собран» в `index_state`.
+///
+/// Ставится массовой загрузкой, когда ядро намеренно отложило наполнение FTS
+/// (`IndexConfig::defer_fts`) ради ранней готовности: остальные инструменты
+/// отвечают, а `search_function`/`search_class`/`search_text` закрыты до конца
+/// сборки. Снимается в [`crate::storage::Storage::build_fts_deferred`].
+pub const FTS_BUILD_PENDING_KEY: &str = "fts_build_pending";
+
 /// Осталась ли в базе отметка о незавершённой массовой загрузке.
 ///
 /// Отсутствие таблицы (база от прежней версии) читается как «отметки нет»:
@@ -557,13 +565,22 @@ pub fn drop_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Resul
     Ok(())
 }
 
-/// Пересоздать индексы и FTS-триггеры, затем перестроить FTS-индексы (после bulk-load).
+/// Пересоздать индексы и FTS-триггеры, затем (если `skip_fts = false`)
+/// перестроить FTS-индексы (после bulk-load).
 ///
 /// Последовательность:
 /// 1. Пересоздаём обычные индексы (один проход по данным — дешевле инкрементальных обновлений).
 /// 2. Пересоздаём FTS-триггеры для будущих изменений.
 /// 3. Rebuild FTS-индексов из уже загруженных данных (команда 'rebuild').
-pub fn rebuild_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+///
+/// `skip_fts = true` — отложенная сборка полнотекста (`defer_fts`): триггеры
+/// создаются (инкремент после сборки работает), а FTS оставляется пустым/старым
+/// до [`crate::storage::Storage::build_fts_deferred`]. Поиск в это время закрыт
+/// флагом `fts_build_pending`.
+pub fn rebuild_indexes_and_triggers(
+    conn: &rusqlite::Connection,
+    skip_fts: bool,
+) -> rusqlite::Result<()> {
     // Массовая фаза: построение всех индексов и перестройка полнотекста. Кеш
     // страниц на время фазы поднимаем (на больших базах 64 МБ мало: дерево
     // индексов и FTS не помещается, работа уходит в случайные чтения), после —
@@ -582,22 +599,24 @@ pub fn rebuild_indexes_and_triggers(conn: &rusqlite::Connection) -> rusqlite::Re
     // Создаём FTS-триггеры
     conn.execute_batch(TRIGGERS_SQL)?;
 
-    // Перестраиваем FTS-индексы из данных основных таблиц (команда 'rebuild').
-    // fts_text_files не перестраивается через 'rebuild' — он contentless, таблицы-
-    // источника для rebuild у него нет. Для него слова подаёт Rust-код через
-    // text_contents (в т.ч. на bulk-load), поэтому в этой функции он уже наполнен.
-    let t = std::time::Instant::now();
-    conn.execute_batch("INSERT INTO fts_functions(fts_functions) VALUES('rebuild');")?;
-    tracing::debug!(
-        "массовая загрузка: полнотекст функций перестроен за {} мс",
-        t.elapsed().as_millis()
-    );
-    let t = std::time::Instant::now();
-    conn.execute_batch("INSERT INTO fts_classes(fts_classes) VALUES('rebuild');")?;
-    tracing::debug!(
-        "массовая загрузка: полнотекст классов перестроен за {} мс",
-        t.elapsed().as_millis()
-    );
+    if !skip_fts {
+        // Перестраиваем FTS-индексы из данных основных таблиц (команда 'rebuild').
+        // fts_text_files не перестраивается через 'rebuild' — он contentless, таблицы-
+        // источника для rebuild у него нет. Для него слова подаёт Rust-код через
+        // text_contents (в т.ч. на bulk-load), поэтому в этой функции он уже наполнен.
+        let t = std::time::Instant::now();
+        conn.execute_batch("INSERT INTO fts_functions(fts_functions) VALUES('rebuild');")?;
+        tracing::debug!(
+            "массовая загрузка: полнотекст функций перестроен за {} мс",
+            t.elapsed().as_millis()
+        );
+        let t = std::time::Instant::now();
+        conn.execute_batch("INSERT INTO fts_classes(fts_classes) VALUES('rebuild');")?;
+        tracing::debug!(
+            "массовая загрузка: полнотекст классов перестроен за {} мс",
+            t.elapsed().as_millis()
+        );
+    }
 
     conn.execute_batch(&format!("PRAGMA cache_size={};", prev_cache))?;
     Ok(())
