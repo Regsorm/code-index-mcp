@@ -1267,7 +1267,7 @@ impl CodeIndexServer {
             // Массовый режим — конкуррентно: каждый элемент берёт своё соединение
             // из пула и исполняется в spawn_blocking (tools::mass_map). Статус
             // папки проверяется один раз на весь батч.
-            if let Some(json) = tools::check_path_status(&entry).await {
+            if let Some(json) = tools::check_path_status_text(&entry).await {
                 return json;
             }
             if names.is_empty() {
@@ -1310,7 +1310,7 @@ impl CodeIndexServer {
         }
         if let Some(names) = p.names {
             // Массовый режим — конкуррентно, зеркало get_function (см. выше).
-            if let Some(json) = tools::check_path_status(&entry).await {
+            if let Some(json) = tools::check_path_status_text(&entry).await {
                 return json;
             }
             if names.is_empty() {
@@ -2357,6 +2357,23 @@ impl ServerHandler for CodeIndexServer {
             .await;
             let value: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"raw": body}));
+            return self.finish(
+                &session_id,
+                &dedup_scope,
+                Ok(CallToolResult::structured(value)),
+            );
+        }
+        // Раньше локальные extension-tools не проверяли готовность; удалённую ветку проверяет нода.
+        // Демон помечает файлы грязными до пачки; после COMMIT идёт надстройка, затем
+        // finish_batch синхронно делает invalidate и только потом выставляет Ready.
+        // Поэтому полный ответ видит сброс кэша, а epoch_before, снятый до ожидания,
+        // не даст maybe_cache записать ответ при смене поколения. Отказ indexing
+        // в кэш не входит.
+        // Текстовый ответ из свежего ядра при досчёте надстройки можно кэшировать:
+        // invalidate затем вытеснит его, а старый ответ отсечёт response_is_stale.
+        if let Some(json) = tools::check_path_status(&entry).await {
+            let value: serde_json::Value =
+                serde_json::from_str(&json).unwrap_or_else(|_| serde_json::json!({"raw": json}));
             return self.finish(
                 &session_id,
                 &dedup_scope,

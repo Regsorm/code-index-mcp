@@ -80,6 +80,9 @@ pub enum PathStatus {
     Ready,
     /// Watcher обрабатывает батч изменений файлов.
     ReindexingBatch,
+    /// Ядро пачки зафиксировано и видно читателям, досчитывается надстройка
+    /// языка (граф вызовов, связи с метаданными).
+    ReindexingExtras,
     /// Ошибка — детали в поле `error`.
     Error,
 }
@@ -218,6 +221,14 @@ mod tests {
     fn path_status_serializes_as_snake_case() {
         let s = serde_json::to_string(&PathStatus::InitialIndexing).unwrap();
         assert_eq!(s, "\"initial_indexing\"");
+    }
+
+    #[test]
+    fn path_status_reindexing_extras_serializes_as_snake_case() {
+        let s = serde_json::to_string(&PathStatus::ReindexingExtras).unwrap();
+        assert_eq!(s, "\"reindexing_extras\"");
+        let back: PathStatus = serde_json::from_str("\"reindexing_extras\"").unwrap();
+        assert_eq!(back, PathStatus::ReindexingExtras);
     }
 
     #[test]

@@ -212,16 +212,12 @@ pub fn format_unavailable(value: ToolUnavailable) -> String {
     }
 }
 
-// ── Ожидание окончания пачки изменений папки ────────────────────────────────
+// ── Ожидание двух ступеней готовности папки ──────────────────────────────────
 //
-// Пока watcher демона применяет пачку изменений (`ReindexingBatch`), прежний
-// `check_path_status` сразу отдавал отказ «Применяется батч изменений», и модель
-// тратила на него целый ход: читала отказ и повторяла вызов. Между тем пачка
-// одного файла обрабатывается за 5–25 мс, в папке 1С — до пары секунд
-// (надстройка на крупной конфигурации). Теперь
-// serve ждёт окончания пачки до предела `[mcp].batch_wait_ms`, опрашивая статус
-// демона, и продолжает вызов как обычно. Не дождался — прежний ответ.
-// Первичную индексацию (идёт минутами) не ждём — отвечаем сразу, как раньше.
+// Текстовым инструментам хватает зафиксированного ядра (`ReindexingExtras`),
+// инструментам графа и расширений нужна полная готовность (`Ready`). Serve ждёт
+// нужной ступени до `[mcp].batch_wait_ms`, опрашивая статус демона. Первичную
+// индексацию не ждём.
 //
 // `check_path_status` вызывается ДО взятия соединения из пула, поэтому ожидание
 // соединение не держит.
@@ -250,26 +246,49 @@ fn batch_wait_ms() -> u64 {
     BATCH_WAIT_MS.load(Ordering::Relaxed)
 }
 
-/// Ждать ли окончания пачки изменений: истина только для `ReindexingBatch` и
-/// только пока ожидание не вышло за предел `limit`. Остальные статусы (Ready,
-/// InitialIndexing, NotStarted, Error) обрабатываются сразу, как раньше.
+/// Ждать ли полной готовности: пачка или надстройка ещё работают, а предел не вышел.
 fn should_wait_for_batch(status: &PathStatus, waited: Duration, limit: Duration) -> bool {
+    matches!(
+        status,
+        PathStatus::ReindexingBatch | PathStatus::ReindexingExtras
+    ) && waited < limit
+}
+
+fn should_wait_for_text(status: &PathStatus, waited: Duration, limit: Duration) -> bool {
     *status == PathStatus::ReindexingBatch && waited < limit
 }
 
-/// Проверить у демона статус папки репо. `None` — папка Ready, можно продолжать.
+/// `Text` — хватает зафиксированного ядра; `Full` — нужна и надстройка. По умолчанию `Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadyStage {
+    Text,
+    #[default]
+    Full,
+}
+
+fn stage_admits(status: &PathStatus, stage: ReadyStage) -> bool {
+    matches!(status, PathStatus::Ready)
+        || (*status == PathStatus::ReindexingExtras && stage == ReadyStage::Text)
+}
+
+/// Проверить у демона статус папки репо для нужной ступени. `None` — можно продолжать.
 /// `Some(json)` — нужно отдать клиенту этот ToolUnavailable-ответ вместо данных.
 ///
-/// Пачку изменений (`ReindexingBatch`) ждём до `[mcp].batch_wait_ms`, опрашивая
+/// Нужную ступень ждём до `[mcp].batch_wait_ms`, опрашивая
 /// статус с шагом `BATCH_WAIT_POLL_MS`. Предел 0 → ровно один запрос.
-pub async fn check_path_status(entry: &RepoEntry) -> Option<String> {
+pub async fn check_path_status_for(entry: &RepoEntry, stage: ReadyStage) -> Option<String> {
     let root = entry.local_root();
     let limit = Duration::from_millis(batch_wait_ms());
     let started = Instant::now();
     let mut resp = client::path_status_async(root).await;
     loop {
         let keep_waiting = match &resp {
-            Ok(attempt) => should_wait_for_batch(&attempt.status, started.elapsed(), limit),
+            Ok(attempt) => match stage {
+                ReadyStage::Full => {
+                    should_wait_for_batch(&attempt.status, started.elapsed(), limit)
+                }
+                ReadyStage::Text => should_wait_for_text(&attempt.status, started.elapsed(), limit),
+            },
             Err(_) => false,
         };
         if !keep_waiting {
@@ -279,8 +298,13 @@ pub async fn check_path_status(entry: &RepoEntry) -> Option<String> {
         resp = client::path_status_async(root).await;
     }
     match resp {
+        Ok(resp) if stage_admits(&resp.status, stage) => None,
         Ok(resp) => match resp.status {
             PathStatus::Ready => None,
+            PathStatus::ReindexingExtras => Some(format_unavailable(ToolUnavailable::Indexing {
+                progress: resp.progress.unwrap_or_default(),
+                message: "Досчитываются граф вызовов и метаданные после правки — повторите запрос".into(),
+            })),
             PathStatus::InitialIndexing | PathStatus::ReindexingBatch => Some(format_unavailable(
                 ToolUnavailable::Indexing {
                     progress: resp.progress.unwrap_or_default(),
@@ -311,10 +335,29 @@ pub async fn check_path_status(entry: &RepoEntry) -> Option<String> {
     }
 }
 
+/// Проверка полной готовности (ступень по умолчанию): ждёт и пачку, и надстройку.
+pub async fn check_path_status(entry: &RepoEntry) -> Option<String> {
+    check_path_status_for(entry, ReadyStage::default()).await
+}
+
+/// Проверка ступени «текст»: хватает зафиксированного ядра, надстройку не ждёт.
+pub async fn check_path_status_text(entry: &RepoEntry) -> Option<String> {
+    check_path_status_for(entry, ReadyStage::Text).await
+}
+
 /// Макрос-хелпер: если папка не Ready — вернуть unavailable JSON немедленно.
 macro_rules! bail_if_not_ready {
     ($entry:expr) => {{
         if let Some(json) = crate::mcp::tools::check_path_status($entry).await {
+            return json;
+        }
+    }};
+}
+
+/// Только для инструментов, читающих данные ядра; новый инструмент ставит `bail_if_not_ready!`.
+macro_rules! bail_if_text_not_ready {
+    ($entry:expr) => {{
+        if let Some(json) = crate::mcp::tools::check_path_status_text($entry).await {
             return json;
         }
     }};
@@ -787,7 +830,7 @@ pub async fn search_function(
     language: Option<String>,
     path_glob: Option<String>,
 ) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     let want = limit.unwrap_or(20);
     // Если path_glob задан — берём с запасом (5×, до 500), потом фильтруем по пути,
@@ -848,7 +891,7 @@ pub async fn search_class(
     language: Option<String>,
     path_glob: Option<String>,
 ) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     let want = limit.unwrap_or(20);
     let sql_limit = if path_glob.is_some() {
@@ -937,7 +980,7 @@ fn cap_record_body(
 }
 
 pub async fn get_function(entry: &RepoEntry, name: String, path_glob: Option<String>) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     get_function_with(&storage, name, path_glob)
 }
@@ -1015,7 +1058,7 @@ pub fn get_function_with(
 }
 
 pub async fn get_class(entry: &RepoEntry, name: String, path_glob: Option<String>) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     get_class_with(&storage, name, path_glob)
 }
@@ -1722,7 +1765,7 @@ pub async fn find_symbol(
     language: Option<String>,
     path_glob: Option<String>,
 ) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     match storage.find_symbol(&name, language.as_deref()) {
         Ok(mut r) => {
@@ -1822,7 +1865,7 @@ pub async fn get_imports(
     language: Option<String>,
     limit: Option<usize>,
 ) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     let cap = limit.unwrap_or(IMPORTS_DEFAULT_LIMIT);
     let cap_extra = |total: usize| {
@@ -1861,7 +1904,7 @@ pub async fn get_imports(
 }
 
 pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     match storage.get_file_summary(&path) {
         Ok(Some(s)) => {
@@ -2243,7 +2286,7 @@ pub async fn search_text(
     language: Option<String>,
     path_glob: Option<String>,
 ) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     let want = limit.unwrap_or(20);
     let sql_limit = if path_glob.is_some() {
@@ -2290,7 +2333,7 @@ pub async fn grep_body(
     path_glob: Option<String>,
     context_lines: Option<usize>,
 ) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     // Если есть либо path_glob, либо context_lines — идём через grep_body_with_options
     // (он отдаёт флаг обрезки). Иначе старый grep_body для обратной совместимости с
@@ -2360,7 +2403,7 @@ pub async fn grep_body(
 // ── Phase 1 tool-handlers ───────────────────────────────────────────────────
 
 pub async fn stat_file(entry: &RepoEntry, path: String) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     // stat_file намеренно НЕ заворачиваем в `_meta` — он non-cacheable по
     // policy (всегда быстрая прямая выборка, к тому же быстро меняется на
@@ -2379,7 +2422,7 @@ pub async fn list_files(
     language: Option<String>,
     limit: Option<usize>,
 ) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     let want = limit.unwrap_or(LIST_FILES_DEFAULT_LIMIT);
     match storage.list_files_filtered(
@@ -2440,7 +2483,7 @@ pub async fn read_file(
     line_start: Option<usize>,
     line_end: Option<usize>,
 ) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     match storage.read_file_text(
         &path,
@@ -2468,7 +2511,7 @@ pub async fn grep_text(
     limit: Option<usize>,
     context_lines: Option<usize>,
 ) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     let want = limit.unwrap_or_else(|| {
         // Без path_glob и language full-scan может быть тяжёлым — занижаем default.
@@ -2615,7 +2658,7 @@ pub async fn grep_code(
     limit: Option<usize>,
     context_lines: Option<usize>,
 ) -> String {
-    bail_if_not_ready!(entry);
+    bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     let want = limit.unwrap_or(GREP_CODE_DEFAULT_LIMIT);
     match storage.grep_code_filtered(
@@ -2813,6 +2856,78 @@ mod tests {
             &PathStatus::ReindexingBatch,
             Duration::from_millis(0),
             Duration::from_millis(0)
+        ));
+    }
+
+    #[test]
+    fn should_wait_for_batch_waits_for_extras() {
+        let limit = Duration::from_millis(2000);
+        assert!(should_wait_for_batch(
+            &PathStatus::ReindexingExtras,
+            Duration::from_millis(1999),
+            limit
+        ));
+        assert!(!should_wait_for_batch(
+            &PathStatus::ReindexingExtras,
+            limit,
+            limit
+        ));
+    }
+
+    #[test]
+    fn should_wait_for_text_skips_extras() {
+        let limit = Duration::from_millis(2000);
+        let waited = Duration::from_millis(10);
+        assert!(should_wait_for_text(
+            &PathStatus::ReindexingBatch,
+            waited,
+            limit
+        ));
+        assert!(!should_wait_for_text(
+            &PathStatus::ReindexingBatch,
+            limit,
+            limit
+        ));
+        for status in [
+            PathStatus::ReindexingExtras,
+            PathStatus::Ready,
+            PathStatus::InitialIndexing,
+            PathStatus::Error,
+            PathStatus::NotStarted,
+        ] {
+            assert!(!should_wait_for_text(&status, waited, limit), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn stage_admits_statuses() {
+        for stage in [ReadyStage::Text, ReadyStage::Full] {
+            assert!(stage_admits(&PathStatus::Ready, stage));
+            for status in [
+                PathStatus::ReindexingBatch,
+                PathStatus::InitialIndexing,
+                PathStatus::Error,
+                PathStatus::NotStarted,
+            ] {
+                assert!(!stage_admits(&status, stage), "{status:?} {stage:?}");
+            }
+        }
+        assert!(stage_admits(
+            &PathStatus::ReindexingExtras,
+            ReadyStage::Text
+        ));
+        assert!(!stage_admits(
+            &PathStatus::ReindexingExtras,
+            ReadyStage::Full
+        ));
+    }
+
+    #[test]
+    fn ready_stage_default_is_full() {
+        assert_eq!(ReadyStage::default(), ReadyStage::Full);
+        assert!(!stage_admits(
+            &PathStatus::ReindexingExtras,
+            ReadyStage::default()
         ));
     }
 

@@ -284,6 +284,7 @@ fn status_ru(status: PathStatus) -> &'static str {
         PathStatus::InitialIndexing => "индексация при старте",
         PathStatus::Ready => "готова",
         PathStatus::ReindexingBatch => "обработка пакета изменений",
+        PathStatus::ReindexingExtras => "досчёт надстройки после пачки",
         PathStatus::Error => "ошибка",
     }
 }
@@ -311,7 +312,9 @@ fn format_pulse(uptime_sec: u64, memory: &str, snapshot: &[PathPulse]) -> Vec<St
     for p in snapshot {
         match p.status {
             PathStatus::Ready => ready += 1,
-            PathStatus::InitialIndexing | PathStatus::ReindexingBatch => indexing += 1,
+            PathStatus::InitialIndexing
+            | PathStatus::ReindexingBatch
+            | PathStatus::ReindexingExtras => indexing += 1,
             PathStatus::Error => errors += 1,
             PathStatus::NotStarted => not_started += 1,
         }
