@@ -5,6 +5,44 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.7.0] — 2026-09-26
+
+**A file edit shows up in the index within a fraction of a second: a single edit takes about 0.1 s instead of 0.55 s, and the 5–6 s stalls while someone reads the database are gone. In 1C folders the edited module text is available in ~0.1 s, the call graph once the extras layer is done. While a change batch is being applied, serve waits for it instead of answering "Applying a batch of changes".**
+
+### Fixed
+
+- **"Ready" no longer waits for the WAL checkpoint.** After every batch the daemon checkpointed the journal and only then marked the folder ready. With an open read transaction on the database the checkpoint waited up to the connection busy timeout — 5 s, the rusqlite default — and gave up silently, so every edit became visible after 5.9 s and serve kept answering "Applying a batch of changes". Status and cache invalidation now happen right after the commit, and the checkpoint runs afterwards without waiting for readers. If a journal of 4096 pages or more cannot be moved into the database, the daemon logs a warning (at most once per 10 minutes per folder).
+- **serve's connection pool no longer returns a connection with an open read.** rusqlite puts a statement back into its cache without resetting it, so an open read could stay inside a pooled connection and block checkpoints for days (on a work machine a journal grew to 81 MB next to a 19 MB database). On return the connection is now cleaned (statement cache flushed, transaction rolled back) or closed if that fails. Checkouts are tracked with a "tool|repo" label; a connection held longer than 60 s is logged by serve with the tool name.
+
+- **An empty graph answer is no longer served from the cache after an edit.** Answers without dependent files (empty result, graph walk) were not evicted by per-file invalidation and lived their 15 s: `get_callers` asked before a call existed kept answering "no callers" for 15 s after the edit, with no refusal. Such answers of the repository are now dropped at the start and at the end of a batch.
+
+### Added
+
+- **Two-stage readiness.** Right after a batch core is committed the folder gets the `reindexing_extras` status: text tools (`read_file`, `get_function`, `get_class`, `grep_*`, `find_symbol`, `get_file_summary`, `list_files`, `stat_file`, `search_function`, `search_class`, `search_text`, `get_imports`) answer immediately, while the call graph and all 1C tools wait for the extras layer (`batch_wait_ms` limit) and return the graph with the edit reflected; if it is not ready in time they refuse instead of silently returning a stale graph. Extension tools previously did not check folder status at all — now they wait for full readiness. Folders without an extras layer are unaffected.
+- **Single-edit window — `quick_window_ms`** (`[[paths]]` in `daemon.toml` or the project's `.code-index/config.json`, default 50 ms). If no event for another file arrives within the window after the first event, the one-file batch is processed right away without waiting for `debounce_ms`. Repeated events for the same file do not switch modes; an event for another file falls back to the regular `debounce_ms` collection capped by `batch_ms`, so bulk changes are handled as before. `0` restores the old behaviour.
+- **Waiting for a change batch — `[mcp].batch_wait_ms`** (default 5000 ms). While the daemon applies a batch to a folder, serve waits for it and answers with fresh data instead of "Applying a batch of changes"; the model does not spend a turn on a retry. Initial indexing is not waited for. `0` disables waiting.
+- **Tool call time limit — `[mcp].tool_timeout_sec`** (default 120 s). A call that does not finish in time is aborted: the client gets an error suggesting a narrower query, and the connection goes back to the pool. The limit aborts calls that are waiting (pool connection, network, federation node); database work running without pauses is not interrupted by the timer. `0` disables the limit.
+
+### Compatibility
+
+- No reindexing required, response format unchanged. The new settings are optional; defaults suit regular use.
+- New `quick_window_ms` values for an already watched folder and `[mcp]` settings take effect after restarting the daemon and serve.
+
+### Verification
+
+- `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features` — 993 tests, 0 failed.
+- Live "write a file → new text through serve" measurement on the local installation:
+
+| Case                                                     |                    1.6.0 |                  1.7.0 |
+|----------------------------------------------------------|-------------------------:|-----------------------:|
+| Single edit, regular folder                              |              0.53–0.56 s |            0.07–0.11 s |
+| Same with an open read held on the database              |              5.91–5.95 s |            0.07–0.10 s |
+| Two files in a row (batch mode)                          |             about 0.55 s |            0.53–0.56 s |
+
+A 1C module edit on a stock trade configuration (57k files): `read_file` sees it in 0.06–0.12 s, `get_function` right after, `get_callers` returns the updated graph 1.8–1.9 s later (extras layer), with no "Applying a batch of changes" answer. In 1.6.0 not even the module text was served until the extras layer finished.
+
+- Linux federation node (local build before publishing): calls through the local serve to four 1C databases — stats, code search, object structure — pass.
+
 ## [1.6.0] — 2026-09-25
 
 **This release ships `code-index-guard` — a `PreToolUse` hook for Claude Code and Codex CLI that steers the model to read code through the index. It denies only where the index actually serves the same file and points to the right tool. Prebuilt binaries for Windows, Linux and macOS are in the release archives.**
