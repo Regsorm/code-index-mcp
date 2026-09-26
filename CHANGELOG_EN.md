@@ -5,14 +5,15 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.8.0] — 2026-09-27
 
-**Fresh indexing of a 100,780-file export got faster: 463 → 377 s (-18.6 %), a repeat pass over an unchanged folder — 454 → 30 s (-93.4 %). The daemon opens non-search tools in 92 s instead of 467, `search_*` — in 179 s instead of 467. Along the way, integrity and resume bugs found by an audit of the branch were fixed.**
+**Faster indexing, same data. On a stock trade configuration (57k files) fresh CLI indexing takes 98.6 s instead of 132.7 (-26 %), a repeat pass with no changes 37.9 s instead of 142.1 (-73 %), a fresh daemon start 113 s instead of 142, and a batch of 100 changed files is visible to search after 128 s instead of 168.5. Databases built by 1.7.0 and 1.8.0 match across all tables. The speed-up and integrity fixes are a contribution by @OniVe (PR #12).**
 
 ### Changed
 
 - **Indexing core — a pipeline instead of sequential phases.** The XML add-on is walked in a single pass; parsing and content compression run in parallel on all cores, SQLite writes go through a serial writer; symbols (functions, classes, calls, variables) are buffered and written with multi-row `INSERT`s; platform ballast and object method edges of the graph are pruned in a single `DELETE`. Result: fresh indexing 462.8 → 376.7 s, add-on 256.2 → 174.3 s.
-- **Deferred full-text build in the daemon.** Right after the core the folder is declared `Ready`: non-search tools work while the FTS is being built; `search_*` answer `{"status":"indexing","layer":"fts"}` until it finishes. Tools are ready in 92 s instead of 467, search — in 179 s instead of 467. The CLI finishes the FTS build if the database is left with the flag after an interruption.
+- **Deferred full-text build in the daemon.** Right after the core the folder is declared `Ready`: non-search tools work while the FTS is being built; `search_*` answer `{"status":"indexing","layer":"fts"}` until it finishes. Tools are ready in 92 s instead of 467, search — in 179 s instead of 467. The CLI finishes the FTS build if the database is left with the flag after an interruption. Early readiness applies when the database is built or checked directly on disk; a new database in the `auto` mode is usually built in memory by the daemon, and the folder opens all at once at the end of the pass.
+- **A full pass over a large batch at runtime does not defer the full-text index.** The folder is closed until the end of the pass anyway, and a synchronous build is cheaper: indexes and full-text on 57k files take 17.9 s instead of 27.5. A "full-text not built" flag left by an interrupted startup build is completed by the pass — `search_*` no longer stay closed until the daemon restarts.
 - **The repeat pass no longer rebuilds the add-on needlessly.** A complete layer is skipped when nothing changed, and changed files are updated per-file; repeat pass 454.2 → 29.9 s.
 - **Add-on phases resume by input fingerprint:** an interruption in the middle of the layer continues from the last completed phase; the fingerprint covers `.bsl`/`.xml`, template contents (`Ext/Template.*`) and `Ext/Predefined.xml`; extensions are matched case-insensitively.
 
@@ -26,11 +27,25 @@ Versioning — [SemVer](https://semver.org/).
 ### Compatibility
 
 - The data and response formats are unchanged, no reindexing is required; the schema and indexes are updated in place. The first daemon pass after the upgrade may finish the full-text and add-on build in the background.
+- The new answers `{"status":"indexing","layer":"fts"}` (search, while the full-text index is being built) and `{"status":"indexing","layer":"extras"}` (extension tools, while the extras layer is being computed) mean "retry the call later".
 
 ### Verification
 
-- `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo test --workspace --all-targets`, doc tests — clean.
-- The `tests/perf_compare.py` harness (v1.5.1 vs this branch, medians of 2 runs, 100,780-file export): fresh indexing 462.8 → 376.7 s, core 206.7 → 202.4 s, add-on 256.2 → 174.3 s, repeat 454.2 → 29.9 s; daemon: non-search tools 467.0 → 92.0 s, `search_function` 467.0 → 178.7 s.
+- `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features` — 1013 tests, 0 failed.
+- Data check: a stock trade configuration database (57k files) built by 1.7.0 and 1.8.0 matched across all 25 tables (row counts and contents), across functions, classes and 1.96 million calls tied to file paths, and across full-text search samples.
+- Live measurement on the same configuration (a copy, isolated daemon):
+
+| Case                                          |              1.7.0 |              1.8.0 |
+|-----------------------------------------------|-------------------:|-------------------:|
+| Fresh CLI indexing                            |            132.7 s |             98.6 s |
+| Repeat CLI pass with no changes               |            142.1 s |             37.9 s |
+| Fresh daemon start, until tools answer        |            142.0 s |            113.1 s |
+| Daemon restart on a ready database            |              3.0 s |              3.5 s |
+| Module edit → new text in `read_file`         |     0.11 to 0.15 s |     0.10 to 0.14 s |
+| Batch of 100 files → `search_function`        |            168.5 s |            128.0 s |
+
+- Linux federation node (local build before publishing): the startup check of six 1C databases took 25 s; statistics, search, call graph, object structure and profile through federation — green.
+- The author's `tests/perf_compare.py` harness (v1.5.1 vs this branch, medians of 2 runs, 100,780-file export): fresh indexing 462.8 → 376.7 s, core 206.7 → 202.4 s, add-on 256.2 → 174.3 s, repeat 454.2 → 29.9 s; daemon: non-search tools 467.0 → 92.0 s, `search_function` 467.0 → 178.7 s.
 - The diff went through two audit rounds (core and bsl add-on), all findings are closed; tests added: `SAVEPOINT`/buffer, resume phase chain, EDT without a watermark, fingerprint sensitivity to `Template.dcs`, case-insensitive extensions.
 
 ## [1.7.0] — 2026-09-26
