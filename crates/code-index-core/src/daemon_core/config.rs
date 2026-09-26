@@ -255,6 +255,19 @@ pub struct McpSection {
     /// ```
     #[serde(default = "default_tool_timeout_sec")]
     pub tool_timeout_sec: u64,
+    /// Сколько serve ждёт окончания пачки изменений папки (`ReindexingBatch`),
+    /// прежде чем ответить «Применяется батч изменений». Пачка одного файла
+    /// применяется за 5–25 мс, поэтому короткое ожидание экономит модели целый
+    /// ход на повторном вызове. Отсутствует → 5000; `0` → не ждать (прежнее
+    /// поведение). На медленной машине с папками 1С (пачка 0,3–0,8 с) можно
+    /// поднять. Первичную индексацию serve не ждёт никогда.
+    ///
+    /// ```toml
+    /// [mcp]
+    /// batch_wait_ms = 5000
+    /// ```
+    #[serde(default = "default_batch_wait_ms")]
+    pub batch_wait_ms: u64,
 }
 
 impl Default for McpSection {
@@ -264,6 +277,7 @@ impl Default for McpSection {
             dedup_enabled: default_dedup_enabled(),
             default_repo: None,
             tool_timeout_sec: default_tool_timeout_sec(),
+            batch_wait_ms: default_batch_wait_ms(),
         }
     }
 }
@@ -274,6 +288,10 @@ fn default_dedup_enabled() -> bool {
 
 fn default_tool_timeout_sec() -> u64 {
     120
+}
+
+fn default_batch_wait_ms() -> u64 {
+    5000
 }
 
 /// Секция `[cap]` из конфига демона — параметры стража размера выдачи
@@ -983,6 +1001,24 @@ mod tests {
         "#;
         let cfg = parse_str(text).unwrap();
         assert_eq!(cfg.mcp.tool_timeout_sec, 0);
+    }
+
+    #[test]
+    fn mcp_batch_wait_default_5000() {
+        // Нет секции [mcp] → serve ждёт окончания пачки изменений до 5000 мс.
+        let cfg: DaemonFileConfig = parse_str("").unwrap();
+        assert_eq!(cfg.mcp.batch_wait_ms, 5000);
+    }
+
+    #[test]
+    fn parses_mcp_batch_wait_ms() {
+        // 0 — ожидание выключено: сразу прежний ответ «Применяется батч изменений».
+        let text = r#"
+            [mcp]
+            batch_wait_ms = 0
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(cfg.mcp.batch_wait_ms, 0);
     }
 
     #[test]

@@ -9,6 +9,9 @@
 // Если папка не `Ready` — возвращается `ToolUnavailable` JSON, и реальный запрос
 // к БД не выполняется.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
 use super::{CodeIndexServer, RepoEntry};
 use crate::daemon_core::client;
 use crate::daemon_core::ipc::{PathStatus, ToolUnavailable};
@@ -209,11 +212,73 @@ pub fn format_unavailable(value: ToolUnavailable) -> String {
     }
 }
 
+// ── Ожидание окончания пачки изменений папки ────────────────────────────────
+//
+// Пока watcher демона применяет пачку изменений (`ReindexingBatch`), прежний
+// `check_path_status` сразу отдавал отказ «Применяется батч изменений», и модель
+// тратила на него целый ход: читала отказ и повторяла вызов. Между тем пачка
+// одного файла обрабатывается за 5–25 мс, в папке 1С — до пары секунд
+// (надстройка на крупной конфигурации). Теперь
+// serve ждёт окончания пачки до предела `[mcp].batch_wait_ms`, опрашивая статус
+// демона, и продолжает вызов как обычно. Не дождался — прежний ответ.
+// Первичную индексацию (идёт минутами) не ждём — отвечаем сразу, как раньше.
+//
+// `check_path_status` вызывается ДО взятия соединения из пула, поэтому ожидание
+// соединение не держит.
+
+/// Предел ожидания окончания пачки изменений в миллисекундах, выставляется при
+/// старте serve из `[mcp].batch_wait_ms`. 0 — ожидание выключено. До
+/// инициализации действует дефолт.
+static BATCH_WAIT_MS: AtomicU64 = AtomicU64::new(5000);
+
+/// Шаг опроса статуса демона при ожидании пачки, мс.
+const BATCH_WAIT_POLL_MS: u64 = 25;
+
+/// Выставить предел ожидания (serve-init по `[mcp].batch_wait_ms`).
+/// 0 — ожидание выключено: один запрос статуса, как раньше.
+pub fn set_batch_wait_ms(ms: u64) {
+    BATCH_WAIT_MS.store(ms, Ordering::Relaxed);
+    if ms == 0 {
+        tracing::info!("serve не ждёт окончания пачки изменений (batch_wait_ms = 0)");
+    } else {
+        tracing::info!("serve ждёт окончания пачки изменений до {} мс", ms);
+    }
+}
+
+/// Текущий предел ожидания в миллисекундах (0 — выключено).
+fn batch_wait_ms() -> u64 {
+    BATCH_WAIT_MS.load(Ordering::Relaxed)
+}
+
+/// Ждать ли окончания пачки изменений: истина только для `ReindexingBatch` и
+/// только пока ожидание не вышло за предел `limit`. Остальные статусы (Ready,
+/// InitialIndexing, NotStarted, Error) обрабатываются сразу, как раньше.
+fn should_wait_for_batch(status: &PathStatus, waited: Duration, limit: Duration) -> bool {
+    *status == PathStatus::ReindexingBatch && waited < limit
+}
+
 /// Проверить у демона статус папки репо. `None` — папка Ready, можно продолжать.
 /// `Some(json)` — нужно отдать клиенту этот ToolUnavailable-ответ вместо данных.
+///
+/// Пачку изменений (`ReindexingBatch`) ждём до `[mcp].batch_wait_ms`, опрашивая
+/// статус с шагом `BATCH_WAIT_POLL_MS`. Предел 0 → ровно один запрос.
 pub async fn check_path_status(entry: &RepoEntry) -> Option<String> {
     let root = entry.local_root();
-    match client::path_status_async(root).await {
+    let limit = Duration::from_millis(batch_wait_ms());
+    let started = Instant::now();
+    let mut resp = client::path_status_async(root).await;
+    loop {
+        let keep_waiting = match &resp {
+            Ok(attempt) => should_wait_for_batch(&attempt.status, started.elapsed(), limit),
+            Err(_) => false,
+        };
+        if !keep_waiting {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(BATCH_WAIT_POLL_MS)).await;
+        resp = client::path_status_async(root).await;
+    }
+    match resp {
         Ok(resp) => match resp.status {
             PathStatus::Ready => None,
             PathStatus::InitialIndexing | PathStatus::ReindexingBatch => Some(format_unavailable(
@@ -2693,6 +2758,63 @@ mod tests {
     use super::*;
     use crate::storage::{PoolConfig, Storage, StoragePool};
     use std::time::{Duration, Instant};
+
+    /// Ожидание пачки включается только для `ReindexingBatch` и только пока не
+    /// исчерпан предел: иначе serve задерживал бы ответ впустую.
+    #[test]
+    fn should_wait_for_batch_only_reindexing_batch_within_limit() {
+        let limit = Duration::from_millis(2000);
+        assert!(should_wait_for_batch(
+            &PathStatus::ReindexingBatch,
+            Duration::from_millis(0),
+            limit
+        ));
+        assert!(should_wait_for_batch(
+            &PathStatus::ReindexingBatch,
+            Duration::from_millis(1999),
+            limit
+        ));
+        // Предел исчерпан → прежний ответ «Применяется батч изменений».
+        assert!(!should_wait_for_batch(
+            &PathStatus::ReindexingBatch,
+            limit,
+            limit
+        ));
+        assert!(!should_wait_for_batch(
+            &PathStatus::ReindexingBatch,
+            Duration::from_millis(5000),
+            limit
+        ));
+    }
+
+    /// Первичная индексация идёт минутами — её не ждём; прочие статусы тоже
+    /// обрабатываются сразу, как раньше.
+    #[test]
+    fn should_wait_for_batch_skips_other_statuses() {
+        let limit = Duration::from_millis(2000);
+        let waited = Duration::from_millis(10);
+        for status in [
+            PathStatus::InitialIndexing,
+            PathStatus::Ready,
+            PathStatus::Error,
+            PathStatus::NotStarted,
+        ] {
+            assert!(
+                !should_wait_for_batch(&status, waited, limit),
+                "ожидание не для {status:?}"
+            );
+        }
+    }
+
+    /// `batch_wait_ms = 0` — ожидание выключено: один запрос статуса, как раньше.
+    #[test]
+    fn should_wait_for_batch_zero_limit_never_waits() {
+        assert!(!should_wait_for_batch(
+            &PathStatus::ReindexingBatch,
+            Duration::from_millis(0),
+            Duration::from_millis(0)
+        ));
+    }
 
     /// Готовая команда идёт человеку в терминал, поэтому расширенного префикса
     /// Windows в ней быть не должно; обычный путь остаётся как есть.

@@ -975,6 +975,7 @@ async fn cmd_serve(
         crate::mcp::cap::set_function_body_cap(daemon_cfg.cap.max_function_body_chars);
         crate::mcp::cap::set_cap_tools(Some(daemon_cfg.cap.cap_tools.clone()));
         crate::mcp::cap::set_cap_enabled(daemon_cfg.cap.cap_enabled);
+        crate::mcp::tools::set_batch_wait_ms(daemon_cfg.mcp.batch_wait_ms);
         let federate_router = federation::server::federate_router(server.clone());
         let allowed = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
             federation::whitelist::build(&serve_cfg),
@@ -1098,6 +1099,7 @@ async fn cmd_serve(
         crate::mcp::cap::set_function_body_cap(cfg.cap.max_function_body_chars);
         crate::mcp::cap::set_cap_tools(Some(cfg.cap.cap_tools.clone()));
         crate::mcp::cap::set_cap_enabled(cfg.cap.cap_enabled);
+        crate::mcp::tools::set_batch_wait_ms(cfg.mcp.batch_wait_ms);
     }
     let bind_host = host.unwrap_or_else(|| "127.0.0.1".to_string());
 
