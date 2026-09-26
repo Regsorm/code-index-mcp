@@ -240,6 +240,21 @@ pub struct McpSection {
     /// ```
     #[serde(default)]
     pub default_repo: Option<String>,
+    /// Предел времени одного вызова инструмента в секундах. Зависший вызов
+    /// держит соединение из пула serve, а соединение — открытое чтение базы,
+    /// из-за чего демон не может схлопнуть журнал WAL и журнал растёт без
+    /// предела. По истечении предела вызов прерывается, клиент получает
+    /// внятную ошибку, а соединение возвращается в пул (там его чистит
+    /// существующая проверка в `Drop for PooledStorage`).
+    /// Отсутствует → 120; `0` → предел выключен. На слабой машине с базой на
+    /// медленном диске (полный `grep_code`, обход графа) можно поднять.
+    ///
+    /// ```toml
+    /// [mcp]
+    /// tool_timeout_sec = 300
+    /// ```
+    #[serde(default = "default_tool_timeout_sec")]
+    pub tool_timeout_sec: u64,
 }
 
 impl Default for McpSection {
@@ -248,12 +263,17 @@ impl Default for McpSection {
             mass_mode_tools: Vec::new(),
             dedup_enabled: default_dedup_enabled(),
             default_repo: None,
+            tool_timeout_sec: default_tool_timeout_sec(),
         }
     }
 }
 
 fn default_dedup_enabled() -> bool {
     true
+}
+
+fn default_tool_timeout_sec() -> u64 {
+    120
 }
 
 /// Секция `[cap]` из конфига демона — параметры стража размера выдачи
@@ -910,6 +930,35 @@ mod tests {
         let cfg = parse_str(text).unwrap();
         assert!(!cfg.mcp.dedup_enabled);
         assert!(cfg.mcp.mass_mode_tools.is_empty());
+    }
+
+    #[test]
+    fn mcp_tool_timeout_default_120() {
+        // Нет секции [mcp] → предел времени вызова инструмента 120 секунд.
+        let cfg: DaemonFileConfig = parse_str("").unwrap();
+        assert_eq!(cfg.mcp.tool_timeout_sec, 120);
+    }
+
+    #[test]
+    fn parses_mcp_tool_timeout_sec() {
+        // Предел задан явно — на слабой машине его поднимают.
+        let text = r#"
+            [mcp]
+            tool_timeout_sec = 300
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(cfg.mcp.tool_timeout_sec, 300);
+    }
+
+    #[test]
+    fn parses_mcp_tool_timeout_sec_zero_disables() {
+        // 0 — предел выключен: вызов по времени не прерывается.
+        let text = r#"
+            [mcp]
+            tool_timeout_sec = 0
+        "#;
+        let cfg = parse_str(text).unwrap();
+        assert_eq!(cfg.mcp.tool_timeout_sec, 0);
     }
 
     #[test]

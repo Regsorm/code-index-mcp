@@ -7,12 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResult, CustomRequest, CustomResult, ErrorCode,
+        CallToolRequestParams, CallToolResult, Content, CustomRequest, CustomResult, ErrorCode,
         Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
         Tool,
     },
@@ -458,6 +459,13 @@ pub struct CodeIndexServer {
     /// алиасов. Хранится в `Arc<Option<..>>`, чтобы разделяться клонами
     /// сервера на сессии.
     pub default_repo: Arc<Option<String>>,
+    /// Предел времени одного вызова инструмента из `daemon.toml
+    /// [mcp].tool_timeout_sec`. `None` — предел выключен (значение `0` в
+    /// конфиге). По истечении предела вызов прерывается, клиент получает
+    /// ошибку, а соединение возвращается в пул: иначе зависший обработчик
+    /// держит соединение (и открытое чтение базы) и не даёт демону схлопнуть
+    /// журнал WAL.
+    pub tool_timeout: Option<Duration>,
     /// In-process кэш результатов tool-вызовов (встроенная форма прокси
     /// mcp-cache-ci для ci-цепочки). Общий на все сессии (поле `Arc`, сервер
     /// клонируется на сессию). Кэшируются только LOCAL-репо (federation
@@ -492,6 +500,7 @@ impl CodeIndexServer {
             allowed_tools: Arc::new(None),
             mass_mode_tools: Arc::new(BTreeSet::new()),
             default_repo: Arc::new(None),
+            tool_timeout: Some(Duration::from_secs(120)),
             // TTL 3600с — подстраховка; основной механизм корректности —
             // инвалидация по scope от демона при переиндексации.
             cache: Arc::new(ServeCache::new(3600, true)),
@@ -523,6 +532,7 @@ impl CodeIndexServer {
             allowed_tools: Arc::new(None),
             mass_mode_tools: Arc::new(BTreeSet::new()),
             default_repo: Arc::new(None),
+            tool_timeout: Some(Duration::from_secs(120)),
             // TTL 3600с — подстраховка; основной механизм корректности —
             // инвалидация по scope от демона при переиндексации.
             cache: Arc::new(ServeCache::new(3600, true)),
@@ -571,6 +581,7 @@ impl CodeIndexServer {
             allowed_tools: Arc::new(None),
             mass_mode_tools: Arc::new(BTreeSet::new()),
             default_repo: Arc::new(None),
+            tool_timeout: Some(Duration::from_secs(120)),
             // TTL 3600с — подстраховка; основной механизм корректности —
             // инвалидация по scope от демона при переиндексации.
             cache: Arc::new(ServeCache::new(3600, true)),
@@ -780,6 +791,27 @@ impl CodeIndexServer {
             );
         }
         self.dedup = Arc::new(SessionDedup::new(enabled));
+        self
+    }
+
+    /// Применить предел времени одного вызова инструмента из `daemon.toml
+    /// [mcp].tool_timeout_sec`. `0` → предел выключен (вызов ждёт сколько
+    /// угодно). Предел нужен, чтобы зависший обработчик не держал соединение
+    /// пула и не мешал демону схлопнуть журнал WAL. Единственная точка
+    /// интеграции `[mcp]` для обеих веток serve.
+    pub fn apply_tool_timeout_sec(mut self, secs: u64) -> Self {
+        if secs == 0 {
+            tracing::info!(
+                "[mcp].tool_timeout_sec = 0 — предел времени вызова инструмента выключен"
+            );
+            self.tool_timeout = None;
+        } else {
+            tracing::info!(
+                "[mcp].tool_timeout_sec = {} — предел времени одного вызова инструмента",
+                secs
+            );
+            self.tool_timeout = Some(Duration::from_secs(secs));
+        }
         self
     }
 
@@ -2020,6 +2052,34 @@ impl CodeIndexServer {
             Err(_) => result,
         }
     }
+
+    /// Ответ клиенту, когда вызов инструмента не уложился в предел времени
+    /// (`[mcp].tool_timeout_sec`). В кэш такой ответ не кладём («maybe_cache» не
+    /// вызывается): ошибка не должна переиспользоваться между вызовами.
+    fn tool_timeout_result(
+        &self,
+        session_id: &Option<String>,
+        dedup_scope: &str,
+        limit: Duration,
+    ) -> Result<CallToolResult, ErrorData> {
+        let secs = limit.as_secs();
+        tracing::warn!(
+            scope = %dedup_scope,
+            secs,
+            "вызов инструмента прерван по пределу времени {} — соединение возвращено в пул",
+            secs
+        );
+        let text = format!(
+            "вызов не уложился в {} с и прерван; предел — `[mcp].tool_timeout_sec` в daemon.toml; \
+             повторите запрос уже, например с `path_glob`",
+            secs
+        );
+        self.finish(
+            session_id,
+            dedup_scope,
+            Ok(CallToolResult::error(vec![Content::text(text)])),
+        )
+    }
 }
 
 impl ServerHandler for CodeIndexServer {
@@ -2214,11 +2274,15 @@ impl ServerHandler for CodeIndexServer {
             let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
             // Метка выдачи — «инструмент|репо»: пул ведёт по ней учёт и называет
             // виновника затянувшегося соединения в журнале.
-            let r = crate::storage::pool::CHECKOUT_LABEL
-                .scope(dedup_scope.clone(), async {
-                    self.tool_router.call(tcc).await
-                })
-                .await;
+            let call = crate::storage::pool::CHECKOUT_LABEL.scope(dedup_scope.clone(), async {
+                self.tool_router.call(tcc).await
+            });
+            // Вызов под общим пределом времени: не уложился — прерываем и
+            // отвечаем ошибкой, соединение возвращается в пул.
+            let r = match with_tool_timeout(self.tool_timeout, call).await {
+                Ok(r) => r,
+                Err(limit) => return self.tool_timeout_result(&session_id, &dedup_scope, limit),
+            };
             self.maybe_cache(
                 &cache_key,
                 repo_opt.as_deref().unwrap_or(""),
@@ -2316,12 +2380,19 @@ impl ServerHandler for CodeIndexServer {
         // по отдельности не правится). Успешные ответы подсказку не получают.
         // Один scope на оба обращения к пулу: и `execute`, и `annotate_stale_index`
         // ходят в хранилище, поэтому метка выдачи должна охватывать их оба.
-        let value = crate::storage::pool::CHECKOUT_LABEL
-            .scope(dedup_scope.clone(), async {
+        let value = match with_tool_timeout(
+            self.tool_timeout,
+            crate::storage::pool::CHECKOUT_LABEL.scope(dedup_scope.clone(), async {
                 let value = ext.execute(args, ctx).await;
                 crate::mcp::tools::annotate_stale_index(value, storage, root_path).await
-            })
-            .await;
+            }),
+        )
+        .await
+        {
+            Ok(value) => value,
+            // Не уложился в предел — отвечаем ошибкой, соединение возвращается в пул.
+            Err(limit) => return self.tool_timeout_result(&session_id, &dedup_scope, limit),
+        };
         let r = Ok(CallToolResult::structured(value));
         self.maybe_cache(
             &cache_key,
@@ -2529,6 +2600,21 @@ fn extension_tool_to_rmcp(t: &dyn IndexTool) -> Tool {
     tool.description = Some(Cow::Owned(t.description().to_string()));
     tool.input_schema = Arc::new(schema_obj);
     tool
+}
+
+/// Обернуть будущее вызова инструмента общим пределом времени. `None` — ждём
+/// без ограничения (предел выключен конфигом), `Some(limit)` — по истечении
+/// предела возвращаем `Err(limit)`, не дожидаясь обработчика: клиент получает
+/// ошибку, а соединение из пула возвращается и очищается в `Drop for
+/// PooledStorage`.
+pub(crate) async fn with_tool_timeout<F: std::future::Future>(
+    limit: Option<Duration>,
+    fut: F,
+) -> Result<F::Output, Duration> {
+    match limit {
+        None => Ok(fut.await),
+        Some(limit) => tokio::time::timeout(limit, fut).await.map_err(|_| limit),
+    }
 }
 
 // ── Тесты заменяемой таблицы репозиториев ──────────────────────────────────
@@ -3417,5 +3503,45 @@ mod default_repo_tests {
             serde_json::Value::String("ut".to_string()),
         );
         assert!(repo_param_present(&Some(args)));
+    }
+}
+
+// ── Тесты предела времени на вызов инструмента ([mcp].tool_timeout_sec) ────
+
+#[cfg(test)]
+mod tool_timeout_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn expires_on_slow_future() {
+        let start = Instant::now();
+        let r = with_tool_timeout(Some(Duration::from_millis(50)), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            7
+        })
+        .await;
+        assert_eq!(r, Err(Duration::from_millis(50)));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "предел сработал раньше, чем завершилось будущее"
+        );
+    }
+
+    #[tokio::test]
+    async fn instant_future_yields_value() {
+        let r = with_tool_timeout(Some(Duration::from_millis(50)), async { 42 }).await;
+        assert_eq!(r, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn no_limit_waits_to_completion() {
+        // None — предел выключен: даже длинное будущее дожидается до конца.
+        let r = with_tool_timeout(None, async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            "готово"
+        })
+        .await;
+        assert_eq!(r, Ok("готово"));
     }
 }
