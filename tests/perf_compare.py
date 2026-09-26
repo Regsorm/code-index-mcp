@@ -7,7 +7,7 @@ parses the stage breakdown from the logs and prints a side-by-side table.
 With ``--daemon`` it additionally starts daemon+serve for both versions and
 measures two readiness milestones via MCP:
 
-* time until non-search tools answer (``get_stats`` stops reporting "indexing");
+* time until non-search tools answer (``get_function`` stops reporting "indexing");
 * time until ``search_function`` returns a result list (full-text search ready).
 
 Examples:
@@ -334,7 +334,14 @@ def daemon_readiness(
                 return "ready"
             if isinstance(value, dict):
                 status = value.get("status")
-                if status in ("indexing", "not_started", "error", "daemon_offline"):
+                if status in (
+                    "indexing",
+                    "not_started",
+                    "error",
+                    "daemon_offline",
+                    "unknown_repo",
+                    "federation_error",
+                ):
                     return str(status)
                 error = value.get("error")
                 if isinstance(error, str) and error:
@@ -344,7 +351,7 @@ def daemon_readiness(
                 return "ready"
             return "other"
 
-        def probe(name: str, args: dict, deadline: float) -> None:
+        def probe(name: str, args: dict, deadline: float) -> bool:
             rid = 100
             last_kind = ""
             while time.monotonic() < deadline:
@@ -368,23 +375,31 @@ def daemon_readiness(
                     )
                     last_kind = kind
                 if kind == "ready":
-                    return
+                    return True
                 time.sleep(2)
+            print(f"    t={time.monotonic() - started:6.1f}s {name}: timeout", flush=True)
+            return False
 
         # tools ready: gated only by path status (core index done)
-        probe(
+        tools_ok = probe(
             "get_function",
             {"repo": "perf", "name": "ОбработкаПроведения"},
             time.monotonic() + timeout,
         )
-        result["tools_ready_s"] = round(time.monotonic() - started, 1)
+        result["tools_ready_s"] = round(time.monotonic() - started, 1) if tools_ok else None
         # search ready: gated additionally by the deferred FTS build
-        probe(
+        search_ok = probe(
             "search_function",
             {"repo": "perf", "query": "ОбработкаПроведения"},
             time.monotonic() + timeout,
         )
-        result["search_ready_s"] = round(time.monotonic() - started, 1)
+        result["search_ready_s"] = round(time.monotonic() - started, 1) if search_ok else None
+        if not tools_ok or not search_ok:
+            result["timed_out"] = [
+                name
+                for name, ok in (("get_function", tools_ok), ("search_function", search_ok))
+                if not ok
+            ]
         result["samples"] = samples
         return result
     finally:
@@ -540,8 +555,8 @@ def main() -> int:
             result = daemon_readiness(binary, repo, args.timeout, acc)
             report.setdefault("daemon", {})[version] = result
             print(
-                f"  tools_ready={result.get('tools_ready_s')}s "
-                f"search_ready={result.get('search_ready_s')}s",
+                f"  tools_ready={fmt(result.get('tools_ready_s'))} "
+                f"search_ready={fmt(result.get('search_ready_s'))}",
                 flush=True,
             )
         base = report["daemon"].get("baseline", {})
