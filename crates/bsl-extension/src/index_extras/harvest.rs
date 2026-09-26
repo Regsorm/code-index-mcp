@@ -93,73 +93,81 @@ impl XmlHarvest {
     /// каждая фаза по отдельности (раньше каждая ещё и логировала — теперь
     /// предупреждение одно на файл).
     pub(crate) fn build(scan: &RepoScan) -> Self {
-        let mut objects: Vec<ObjectXmlEntry> = Vec::with_capacity(scan.root_xmls.len());
-        for path in &scan.root_xmls {
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let folder = path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let (header, synonym) = match parse_object_header_xml(&content) {
-                Some((mt, nm, syn)) => (Some((mt, nm)), syn),
-                None => (None, None),
-            };
-            let structured = OBJECT_FOLDERS.iter().any(|(f, _)| *f == folder);
+        // Файлы независимы, поэтому разбор раскидывается по ядрам; `par_iter`
+        // с `collect` сохраняет порядок входного списка — он важен для base-first
+        // приоритета синонимов и слияния структур.
+        use rayon::prelude::*;
 
-            let (structure, edges) = if structured {
-                let structure = match parse_object_structure_content(path, &content) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        tracing::warn!("object_attributes: {}: {}", path.display(), e);
-                        None
-                    }
+        let objects: Vec<ObjectXmlEntry> = scan
+            .root_xmls
+            .par_iter()
+            .filter_map(|path| {
+                let content = std::fs::read_to_string(path).ok()?;
+                let folder = path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let (header, synonym) = match parse_object_header_xml(&content) {
+                    Some((mt, nm, syn)) => (Some((mt, nm)), syn),
+                    None => (None, None),
                 };
-                let edges = match parse_object_attributes_xml(&content) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::warn!("data_links: {}: {}", path.display(), e);
-                        Vec::new()
-                    }
+                let structured = OBJECT_FOLDERS.iter().any(|(f, _)| *f == folder);
+
+                let (structure, edges) = if structured {
+                    let structure = match parse_object_structure_content(path, &content) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            tracing::warn!("object_attributes: {}: {}", path.display(), e);
+                            None
+                        }
+                    };
+                    let edges = match parse_object_attributes_xml(&content) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!("data_links: {}: {}", path.display(), e);
+                            Vec::new()
+                        }
+                    };
+                    (structure, edges)
+                } else {
+                    (None, Vec::new())
                 };
-                (structure, edges)
-            } else {
-                (None, Vec::new())
-            };
 
-            objects.push(ObjectXmlEntry {
-                path: path.clone(),
-                folder,
-                stem,
-                header,
-                synonym,
-                structured,
-                structure,
-                edges,
-                uuid: extract_object_uuid_from_str(&content),
-                command_uuids: extract_all_command_uuids_from_str(&content),
-            });
-        }
+                Some(ObjectXmlEntry {
+                    path: path.clone(),
+                    folder,
+                    stem,
+                    header,
+                    synonym,
+                    structured,
+                    structure,
+                    edges,
+                    uuid: extract_object_uuid_from_str(&content),
+                    command_uuids: extract_all_command_uuids_from_str(&content),
+                })
+            })
+            .collect();
 
-        let mut form_descriptor_uuids: HashMap<PathBuf, String> = HashMap::new();
-        for path in &scan.form_descriptors {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Some(uuid) = extract_form_uuid_any_from_str(&content) {
-                    if !uuid.is_empty() {
-                        form_descriptor_uuids.insert(path.clone(), uuid);
-                    }
+        let form_descriptor_uuids: HashMap<PathBuf, String> = scan
+            .form_descriptors
+            .par_iter()
+            .filter_map(|path| {
+                let content = std::fs::read_to_string(path).ok()?;
+                let uuid = extract_form_uuid_any_from_str(&content)?;
+                if uuid.is_empty() {
+                    None
+                } else {
+                    Some((path.clone(), uuid))
                 }
-            }
-        }
+            })
+            .collect();
 
         Self {
             objects,

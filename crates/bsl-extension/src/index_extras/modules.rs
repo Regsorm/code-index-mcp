@@ -94,32 +94,53 @@ pub(crate) fn index_metadata_modules(
         params![REPO_DEFAULT],
     )?;
     let mut total: usize = 0;
-    let mut skipped: usize = 0;
-    // Кэш описей выгрузки на весь проход: `build_module_row` берёт из него
-    // версию модуля, не перечитывая опись для каждого .bsl.
-    let mut cfgver_cache: std::collections::HashMap<
+    // Версии модулей: по одному разбору ConfigDumpInfo.xml на область ЗАРАНЕЕ.
+    // Так параллельный проход не делит общий изменяемый кэш: каждый поток
+    // читает готовую карту своей области.
+    let mut versions_by_sub_root: std::collections::HashMap<
         std::path::PathBuf,
         std::collections::HashMap<String, String>,
     > = std::collections::HashMap::new();
-
     for sub_root in &sub_configs {
-        // Модули области уже отобраны единым обходом (`scan.rs`).
-        for path in scan.files_of(&scan.bsl_files, sub_root) {
+        let versions = parse_config_dump_info(sub_root).unwrap_or_else(|e| {
+            tracing::warn!(
+                "ConfigDumpInfo {}: {} — версия модуля не определена",
+                sub_root.display(),
+                e
+            );
+            Default::default()
+        });
+        versions_by_sub_root.insert(sub_root.clone(), versions);
+    }
+
+    // Файлы всех областей — плоский список пар (область, путь): строки
+    // собираются параллельно, вставка серийная (SQLite — один писатель).
+    let pairs: Vec<(&std::path::PathBuf, &std::path::PathBuf)> = sub_configs
+        .iter()
+        .flat_map(|sub_root| {
+            scan.files_of(&scan.bsl_files, sub_root)
+                .map(move |path| (sub_root, path))
+        })
+        .collect();
+    use rayon::prelude::*;
+    let empty_versions = std::collections::HashMap::new();
+    let rows: Vec<Option<ModuleRow>> = pairs
+        .par_iter()
+        .map(|(sub_root, path)| {
+            let versions = versions_by_sub_root
+                .get(*sub_root)
+                .unwrap_or(&empty_versions);
             // Строку собирает тот же хелпер, что и пофайловая ветка инкремента.
-            // Раньше здесь лежала своя копия той же логики (классификация типа,
-            // поиск владельца, чтение идентификатора), и правка одной стороны не
-            // действовала во второй — так модули команд объектов остались бы вне
-            // перечня даже после исправления разбора их пути (E-7).
-            let row = match build_module_row(repo_root, path, &mut cfgver_cache, Some(&ids)) {
-                Some(r) => r,
-                None => {
-                    skipped += 1;
-                    continue;
-                }
-            };
-            insert_module_row(conn, &row)?;
-            total += 1;
-        }
+            // Раньше здесь лежала своя копия той же логики, и правка одной
+            // стороны не действовала во второй (E-7).
+            build_module_row_prefilled(repo_root, path, versions, Some(&ids))
+        })
+        .collect();
+
+    let skipped = rows.iter().filter(|r| r.is_none()).count();
+    for row in rows.into_iter().flatten() {
+        insert_module_row(conn, &row)?;
+        total += 1;
     }
     conn.execute("COMMIT", [])?;
 
@@ -167,6 +188,33 @@ pub(crate) fn build_module_row(
         std::collections::HashMap<String, String>,
     >,
     ids: Option<&XmlIdCache>,
+) -> Option<ModuleRow> {
+    build_module_row_with(repo_root, bsl_path, ids, None, Some(cfgver_cache))
+}
+
+/// Как [`build_module_row`], но версии берутся из ГОТОВОЙ карты области
+/// (`versions` — уже разобранный `ConfigDumpInfo.xml`): нужно параллельному
+/// проходу полной индексации, где общий изменяемый кэш невозможен.
+pub(crate) fn build_module_row_prefilled(
+    repo_root: &Path,
+    bsl_path: &Path,
+    versions: &std::collections::HashMap<String, String>,
+    ids: Option<&XmlIdCache>,
+) -> Option<ModuleRow> {
+    build_module_row_with(repo_root, bsl_path, ids, Some(versions), None)
+}
+
+fn build_module_row_with(
+    repo_root: &Path,
+    bsl_path: &Path,
+    ids: Option<&XmlIdCache>,
+    versions_ready: Option<&std::collections::HashMap<String, String>>,
+    cfgver_cache: Option<
+        &mut std::collections::HashMap<
+            std::path::PathBuf,
+            std::collections::HashMap<String, String>,
+        >,
+    >,
 ) -> Option<ModuleRow> {
     let file_name = bsl_path.file_name().and_then(|n| n.to_str())?;
     let module_type = module_type_by_filename(file_name)?;
@@ -222,17 +270,23 @@ pub(crate) fn build_module_row(
     let sub_root =
         sub_root_for_path(repo_root, bsl_path).unwrap_or_else(|| repo_root.to_path_buf());
     let extension_name = compute_extension_name(repo_root, &sub_root);
-    let config_versions = cfgver_cache.entry(sub_root.clone()).or_insert_with(|| {
-        parse_config_dump_info(&sub_root).unwrap_or_else(|e| {
-            tracing::warn!(
-                "ConfigDumpInfo {}: {} — версия модуля не определена",
-                sub_root.display(),
-                e
-            );
-            Default::default()
-        })
-    });
-    let config_version = config_versions.get(&object_id).cloned();
+    let config_version = match versions_ready {
+        Some(v) => v.get(&object_id).cloned(),
+        None => {
+            let cache = cfgver_cache.expect("build_module_row_with: versions или cache");
+            let map = cache.entry(sub_root.clone()).or_insert_with(|| {
+                parse_config_dump_info(&sub_root).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "ConfigDumpInfo {}: {} — версия модуля не определена",
+                        sub_root.display(),
+                        e
+                    );
+                    Default::default()
+                })
+            });
+            map.get(&object_id).cloned()
+        }
+    };
     let full_name = format!("{}.{}", object_name, effective_type);
     let code_path = bsl_path
         .strip_prefix(repo_root)

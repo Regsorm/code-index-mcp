@@ -189,6 +189,7 @@ dependencies = [
  "clap",
  "code-index-core",
  "quick-xml",
+ "rayon",
  "reqwest",
  "rusqlite",
  "serde",

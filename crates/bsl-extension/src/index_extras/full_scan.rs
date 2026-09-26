@@ -624,35 +624,42 @@ pub(crate) fn index_metadata_code_usages(
          VALUES (?, ?, ?, ?, ?, ?, ?)",
     )?;
 
-    let mut total: usize = 0;
-    let mut files: usize = 0;
+    // Файлы независимы: чтение и regex-разбор (CPU) — параллельно, вставка —
+    // серийно. На 13 тыс. модулей это убирает десятки секунд с пути
+    // восстановления после обрыва (когда parse-collector уже не поможет).
+    use rayon::prelude::*;
     let filter = DirFilter::load(repo_root);
-    for entry in WalkDir::new(repo_root)
+    let bsl_paths: Vec<std::path::PathBuf> = WalkDir::new(repo_root)
         .into_iter()
         .filter_entry(|e| filter.allows(e))
         .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let is_bsl = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("bsl"))
-            == Some(true);
-        if !is_bsl {
-            continue;
-        }
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue, // не UTF-8 / нечитаемый — пропуск
-        };
-        let usages = extract_code_usages(&content);
-        if usages.is_empty() {
-            continue;
-        }
-        let rel = rel_path(repo_root, path);
+        .filter(|e| {
+            e.file_type().is_file()
+                && e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("bsl"))
+                    == Some(true)
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    let parsed: Vec<(String, Vec<crate::code_usages::CodeUsage>)> = bsl_paths
+        .par_iter()
+        .filter_map(|path| {
+            let content = std::fs::read_to_string(path).ok()?; // не UTF-8 — пропуск
+            let usages = extract_code_usages(&content);
+            if usages.is_empty() {
+                None
+            } else {
+                Some((rel_path(repo_root, path), usages))
+            }
+        })
+        .collect();
+
+    let mut total: usize = 0;
+    let mut files: usize = 0;
+    for (rel, usages) in &parsed {
         files += 1;
         for u in usages {
             stmt.execute(params![
@@ -661,7 +668,7 @@ pub(crate) fn index_metadata_code_usages(
                 &u.object_ref_key,
                 &u.member_path,
                 u.usage_kind,
-                &rel,
+                rel,
                 u.line as i64,
             ])?;
             total += 1;
@@ -895,6 +902,51 @@ pub(crate) fn index_procedure_terms(repo_root: &Path, conn: &rusqlite::Connectio
         rows.flatten().collect()
     };
 
+    // Группы процедур по файлу: `procs` отсортирован по path, поэтому границы
+    // файлов — это соседние различающиеся пути. Разбор комментариев и терминов
+    // по файлам независим — раскладываем на ядра; вставка серийная.
+    use rayon::prelude::*;
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for (i, (path, _, _)) in procs.iter().enumerate() {
+        match groups.last_mut() {
+            Some(last) if procs[last.0].0 == *path => last.1 = i + 1,
+            _ => groups.push((i, i + 1)),
+        }
+    }
+    let rows: Vec<(String, String)> = groups
+        .par_iter()
+        .flat_map_iter(|&(start, end)| {
+            let path = procs[start].0.as_str();
+            // Один read на файл: строки нужны для комментария над процедурой.
+            let lines: Vec<String> =
+                std::fs::read_to_string(repo_root.join(path.replace('\\', "/")))
+                    .map(|c| c.lines().map(String::from).collect())
+                    .unwrap_or_default();
+            let object = object_from_module_path(path);
+            let synonym = object
+                .as_ref()
+                .and_then(|(mt, nm)| syn.get(&format!("{}.{}", mt, nm)))
+                .cloned();
+            procs[start..end]
+                .iter()
+                .filter_map(|(_, name, line_start)| {
+                    let comment = extract_leading_comment(&lines, (*line_start).max(0) as usize);
+                    let terms = build_terms(
+                        name,
+                        object.as_ref().map(|(_, nm)| nm.as_str()),
+                        synonym.as_deref(),
+                        comment.as_deref(),
+                    );
+                    if terms.is_empty() {
+                        None
+                    } else {
+                        Some((format!("{}::{}", path, name), terms))
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -911,32 +963,8 @@ pub(crate) fn index_procedure_terms(repo_root: &Path, conn: &rusqlite::Connectio
          VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(repo, proc_key) DO NOTHING",
     )?;
 
-    let mut cur_path = String::new();
-    let mut lines: Vec<String> = Vec::new();
     let mut filled = 0usize;
-    for (path, name, line_start) in &procs {
-        if *path != cur_path {
-            cur_path = path.clone();
-            lines = std::fs::read_to_string(repo_root.join(path.replace('\\', "/")))
-                .map(|c| c.lines().map(String::from).collect())
-                .unwrap_or_default();
-        }
-        let comment = extract_leading_comment(&lines, (*line_start).max(0) as usize);
-        let object = object_from_module_path(path);
-        let synonym = object
-            .as_ref()
-            .and_then(|(mt, nm)| syn.get(&format!("{}.{}", mt, nm)))
-            .map(String::as_str);
-        let terms = build_terms(
-            name,
-            object.as_ref().map(|(_, nm)| nm.as_str()),
-            synonym,
-            comment.as_deref(),
-        );
-        if terms.is_empty() {
-            continue;
-        }
-        let proc_key = format!("{}::{}", path, name);
+    for (proc_key, terms) in &rows {
         filled += ins.execute(params![REPO_DEFAULT, proc_key, terms, MECH_SIGNATURE, now])?;
     }
     drop(ins);
@@ -1065,8 +1093,34 @@ pub(crate) fn index_metadata_forms(scan: &RepoScan, conn: &rusqlite::Connection)
     // Ищем `Form.xml` в любом дочернем `Forms/<Name>/[Ext/]Form.xml`.
     // Имя владельца восстанавливается из пути: ищем сегмент под
     // `Forms/`, значит путь выглядит как `<...>/<MetaType>/<OwnerName>/Forms/<FormName>/...Form.xml`.
-    // Список файлов уже собран единым обходом (`scan.rs`).
+    // Список файлов уже собран единым обходом (`scan.rs`). Разбор независимых
+    // файлов — параллельно, запись — серийно.
     let repo_root = &scan.repo_root;
+    use rayon::prelude::*;
+    let entries: Vec<(String, String, String)> = scan
+        .form_xmls
+        .par_iter()
+        .filter_map(|path| {
+            // Path: .../<MetaType>/<OwnerName>/Forms/<FormName>/[Ext/]Form.xml
+            let (owner_full, form_name) = decode_form_path(repo_root, path)?;
+            let handlers = match parse_form_file(path) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("parse_form_file({}): {}", path.display(), e);
+                    return None;
+                }
+            };
+            let handlers_json = match crate::xml::forms::handlers_to_json(&handlers) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::warn!("handlers_to_json({}): {}", path.display(), e);
+                    return None;
+                }
+            };
+            Some((owner_full, form_name, handlers_json))
+        })
+        .collect();
+
     let mut count = 0usize;
     let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
     conn.execute("BEGIN", [])?;
@@ -1083,20 +1137,7 @@ pub(crate) fn index_metadata_forms(scan: &RepoScan, conn: &rusqlite::Connection)
          VALUES (?, ?, ?, ?)",
     )?;
 
-    for path in &scan.form_xmls {
-        // Path: .../<MetaType>/<OwnerName>/Forms/<FormName>/[Ext/]Form.xml
-        let (owner_full, form_name) = match decode_form_path(repo_root, path) {
-            Some(t) => t,
-            None => continue,
-        };
-        let handlers = match parse_form_file(path) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!("parse_form_file({}): {}", path.display(), e);
-                continue;
-            }
-        };
-        let handlers_json = crate::xml::forms::handlers_to_json(&handlers)?;
+    for (owner_full, form_name, handlers_json) in entries {
         stmt.execute(params![
             REPO_DEFAULT,
             &owner_full,
@@ -1135,16 +1176,17 @@ pub(crate) fn index_metadata_forms(scan: &RepoScan, conn: &rusqlite::Connection)
 /// `index_metadata_objects` — та чистит весь перечень репо целиком.
 pub(crate) fn index_object_templates(scan: &RepoScan, conn: &rusqlite::Connection) -> Result<()> {
     let repo_root = &scan.repo_root;
-    let mut rows: Vec<TemplateRow> = Vec::new();
     // Список описаний макетов уже собран единым обходом: это XML, лежащий
     // ПРЯМО в папке `Templates` (`<...>/<ПапкаВида>/<Объект>/Templates/<Имя>.xml`).
     // Всё остальное внутри (`<Имя>/Ext/Template.xml` — само содержимое) обход
-    // в эту категорию не относит.
-    for path in &scan.template_descriptors {
-        if let Some(row) = template_row_from_path(repo_root, path) {
-            rows.push(row);
-        }
-    }
+    // в эту категорию не относит. Файлы независимы — разбираем параллельно,
+    // пишем серийно (SQLite — один писатель).
+    use rayon::prelude::*;
+    let rows: Vec<TemplateRow> = scan
+        .template_descriptors
+        .par_iter()
+        .filter_map(|path| template_row_from_path(repo_root, path))
+        .collect();
 
     let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
     conn.execute("BEGIN", [])?;
