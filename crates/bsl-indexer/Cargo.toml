@@ -16,7 +16,7 @@ path = "src/main.rs"
 # Cargo features. Прокидываются в bsl-extension. Базовая сборка без
 # features валидна — `bsl-indexer enrich` тогда возвращает понятную
 # ошибку «фича не собрана». CI (этап 7-8) собирает релизный артефакт
-# с `--features enrichment[,embeddings]`.
+# с `--features enrichment`.
 [features]
 default = []
 enrichment = ["bsl-extension/enrichment"]

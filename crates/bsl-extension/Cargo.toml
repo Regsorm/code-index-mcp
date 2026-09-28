@@ -12,9 +12,8 @@ path = "src/lib.rs"
 
 # Cargo features. По умолчанию включены только базовые XML-парсеры,
 # schema_extensions, index_extras и MCP-tools. Опциональные фичи —
-# `enrichment` (LLM-обогащение процедур терминами для FTS-поиска)
-# и в будущем `embeddings` (этап 5b) — включаются на сборке
-# `bsl-indexer` под флагом `--features enrichment[,embeddings]`.
+# `enrichment` (LLM-обогащение процедур терминами для FTS-поиска) —
+# включается на сборке `bsl-indexer` под флагом `--features enrichment`.
 #
 # Без feature `enrichment` сама таблица procedure_enrichment всё равно
 # создаётся (она занимает 0 байт пока пуста) и MCP-tool `search_terms`
