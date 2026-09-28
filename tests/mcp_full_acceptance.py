@@ -156,7 +156,14 @@ def mcp_list_tools(url: str, session: str) -> list[dict[str, Any]]:
     return list(reply["result"]["tools"])
 
 
-def mcp_call(url: str, session: str, name: str, args: dict[str, Any], request_id: int) -> tuple[Any, int, str | None]:
+def mcp_call(
+    url: str,
+    session: str,
+    name: str,
+    args: dict[str, Any],
+    request_id: int,
+    timeout: float = 180.0,
+) -> tuple[Any, int, str | None]:
     try:
         reply, _ = mcp_post(
             url,
@@ -167,6 +174,7 @@ def mcp_call(url: str, session: str, name: str, args: dict[str, Any], request_id
                 "params": {"name": name, "arguments": args},
             },
             session,
+            timeout,
         )
     except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
         return None, 0, f"transport: {exc}"

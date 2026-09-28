@@ -5,10 +5,12 @@ runs a full fresh index on the same repository for each of them several times,
 parses the stage breakdown from the logs and prints a side-by-side table.
 
 With ``--daemon`` it additionally starts daemon+serve for both versions and
-measures two readiness milestones via MCP:
+measures readiness milestones and the first-edit latency via MCP:
 
 * time until non-search tools answer (``get_function`` stops reporting "indexing");
-* time until ``search_function`` returns a result list (full-text search ready).
+* time until ``search_function`` returns a result list (full-text search ready);
+* time from editing one ``.bsl`` file to the call graph serving the new edge
+  (path status is ready again and ``find_path_bsl`` sees the new pair).
 
 Examples:
     python tests/perf_compare.py --repo tests/cf --runs 2
@@ -23,6 +25,7 @@ import importlib.util
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import statistics
@@ -248,23 +251,75 @@ def load_acceptance():
     return module
 
 
+def binary_version(binary: Path) -> str | None:
+    """First line of ``binary --version``; ``None`` when it cannot be read."""
+    try:
+        out = subprocess.run(
+            [str(binary), "--version"], capture_output=True, text=True, timeout=30
+        )
+    except Exception:  # noqa: BLE001 - провенанс не должен ронять замер
+        return None
+    if out.returncode != 0:
+        return None
+    lines = out.stdout.strip().splitlines()
+    return lines[0] if lines else None
+
+
+def git_rev(ref: str) -> str | None:
+    """Short commit hash of ``ref``; ``+dirty`` when the tree has changes."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", ref],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        rev = out.stdout.strip()
+    except Exception:  # noqa: BLE001 - провенанс не должен ронять замер
+        return None
+    # Сбой проверки дерева не должен терять уже полученный хэш.
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        return rev
+    return rev + ("+dirty" if status.stdout.strip() else "")
+
+
 def stop_process(proc: subprocess.Popen | None) -> None:
     if proc is None or proc.poll() is not None:
         return
     # taskkill /T on Windows: a serve process with an open MCP session may
     # ignore terminate while it waits on a blocking tool call.
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-            capture_output=True,
-            check=False,
-        )
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # CreateProcess может отказать (антивирус, лимиты) или taskkill
+            # зависнуть — не роняем прогон: ниже процесс добивается по PID.
+            pass
     else:
         proc.terminate()
     try:
         proc.wait(timeout=20)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def daemon_readiness(
@@ -282,6 +337,9 @@ def daemon_readiness(
     # Процессы по имени образа не гасим: под `taskkill /IM` попадают и рабочие
     # демон с выдачей. Свои процессы останавливает `stop_process` по PID, а
     # остаток прошлого прогона, держащий репозиторий, поймает `wipe_index`.
+    # Режим хранилища не подменяем: `auto` остаётся как есть. К открытию
+    # extras-гейта in-memory база уже сброшена и переоткрыта на диске, поэтому
+    # метрика первой правки меряется в обоих режимах (см. `first_edit_scenario`).
     wipe_index(repo)
     home = Path(tempfile.mkdtemp(prefix="perf-daemon-"))
     (home / "daemon.toml").write_text(
@@ -299,9 +357,18 @@ def daemon_readiness(
     env = os.environ.copy()
     env["CODE_INDEX_HOME"] = str(home)
     env["RUST_LOG"] = "info"
+    # На Windows `daemon run` сам себя детлешит (`DETACHED_PROCESS`) и выходит:
+    # Popen остаётся лишь launcher'ом, убивать по его PID некого, а detached-клон
+    # держит `.code-index` и переживает `stop_process` — следующий прогон тогда
+    # честно отказывается стирать занятый индекс. Флаг оставляет демон прямым
+    # потомком, и `stop_process` снимает ровно СВОЙ процесс (замечание к PR #12:
+    # чужие `bsl-indexer` по имени образа не гасим).
+    env["CODE_INDEX_DAEMON_DETACHED"] = "1"
 
     daemon = None
     serve = None
+    daemon_log = None
+    serve_log = None
     result: dict[str, Any] = {}
     samples: list[dict[str, Any]] = []
     try:
@@ -348,8 +415,8 @@ def daemon_readiness(
         url = f"http://127.0.0.1:{port}/mcp"
         session = acc.mcp_connect(url)
 
-        def call(name: str, args: dict, rid: int) -> Any:
-            value, _, error = acc.mcp_call(url, session, name, args, rid)
+        def call(name: str, args: dict, rid: int, call_timeout: float = 30.0) -> Any:
+            value, _, error = acc.mcp_call(url, session, name, args, rid, call_timeout)
             if error:
                 return None
             return acc.unwrap(value)
@@ -431,12 +498,426 @@ def daemon_readiness(
                 for name, ok in (("get_function", tools_ok), ("search_function", search_ok))
                 if not ok
             ]
+        # First edit after start: the watch path must make new code visible in
+        # the call graph — see `first_edit_scenario`. A harness bug here must not
+        # sink the whole run, so the scenario is guarded and reported as an error.
+        partial: dict[str, Any] = {}
+        try:
+            result.update(
+                first_edit_scenario(
+                    repo, call, started, timeout, samples, home / "daemon.log", partial
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - диагностика важнее строгости
+            # Частичный результат сценария не теряем: target/restored/storage_mode
+            # остаются в отчёте, даже если сценарий упал на середине.
+            result.update(partial)
+            result.setdefault("first_edit_s", None)
+            result["first_edit_error"] = str(exc)
+        if result.get("first_edit_timed_out"):
+            result.setdefault("timed_out", []).append("first_edit")
+        if result.get("first_edit_s") is None:
+            reason = (
+                result.get("first_edit_skip")
+                or result.get("first_edit_error")
+                or "timeout"
+            )
+            if result.get("first_edit_skip"):
+                # Ожидаемый пропуск (in-memory база, нет .bsl) — без хвоста лога.
+                print(f"    first edit metric skipped: {reason}", flush=True)
+            else:
+                print(f"    first edit metric failed: {reason}", flush=True)
+                tail = read_log_tail(home / "daemon.log", 15)
+                if tail:
+                    print("    daemon.log tail:", flush=True)
+                    print(tail, flush=True)
         result["samples"] = samples
         return result
     finally:
         stop_process(serve)
         stop_process(daemon)
+        # Хендлы журналов держат каталог на Windows: без закрытия `rmtree`
+        # молча ничего не удаляет (накопилось 29 каталогов perf-daemon-*).
+        for handle in (serve_log, daemon_log):
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
         shutil.rmtree(home, ignore_errors=True)
+
+
+def read_log_tail(path: Path, lines: int) -> str:
+    """Last lines of a log file, indented for printing; empty on read failure."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(f"      {line}" for line in text[-lines:])
+
+
+def daemon_storage_mode(log_path: Path) -> str | None:
+    """Storage mode the daemon planned for the new database (``disk``/``memory``).
+
+    Read from the log line `новая база — режим хранилища: …` (v1.8.0+). The
+    benchmark leaves `auto` as is and does not skip either mode: by the time the
+    extras gate opens, an in-memory database has already been flushed and
+    reopened on disk, so the first edit is measured on the same disk-backed
+    service. The field is informational.
+    """
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"новая база — режим хранилища: (на диске|в оперативной памяти)", text)
+    if not match:
+        return None
+    return "disk" if match.group(1) == "на диске" else "memory"
+
+
+def log_size(path: Path) -> int:
+    """Current byte size of a log file (0 when it does not exist yet)."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def read_log_slice(path: Path, offset: int) -> str:
+    """Log text written after ``offset``; empty on read failure."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def wait_for_log_marker(log_path: Path, marker: str, deadline: float) -> bool:
+    """Wait until ``marker`` appears in the log; ``False`` on timeout."""
+    while time.monotonic() < deadline:
+        try:
+            if marker in log_path.read_text(encoding="utf-8", errors="replace"):
+                return True
+        except OSError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def graph_phase_seconds(text: str) -> float | None:
+    """Seconds of the FIRST ``этап N  граф вызовов`` block in a log slice.
+
+    The slice starts right before the marker write, so the first block is the
+    batch that ADDED the marker; the restore batch is logged later and is not in
+    the slice. The stage number is positional, so it is not pinned.
+    This is the phase that regressed in 1.8.0 (full scan of ``proc_call_graph``
+    on every edit); the wall-clock MCP milestone is dominated by the watcher
+    scheduler, so the phase time is the precise regression signal.
+    """
+    stage_re = re.compile(r"этап\s+\d+\s+граф вызовов\s")
+    for line in text.splitlines():
+        if not stage_re.search(line):
+            continue
+        duration = parse_duration(line)
+        if duration is not None:
+            return duration
+    return None
+
+
+def strip_perf_edit_markers(raw: bytes) -> bytes:
+    """Remove ``PerfEdit...`` procedures left in the file by an aborted run.
+
+    The scenario repairs the target before measuring and verifies the bytes
+    after restore, so a killed run cannot turn into the "original" baseline.
+    """
+    text = raw.decode("utf-8", errors="surrogateescape")
+    # Удаляем ровно ту пару процедур, которую дописывает сценарий
+    # (PerfEditCaller<8 hex> + PerfEditCallee<8 hex>), и не трогаем остальные
+    # байты файла — прежняя версия нормализовала хвост переводами строк.
+    marker = re.compile(
+        r"\n\nПроцедура (PerfEditCaller[0-9a-f]{8})\(\) Экспорт\r?\n"
+        r"    (PerfEditCallee[0-9a-f]{8})\(\);\r?\n"
+        r"КонецПроцедуры\r?\n\r?\n"
+        r"Процедура \2\(\) Экспорт\r?\n"
+        r"КонецПроцедуры\r?\n"
+    )
+    return marker.sub("", text).encode("utf-8", errors="surrogateescape")
+
+
+def function_present(value: Any, name: str) -> bool:
+    """Is the procedure ``name`` present in a ``get_function`` answer?"""
+    if isinstance(value, list):
+        return any(isinstance(x, dict) and x.get("name") == name for x in value)
+    if isinstance(value, dict):
+        inner = value.get("result")
+        if isinstance(inner, list):
+            return any(isinstance(x, dict) and x.get("name") == name for x in inner)
+        # Без списка в ``result`` присутствие не подтвердить: подстрочный поиск
+        # по JSON ловил имя в тексте ошибки.
+        return False
+    return False
+
+
+def repo_path_status(health: Any, alias: str) -> str | None:
+    """Path status of one repo alias from a ``health`` answer."""
+    if not isinstance(health, dict):
+        return None
+    for item in health.get("repos") or []:
+        if isinstance(item, dict) and item.get("repo") == alias:
+            status = (item.get("path_status") or {}).get("status")
+            return str(status) if status else None
+    return None
+
+
+def first_edit_scenario(
+    repo: Path,
+    call: Any,
+    started: float,
+    timeout: float,
+    samples: list[dict[str, Any]],
+    log_path: Path,
+    out: dict[str, Any],
+) -> dict[str, Any]:
+    """First edit after daemon start: seconds until the graph serves the new edge.
+
+    One ``.bsl`` file gets a unique caller/callee pair appended; the milestone is
+    the moment both hold: the path status is ``ready`` again (in 1.8.x this covers
+    ``reindexing_extras``, i.e. the add-on rebuild) and ``find_path_bsl`` returns
+    the new pair. The graph phase of the ADD batch is parsed from the log slice
+    taken before the marker write. This is the scenario that regressed in 1.8.0,
+    when the partial call-type index stopped serving the layer deletes and the
+    first edit waited for a full scan of ``proc_call_graph`` on a cold database.
+    """
+    candidates: list[tuple[str, Path]] = []
+    # `out` живёт у вызывающего: частичный результат переживает исключение.
+    result = out
+    mode = daemon_storage_mode(log_path)
+    if mode is not None:
+        result["first_edit_storage_mode"] = mode
+    # Режим хранилища не подменяем и не блокируем замер: к моменту открытия
+    # extras-гейта in-memory база уже сброшена и переоткрыта на диске
+    # (прогрессивный Ready для памяти не выставляется), так что правка меряется
+    # по той же дисковой базе, что и обычно.
+    # A folder is declared ready for non-search tools before the add-on layer is
+    # finished (progressive readiness), and an edit in that window is not seen by
+    # the watcher at all (verified: the marker never reached functions/calls/
+    # proc_call_graph). Wait for the extras gate to open, then measure the first
+    # edit of a fully ready folder.
+    probe = "PerfProbeNoSuchProcedure"
+    extras_deadline = time.monotonic() + min(timeout, 1200.0)
+    rid = 400
+    unavailable = 0
+    while time.monotonic() < extras_deadline:
+        value = call(
+            "find_path_bsl",
+            {"repo": "perf", "from": probe, "to": probe, "_poll": rid},
+            rid,
+        )
+        rid += 1
+        if isinstance(value, dict) and "found" in value:
+            result["first_edit_extras_ready_s"] = round(time.monotonic() - started, 1)
+            break
+        # Отличаем «слой ещё строится» от «демон не отвечает»: у второго своя
+        # причина отказа, и ждать его двадцать минут бессмысленно. Транспортный
+        # None (RPC/сеть) — тоже недоступность, а не ожидание.
+        if value is None or (
+            isinstance(value, dict)
+            and (
+                value.get("error")
+                or value.get("status")
+                in ("daemon_offline", "unknown_repo", "error", "not_started")
+            )
+        ):
+            unavailable += 1
+            if unavailable >= 15:  # ~30 секунд подряд
+                result["first_edit_s"] = None
+                result["first_edit_skip"] = "daemon unavailable"
+                result["first_edit_extras_ready_s"] = None
+                return result
+        else:
+            # Гейт ещё строится — это ожидание, а не отказ.
+            unavailable = 0
+        time.sleep(2)
+    else:
+        result["first_edit_s"] = None
+        result["first_edit_skip"] = "extras layer not ready"
+        result["first_edit_extras_ready_s"] = None
+        return result
+
+    # Слежение включается после первичной сборки, примерно на открытии гейта.
+    # Ждём строку журнала: иначе правка может быть записана до старта watcher'а
+    # и потеряна, а сводка первичной сборки — попасть в срез до offset.
+    watcher_deadline = time.monotonic() + min(timeout, 60.0)
+    result["first_edit_watcher_ready"] = wait_for_log_marker(
+        log_path, "слежение за файлами включено", watcher_deadline
+    )
+    if not result["first_edit_watcher_ready"]:
+        if result.get("first_edit_storage_mode") is not None:
+            # Современная версия пишет и строку режима, и строку слежения:
+            # если слежения нет — watcher не поднялся, правка потерялась бы.
+            result["first_edit_s"] = None
+            result["first_edit_skip"] = "watcher not started"
+            return result
+        # Легаси-версии (до 1.8.0) строки о слежении не пишут, а Ready там
+        # выставляется прямо перед create_watcher — ждать нечего, меряем.
+        result["first_edit_watcher_legacy"] = True
+
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = [d for d in dirnames if d != ".code-index"]
+        for name in filenames:
+            if not name.lower().endswith(".bsl"):
+                continue
+            path = Path(dirpath) / name
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if 0 < size < 200_000:
+                candidates.append((str(path.relative_to(repo)), path))
+    if not candidates:
+        result["first_edit_s"] = None
+        result["first_edit_skip"] = "no .bsl under 200 KB"
+        return result
+    candidates.sort()
+    target = candidates[0][1]
+
+    hex_id = secrets.token_hex(4)
+    caller = f"PerfEditCaller{hex_id}"
+    callee = f"PerfEditCallee{hex_id}"
+    result["first_edit_target"] = str(target.relative_to(repo))
+    # Прерванный прогон мог оставить свои процедуры: чиним файл до замера,
+    # иначе «оригинал» уже содержал бы чужой маркер, и restore закреплял бы его.
+    raw = target.read_bytes()
+    original = strip_perf_edit_markers(raw)
+    if b"PerfEdit" in original:
+        # Обрезанный жёстким завершением маркер безопасно не разобрать — не
+        # меряем на заведомо грязном файле.
+        result["first_edit_s"] = None
+        result["first_edit_skip"] = "unclean PerfEdit leftovers in target file"
+        return result
+    if original != raw:
+        target.write_bytes(original)
+        result["first_edit_repaired"] = True
+    addition = (
+        f"\n\nПроцедура {caller}() Экспорт\n"
+        f"    {callee}();\n"
+        "КонецПроцедуры\n\n"
+        f"Процедура {callee}() Экспорт\n"
+        "КонецПроцедуры\n"
+    ).encode()
+
+    result["first_edit_pair"] = f"{caller}->{callee}"
+    deadline = time.monotonic() + min(timeout, 900.0)
+    path_s: float | None = None
+    core_s: float | None = None
+    busy_seen = False
+    health_missing = 0
+    try:
+        log_offset = log_size(log_path)
+        target.write_bytes(original + addition)
+        edit_started = time.monotonic()
+        while time.monotonic() < deadline:
+            status = repo_path_status(call("health", {}, rid), "perf")
+            rid += 1
+            if status is None:
+                # health не ответил/сменил формат — считаем отдельно, иначе
+                # молча уйдём в 900-секундный таймаут.
+                health_missing += 1
+            value = call(
+                "find_path_bsl",
+                {
+                    "repo": "perf",
+                    "from": caller,
+                    "to": callee,
+                    "max_depth": 2,
+                    # Unique extra arg: the response cache (15 s TTL for answers
+                    # without file deps) hashes all args, so a stale
+                    # ``found: false`` otherwise hides the batch finish.
+                    "_poll": rid,
+                },
+                rid,
+            )
+            rid += 1
+            core_value = call(
+                "get_function", {"repo": "perf", "name": caller, "_poll": rid}, rid
+            )
+            rid += 1
+            graph_ok = isinstance(value, dict) and value.get("found") is True
+            core_ok = function_present(core_value, caller)
+            if graph_ok and path_s is None:
+                path_s = time.monotonic() - edit_started
+            if core_ok and core_s is None:
+                core_s = time.monotonic() - edit_started
+            if status not in (None, "ready"):
+                busy_seen = True
+            samples.append(
+                {
+                    "t": round(time.monotonic() - started, 1),
+                    "tool": "first_edit",
+                    "kind": (
+                        "ready"
+                        if (graph_ok and status == "ready")
+                        else ("graph_wait" if status == "ready" else str(status))
+                    ),
+                    "core": core_ok,
+                    "head": str(value)[:120],
+                }
+            )
+            if graph_ok and status == "ready":
+                result["first_edit_s"] = round(time.monotonic() - edit_started, 1)
+                break
+            time.sleep(1)
+        else:
+            result["first_edit_s"] = None
+            result["first_edit_timed_out"] = True
+        # Сводку батча журнал пишет при его завершении: в срезе от offset лежит
+        # батч ДОБАВЛЕНИЯ (restore идёт позже), а номер этапа позиционный —
+        # парсим первый блок «граф вызовов» и даём логу догнать.
+        for _ in range(10):
+            phase = graph_phase_seconds(read_log_slice(log_path, log_offset))
+            if phase is not None:
+                result["first_edit_graph_phase_s"] = phase
+                break
+            time.sleep(0.5)
+        else:
+            # Следа нет не просто так: фиксируем явный None, чтобы в отчёте
+            # было видно, что фаза не распарсилась, а не потерялась.
+            result["first_edit_graph_phase_s"] = None
+    finally:
+        try:
+            target.write_bytes(original)
+            restored = target.read_bytes() == original
+            result["first_edit_restored"] = restored
+            if not restored:
+                result["first_edit_restore_error"] = "bytes differ after restore"
+        except OSError as exc:
+            result["first_edit_restored"] = False
+            result["first_edit_restore_error"] = str(exc)
+
+    result["first_edit_path_s"] = round(path_s, 1) if path_s is not None else None
+    result["first_edit_core_s"] = round(core_s, 1) if core_s is not None else None
+    result["first_edit_busy_seen"] = busy_seen
+    result["first_edit_health_missing"] = health_missing
+
+    # Best effort: let the watcher absorb the restore, so the next version starts
+    # from an unmodified dump even if it does not wipe the database first.
+    # Фактическая длительность пишется в отчёт: один MCP-вызов имеет свой
+    # таймаут (call_timeout), поэтому кап 60 с — мягкий.
+    settle_started = time.monotonic()
+    settle_deadline = settle_started + 60
+    while time.monotonic() < settle_deadline:
+        value = call(
+            "find_path_bsl",
+            {"repo": "perf", "from": caller, "to": callee, "max_depth": 2, "_poll": rid},
+            rid,
+        )
+        rid += 1
+        if isinstance(value, dict) and value.get("found") is False:
+            break
+        time.sleep(1)
+    result["first_edit_settle_s"] = round(time.monotonic() - settle_started, 1)
+    return result
 
 
 # ── reporting ────────────────────────────────────────────────────────────────
@@ -511,7 +992,11 @@ def main() -> int:
     report: dict[str, Any] = {
         "repo": str(repo),
         "baseline_ref": args.baseline,
+        "baseline_version": binary_version(baseline_bin),
+        "current_version": binary_version(current_bin),
+        "current_commit": git_rev("HEAD"),
         "runs": args.runs,
+        "daemon_runs": 1 if (args.daemon or args.daemon_only) else 0,
     }
 
     if args.daemon_only:
@@ -585,9 +1070,14 @@ def main() -> int:
             print(f"[{version}] daemon readiness…")
             result = daemon_readiness(binary, repo, args.timeout, acc)
             report.setdefault("daemon", {})[version] = result
+            gp = result.get("first_edit_graph_phase_s")
+            gp_text = f"{gp:.2f}s" if gp is not None else "—"
             print(
                 f"  tools_ready={fmt(result.get('tools_ready_s'))} "
-                f"search_ready={fmt(result.get('search_ready_s'))}",
+                f"search_ready={fmt(result.get('search_ready_s'))} "
+                f"first_edit={fmt(result.get('first_edit_s'))} "
+                f"path={fmt(result.get('first_edit_path_s'))} "
+                f"graph_phase={gp_text}",
                 flush=True,
             )
         base = report["daemon"].get("baseline", {})
@@ -595,10 +1085,19 @@ def main() -> int:
         for key, label in (
             ("tools_ready_s", "tools ready (non-search MCP)"),
             ("search_ready_s", "search_function ready"),
+            ("first_edit_s", "first edit (batch ready)"),
+            ("first_edit_path_s", "first edit (graph serves edge)"),
+            ("first_edit_graph_phase_s", "first edit: graph phase (log)"),
         ):
             b, c = base.get(key), cur.get(key)
             delta = f"{(c - b) / b * 100:+.1f}%" if b and c else "—"
-            daemon_rows.append((label, fmt(b), fmt(c), delta))
+            if key == "first_edit_graph_phase_s":
+                # Фаза мала (десятки мс) — в таблице тоже два знака, как в строке версии.
+                b_text = "—" if b is None else f"{b:.2f}s"
+                c_text = "—" if c is None else f"{c:.2f}s"
+            else:
+                b_text, c_text = fmt(b), fmt(c)
+            daemon_rows.append((label, b_text, c_text, delta))
         print_table(f"Daemon readiness vs {args.baseline}", daemon_rows)
 
     if args.json:
