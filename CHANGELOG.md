@@ -3,7 +3,7 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 Версионирование — [SemVer](https://semver.org/lang/ru/).
 
-## [Не выпущено]
+## [1.14.1] — 2026-10-20
 
 **Пять замечаний к 1.14.0: путь в записях `get_function`/`get_class`, умолчания исключений, видимость нового `[[paths]]` в `serve`, подсказка при `pattern=`, свежесть прочитанной копии.**
 

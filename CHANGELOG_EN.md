@@ -5,7 +5,7 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.14.1] — 2026-10-20
 
 **Five findings against 1.14.0: the file path in `get_function`/`get_class` records, exclusion defaults, a new `[[paths]]` not reaching `serve`, the hint on `pattern=`, and the freshness of a read copy.**
 
