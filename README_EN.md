@@ -364,6 +364,12 @@ All search tools (`search_function`, `search_class`, `get_function`, `get_class`
 
 **Unknown keys no longer vanish silently (v1.13.0).** A key the tool does not have was dropped while parsing the arguments, so a call with a foreign filter name (`glob` instead of `path_glob`, `start_line` instead of `line_start`) looked healthy: the answer came back without the filter applied. Common foreign names are now accepted as synonyms — `glob` for `path_glob` (`grep_code`, `grep_text`, `grep_body`), `start_line`/`end_line` for `line_start`/`line_end` (`read_file`), `depth` for `max_depth` (`get_call_tree`) — and anything else unrecognised is visible in the response itself: `unknown_params` (what was not recognised) and `unknown_params_note` (what the tool does accept). The call is not rejected: the server still answers with data.
 
+**The `path` alias and the path in records.** `path` is accepted as a synonym of `path_glob` in `get_function`, `get_class` and `find_symbol` — previously the key was dropped silently and the file filter did not apply. Every `FunctionRecord`/`ClassRecord` now carries `path`: with several same-named bodies, line numbers without a file address nothing, and the answer read as two functions in one module.
+
+**Freshness of a read copy.** `read_file` returns `mtime` and `indexed_at` of the indexed copy, `stat_file` returns `indexed_at`; the caller compares the copy with the disk and does not apply an edit to stale text.
+
+**Empty `grep_code` hint.** If the search went through `pattern=` and the value contains regex metacharacters (`|`, `(`, `[`, `.`, `{`, `?`, `\`), the hint says `pattern` is a literal substring and only `regex=` searches for an alternative. The oversize caveat now carries the number of files skipped by size (zero means size is not the reason).
+
 ### Code-file content storage (v0.8.0)
 
 Starting with v0.8.0, code-file content is stored in the `file_contents` table (zstd-compressed) and returned by `read_file` and searched by `grep_code`. Large files can be excluded from storage via `max_code_file_size_bytes` (default **5 MB**):
@@ -394,7 +400,7 @@ All fields are optional; omitting the section uses the defaults. The default is 
 
 ### Re-reading `serve.toml` without a restart (v1.1.0)
 
-In federation mode `serve` watches `serve.toml` and `daemon.toml` itself: half a second after a save the repository table is rebuilt as a whole, and a new alias is served without a restart — MCP sessions that are already open see it right away. An edit is applied all or nothing: a parse error, a database that fails to open, or a local alias in `serve.toml` without an entry in `daemon.toml` keeps the previous table. To apply by hand — `POST /reload` (protected by the same allowed-address list); the result of the last attempt is the `config_reload` field of the `health` tool. Changing `[me].ip`, `[pool]`, and also the `[mcp]`, `[tools]` and `[cap]` sections requires a restart of `serve`: they are read once, when the server is built, and a re-read names them in the `restart_required` field — previously an edit to `mass_mode_tools` looked applied, with "re-read without changes" in the log. The daemon also watches `daemon.toml` itself: a new directory starts being indexed and a removed one stops being tracked without a restart — `daemon reload` remains a manual fallback.
+In federation mode `serve` watches `serve.toml` and `daemon.toml` itself: half a second after a save the repository table is rebuilt as a whole, and a new alias is served without a restart — MCP sessions that are already open see it right away. An edit is applied all or nothing: a parse error, a database that fails to open, or a local alias in `serve.toml` without an entry in `daemon.toml` keeps the previous table. To apply by hand — `POST /reload` (protected by the same allowed-address list); the result of the last attempt is the `config_reload` field of the `health` tool. Changing `[me].ip`, `[pool]`, and also the `[mcp]`, `[tools]` and `[cap]` sections requires a restart of `serve`: they are read once, when the server is built, and a re-read names them in the `restart_required` field — previously an edit to `mass_mode_tools` looked applied, with "re-read without changes" in the log. The daemon also watches `daemon.toml` itself: a new directory starts being indexed and a removed one stops being tracked without a restart — `daemon reload` remains a manual fallback. Note: in `--path` mode (no `serve.toml`) the `serve` alias list is a snapshot taken at its start and an edit to `daemon.toml` does not change it — the `daemon reload` answer then carries `restart_required` telling you to restart `serve`, the `health` tool repeats this in `aliases_note`, and `unknown_repo` explains why a just-added path is not visible yet.
 
 ### Which `Host` values `/mcp` accepts (v1.8.6)
 
@@ -665,6 +671,16 @@ reports zero size — the file is being written all along, read its contents.
   "batch_ms": 30000
 }
 ```
+
+**What is excluded by default.** On top of whatever `exclude_dirs` lists, the walk
+always skips `node_modules`, `.venv`, `__pycache__`, `.git`, `.code-index`,
+`target`, `.mypy_cache`, `.pytest_cache`, `.tox`, `dist`, `build`, `obj`, `out`,
+`publish`, `.vs`, `.worktrees`, `venv`, `env`, `.env`. The list is additive: a
+custom `exclude_dirs` extends the built-in set instead of replacing it. `bin` is
+deliberately NOT excluded: in Rust (`src/bin`), Python and Node (`bin/cli.js`) it
+is a directory with real code; a .NET repository, where `bin` is purely an output
+directory, is better off adding it to its own config. The effective list is
+returned by `get_stats` (the `exclude_dirs` field) and printed by `init`. `get_stats` also returns `exclude_dirs_note`: the list is read from disk now, while the daemon worker applies the configuration it read at its own start — editing `config.json` needs a daemon restart.
 
 Key fields:
 

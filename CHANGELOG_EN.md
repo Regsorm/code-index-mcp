@@ -5,6 +5,31 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+**Five findings against 1.14.0: the file path in `get_function`/`get_class` records, exclusion defaults, a new `[[paths]]` not reaching `serve`, the hint on `pattern=`, and the freshness of a read copy.**
+
+### Added
+
+- **A `path` field in every `FunctionRecord` and `ClassRecord`.** `get_function` and `get_class` now return the file path next to `line_start`/`line_end`: with several same-named bodies, line numbers alone address nothing, and the answer read as two functions in one module (in 1C that is a compile error). The body comes from the file named in the record; a separate `grep_code` is no longer needed.
+- **An `exclude_dirs` field in `get_stats`.** The effective walk exclusion set — the built-in list plus the repository's `.code-index/config.json`. Without `repo` the list sits at the top level of the answer, with `repo` it is inside the repository entry. The built-in composition no longer has to be established by probing directories. `exclude_dirs_note` next to it says the list is read from disk now: the daemon worker applies the configuration it read at its own start, so editing `config.json` needs a daemon restart.
+- **A `restart_required` field in the `daemon reload` answer.** When `[[paths]]` changed, the answer says outright that `serve` holds its alias list from its own start: `--path` mode needs a `serve` restart, federated mode needs `/reload`.
+- **An `aliases_note` field in `health`.** The same fact is named in the status summary: where the alias list came from and what to do after editing `daemon.toml`.
+- **An `mtime` field in `read_file`.** Together with `indexed_at` (no longer stripped from the answer) it lets the caller compare the read copy with the disk and avoid applying an edit to stale text.
+
+### Fixed
+
+- **`path` is accepted as a synonym of `path_glob`** in `get_function`, `get_class` and `find_symbol`: previously the key was dropped silently, the file filter did not apply, and the answer looked correct.
+- **Built-in walk exclusions now include `obj`, `out`, `publish`, `.vs`, `.worktrees`.** A repository with several git worktrees used to be indexed mostly as its own copies (83 % of files from `.worktrees` in the reporter's measurement), and default search went through other branches. `bin` is deliberately NOT part of the defaults: in Rust (`src/bin`), Python and Node (`bin/cli.js`) it is a directory with real code — a .NET repository, where `bin` is output only, is better off adding it to its own `.code-index/config.json`.
+- **`init` prints the effective exclusion list**, so the generated config shows what is skipped without editing it.
+- **`unknown_repo` explains the alias snapshot:** the message says the list was taken when `serve` started and editing `daemon.toml` alone does not change it.
+- **An empty `grep_code` answer names the cause.** If the search went through `pattern=` and the value contains regex metacharacters (`|`, `(`, `[`, `.`, `{`, `?`, `\`), the hint says `pattern` is a literal substring and only `regex=` searches for an alternative. The oversize caveat now carries the number of files skipped by size (zero means size is not the reason) instead of a generic phrase.
+
+### Compatibility
+
+- No reindex is required: the database schema and the storage format are untouched, the response fields are additive.
+- The new exclusions apply from the next walk: copies already indexed from `obj`/`out`/`publish`/`.vs`/`.worktrees` stay in the database until a full pass — such a repository needs `index --force`, otherwise old records still reach the output.
+
 ## [1.14.0] — 2026-10-15
 
 **Metadata-property references: the report's main data composition schema is no longer reported as unused.**
