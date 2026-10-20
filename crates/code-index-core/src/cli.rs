@@ -512,7 +512,14 @@ async fn serve_http(
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    let session_manager = Arc::new(LocalSessionManager::default());
+    // rmcp закрывает сессию после простоя (`SessionConfig::keep_alive`, по умолчанию 300 с).
+    // Клиент, который не обращается к серверу дольше этого времени, на следующем запросе
+    // получает 404 «Not Found: Session not found» и вынужден переподключаться — в журнале
+    // LibreChat это выглядело как обрыв сессии каждые ~5 минут. Держим сессию час: с запасом
+    // больше любого клиентского цикла, но мёртвые сессии всё равно убираются.
+    let mut session_manager = LocalSessionManager::default();
+    session_manager.session_config.keep_alive = Some(std::time::Duration::from_secs(3600));
+    let session_manager = Arc::new(session_manager);
     let svc_server = server.clone();
     let mut http_config = StreamableHttpServerConfig::default();
     for entry in &allowed_hosts {
