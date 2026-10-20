@@ -1698,7 +1698,11 @@ fn cmd_init(path: String) -> anyhow::Result<()> {
 
     println!("Создан файл конфигурации: {}", config_path.display());
     println!("Отредактируйте его при необходимости:");
-    println!("  exclude_dirs          — дополнительные директории для исключения");
+    println!(
+        "  exclude_dirs          — дополнительные директории для исключения \
+         (встроенно исключаются всегда: {})",
+        crate::indexer::file_types::EXCLUDE_DIRS.join(", ")
+    );
     println!("  extra_text_extensions — дополнительные расширения для FTS-индексации");
     println!("  max_file_size         — макс. размер текстового файла в байтах (по умолчанию 1 МБ, не влияет на код)");
     println!("  max_files             — лимит файлов (0 = без лимита)");

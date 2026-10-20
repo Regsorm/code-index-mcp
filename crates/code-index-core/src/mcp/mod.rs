@@ -132,6 +132,11 @@ pub struct NameParams {
     pub language: Option<String>,
     /// Glob по path (Phase 1, post-filter).
     pub path_glob: Option<String>,
+    /// Синоним `path_glob`: имя ключа переносится из встроенных инструментов
+    /// чтения (`path`), и раньше он отбрасывался — отбор по файлу не срабатывал,
+    /// а ответ выглядел исправным (issue #23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Параметры для get_function/get_class с поддержкой МАССОВОГО режима:
@@ -151,6 +156,33 @@ pub struct MultiNameParams {
     pub language: Option<String>,
     /// Glob по path (Phase 1, post-filter).
     pub path_glob: Option<String>,
+    /// Синоним `path_glob` — см. `NameParams::path` (issue #23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl NameParams {
+    /// Свести синоним `path` в `path_glob` ДО любых отборов и пересылки на
+    /// удалённый узел: иначе ключ принимается, но не применяется — ответ
+    /// выглядит исправным, а отбор по файлу пропущен (issue #23).
+    fn normalize_path_alias(mut self) -> Self {
+        if self.path_glob.is_none() {
+            self.path_glob = self.path.take();
+        }
+        self.path = None;
+        self
+    }
+}
+
+impl MultiNameParams {
+    /// Синоним `path` → `path_glob` (issue #23), см. [`NameParams`].
+    fn normalize_path_alias(mut self) -> Self {
+        if self.path_glob.is_none() {
+            self.path_glob = self.path.take();
+        }
+        self.path = None;
+        self
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -343,6 +375,71 @@ pub fn grep_regex_from_params(
 pub fn path_glob_from_params(path_glob: Option<String>, glob: Option<String>) -> Option<String> {
     let filled = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
     filled(path_glob).or_else(|| filled(glob))
+}
+
+/// Подсказка для ПУСТОЙ выдачи `grep_code`, когда поиск шёл по `pattern=`, а в
+/// значении есть метасимволы regex.
+///
+/// `pattern=` — буквальная подстрока (issue #22), поэтому `a|b` ищется как
+/// текст «a|b» и честно даёт ноль. Раньше в такой выдаче единственной
+/// конкретной зацепкой была оговорка про oversize, и она уводила в сторону:
+/// автор записал несуществующий дефект «файл на 750 КБ выпал из индекса»
+/// (issue #23). Подсказка обязана назвать настоящую причину.
+fn grep_pattern_meta_hint(p: &GrepCodeParams) -> Option<String> {
+    // Пустая строка равносильна незаданному ключу (см. grep_regex_from_params):
+    // `regex=""` вместе с `pattern=` — это поиск по pattern, и подсказку он
+    // заслуживает так же, как вызов без regex вовсе.
+    let filled = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if filled(&p.regex) || filled(&p.query) {
+        return None;
+    }
+    let pattern = p.pattern.as_deref().filter(|s| !s.trim().is_empty())?;
+    let meta: Vec<String> = ['|', '(', '[', '?', '\\', '^', '$', '+', '*', '.', '{', '}']
+        .into_iter()
+        .filter(|c| pattern.contains(*c))
+        .map(|c| format!("`{}`", c))
+        .collect();
+    if meta.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "0 совпадений: поиск шёл по pattern= — это БУКВАЛЬНАЯ подстрока, \
+         а в значении есть метасимволы regex ({}). Если задумана альтернатива, \
+         нужен regex= (синтаксис crate regex).",
+        meta.join(", ")
+    ))
+}
+
+/// Дополнить ПУСТУЮ выдачу `grep_code` подсказкой о причине пустоты. Нужен для
+/// ответа удалённого узла: там ключ `pattern` уже сведён в `regex`, и причину
+/// «значение взято буквально» восстановить нечем (issue #23).
+///
+/// Ответ, где совпадения есть или который не разбирается как JSON, не трогаем:
+/// диагностика не должна ломать выдачу.
+fn inject_empty_grep_hint(body: String, hint: Option<String>) -> String {
+    let Some(hint) = hint else { return body };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let shown = value.get("shown").and_then(|v| v.as_u64()).or_else(|| {
+        value
+            .get("result")
+            .and_then(|r| r.get("shown"))
+            .and_then(|v| v.as_u64())
+    });
+    if shown != Some(0) {
+        return body;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        // Подсказку узла НЕ выбрасываем: в ней число oversize-файлов, которого
+        // у нас нет. Свою причину ставим первой — она объясняет сам вызов.
+        let combined = match obj.get("hint").and_then(|v| v.as_str()) {
+            Some(existing) if !existing.trim().is_empty() => format!("{hint} {existing}"),
+            _ => hint,
+        };
+        obj.insert("hint".to_string(), serde_json::Value::String(combined));
+    }
+    serde_json::to_string(&value).unwrap_or(body)
 }
 
 /// Свести ключи диапазона строк `read_file` к канонической паре.
@@ -1048,14 +1145,25 @@ impl CodeIndexServer {
         let entry = self.repos.load().get(alias).cloned();
         entry.ok_or_else(|| {
             tools::format_unavailable(crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
-                message: format!(
-                    "Неизвестный repo '{}'. Доступные: {:?}. Укажите один из алиасов, переданных в --path alias=dir при запуске сервера.",
-                    alias,
-                    self.repo_aliases()
-                ),
+                message: unknown_repo_message(alias, &self.repo_aliases()),
             })
         })
     }
+}
+
+/// Сообщение `unknown_repo` — одно на все ветки.
+///
+/// `get_stats` разбирает алиас сам, до `resolve_repo`, и своя строка там
+/// расходилась с общей: `health` и `grep_code` объясняли, что список алиасов
+/// снят при старте `serve`, а `get_stats` с чужим алиасом отвечал прежним
+/// текстом (issue #23 — «правка daemon.toml не видна» упиралась именно в него).
+pub(crate) fn unknown_repo_message(alias: &str, aliases: &[String]) -> String {
+    format!(
+        "Неизвестный repo '{}'. Доступные: {:?}. Укажите один из алиасов, переданных в --path alias=dir при запуске сервера. \
+         Список снят при старте serve: правка daemon.toml сама по себе его не меняет — в режиме --path нужен перезапуск serve, \
+         в федеративном режиме — перечитывание конфигурации (/reload) или перезапуск.",
+        alias, aliases
+    )
 }
 
 // ── Conditional registration helpers ──────────────────────────────────────
@@ -1300,6 +1408,7 @@ impl CodeIndexServer {
         description = "Тело функции по ТОЧНОМУ имени (с исходником). Уникальное имя → одно тело. НЕуникальное (совпадений > порога) → тела опускаются, возвращаются локации + hint: уточните path_glob к нужному файлу. Навигация «где символ» без тел — find_symbol; поиск по словам — search_function. Возвращает JSON-массив FunctionRecord (или облегчённые локации при множестве). МАССОВЫЙ РЕЖИМ ('names'): батчи список ТОЛЬКО когда точно нужны тела ВСЕХ этих функций и результат одной не отменит надобность в остальных (например, правишь их все). Если ОТБИРАЕШЬ, какие из кандидатов релевантны, — НЕ батчи, бери по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в порядке запроса."
     )]
     async fn get_function(&self, Parameters(p): Parameters<MultiNameParams>) -> String {
+        let p = p.normalize_path_alias();
         let entry = match self.resolve_repo(&p.repo) {
             Ok(e) => e,
             Err(j) => return j,
@@ -1345,6 +1454,7 @@ impl CodeIndexServer {
         description = "Тело класса/структуры по ТОЧНОМУ имени (с исходником). НЕуникальное имя (совпадений > порога) → тела опускаются, локации + hint, уточните path_glob. Навигация без тел — find_symbol; поиск по словам — search_class. Возвращает JSON-массив ClassRecord (или локации при множестве). МАССОВЫЙ РЕЖИМ ('names'): батчи список ТОЛЬКО когда точно нужны тела ВСЕХ этих классов и результат одного не отменит надобность в остальных (например, правишь их все). Если ОТБИРАЕШЬ, какие из кандидатов релевантны, — НЕ батчи, бери по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в порядке запроса."
     )]
     async fn get_class(&self, Parameters(p): Parameters<MultiNameParams>) -> String {
+        let p = p.normalize_path_alias();
         let entry = match self.resolve_repo(&p.repo) {
             Ok(e) => e,
             Err(j) => return j,
@@ -1486,6 +1596,7 @@ impl CodeIndexServer {
         description = "Навигация: ГДЕ определён символ по ТОЧНОМУ имени — локации функций/классов/переменных/импортов БЕЗ тел (как search_*). Тело конкретного — get_function/get_class. Возвращает {functions, classes, variables, imports} (облегчённые: имя/путь/строки/сигнатура). Голым именем зови ТОЛЬКО для уникального имени: если имя — стандартный обработчик объекта/набора записей или просто распространённое, вернутся сотни локаций (truncated) — для таких сразу задавай path_glob (фильтр по пути)."
     )]
     async fn find_symbol(&self, Parameters(p): Parameters<NameParams>) -> String {
+        let p = p.normalize_path_alias();
         let entry = match self.resolve_repo(&p.repo) {
             Ok(e) => e,
             Err(j) => return j,
@@ -1555,11 +1666,7 @@ impl CodeIndexServer {
             let Some(entry) = entry else {
                 return tools::format_unavailable(
                     crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
-                        message: format!(
-                            "Неизвестный repo '{}'. Доступные: {:?}.",
-                            alias,
-                            self.repo_aliases()
-                        ),
+                        message: unknown_repo_message(alias, &self.repo_aliases()),
                     },
                 );
             };
@@ -1774,6 +1881,10 @@ impl CodeIndexServer {
         // `glob` — алиас `path_glob` (issue #22): ключ отбрасывался молча, и
         // выдача без отбора выглядела исправной.
         let path_glob = path_glob_from_params(p.path_glob.clone(), p.glob.clone());
+        // Подсказку про `pattern=` считаем ДО любых веток: при пересылке на
+        // удалённый узел ключ `pattern` сводится в `regex`, и тамошняя сторона
+        // восстановить причину уже не может (issue #23).
+        let pattern_hint = grep_pattern_meta_hint(&p);
         if !entry.is_local {
             // Ключи сводим ДО пересылки: узел может быть на прежней сборке, где
             // поля `pattern` ещё нет, и при разборе оно бы потерялось.
@@ -1782,7 +1893,7 @@ impl CodeIndexServer {
             p.pattern = None;
             p.path_glob = path_glob.clone();
             p.glob = None;
-            return crate::federation::dispatcher::dispatch_remote(
+            let body = crate::federation::dispatcher::dispatch_remote(
                 &self.clients,
                 &entry.ip,
                 entry.port,
@@ -1790,6 +1901,9 @@ impl CodeIndexServer {
                 &p,
             )
             .await;
+            // Пустую выдачу удалённого узла дополняем подсказкой здесь: у него
+            // нет исходного ключа поиска, а значит и причины пустоты.
+            return inject_empty_grep_hint(body, pattern_hint);
         }
         tools::grep_code(
             &entry,
@@ -1798,6 +1912,7 @@ impl CodeIndexServer {
             p.language,
             p.limit,
             p.context_lines,
+            pattern_hint,
         )
         .await
     }
@@ -3991,5 +4106,151 @@ mod tool_timeout_tests {
         })
         .await;
         assert_eq!(r, Ok("готово"));
+    }
+}
+
+// ── Тесты приёмки issue #23 ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod issue23_tests {
+    use super::*;
+
+    fn grep_params(pattern: Option<&str>, regex: Option<&str>) -> GrepCodeParams {
+        GrepCodeParams {
+            repo: "r".into(),
+            regex: regex.map(str::to_string),
+            query: None,
+            pattern: pattern.map(str::to_string),
+            path_glob: None,
+            glob: None,
+            language: None,
+            limit: None,
+            context_lines: None,
+        }
+    }
+
+    /// Пустая выдача по `pattern=` с метасимволами regex обязана называть
+    /// настоящую причину: `pattern` — буквальная подстрока.
+    #[test]
+    fn pattern_with_regex_meta_gets_explicit_hint() {
+        let hint = grep_pattern_meta_hint(&grep_params(Some("СтрНайти|Найти"), None))
+            .expect("подсказка обязана быть");
+        assert!(hint.contains("БУКВАЛЬНАЯ"), "{hint}");
+        assert!(hint.contains("regex="), "{hint}");
+    }
+
+    #[test]
+    fn plain_pattern_gets_no_meta_hint() {
+        assert!(
+            grep_pattern_meta_hint(&grep_params(Some("ПрофильПоНаименованию"), None)).is_none()
+        );
+    }
+
+    /// Явный `regex=` — метасимволы законны, подсказки нет.
+    #[test]
+    fn regex_key_suppresses_meta_hint() {
+        assert!(grep_pattern_meta_hint(&grep_params(Some("a|b"), Some("a|b"))).is_none());
+    }
+
+    /// `regex=""` равносилен незаданному ключу: поиск шёл по `pattern=`, и
+    /// подсказка положена так же, как вызову без regex вовсе.
+    #[test]
+    fn empty_regex_does_not_suppress_meta_hint() {
+        assert!(grep_pattern_meta_hint(&grep_params(Some("a|b"), Some(""))).is_some());
+    }
+
+    /// Удалённый узел: его пустую выдачу дополняем подсказкой (ключ `pattern`
+    /// до него не доехал), а непустую — не трогаем.
+    #[test]
+    fn remote_empty_result_gets_hint() {
+        let body = "{\"result\":{\"files\":{},\"shown\":0},\"_meta\":{}}".to_string();
+        let out = inject_empty_grep_hint(body, Some("причина".into()));
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["hint"], "причина");
+        assert_eq!(value["result"]["shown"], 0);
+    }
+
+    /// Подсказка удалённого узла (число oversize-файлов) не должна теряться:
+    /// своя причина дописывается к ней, а не затирает её.
+    #[test]
+    fn remote_hint_is_extended_not_replaced() {
+        let body = "{\"result\":{\"files\":{},\"shown\":0},\
+                    \"hint\":\"Пропущено по размеру: 2.\"}"
+            .to_string();
+        let out = inject_empty_grep_hint(body, Some("поиск шёл по pattern=".into()));
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let hint = value["hint"].as_str().unwrap();
+        assert!(hint.contains("pattern="), "{hint}");
+        assert!(hint.contains("Пропущено по размеру"), "{hint}");
+    }
+
+    #[test]
+    fn remote_nonempty_result_keeps_body() {
+        let body = "{\"result\":{\"files\":{\"a.rs\":[\"1: x\"]},\"shown\":1}}".to_string();
+        let out = inject_empty_grep_hint(body.clone(), Some("причина".into()));
+        assert_eq!(out, body);
+    }
+
+    /// `path` — синоним `path_glob`: ключ из встроенных инструментов чтения
+    /// не должен молча терять отбор по файлу.
+    #[test]
+    fn name_params_treat_path_as_path_glob() {
+        let p = NameParams {
+            repo: "r".into(),
+            name: "F".into(),
+            language: None,
+            path_glob: None,
+            path: Some("Forms/Module.bsl".into()),
+        }
+        .normalize_path_alias();
+        assert_eq!(p.path_glob.as_deref(), Some("Forms/Module.bsl"));
+        assert!(
+            p.path.is_none(),
+            "синоним не должен уезжать на удалённый узел"
+        );
+    }
+
+    /// После сведения `path` → `path_glob` ключ `path` не должен уезжать на
+    /// удалённый узел даже как `null`: там он разбирается в «задан пустой путь».
+    #[test]
+    fn normalized_path_is_not_serialized() {
+        let p = MultiNameParams {
+            repo: "r".into(),
+            name: Some("F".into()),
+            names: None,
+            language: None,
+            path_glob: None,
+            path: Some("Forms/Module.bsl".into()),
+        }
+        .normalize_path_alias();
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(v.get("path").is_none(), "path уехал на узел: {v}");
+        assert_eq!(v["path_glob"], "Forms/Module.bsl");
+    }
+
+    /// Точка и фигурные скобки — метасимволы regex: значение `Module.bsl` или
+    /// `a{2}` через `pattern=` ищется буквально, и при пустой выдаче об этом
+    /// надо сказать (замечание приёмки к первой редакции подсказки).
+    #[test]
+    fn dot_and_braces_count_as_regex_metacharacters() {
+        for value in ["Module.bsl", "a{2}", "ab+c"] {
+            let hint = grep_pattern_meta_hint(&grep_params(Some(value), None))
+                .unwrap_or_else(|| panic!("подсказка обязана быть для {value}"));
+            assert!(hint.contains("БУКВАЛЬНАЯ"), "{value}: {hint}");
+        }
+    }
+
+    #[test]
+    fn path_glob_wins_over_path_alias() {
+        let p = MultiNameParams {
+            repo: "r".into(),
+            name: Some("F".into()),
+            names: None,
+            language: None,
+            path_glob: Some("a/**".into()),
+            path: Some("b/**".into()),
+        }
+        .normalize_path_alias();
+        assert_eq!(p.path_glob.as_deref(), Some("a/**"));
     }
 }

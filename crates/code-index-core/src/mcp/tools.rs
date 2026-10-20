@@ -595,7 +595,7 @@ pub(crate) fn wrap_with_meta_extra<T: serde::Serialize>(
 /// get_callers сериализуются в JSON-массив, а не объект). `mtime`/`file_size`
 /// НЕ трогаем намеренно — их смысл несёт stat_file.
 fn strip_plumbing_recursive(v: &mut serde_json::Value) {
-    const PLUMBING_KEYS: [&str; 5] = ["id", "file_id", "node_hash", "content_hash", "indexed_at"];
+    const PLUMBING_KEYS: [&str; 4] = ["id", "file_id", "node_hash", "content_hash"];
     match v {
         serde_json::Value::Object(map) => {
             for k in PLUMBING_KEYS {
@@ -1111,6 +1111,12 @@ pub fn get_function_with(
                 r.retain(|fr| matches_with(&matcher, &lookup_path(storage, fr.file_id)));
             }
             let deps = collect_paths_via(storage, &r, |fr| fr.file_id);
+            // Путь файла — в КАЖДОЙ записи: при нескольких одноимённых телах
+            // `line_start`/`line_end` без файла не адресуют ничего, и ответ
+            // читается как две функции в одном модуле (issue #23).
+            for fr in r.iter_mut() {
+                fr.path = Some(lookup_path(storage, fr.file_id));
+            }
             // Горячее имя (много одноимённых определений): тела опускаем — иначе ответ
             // раздувается телами всех совпадений до сотен K токенов. Возвращаем локации.
             if r.len() > MULTI_DEF_THRESHOLD {
@@ -1187,6 +1193,10 @@ pub fn get_class_with(
                 r.retain(|cr| matches_with(&matcher, &lookup_path(storage, cr.file_id)));
             }
             let deps = collect_paths_via(storage, &r, |cr| cr.file_id);
+            // Путь файла в каждой записи — см. get_function_with (issue #23).
+            for cr in r.iter_mut() {
+                cr.path = Some(lookup_path(storage, cr.file_id));
+            }
             if r.len() > MULTI_DEF_THRESHOLD {
                 let total = r.len();
                 let hits: Vec<serde_json::Value> = r
@@ -2446,11 +2456,58 @@ pub async fn one_stats(
     alias: &str,
     entry: &RepoEntry,
 ) -> serde_json::Value {
-    if entry.is_local {
+    let mut value = if entry.is_local {
         local_stats(alias, entry).await
     } else {
         remote_stats(server, alias, entry).await
+    };
+    // Действующий список исключений — в КАЖДОЙ сводке, включая запрос по
+    // одному `repo`: без него состав умолчаний и своих добавок выясняется
+    // перебором каталогов (issue #23). Для remote-репо список приходит от
+    // самого узла: свой встроенный набор подставлять туда нельзя — он затрёт
+    // то, что оператор дописал в конфиге узла.
+    if entry.is_local {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "exclude_dirs".to_string(),
+                serde_json::json!(effective_exclude_dirs(entry)),
+            );
+            // Список собран с диска СЕЙЧАС, а воркер демона применяет
+            // конфигурацию, прочитанную при его старте: после правки
+            // config.json расхождение возможно до перезапуска демона.
+            // Пометка обязательна — иначе ответ выдаёт желаемое за
+            // действующее (issue #23, комментарий про config.json).
+            obj.insert(
+                "exclude_dirs_note".to_string(),
+                serde_json::json!(
+                    "Список собран из встроенного набора и .code-index/config.json на диске сейчас; \
+                     работающий воркер демона применил конфигурацию, прочитанную при его старте, \
+                     поэтому после правки config.json нужен перезапуск демона (daemon reload его не перечитывает)."
+                ),
+            );
+        }
     }
+    value
+}
+
+/// Действующий список исключений репозитория: встроенный набор плюс то, что
+/// оператор дописал в его `.code-index/config.json`. Список дополняющий —
+/// пользовательские имена не заменяют встроенные (`IndexConfig::is_excluded_dir`).
+fn effective_exclude_dirs(entry: &RepoEntry) -> Vec<String> {
+    let mut dirs: Vec<String> = crate::indexer::file_types::EXCLUDE_DIRS
+        .iter()
+        .map(|dir| (*dir).to_string())
+        .collect();
+    if entry.is_local {
+        if let Ok(cfg) = crate::indexer::config::IndexConfig::load(entry.local_root()) {
+            for dir in cfg.exclude_dirs {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+    }
+    dirs
 }
 
 pub(crate) async fn stats_for_entry(
@@ -2468,11 +2525,7 @@ pub async fn get_stats(server: &CodeIndexServer, repo: Option<String>) -> String
         return match entry {
             Some(entry) => stats_for_entry(server, &alias, &entry).await,
             None => format_unavailable(ToolUnavailable::UnknownRepo {
-                message: format!(
-                    "Неизвестный repo '{}'. Доступные: {:?}.",
-                    alias,
-                    server.repo_aliases()
-                ),
+                message: crate::mcp::unknown_repo_message(&alias, &server.repo_aliases()),
             }),
         };
     }
@@ -2506,7 +2559,14 @@ pub async fn get_stats(server: &CodeIndexServer, repo: Option<String>) -> String
         let kb = b.get("repo").and_then(|v| v.as_str()).unwrap_or("");
         ka.cmp(kb)
     });
-    to_json(&serde_json::json!({ "repos": all }))
+    // Действующий список встроенных исключений — на верхнем уровне; у каждого
+    // репозитория в `repos` он же дополнен его `.code-index/config.json`
+    // (поле `exclude_dirs` внутри записи). Без этого состав умолчаний не
+    // виден из `init`-конфига, и его выясняли перебором каталогов (issue #23).
+    to_json(&serde_json::json!({
+        "repos": all,
+        "exclude_dirs": crate::indexer::file_types::EXCLUDE_DIRS,
+    }))
 }
 
 pub async fn search_text(
@@ -2888,6 +2948,7 @@ pub async fn grep_code(
     language: Option<String>,
     limit: Option<usize>,
     context_lines: Option<usize>,
+    empty_hint: Option<String>,
 ) -> String {
     bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
@@ -2918,11 +2979,27 @@ pub async fn grep_code(
                 .then(|| declarative_binding_hint(entry, &storage, &regex))
                 .flatten();
             let hint = if shown == 0 {
-                Some(grep_code_empty_hint(entry.language.as_deref()))
+                // Сколько файлов в области поиска реально пропущено по размеру:
+                // общая фраза «oversize пропускаются» уводила в сторону при
+                // честном нуле (issue #23). Число называем прямо.
+                let oversize = storage.count_oversize_files(language.as_deref());
+                let base = empty_hint
+                    .as_deref()
+                    .unwrap_or_else(|| grep_code_empty_hint(entry.language.as_deref()));
+                Some(format!(
+                    "{} Пропущено по размеру (oversize, содержимого в индексе нет): {}.{}",
+                    base,
+                    oversize,
+                    if oversize == 0 {
+                        " Значит, дело не в размере файлов."
+                    } else {
+                        " Такие файлы читаются через get_function/grep_body."
+                    }
+                ))
             } else {
-                declarative.as_deref()
+                declarative
             };
-            wrap_with_meta_hint(&storage, &payload, deps, hint)
+            wrap_with_meta_hint(&storage, &payload, deps, hint.as_deref())
         }
         Err(e) => format!("{{\"error\": \"grep_code: {}\"}}", e),
     }
@@ -3023,6 +3100,12 @@ pub async fn health(server: &CodeIndexServer) -> String {
         "daemon": daemon_health,
         "repos": repos,
         "config_reload": config_reload,
+        // Откуда взят список алиасов и что с ним делать после правки конфига:
+        // без этой строки `unknown_repo` после `daemon reload` читался как
+        // «папка ещё индексируется» либо как опечатка в алиасе (issue #23).
+        "aliases_note": "Список алиасов снят при старте serve. Правка daemon.toml [[paths]] \
+                         сама по себе его не меняет: в режиме --path нужен перезапуск serve, \
+                         в федеративном режиме — /reload (или перезапуск).",
     });
     to_json(&obj)
 }
@@ -3332,7 +3415,10 @@ mod tests {
         assert_eq!(nested["keep"], 7);
 
         let second = arr[1].as_object().unwrap();
-        assert!(!second.contains_key("indexed_at"));
+        // `indexed_at` НЕ срезается (issue #23): без него `read_file` и
+        // `stat_file` нечем сверить прочитанную копию с диском. Внутренние
+        // id/хэши по-прежнему срезаны.
+        assert_eq!(second["indexed_at"], "2026-06-22");
         assert_eq!(second["path"], "src/x.bsl");
         assert_eq!(second["lines_total"], 100);
     }

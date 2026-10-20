@@ -264,11 +264,7 @@ async fn handle_get_stats(
         }
         return ok_json(crate::mcp::tools::format_unavailable(
             crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
-                message: format!(
-                    "Неизвестный repo '{}'. Доступные на этой ноде: {:?}.",
-                    alias,
-                    server.repo_aliases()
-                ),
+                message: crate::mcp::unknown_repo_message(alias, &server.repo_aliases()),
             },
         ));
     }
@@ -424,6 +420,9 @@ async fn handle_grep_code(
             p.language,
             p.limit,
             p.context_lines,
+            // Узел-приёмник не знает, каким ключом звал вызывающий: свою
+            // подсказку про `pattern=` строит сторона-источник.
+            None,
         )
         .await,
     )

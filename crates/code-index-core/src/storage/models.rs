@@ -18,6 +18,11 @@ pub struct FileRecord {
 pub struct FunctionRecord {
     pub id: Option<i64>,
     pub file_id: i64,
+    /// Путь файла, где определено тело. Заполняется MCP-слоем при выдаче:
+    /// при нескольких одноимённых записях `line_start`/`line_end` без файла
+    /// не адресуют ничего (issue #23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub name: String,
     pub qualified_name: Option<String>,
     pub line_start: usize,
@@ -39,6 +44,9 @@ pub struct FunctionRecord {
 pub struct ClassRecord {
     pub id: Option<i64>,
     pub file_id: i64,
+    /// Путь файла, где определён класс (см. `FunctionRecord::path`, issue #23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub name: String,
     pub line_start: usize,
     pub line_end: usize,
@@ -193,6 +201,11 @@ pub struct ReadFileResult {
     /// Полезно вместе с `oversize=true` для понимания насколько файл велик.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_size: Option<i64>,
+    /// mtime проиндексированной копии (unix-секунды). Вместе с `indexed_at`
+    /// даёт вызывающему возможность самому сверить копию с диском: без них
+    /// правка «по прочитанному» может лечь на устаревший текст (issue #23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<i64>,
     /// Эффективный лимит, по которому был принят `oversize` для этого репо
     /// (per-path > [indexer] > hardcoded 5 МБ). Помогает оператору быстро
     /// понять, нужно ли увеличивать лимит в `daemon.toml`.

@@ -133,6 +133,7 @@ async fn reload(State(app): State<Arc<AppState>>) -> impl IntoResponse {
                 added: vec![],
                 removed: vec![],
                 unchanged: vec![],
+                restart_required: vec![],
                 error: Some("Runner демона не принимает команды".into()),
             }),
         )
@@ -147,6 +148,7 @@ async fn reload(State(app): State<Arc<AppState>>) -> impl IntoResponse {
                 added: vec![],
                 removed: vec![],
                 unchanged: vec![],
+                restart_required: vec![],
                 error: Some("Runner демона не ответил на reload".into()),
             }),
         )

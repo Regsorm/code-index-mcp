@@ -133,7 +133,19 @@ pub fn size_allowed(path: &Path, category: &FileCategory, size: u64, max_file_si
         || size as usize <= max_file_size
 }
 
-/// Директории, которые следует исключать при обходе
+/// Директории, которые следует исключать при обходе.
+///
+/// `obj` — артефакты сборки .NET (в том числе автогенерируемые
+/// `*.AssemblyInfo.cs`), `out`/`publish` — выходные каталоги сборки, `.vs` —
+/// кэш IDE, `.worktrees` — копии рабочих деревьев git: без них репозиторий с
+/// несколькими worktree индексируется в основном своими же копиями (issue #23:
+/// 83 % файлов из `.worktrees`), и выдача поиска по умолчанию идёт по чужим
+/// ветвям.
+///
+/// `bin` в умолчание НЕ входит намеренно: в Rust (`src/bin`), Python и Node
+/// (`bin/cli.js`) это каталог с настоящим кодом — у нас самих под ним лежит
+/// `npm/bin/cli.js`. Репозиторию .NET, где `bin` — только выходной каталог,
+/// дешевле добавить его в `exclude_dirs` своего `.code-index/config.json`.
 pub const EXCLUDE_DIRS: &[&str] = &[
     "node_modules",
     ".venv",
@@ -146,6 +158,11 @@ pub const EXCLUDE_DIRS: &[&str] = &[
     ".tox",
     "dist",
     "build",
+    "obj",
+    "out",
+    "publish",
+    ".vs",
+    ".worktrees",
     "venv",
     "env",
     ".env",
@@ -527,5 +544,20 @@ mod tests {
         assert!(is_excluded_dir("__pycache__"));
         assert!(!is_excluded_dir("src"));
         assert!(!is_excluded_dir("my_project"));
+    }
+
+    /// issue #23: артефакты сборки .NET и копии рабочих деревьев git не должны
+    /// индексироваться. Без них репозиторий с семью worktree отдавал 83 %
+    /// выдачи из копий, а поиск по умолчанию шёл по чужим ветвям.
+    #[test]
+    fn test_build_artifacts_and_worktrees_are_excluded() {
+        for dir in ["obj", "out", "publish", ".vs", ".worktrees"] {
+            assert!(is_excluded_dir(dir), "должна исключаться: {dir}");
+        }
+        // Имена, которые НЕ должны попасть под исключение: в них живёт код
+        // (Rust `src/bin`, `bin/cli.js` у npm-пакетов, `bin/` со скриптами).
+        assert!(!is_excluded_dir("bin"));
+        assert!(!is_excluded_dir("builders"));
+        assert!(!is_excluded_dir("objects"));
     }
 }

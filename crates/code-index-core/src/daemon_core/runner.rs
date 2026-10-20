@@ -613,6 +613,7 @@ async fn handle_reload(
                 added: vec![],
                 removed: vec![],
                 unchanged: vec![],
+                restart_required: vec![],
                 error: Some(format!("Не удалось перечитать конфиг: {}", e)),
             };
         }
@@ -688,11 +689,25 @@ async fn handle_reload(
         state.apply_config(&effective).await;
     }
 
+    // Демон применил [[paths]] сам, но список алиасов у `serve` — снимок,
+    // снятый при его старте. В режиме `--path` добавленный путь инструментам
+    // не виден, и вызов отвечает `unknown_repo` (issue #23): сказать об этом
+    // здесь единственное место, где это ещё можно заметить.
+    let mut restart_required = Vec::new();
+    if !added.is_empty() || !removed.is_empty() {
+        restart_required.push(
+            "serve: список алиасов снят при старте — перезапустите serve (режим --path) \
+             или вызовите /reload (федеративный режим)"
+                .to_string(),
+        );
+    }
+
     ReloadResponse {
         reloaded: launch_errors.is_empty(),
         added,
         removed,
         unchanged,
+        restart_required,
         error: if launch_errors.is_empty() {
             None
         } else {

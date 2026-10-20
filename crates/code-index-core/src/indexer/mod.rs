@@ -1025,6 +1025,8 @@ impl<'a> Indexer<'a> {
             .map(|f| FunctionRecord {
                 id: None,
                 file_id,
+                // Путь заполняет MCP-слой при выдаче (issue #23).
+                path: None,
                 name: f.name.clone(),
                 qualified_name: f.qualified_name.clone(),
                 line_start: f.line_start,
@@ -1051,6 +1053,7 @@ impl<'a> Indexer<'a> {
             .map(|c| ClassRecord {
                 id: None,
                 file_id,
+                path: None,
                 name: c.name.clone(),
                 line_start: c.line_start,
                 line_end: c.line_end,

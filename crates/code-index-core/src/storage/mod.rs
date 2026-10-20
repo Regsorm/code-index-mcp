@@ -1344,6 +1344,25 @@ impl Storage {
         Self::grep_zstd_stream(rows, &compiled, limit, context_lines, max_total_bytes)
     }
 
+    /// Сколько файлов в области поиска пропущено по размеру (`oversize`):
+    /// у них нет content в `file_contents`, поэтому `grep_code` их не видит.
+    /// Нужно, чтобы пустая выдача называла ЧИСЛО, а не общую оговорку
+    /// «oversize-файлы пропускаются» (issue #23).
+    pub fn count_oversize_files(&self, language: Option<&str>) -> i64 {
+        let sql_with_lang = "SELECT COUNT(*)
+             FROM file_contents fc
+             JOIN files fi ON fi.id = fc.file_id
+             WHERE fc.oversize = 1 AND fi.language = ?1";
+        let sql_all = "SELECT COUNT(*) FROM file_contents WHERE oversize = 1";
+        let result = match language {
+            Some(lang) => self
+                .conn
+                .query_row(sql_with_lang, params![lang], |r| r.get(0)),
+            None => self.conn.query_row(sql_all, [], |r| r.get(0)),
+        };
+        result.unwrap_or(0)
+    }
+
     // ── Поисковые запросы ────────────────────────────────────────────────────
 
     /// Полнотекстовый поиск функций через FTS5.
@@ -2725,11 +2744,13 @@ impl Storage {
             // Эффективный лимит размера code-файла для этого репо.
             size_limit_bytes,
         } = options;
-        // Сначала ищем файл в files (берём id, lines_total, indexed_at, file_size)
-        let meta: Option<(i64, i64, String, Option<i64>)> = self
+        // Сначала ищем файл в files (берём id, lines_total, indexed_at, file_size, mtime)
+        // Тип строки метаданных файла: id, lines_total, indexed_at, file_size, mtime.
+        type FileMetaRow = (i64, i64, String, Option<i64>, Option<i64>);
+        let meta: Option<FileMetaRow> = self
             .conn
             .query_row(
-                "SELECT id, lines_total, indexed_at, file_size FROM files WHERE path = ?1",
+                "SELECT id, lines_total, indexed_at, file_size, mtime FROM files WHERE path = ?1",
                 params![path],
                 |r| {
                     Ok((
@@ -2737,13 +2758,14 @@ impl Storage {
                         r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
                     ))
                 },
             )
             .optional()
             .context("read_file_text: ошибка SELECT files")?;
 
-        let Some((file_id, lines_total_i, indexed_at, file_size)) = meta else {
+        let Some((file_id, lines_total_i, indexed_at, file_size, mtime)) = meta else {
             return Ok(None);
         };
         let lines_total = lines_total_i as usize;
@@ -2772,6 +2794,7 @@ impl Storage {
                 category: "text".to_string(),
                 oversize: false,
                 file_size,
+                mtime,
                 size_limit: None,
                 hint: None,
             }));
@@ -2794,6 +2817,7 @@ impl Storage {
                     category: "code".to_string(),
                     oversize: false,
                     file_size,
+                    mtime,
                     size_limit: None,
                     hint: Some(
                         "Content code-файла ещё не наполнен (backfill в процессе после v0.8.0). \
@@ -2826,6 +2850,7 @@ impl Storage {
                     category: "code".to_string(),
                     oversize: true,
                     file_size,
+                    mtime,
                     size_limit: size_limit_bytes,
                     hint: Some(hint),
                 }))
@@ -2849,6 +2874,7 @@ impl Storage {
                     category: "code".to_string(),
                     oversize: false,
                     file_size,
+                    mtime,
                     size_limit: None,
                     hint: None,
                 }))
@@ -2866,6 +2892,7 @@ impl Storage {
                     category: "code".to_string(),
                     oversize: false,
                     file_size,
+                    mtime,
                     size_limit: None,
                     hint: Some(
                         "Битая запись file_contents (blob=NULL без oversize). \
@@ -3807,6 +3834,8 @@ fn row_to_function(row: &rusqlite::Row<'_>) -> rusqlite::Result<FunctionRecord> 
     Ok(FunctionRecord {
         id: Some(row.get(0)?),
         file_id: row.get(1)?,
+        // Путь заполняет MCP-слой при выдаче (см. FunctionRecord::path).
+        path: None,
         name: row.get(2)?,
         qualified_name: row.get(3)?,
         line_start: row.get::<_, i64>(4)? as usize,
@@ -3828,6 +3857,8 @@ fn row_to_class(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClassRecord> {
     Ok(ClassRecord {
         id: Some(row.get(0)?),
         file_id: row.get(1)?,
+        // Путь заполняет MCP-слой при выдаче (см. ClassRecord::path).
+        path: None,
         name: row.get(2)?,
         line_start: row.get::<_, i64>(3)? as usize,
         line_end: row.get::<_, i64>(4)? as usize,
@@ -4440,6 +4471,7 @@ mod tests {
             .insert_classes(&[ClassRecord {
                 id: None,
                 file_id,
+                path: None,
                 name: "ОписаниеОперации".into(),
                 line_start: 1,
                 line_end: 5,
@@ -4517,6 +4549,7 @@ mod tests {
             .insert_classes(&[ClassRecord {
                 id: None,
                 file_id,
+                path: None,
                 name: "ОписаниеОперации".into(),
                 line_start: 1,
                 line_end: 5,
@@ -4547,6 +4580,7 @@ mod tests {
             .insert_classes(&[ClassRecord {
                 id: None,
                 file_id,
+                path: None,
                 name: "Bar".into(),
                 line_start: 1,
                 line_end: 5,
@@ -7055,6 +7089,7 @@ mod tests {
                     FunctionRecord {
                         id: None,
                         file_id,
+                        path: None,
                         name: format!("fn{}", i),
                         qualified_name: None,
                         line_start: i,

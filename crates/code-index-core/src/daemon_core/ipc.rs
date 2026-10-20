@@ -138,6 +138,14 @@ pub struct ReloadResponse {
     pub removed: Vec<PathBuf>,
     /// Пути, которые остались без изменений.
     pub unchanged: Vec<PathBuf>,
+    /// Что нужно сделать снаружи, чтобы правка заработала. Пусто — ничего.
+    ///
+    /// `[[paths]]` демон применяет сам, но `serve` держит СВОЙ снимок
+    /// "алиас → база", снятый при старте: в режиме `--path` путь, добавленный
+    /// в daemon.toml, инструментам не виден, и они отвечают `unknown_repo`
+    /// (issue #23). Честный ответ важнее молчания.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_required: Vec<String>,
     /// Сообщение об ошибке чтения конфига, если reload провалился.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
