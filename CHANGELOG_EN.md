@@ -5,6 +5,21 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.15.0] — 2026-10-22
+
+**Git layer: history, changes and file content by revision straight from MCP.**
+
+### Added
+
+- Five tools: `git_log` (commit history, `total` before truncation), `git_changed_files` (statuses, renames, binaries, `empty_range`), `git_changes_by_object` (grouping by `metadata_modules` objects or by the `base/<Category>/<Name>/…`, `extensions/<Name>/…` and `External/<Name>/…` layout, `ungrouped` for the rest), `git_diff` (unified diff of one file) and `git_show_file` (historical blob with a line range). All of them keep deterministic order, require positive limits and truncate by Unicode characters with `truncated` and `hint`.
+- `[[paths]].git` and `[[paths]].git_path` settings: enabled only by `git = true`; a path without the flag is ignored with a warning. Settings are applied before the transport starts in both single and federated mode, hot-reloaded by the watcher without a restart (clearing the flag returns the disabled state), and git changes participate in `repo_changed`.
+- Dates (`YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `YYYY-MM-DDTHH:MM`) are expanded in the local zone of the executing machine: `to`/`rev` at 23:59:59, `from` at 00:00:00; `to` is resolved against `HEAD` first, then `from` against the resolved `to`. Responses keep the original input, `resolved_hash`/`hash`, `date`, `subject`, `resolved_as`, `timezone` and `resolved_at`.
+- Paths are index-root relative; for a subdirectory git runs with `--relative`, so changes outside the indexed subdirectory stay invisible. A bare repository uses `--git-dir` and repository-root paths. A shallow clone is refused with a `git fetch --unshallow` hint; the network and lazy object fetching are disabled.
+
+### Limitations
+
+- Database schema, migrations and the indexer are unchanged; no new dependencies were added (chrono, globset and tempfile were already wired). No reindexing is required.
+
 ## [1.14.1] — 2026-10-20
 
 **Five findings against 1.14.0: the file path in `get_function`/`get_class` records, exclusion defaults, a new `[[paths]]` not reaching `serve`, the hint on `pattern=`, and the freshness of a read copy.**

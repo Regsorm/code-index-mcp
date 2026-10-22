@@ -12,7 +12,7 @@ Published on Infostart: [Code Index — структурный поиск по �
 
 **Rust-native code index for AI agents. Static binary. Production-grade BSL/1C support.**
 
-One static binary for Windows/Linux/macOS — no runtime, no dependencies. Indexes large repositories in seconds, returns results to AI agents over MCP in milliseconds. 37 tools: 20 universal + 17 BSL-specific for 1C:Enterprise configurations.
+One static binary for Windows/Linux/macOS — no runtime, no dependencies. Indexes large repositories in seconds, returns results to AI agents over MCP in milliseconds. 42 tools: 25 universal + 17 BSL-specific for 1C:Enterprise configurations.
 
 ## What's inside
 
@@ -359,8 +359,30 @@ is one JSON line. Build: `cargo build --release -p code-index-copy`; options and
 | `grep_text` | **(v0.7.0)** Regex search over text-file content (REGEXP). Closes the FTS5 special-character gap. Optional `path_glob`, `language`, `context_lines`. Hard-cap 1 MB on response size. **v1.13.0:** `glob` is accepted as a synonym of `path_glob` |
 | `grep_code` | **(v0.8.0)** Regex search over **code-file** content (`.py`, `.bsl`, `.rs`, `.ts`, etc.) via `file_contents` table (zstd-decode in Rust). Same parameters as `grep_text`: `regex`, `path_glob?`, `language?`, `limit?`, `context_lines?`. Since v0.66.0 both tools also accept `pattern` — a literal, case-insensitive substring (escaped before the search), the same meaning it has in `grep_body`. Complements `grep_body` (which searches only inside function/class bodies). Oversize files are skipped. **v1.13.0:** `glob` is accepted as a synonym of `path_glob` |
 | `health` | MCP server health and connected repos |
+| `git_log` | **(v1.15.0)** Commit history: `repo`, `rev?` (hash/branch/tag/local date, default `HEAD`), `path?` (literal index-root path), `limit?` (default 20). Returns the resolved revision `{input, resolved_hash, hash, date, subject, resolved_as, timezone, resolved_at}` and `commits[]` with `hash/short/date/author/subject`; `total` counts the whole matching history before truncation |
+| `git_changed_files` | **(v1.15.0)** Changed files between `from`/`to` snapshots (revision or local date): `A/M/D/R/C` statuses (`T` reported as `M`), `old_path` for renames, `insertions`/`deletions` (binary files: `binary: true`, zero contribution), `path_glob?`, `limit?` (default 200). `files_changed` and sums are computed after filtering and before truncation; equal hashes yield `empty_range: true` |
+| `git_changes_by_object` | **(v1.15.0)** The same changes grouped by 1C metadata objects: `metadata_modules` (index-root-relative `code_path`, rows stored under `REPO_DEFAULT`), otherwise the `base/<Category>/<Name>/…`, `extensions/<Name>/…` and `External/<Name>/…` layout, unknown paths become `ungrouped`. `meta_type` only from a known category (`Extension` for extensions). `limit?` (default 100), `include_files?` (default false); `totals` and `objects_total` are always complete, paths carry `paths_truncated` |
+| `git_diff` | **(v1.15.0)** Unified diff of one file: required `path`, `from`/`to`, `context_lines?` (default 3), `max_chars?` (default 20000). Returns `status/insertions/deletions/patch`; renames include both sides, binary content is not decoded; a path absent from both snapshots is an error, an unchanged one gives an empty `patch` |
+| `git_show_file` | **(v1.15.0)** Historical file content `show <rev>:<path>`: `rev?` (default `HEAD`), `line_start?`/`line_end?` (1-based inclusive), `max_chars?` (default 20000). `lines_total` is counted before the range and truncation; a directory, a missing path and binary/undecodable content are structured errors |
 
 All search tools (`search_function`, `search_class`, `get_function`, `get_class`, `find_symbol`, `search_text`, `grep_body`) accept an optional **`path_glob`** parameter (v0.7.0) to scope results to a subtree (e.g., `src/auth/**`, `Documents/**/*.bsl`). Implementation: post-filter via the `globset` crate after the SQL query. Since v0.32.0, `path_glob`/`pattern` support `{a,b}` brace alternates (`**/*.{bsl,xml}`) — including in `grep_code`/`grep_text`/`grep_body`/`list_files`, where the filter runs at the SQLite GLOB level (the pattern is expanded into an OR group of conditions). In `search_function`/`search_class`/`search_text` the post-filter runs after records are fetched by relevance, so a scoped result may be incomplete; since v0.49.8 such a response carries `prefilter_exhausted` together with `prefetched`/`shown` — on non-empty results too, not only on empty ones.
+
+### Git layer: history and changes (v1.15.0)
+
+Git tools are enabled per `[[paths]]` entry with `git = true`. `git_path` points at the repository when it differs from `path` (for example, the index is built from an export subdirectory while the work tree lives above). Without `git = true` the tools answer with “git layer for repository <alias> is not enabled”, and a configured `git_path` is ignored with a warning in the log.
+
+```toml
+[[paths]]
+path = "/srv/export/base"        # index root
+alias = "ut"
+git = true
+git_path = "/srv/export"         # optional: where the work tree lives
+```
+
+- **Dates and timezone.** Besides a revision (`rev`, `from`, `to`) the tools accept strictly `YYYY-MM-DD`, `YYYY-MM-DD HH:MM` and `YYYY-MM-DDTHH:MM`. A date is expanded in the local zone of the executing machine: `to`/`rev` — 23:59:59, `from` — 00:00:00. `to` is resolved first against `HEAD`, then `from` against the resolved `to`; no implicit merge-base is used. A non-existent or ambiguous local moment is an error, and so is the absence of a commit before the bound (the error names the date and the upper bound). Every response carries the original input, `resolved_hash` (plus the compatible `hash` duplicate), `date`, `subject`, `resolved_as` (`rev`/`date`), `timezone` and `resolved_at`. Note: inside the node container the local zone is UTC, so the day boundary is shifted relative to the Moscow time of the auto-commits — check `timezone` in the response.
+- **Coordinates.** All paths are literal, relative to the index root; absolute paths, NUL and `..` escapes are rejected, and a historical path need not exist on disk. For a subdirectory the commands run from the index root with `--relative`, so changes outside the indexed subdirectory never appear. For a bare repository (`--git-dir`) paths are relative to the repository root — the only exception.
+- **Shallow.** A truncated history (`rev-parse --is-shallow-repository`) is refused with a `git fetch --unshallow` hint; the tool never runs fetch and never touches the network.
+- **No restart needed.** Editing `git`/`git_path` in `daemon.toml` is applied by the watcher: local entries are updated atomically, clearing the flag or removing `git_path` returns the disabled state. A TOML error keeps the previous snapshot; git itself is not probed while loading the configuration — a wrong `git_path` produces a tool error, not a serve failure.
 
 **Unknown keys no longer vanish silently (v1.13.0).** A key the tool does not have was dropped while parsing the arguments, so a call with a foreign filter name (`glob` instead of `path_glob`, `start_line` instead of `line_start`) looked healthy: the answer came back without the filter applied. Common foreign names are now accepted as synonyms — `glob` for `path_glob` (`grep_code`, `grep_text`, `grep_body`), `start_line`/`end_line` for `line_start`/`line_end` (`read_file`), `depth` for `max_depth` (`get_call_tree`) — and anything else unrecognised is visible in the response itself: `unknown_params` (what was not recognised) and `unknown_params_note` (what the tool does accept). The call is not rejected: the server still answers with data.
 
