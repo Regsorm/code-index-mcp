@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 use super::CodeIndexServer;
 use crate::daemon_core::config;
 use crate::federation::reload::{absolute_path, ServeConfigReloader};
+use crate::mcp::RepoGitConfig;
 use crate::watcher::is_config_change;
 
 /// Запускает background task, отслеживающий изменения `daemon.toml`.
@@ -234,6 +235,11 @@ async fn reload_from_disk(server: &CodeIndexServer, daemon_toml_path: &Path) -> 
     // Язык и процессор записей — до подмены инструментов: инструмент языка,
     // вызванный сразу после перечитки, должен застать привязанный процессор.
     server.apply_repo_languages(&languages);
+    // Git-слой применяется тем же проходом: снятый бит и исчезнувшая
+    // настройка алиаса возвращают локальную запись в выключенное состояние.
+    // Сам git здесь не проверяется — неправильный git_path даёт ошибку
+    // инструмента, а не отказ перечитывания конфигурации.
+    server.apply_repo_git_configs(&path_git_configs(&cfg));
     let active: BTreeSet<String> = languages.into_values().collect();
 
     tracing::info!(
@@ -285,6 +291,36 @@ pub(crate) fn path_languages(cfg: &config::DaemonFileConfig) -> BTreeMap<String,
 /// языки, что у записей в [`path_languages`].
 pub(crate) fn active_languages(cfg: &config::DaemonFileConfig) -> BTreeSet<String> {
     path_languages(cfg).into_values().collect()
+}
+
+/// Настройки git-слоя каждой записи `[[paths]]` по её алиасу.
+///
+/// Эффективное включение — только `git = true`. `git_path` без включения
+/// игнорируется с предупреждением: иначе оператор считал бы, что инструменты
+/// работают, а узел молча оставался выключенным.
+pub(crate) fn path_git_configs(cfg: &config::DaemonFileConfig) -> BTreeMap<String, RepoGitConfig> {
+    let mut configs = BTreeMap::new();
+    for entry in &cfg.paths {
+        let enabled = entry.git == Some(true);
+        if entry.git_path.is_some() && !enabled {
+            tracing::warn!(
+                "config_watch: у {} задан git_path, но git не включён (нужно git = true) — путь игнорируется",
+                entry.path.display()
+            );
+        }
+        configs.insert(
+            entry.effective_alias(),
+            RepoGitConfig {
+                enabled,
+                git_path: if enabled {
+                    entry.git_path.clone()
+                } else {
+                    None
+                },
+            },
+        );
+    }
+    configs
 }
 
 #[cfg(test)]
@@ -339,6 +375,7 @@ mod tests {
             is_local: false,
             language: None,
             processor: None,
+            git_config: Default::default(),
         }
     }
 
@@ -420,6 +457,7 @@ mod tests {
                 is_local: true,
                 language: None,
                 processor: None,
+                git_config: Default::default(),
             },
         );
         repos.insert("remote".to_string(), dummy_repo());
@@ -574,5 +612,33 @@ path = "/tmp/z"
         // Не паникуем, не валимся в Err.
         reload_from_disk(&server, &toml_path).await.unwrap();
         assert_eq!(server.extension_tools_count(), 0);
+    }
+
+    /// Настройки git-слоя по алиасам: включение только по `git = true`,
+    /// `git_path` без бита отбрасывается (с предупреждением в журнал).
+    #[test]
+    fn path_git_configs_follows_flag() {
+        let text = r#"
+[[paths]]
+path = "/srv/a"
+alias = "a"
+git = true
+
+[[paths]]
+path = "/srv/b"
+alias = "b"
+git_path = "/srv/repo"
+
+[[paths]]
+path = "/srv/c"
+alias = "c"
+"#;
+        let cfg: config::DaemonFileConfig = toml::from_str(text).unwrap();
+        let map = path_git_configs(&cfg);
+        assert!(map["a"].enabled);
+        assert!(map["a"].git_path.is_none());
+        assert!(!map["b"].enabled);
+        assert!(map["b"].git_path.is_none());
+        assert!(!map["c"].enabled);
     }
 }

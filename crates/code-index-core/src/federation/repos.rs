@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 
 use crate::daemon_core::config::DaemonFileConfig;
+use crate::mcp::RepoGitConfig;
 
 use super::config::ServeFileConfig;
 
@@ -37,6 +38,9 @@ pub struct FederatedRepo {
     pub db_path: Option<PathBuf>,
     /// Признак «репо обслуживается этой машиной».
     pub is_local: bool,
+    /// Настройки git-слоя. Заполняются только для локальных записей — у
+    /// удалённых git-конфигурация принадлежит исполняющей ноде.
+    pub git_config: RepoGitConfig,
 }
 
 /// Свести реестры воедино. Ошибки в этой функции — только если входные
@@ -51,8 +55,25 @@ pub fn merge(
     // Карта alias → PathBuf из daemon.toml (используется только для local-репо).
     let mut local_paths: std::collections::HashMap<String, PathBuf> =
         std::collections::HashMap::new();
+    // Настройки git-слоя — тоже только для локальных записей: у удалённого
+    // репо git-конфигурация принадлежит исполняющей ноде.
+    let mut local_git: std::collections::HashMap<String, RepoGitConfig> =
+        std::collections::HashMap::new();
     for entry in &daemon.paths {
-        local_paths.insert(entry.effective_alias(), entry.path.clone());
+        let alias = entry.effective_alias();
+        local_paths.insert(alias.clone(), entry.path.clone());
+        let enabled = entry.git == Some(true);
+        local_git.insert(
+            alias,
+            RepoGitConfig {
+                enabled,
+                git_path: if enabled {
+                    entry.git_path.clone()
+                } else {
+                    None
+                },
+            },
+        );
     }
 
     let mut out = Vec::with_capacity(serve.paths.len());
@@ -71,6 +92,7 @@ pub fn merge(
                         root_path: Some(root),
                         db_path: Some(db),
                         is_local: true,
+                        git_config: local_git.get(&entry.alias).cloned().unwrap_or_default(),
                     });
                 }
                 None => {
@@ -91,6 +113,7 @@ pub fn merge(
                 root_path: None,
                 db_path: None,
                 is_local: false,
+                git_config: RepoGitConfig::default(),
             });
         }
     }
@@ -161,6 +184,8 @@ mod tests {
                     language: None,
                     max_code_file_size_bytes: None,
                     bulk_batch_threshold: None,
+                    git: None,
+                    git_path: None,
                 })
                 .collect(),
             enrichment: None,

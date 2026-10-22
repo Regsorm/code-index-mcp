@@ -20,10 +20,11 @@ use axum::{
 };
 
 use crate::mcp::{
-    grep_regex_from_params, tools, CallTreeParams, CodeIndexServer, ExtensionToolParams,
-    FilePathParams, FindPathParams, FunctionNameParams, GrepBodyParams, GrepCodeParams,
-    GrepTextParams, ImportParams, ListFilesParams, NameParams, ReadFileParams, RepoEntry,
-    SearchParams, StatFileParams, StatsParams,
+    git_tools, grep_regex_from_params, tools, CallTreeParams, CodeIndexServer, ExtensionToolParams,
+    FilePathParams, FindPathParams, FunctionNameParams, GitChangedFilesParams,
+    GitChangesByObjectParams, GitDiffParams, GitLogParams, GitShowFileParams, GrepBodyParams,
+    GrepCodeParams, GrepTextParams, ImportParams, ListFilesParams, NameParams, ReadFileParams,
+    RepoEntry, SearchParams, StatFileParams, StatsParams,
 };
 
 use super::dispatcher::federation_error;
@@ -52,6 +53,19 @@ pub fn federate_router(server: CodeIndexServer) -> Router {
         .route("/federate/stat_file", post(handle_stat_file))
         .route("/federate/list_files", post(handle_list_files))
         .route("/federate/read_file", post(handle_read_file))
+        // Git-слой: те же пять функций, что и в MCP-слое; git_config
+        // проверяет исполняющая локальная нода.
+        .route("/federate/git_log", post(handle_git_log))
+        .route(
+            "/federate/git_changed_files",
+            post(handle_git_changed_files),
+        )
+        .route(
+            "/federate/git_changes_by_object",
+            post(handle_git_changes_by_object),
+        )
+        .route("/federate/git_diff", post(handle_git_diff))
+        .route("/federate/git_show_file", post(handle_git_show_file))
         .route("/federate/grep_text", post(handle_grep_text))
         // Phase 2 (v0.8.0)
         .route("/federate/grep_code", post(handle_grep_code))
@@ -359,6 +373,61 @@ async fn handle_read_file(
         Err(r) => return *r,
     };
     ok_json(tools::read_file(&entry, p.path, p.line_start, p.line_end).await)
+}
+
+async fn handle_git_log(
+    State(server): State<Server>,
+    Json(p): Json<GitLogParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "git_log") {
+        Ok(e) => e,
+        Err(r) => return *r,
+    };
+    ok_json(git_tools::git_log(&entry, p).await)
+}
+
+async fn handle_git_changed_files(
+    State(server): State<Server>,
+    Json(p): Json<GitChangedFilesParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "git_changed_files") {
+        Ok(e) => e,
+        Err(r) => return *r,
+    };
+    ok_json(git_tools::git_changed_files(&entry, p).await)
+}
+
+async fn handle_git_changes_by_object(
+    State(server): State<Server>,
+    Json(p): Json<GitChangesByObjectParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "git_changes_by_object") {
+        Ok(e) => e,
+        Err(r) => return *r,
+    };
+    ok_json(git_tools::git_changes_by_object(&entry, p).await)
+}
+
+async fn handle_git_diff(
+    State(server): State<Server>,
+    Json(p): Json<GitDiffParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "git_diff") {
+        Ok(e) => e,
+        Err(r) => return *r,
+    };
+    ok_json(git_tools::git_diff(&entry, p).await)
+}
+
+async fn handle_git_show_file(
+    State(server): State<Server>,
+    Json(p): Json<GitShowFileParams>,
+) -> axum::response::Response {
+    let entry = match resolve_local(&server, &p.repo, "git_show_file") {
+        Ok(e) => e,
+        Err(r) => return *r,
+    };
+    ok_json(git_tools::git_show_file(&entry, p).await)
 }
 
 async fn handle_grep_text(

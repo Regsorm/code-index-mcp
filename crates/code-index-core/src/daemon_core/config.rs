@@ -565,6 +565,19 @@ pub struct PathEntry {
     /// либо hardcoded дефолт 8000 файлов.
     #[serde(default)]
     pub bulk_batch_threshold: Option<usize>,
+
+    /// Признак включения git-слоя для этой папки. Эффективное включение —
+    /// только `Some(true)`; `None` и `Some(false)` оставляют git-инструменты
+    /// для репозитория выключенными.
+    #[serde(default)]
+    pub git: Option<bool>,
+
+    /// Путь к git-репозиторию, если он не совпадает с `path` (например,
+    /// индекс собирается из подкаталога выгрузки, а корень рабочего дерева
+    /// лежит выше). Учитывается только вместе с `git = true`; без включения
+    /// путь игнорируется с предупреждением в журнале.
+    #[serde(default)]
+    pub git_path: Option<PathBuf>,
 }
 
 impl PathEntry {
@@ -704,6 +717,8 @@ mod tests {
             language: None,
             max_code_file_size_bytes: None,
             bulk_batch_threshold: None,
+            git: None,
+            git_path: None,
         };
         assert_eq!(entry.effective_alias(), "some_folder_name");
     }
@@ -799,6 +814,8 @@ mod tests {
             language: None,
             max_code_file_size_bytes: Some(1024),
             bulk_batch_threshold: None,
+            git: None,
+            git_path: None,
         };
         let indexer_with_global = IndexerSection {
             max_code_file_size_bytes: Some(2048),
@@ -821,6 +838,8 @@ mod tests {
             language: None,
             max_code_file_size_bytes: None,
             bulk_batch_threshold: None,
+            git: None,
+            git_path: None,
         };
         assert_eq!(
             entry_no_override.effective_max_code_file_size(&indexer_with_global),
@@ -1082,5 +1101,48 @@ mod tests {
     fn mcp_default_repo_absent_is_none() {
         let cfg: DaemonFileConfig = parse_str("").unwrap();
         assert!(cfg.mcp.default_repo.is_none());
+    }
+
+    #[test]
+    fn config_git_defaults() {
+        // Ни `git`, ни `git_path` не заданы — слой выключен.
+        let cfg: DaemonFileConfig = parse_str("[[paths]]\npath = '/srv/export'\n").unwrap();
+        assert_eq!(cfg.paths.len(), 1);
+        assert_eq!(cfg.paths[0].git, None);
+        assert_eq!(cfg.paths[0].git_path, None);
+    }
+
+    #[test]
+    fn config_git_enabled() {
+        let cfg: DaemonFileConfig =
+            parse_str("[[paths]]\npath = '/srv/export'\ngit = true\n").unwrap();
+        assert_eq!(cfg.paths[0].git, Some(true));
+        assert_eq!(cfg.paths[0].git_path, None);
+    }
+
+    #[test]
+    fn config_git_path_override() {
+        let cfg: DaemonFileConfig = parse_str(
+            "[[paths]]\npath = '/srv/export/base'\ngit = true\ngit_path = '/srv/export'\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.paths[0].git, Some(true));
+        assert_eq!(
+            cfg.paths[0].git_path.as_deref(),
+            Some(std::path::Path::new("/srv/export"))
+        );
+    }
+
+    #[test]
+    fn config_git_path_without_enable_warn() {
+        // Путь без бита разбор сохраняет, но эффективно он не применяется:
+        // это делает `path_git_configs` (с предупреждением в журнал).
+        let cfg: DaemonFileConfig =
+            parse_str("[[paths]]\npath = '/srv/export/base'\ngit_path = '/srv/export'\n").unwrap();
+        assert_eq!(cfg.paths[0].git, None);
+        assert_eq!(
+            cfg.paths[0].git_path.as_deref(),
+            Some(std::path::Path::new("/srv/export"))
+        );
     }
 }

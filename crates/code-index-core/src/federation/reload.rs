@@ -318,6 +318,7 @@ fn repo_changed(left: &RepoEntry, right: &RepoEntry) -> bool {
         || left.ip != right.ip
         || left.port != right.port
         || left.language != right.language
+        || left.git_config != right.git_config
 }
 
 fn diff_repos(

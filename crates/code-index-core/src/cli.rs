@@ -1059,6 +1059,10 @@ async fn cmd_serve(
         crate::mcp::cap::set_cap_tools(Some(daemon_cfg.cap.cap_tools.clone()));
         crate::mcp::cap::set_cap_enabled(daemon_cfg.cap.cap_enabled);
         crate::mcp::tools::set_batch_wait_ms(daemon_cfg.mcp.batch_wait_ms);
+        // Настройки git-слоя применяем ДО старта транспорта, в том числе когда
+        // daemon.toml взят по стандартному пути: git-инструменты обязаны быть
+        // доступны первому же вызову, а не после события watcher'а.
+        server.apply_repo_git_configs(&crate::mcp::config_watch::path_git_configs(&daemon_cfg));
         let federate_router = federation::server::federate_router(server.clone());
         let allowed = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
             federation::whitelist::build(&serve_cfg),
@@ -1171,6 +1175,7 @@ async fn cmd_serve(
                         is_local: true,
                         language,
                         processor: None,
+                        git_config: Default::default(),
                     },
                 );
             }
@@ -1196,6 +1201,12 @@ async fn cmd_serve(
         crate::mcp::tools::set_batch_wait_ms(cfg.mcp.batch_wait_ms);
     }
     let bind_host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+
+    // Git-слой одиночного режима: конфигурация из --config, до старта
+    // транспорта. Без конфигурации настройки остаются выключенными.
+    if let Some(cfg) = &daemon_cfg {
+        server.apply_repo_git_configs(&crate::mcp::config_watch::path_git_configs(cfg));
+    }
 
     // Если запуск с --config — подписываемся на изменения daemon.toml,
     // чтобы реактивно пересобирать active_languages/extension_tools

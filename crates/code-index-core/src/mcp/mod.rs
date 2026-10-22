@@ -33,7 +33,24 @@ use crate::storage::{PoolConfig, Storage, StoragePool};
 
 pub mod cap;
 pub mod config_watch;
+pub mod git_tools;
 pub mod tools;
+
+/// Настройки git-слоя одной локальной записи репозитория.
+///
+/// Приходят из `daemon.toml` (`[[paths]].git` / `[[paths]].git_path`) и
+/// применяются к записи атомарно при загрузке конфигурации и на каждое
+/// перечитывание. Включение эффективно только при `enabled == true`
+/// (`git = true` в TOML); отсутствие настройки, `git = false` и удаление
+/// `git_path` возвращают узел в выключенное состояние.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoGitConfig {
+    /// Git-слой включён для этого репозитория.
+    pub enabled: bool,
+    /// Настроенный путь к git-репозиторию; `None` — брать `PathEntry.path`.
+    /// Заполняется только вместе с `enabled`.
+    pub git_path: Option<PathBuf>,
+}
 
 /// IP по умолчанию для legacy-конструкторов (моно-режим без serve.toml).
 /// Все репо считаются local на этом IP.
@@ -75,6 +92,9 @@ pub struct RepoEntry {
     /// (`LanguageProcessor::declarative_callers`). `None` — remote-репо,
     /// язык не определён либо сервер собран без реестра.
     pub processor: Option<Arc<dyn LanguageProcessor>>,
+    /// Настройки git-слоя (только для local-записей). Legacy-конструкторы
+    /// без конфигурации оставляют git выключенным.
+    pub git_config: RepoGitConfig,
 }
 
 impl RepoEntry {
@@ -325,6 +345,84 @@ pub struct ListFilesParams {
     /// Максимум файлов в ответе. Default 500. При обрезке в ответе —
     /// {truncated, total, shown, limit}.
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GitLogParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория (из --path alias=dir при запуске сервера).
+    /// Git-слой должен быть включён: `git = true` в [[paths]] daemon.toml.
+    pub repo: String,
+    /// Ревизия: хеш, ветка, тег или локальная дата (`YYYY-MM-DD`,
+    /// `YYYY-MM-DD HH:MM`, `YYYY-MM-DDTHH:MM`). По умолчанию HEAD.
+    pub rev: Option<String>,
+    /// Буквальный путь от корня индекса. Ограничивает историю одним файлом
+    /// или каталогом.
+    pub path: Option<String>,
+    /// Максимум коммитов в ответе (default 20). `total` считается по всей
+    /// подходящей истории до обрезки.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GitChangedFilesParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория; git-слой должен быть включён.
+    pub repo: String,
+    /// Нижняя граница диапазона: ревизия или локальная дата. Без `from`
+    /// диапазон пуст (снимок сравнивается сам с собой).
+    pub from: Option<String>,
+    /// Верхняя граница диапазона: ревизия или локальная дата. По умолчанию HEAD.
+    pub to: Option<String>,
+    /// Glob по индексному пути, сужающий список изменений.
+    pub path_glob: Option<String>,
+    /// Максимум файлов в ответе (default 200).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GitChangesByObjectParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория; git-слой должен быть включён.
+    pub repo: String,
+    /// Нижняя граница диапазона: ревизия или локальная дата.
+    pub from: Option<String>,
+    /// Верхняя граница диапазона: ревизия или локальная дата. По умолчанию HEAD.
+    pub to: Option<String>,
+    /// Максимум объектов в ответе (default 100). `totals` и `objects_total`
+    /// всегда полные.
+    pub limit: Option<usize>,
+    /// Отдавать пути файлов внутри объектов (default false).
+    pub include_files: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GitDiffParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория; git-слой должен быть включён.
+    pub repo: String,
+    /// ОБЯЗАТЕЛЕН. Буквальный путь от корня индекса.
+    pub path: String,
+    /// Нижняя граница диапазона: ревизия или локальная дата.
+    pub from: Option<String>,
+    /// Верхняя граница диапазона: ревизия или локальная дата. По умолчанию HEAD.
+    pub to: Option<String>,
+    /// Контекст unified diff (default 3).
+    pub context_lines: Option<usize>,
+    /// Предел длины патча в Unicode-символах (default 20000).
+    pub max_chars: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GitShowFileParams {
+    /// ОБЯЗАТЕЛЕН. Алиас репозитория; git-слой должен быть включён.
+    pub repo: String,
+    /// ОБЯЗАТЕЛЕН. Буквальный путь от корня индекса.
+    pub path: String,
+    /// Ревизия: хеш, ветка, тег или локальная дата. По умолчанию HEAD.
+    pub rev: Option<String>,
+    /// Начало диапазона строк, 1-based inclusive (default 1).
+    pub line_start: Option<usize>,
+    /// Конец диапазона строк, 1-based inclusive (default — конец файла).
+    pub line_end: Option<usize>,
+    /// Предел длины содержимого в Unicode-символах (default 20000).
+    pub max_chars: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -755,6 +853,7 @@ impl CodeIndexServer {
                     is_local: true,
                     language: None,
                     processor: None,
+                    git_config: RepoGitConfig::default(),
                 },
             );
         }
@@ -783,6 +882,7 @@ impl CodeIndexServer {
                 is_local: true,
                 language: None,
                 processor: None,
+                git_config: RepoGitConfig::default(),
             },
         );
         Self::with_repos(map)
@@ -1119,6 +1219,31 @@ impl CodeIndexServer {
         }
     }
 
+    /// Атомарно применить настройки git-слоя к локальным записям.
+    ///
+    /// Записи, которых нет в `configs` (алиас исчез из `[[paths]]`), получают
+    /// выключенное состояние с путём по умолчанию; remote-записи не трогаются
+    /// вовсе — их конфигурация живёт на исполняющей ноде. Карта подменяется
+    /// одним `store` и только если хоть одна запись изменилась.
+    pub fn apply_repo_git_configs(&self, configs: &BTreeMap<String, RepoGitConfig>) {
+        let old = self.repos.load_full();
+        let mut map = (*old).clone();
+        let mut changed = false;
+        for (alias, entry) in map.iter_mut() {
+            if !entry.is_local {
+                continue;
+            }
+            let desired = configs.get(alias).cloned().unwrap_or_default();
+            if entry.git_config != desired {
+                entry.git_config = desired;
+                changed = true;
+            }
+        }
+        if changed {
+            self.repos.store(Arc::new(map));
+        }
+    }
+
     /// Отправить `notifications/tools/list_changed` по сохранённому peer.
     /// Если peer не сохранён (клиент ещё не подключился или сессия
     /// уже завершилась) — просто пишем info в лог. Ошибки отправки
@@ -1264,6 +1389,7 @@ pub(crate) fn build_federated_repo_map(
                 is_local: true,
                 language: local_languages.get(&alias).cloned(),
                 processor: None,
+                git_config: repo.git_config,
             }
         } else {
             RepoEntry {
@@ -1274,6 +1400,7 @@ pub(crate) fn build_federated_repo_map(
                 is_local: false,
                 language: None,
                 processor: None,
+                git_config: RepoGitConfig::default(),
             }
         };
         map.insert(alias, entry);
@@ -1918,6 +2045,114 @@ impl CodeIndexServer {
     }
 
     #[tool(
+        description = "История git-коммитов репозитория. ОБЯЗАТЕЛЕН repo (git-слой включается git = true в daemon.toml). rev — хеш/ветка/тег/локальная дата (YYYY-MM-DD, YYYY-MM-DD HH:MM, YYYY-MM-DDTHH:MM), по умолчанию HEAD. path — буквальный путь от корня индекса. limit — максимум коммитов (default 20), total считается по всей подходящей истории. Возвращает {rev: {input,resolved_hash,hash,date,subject,resolved_as,timezone,resolved_at}, commits:[{hash,short,date,author,subject}], shown,total,limit,truncated,hint?}."
+    )]
+    async fn git_log(&self, Parameters(p): Parameters<GitLogParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) {
+            Ok(e) => e,
+            Err(j) => return j,
+        };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients,
+                &entry.ip,
+                entry.port,
+                "git_log",
+                &p,
+            )
+            .await;
+        }
+        git_tools::git_log(&entry, p).await
+    }
+
+    #[tool(
+        description = "Изменённые git-файлы между двумя снимками (from/to — ревизия или локальная дата; to по умолчанию HEAD, без from диапазон пуст). path_glob — glob по индексному пути. limit — максимум файлов (default 200). Возвращает статусы (A/M/D/R/C, T считается M), insertions/deletions (бинарные — 0 и binary=true), old_path для переименований, files_changed и суммы после фильтра до обрезки, empty_range для совпавших хешей, truncated и hint при обрезке."
+    )]
+    async fn git_changed_files(&self, Parameters(p): Parameters<GitChangedFilesParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) {
+            Ok(e) => e,
+            Err(j) => return j,
+        };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients,
+                &entry.ip,
+                entry.port,
+                "git_changed_files",
+                &p,
+            )
+            .await;
+        }
+        git_tools::git_changed_files(&entry, p).await
+    }
+
+    #[tool(
+        description = "Изменения git, сгруппированные по объектам метаданных 1С. from/to — ревизия или локальная дата (to по умолчанию HEAD), limit — максимум объектов (default 100), include_files — отдавать пути внутри объектов (default false). Объект берётся из metadata_modules (code_path от корня индекса, записи под REPO_DEFAULT), иначе разбирается раскладка base/<Категория>/<Имя>/…, extensions/<Имя>/… и External/<Имя>/…; неизвестные пути — ungrouped. meta_type выводится только из известной категории. totals и objects_total всегда полные; paths помечаются paths_truncated."
+    )]
+    async fn git_changes_by_object(
+        &self,
+        Parameters(p): Parameters<GitChangesByObjectParams>,
+    ) -> String {
+        let entry = match self.resolve_repo(&p.repo) {
+            Ok(e) => e,
+            Err(j) => return j,
+        };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients,
+                &entry.ip,
+                entry.port,
+                "git_changes_by_object",
+                &p,
+            )
+            .await;
+        }
+        git_tools::git_changes_by_object(&entry, p).await
+    }
+
+    #[tool(
+        description = "Unified diff одного файла между двумя снимками. ОБЯЗАТЕЛЕН буквальный path от корня индекса (from/to — ревизия или локальная дата, to по умолчанию HEAD). context_lines — контекст (default 3), max_chars — предел патча (default 20000). Возвращает status, insertions, deletions, patch; для переименования в патч входят обе стороны, бинарное содержимое не декодируется (binary=true, patch пуст). Отсутствующий в обоих снимках путь — ошибка, неизменённый — пустой patch и status=unchanged."
+    )]
+    async fn git_diff(&self, Parameters(p): Parameters<GitDiffParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) {
+            Ok(e) => e,
+            Err(j) => return j,
+        };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients,
+                &entry.ip,
+                entry.port,
+                "git_diff",
+                &p,
+            )
+            .await;
+        }
+        git_tools::git_diff(&entry, p).await
+    }
+
+    #[tool(
+        description = "Историческое содержимое файла из git (show <rev>:<path>). ОБЯЗАТЕЛЕН буквальный path от корня индекса; rev — хеш/ветка/тег/локальная дата (по умолчанию HEAD). Диапазон строк line_start/line_end — 1-based inclusive; lines_total считается по файлу до диапазона и обрезки. max_chars — предел содержимого (default 20000). Каталог, отсутствующий путь и бинарное/недекодируемое содержимое — структурированная ошибка; при обрезке truncated=true и hint."
+    )]
+    async fn git_show_file(&self, Parameters(p): Parameters<GitShowFileParams>) -> String {
+        let entry = match self.resolve_repo(&p.repo) {
+            Ok(e) => e,
+            Err(j) => return j,
+        };
+        if !entry.is_local {
+            return crate::federation::dispatcher::dispatch_remote(
+                &self.clients,
+                &entry.ip,
+                entry.port,
+                "git_show_file",
+                &p,
+            )
+            .await;
+        }
+        git_tools::git_show_file(&entry, p).await
+    }
+
+    #[tool(
         description = "Проверка живости MCP-сервера и демона индексации по всем подключённым репо. Возвращает JSON."
     )]
     async fn health(&self) -> String {
@@ -1942,7 +2177,17 @@ impl CodeIndexServer {
 /// точечная инвалидация до него не достаёт: устаревшие метаданные файла жили
 /// весь срок хранения записи.
 fn is_cacheable_tool(tool: &str) -> bool {
-    !matches!(tool, "health" | "get_stats" | "stat_file")
+    !matches!(
+        tool,
+        "health"
+            | "get_stats"
+            | "stat_file"
+            | "git_log"
+            | "git_changed_files"
+            | "git_changes_by_object"
+            | "git_diff"
+            | "git_show_file"
+    )
 }
 
 /// Срок хранения ответа, у которого НЕТ зависимых файлов (M-7).
@@ -2998,6 +3243,7 @@ mod repo_snapshot_tests {
             is_local: false,
             language: None,
             processor: None,
+            git_config: RepoGitConfig::default(),
         }
     }
 
@@ -3557,6 +3803,7 @@ mod conditional_registration_tests {
             is_local: false,
             language: language.map(String::from),
             processor: None,
+            git_config: RepoGitConfig::default(),
         }
     }
 
@@ -3755,6 +4002,12 @@ mod cache_policy_tests {
         assert!(!is_cacheable_tool("stat_file"));
         assert!(!is_cacheable_tool("health"));
         assert!(!is_cacheable_tool("get_stats"));
+        // Git-слой меняется вместе с репозиторием, а не с файлами индекса.
+        assert!(!is_cacheable_tool("git_log"));
+        assert!(!is_cacheable_tool("git_changed_files"));
+        assert!(!is_cacheable_tool("git_changes_by_object"));
+        assert!(!is_cacheable_tool("git_diff"));
+        assert!(!is_cacheable_tool("git_show_file"));
         // Инструменты данных кэшируются как прежде.
         assert!(is_cacheable_tool("get_function"));
         assert!(is_cacheable_tool("grep_code"));
@@ -3890,6 +4143,7 @@ mod default_repo_tests {
             is_local: false,
             language: None,
             processor: None,
+            git_config: RepoGitConfig::default(),
         }
     }
 

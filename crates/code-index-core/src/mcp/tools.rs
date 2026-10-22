@@ -3931,6 +3931,7 @@ mod tests {
             is_local: true,
             language: None,
             processor: None,
+            git_config: Default::default(),
         };
 
         let value = local_stats("test", &entry).await;
