@@ -361,6 +361,9 @@ pub struct GitLogParams {
     /// Максимум коммитов в ответе (default 20). `total` считается по всей
     /// подходящей истории до обрезки.
     pub limit: Option<usize>,
+    /// Часовой пояс для дат без смещения: `+03:00` (или `UTC`). Не задан —
+    /// локальный пояс исполняющей машины.
+    pub tz: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -376,6 +379,9 @@ pub struct GitChangedFilesParams {
     pub path_glob: Option<String>,
     /// Максимум файлов в ответе (default 200).
     pub limit: Option<usize>,
+    /// Часовой пояс для дат без смещения: `+03:00` (или `UTC`). Не задан —
+    /// локальный пояс исполняющей машины.
+    pub tz: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -391,6 +397,9 @@ pub struct GitChangesByObjectParams {
     pub limit: Option<usize>,
     /// Отдавать пути файлов внутри объектов (default false).
     pub include_files: Option<bool>,
+    /// Часовой пояс для дат без смещения: `+03:00` (или `UTC`). Не задан —
+    /// локальный пояс исполняющей машины.
+    pub tz: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -407,6 +416,9 @@ pub struct GitDiffParams {
     pub context_lines: Option<usize>,
     /// Предел длины патча в Unicode-символах (default 20000).
     pub max_chars: Option<usize>,
+    /// Часовой пояс для дат без смещения: `+03:00` (или `UTC`). Не задан —
+    /// локальный пояс исполняющей машины.
+    pub tz: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -423,6 +435,9 @@ pub struct GitShowFileParams {
     pub line_end: Option<usize>,
     /// Предел длины содержимого в Unicode-символах (default 20000).
     pub max_chars: Option<usize>,
+    /// Часовой пояс для дат без смещения: `+03:00` (или `UTC`). Не задан —
+    /// локальный пояс исполняющей машины.
+    pub tz: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -2045,7 +2060,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "История git-коммитов репозитория. ОБЯЗАТЕЛЕН repo (git-слой включается git = true в daemon.toml). rev — хеш/ветка/тег/локальная дата (YYYY-MM-DD, YYYY-MM-DD HH:MM, YYYY-MM-DDTHH:MM), по умолчанию HEAD. path — буквальный путь от корня индекса. limit — максимум коммитов (default 20), total считается по всей подходящей истории. Возвращает {rev: {input,resolved_hash,hash,date,subject,resolved_as,timezone,resolved_at}, commits:[{hash,short,date,author,subject}], shown,total,limit,truncated,hint?}."
+        description = "История git-коммитов репозитория. ОБЯЗАТЕЛЕН repo (git-слой включается git = true в daemon.toml). rev — хеш/ветка/тег/локальная дата (YYYY-MM-DD, YYYY-MM-DD HH:MM, YYYY-MM-DDTHH:MM), по умолчанию HEAD; tz — смещение для дат (`+03:00` или `UTC`), по умолчанию локальный пояс. path — буквальный путь от корня индекса. limit — максимум коммитов (default 20), total считается по всей подходящей истории. Возвращает {rev: {input,resolved_hash,hash,date,subject,resolved_as,timezone,resolved_at}, commits:[{hash,short,date,author,subject}], shown,total,limit,truncated,hint?}."
     )]
     async fn git_log(&self, Parameters(p): Parameters<GitLogParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
@@ -2066,7 +2081,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Изменённые git-файлы между двумя снимками (from/to — ревизия или локальная дата; to по умолчанию HEAD, без from диапазон пуст). path_glob — glob по индексному пути. limit — максимум файлов (default 200). Возвращает статусы (A/M/D/R/C, T считается M), insertions/deletions (бинарные — 0 и binary=true), old_path для переименований, files_changed и суммы после фильтра до обрезки, empty_range для совпавших хешей, truncated и hint при обрезке."
+        description = "Изменённые git-файлы между двумя снимками (from/to — ревизия или локальная дата; to по умолчанию HEAD, без from диапазон пуст; tz — смещение для дат, по умолчанию локальный пояс). path_glob — glob по индексному пути. limit — максимум файлов (default 200). Возвращает статусы (A/M/D/R/C, T считается M), insertions/deletions (бинарные — 0 и binary=true), old_path для переименований, files_changed и суммы после фильтра до обрезки, empty_range для совпавших хешей, truncated и hint при обрезке."
     )]
     async fn git_changed_files(&self, Parameters(p): Parameters<GitChangedFilesParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
@@ -2087,7 +2102,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Изменения git, сгруппированные по объектам метаданных 1С. from/to — ревизия или локальная дата (to по умолчанию HEAD), limit — максимум объектов (default 100), include_files — отдавать пути внутри объектов (default false). Объект берётся из metadata_modules (code_path от корня индекса, записи под REPO_DEFAULT), иначе разбирается раскладка base/<Категория>/<Имя>/…, extensions/<Имя>/… и External/<Имя>/…; неизвестные пути — ungrouped. meta_type выводится только из известной категории. totals и objects_total всегда полные; paths помечаются paths_truncated."
+        description = "Изменения git, сгруппированные по объектам метаданных 1С. from/to — ревизия или локальная дата (to по умолчанию HEAD), limit — максимум объектов (default 100), include_files — отдавать пути внутри объектов (default false). Объект берётся из metadata_modules (code_path от корня индекса, записи под REPO_DEFAULT), иначе разбирается раскладка base/<Категория>/<Имя>/…, extensions/<Имя>/… и External/<Имя>/…; неизвестные пути — ungrouped. meta_type выводится из известной категории (для metadata_modules — по первой части имени, у модулей форм это тип владельца). tz — смещение для дат, по умолчанию локальный пояс. totals и objects_total всегда полные; paths помечаются paths_truncated."
     )]
     async fn git_changes_by_object(
         &self,
@@ -2111,7 +2126,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Unified diff одного файла между двумя снимками. ОБЯЗАТЕЛЕН буквальный path от корня индекса (from/to — ревизия или локальная дата, to по умолчанию HEAD). context_lines — контекст (default 3), max_chars — предел патча (default 20000). Возвращает status, insertions, deletions, patch; для переименования в патч входят обе стороны, бинарное содержимое не декодируется (binary=true, patch пуст). Отсутствующий в обоих снимках путь — ошибка, неизменённый — пустой patch и status=unchanged."
+        description = "Unified diff одного файла между двумя снимками. ОБЯЗАТЕЛЕН буквальный path от корня индекса (from/to — ревизия или локальная дата, to по умолчанию HEAD; tz — смещение для дат, по умолчанию локальный пояс). context_lines — контекст (default 3), max_chars — предел патча (default 20000). Возвращает status, insertions, deletions, patch; для переименования в патч входят обе стороны, бинарное содержимое не декодируется (binary=true, patch пуст). Отсутствующий в обоих снимках путь — ошибка, неизменённый — пустой patch и status=unchanged."
     )]
     async fn git_diff(&self, Parameters(p): Parameters<GitDiffParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
@@ -2132,7 +2147,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Историческое содержимое файла из git (show <rev>:<path>). ОБЯЗАТЕЛЕН буквальный path от корня индекса; rev — хеш/ветка/тег/локальная дата (по умолчанию HEAD). Диапазон строк line_start/line_end — 1-based inclusive; lines_total считается по файлу до диапазона и обрезки. max_chars — предел содержимого (default 20000). Каталог, отсутствующий путь и бинарное/недекодируемое содержимое — структурированная ошибка; при обрезке truncated=true и hint."
+        description = "Историческое содержимое файла из git (show <rev>:<path>). ОБЯЗАТЕЛЕН буквальный path от корня индекса; rev — хеш/ветка/тег/локальная дата (по умолчанию HEAD); tz — смещение для дат, по умолчанию локальный пояс. Диапазон строк line_start/line_end — 1-based inclusive; lines_total считается по файлу до диапазона и обрезки. max_chars — предел содержимого (default 20000). Каталог, отсутствующий путь и бинарное/недекодируемое содержимое — структурированная ошибка; при обрезке truncated=true и hint."
     )]
     async fn git_show_file(&self, Parameters(p): Parameters<GitShowFileParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {

@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use chrono::{Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{FixedOffset, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
 use serde::Serialize;
 
 use super::RepoEntry;
@@ -67,6 +67,13 @@ fn meta_type_for_category(category: &str) -> Option<String> {
         .iter()
         .find(|(plural, _)| *plural == category)
         .map(|(_, meta_type)| (*meta_type).to_string())
+}
+
+/// Тип метаданных по квалифицированному имени из `metadata_modules`
+/// (`Documents.Имя`, `Catalogs.Имя.Form.Форма`): категория — первая часть
+/// имени. Для модулей форм это тип владельца: своей категории у формы нет.
+fn meta_type_for_qualified(name: &str) -> Option<String> {
+    name.split('.').next().and_then(meta_type_for_category)
 }
 
 /// Сколько путей объекта отдавать в `git_changes_by_object` до отметки
@@ -597,8 +604,14 @@ async fn commit_info(ctx: &GitContext, hash: &str) -> Result<(String, String), G
     Ok((date, subject))
 }
 
-fn resolved_by_rev(input: &str, hash: String, date: String, subject: String) -> ResolvedRevision {
-    let now = Local::now();
+fn resolved_by_rev(
+    input: &str,
+    hash: String,
+    date: String,
+    subject: String,
+    tz: Option<&str>,
+) -> ResolvedRevision {
+    let (timezone, resolved_at) = now_in(tz);
     ResolvedRevision {
         input: input.to_string(),
         resolved_hash: hash.clone(),
@@ -606,17 +619,23 @@ fn resolved_by_rev(input: &str, hash: String, date: String, subject: String) -> 
         date,
         subject,
         resolved_as: "rev".to_string(),
-        timezone: now.offset().to_string(),
-        resolved_at: now.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+        timezone,
+        resolved_at,
     }
 }
 
-/// Разобрать локальную дату строго в одном из трёх форматов.
-fn parse_local_moment(
+/// Разобрать дату строго в одном из трёх форматов и вернуть момент в ISO-8601
+/// вместе с обозначением часового пояса.
+///
+/// `tz` — смещение вида `+03:00` (или `UTC`); не задано — локальный пояс
+/// исполняющей машины. Для явного смещения переход часов не применяется:
+/// пояс уже задан.
+fn parse_moment(
     repo: &str,
     input: &str,
     end_of_day: bool,
-) -> Result<chrono::DateTime<Local>, GitError> {
+    tz: Option<&str>,
+) -> Result<(String, String), GitError> {
     let naive: NaiveDateTime = if let Ok(date) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
         let time = if end_of_day {
             date.and_hms_opt(23, 59, 59)
@@ -637,19 +656,92 @@ fn parse_local_moment(
             )
             .with_input(input));
     };
-    match Local.from_local_datetime(&naive) {
-        LocalResult::Single(dt) => Ok(dt),
-        LocalResult::Ambiguous(_, _) => Err(GitError::new(
-            repo,
-            format!("локальный момент '{input}' неоднозначен из-за перехода часового пояса"),
-        )
-        .with_input(input)
-        .with_hint("укажите дату без времени или другое время")),
-        LocalResult::None => Err(GitError::new(
-            repo,
-            format!("локальный момент '{input}' не существует из-за перехода часового пояса"),
-        )
-        .with_input(input)),
+    match tz {
+        Some(text) => {
+            let offset = parse_offset(text).ok_or_else(|| {
+                GitError::new(
+                    repo,
+                    format!("не удалось разобрать часовой пояс '{text}': ожидается +03:00 или UTC"),
+                )
+                .with_input(input)
+            })?;
+            let moment = offset.from_local_datetime(&naive).single().ok_or_else(|| {
+                GitError::new(
+                    repo,
+                    format!("момент '{input}' не существует в поясе {text}"),
+                )
+                .with_input(input)
+            })?;
+            Ok((
+                moment.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+                offset.to_string(),
+            ))
+        }
+        None => match Local.from_local_datetime(&naive) {
+            LocalResult::Single(dt) => Ok((
+                dt.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+                dt.offset().to_string(),
+            )),
+            LocalResult::Ambiguous(_, _) => Err(GitError::new(
+                repo,
+                format!("локальный момент '{input}' неоднозначен из-за перехода часового пояса"),
+            )
+            .with_input(input)
+            .with_hint("укажите дату без времени, другое время или параметр tz")),
+            LocalResult::None => Err(GitError::new(
+                repo,
+                format!("локальный момент '{input}' не существует из-за перехода часового пояса"),
+            )
+            .with_input(input)
+            .with_hint("укажите параметр tz со смещением, например +03:00")),
+        },
+    }
+}
+
+/// Разобрать смещение часового пояса: `+03:00`, `-05:00`, `UTC`, `Z`.
+fn parse_offset(text: &str) -> Option<FixedOffset> {
+    let trimmed = text.trim();
+    let body = if trimmed.eq_ignore_ascii_case("utc") || trimmed.eq_ignore_ascii_case("z") {
+        "+00:00"
+    } else {
+        trimmed
+    };
+    let mut parts = body.splitn(2, ':');
+    let head = parts.next().unwrap_or("");
+    let tail = parts.next().unwrap_or("");
+    if !(head.starts_with('+') || head.starts_with('-')) {
+        return None;
+    }
+    let hours: i32 = head
+        .trim_start_matches('+')
+        .trim_start_matches('-')
+        .parse()
+        .ok()?;
+    let minutes: i32 = tail.parse().ok()?;
+    if !(0..=14).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    let sign = if head.starts_with('-') { -1 } else { 1 };
+    FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60))
+}
+
+/// Текущий момент и обозначение пояса для ответа инструмента.
+fn now_in(tz: Option<&str>) -> (String, String) {
+    match tz.and_then(parse_offset) {
+        Some(offset) => (
+            offset.to_string(),
+            chrono::Utc::now()
+                .with_timezone(&offset)
+                .format("%Y-%m-%dT%H:%M:%S%:z")
+                .to_string(),
+        ),
+        None => {
+            let now = Local::now();
+            (
+                now.offset().to_string(),
+                now.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+            )
+        }
     }
 }
 
@@ -665,6 +757,7 @@ pub async fn resolve_revision(
     input: &str,
     upper: &str,
     end_of_day: bool,
+    tz: Option<&str>,
 ) -> Result<ResolvedRevision, GitError> {
     validate_rev_input(&ctx.alias, input)?;
     let verify = ctx
@@ -679,12 +772,11 @@ pub async fn resolve_revision(
         let hash = out.trimmed();
         if !hash.is_empty() {
             let (date, subject) = commit_info(ctx, &hash).await?;
-            return Ok(resolved_by_rev(input, hash, date, subject));
+            return Ok(resolved_by_rev(input, hash, date, subject, tz));
         }
     }
 
-    let moment = parse_local_moment(&ctx.alias, input, end_of_day)?;
-    let moment_text = moment.format("%Y-%m-%dT%H:%M:%S%:z").to_string();
+    let (moment_text, tz_label) = parse_moment(&ctx.alias, input, end_of_day, tz)?;
     let out = ctx
         .git(vec![
             "rev-list".into(),
@@ -713,8 +805,8 @@ pub async fn resolve_revision(
         date,
         subject,
         resolved_as: "date".to_string(),
-        timezone: moment.offset().to_string(),
-        resolved_at: Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+        timezone: tz_label,
+        resolved_at: now_in(tz).1,
     })
 }
 
@@ -724,11 +816,12 @@ pub async fn resolve_range(
     ctx: &GitContext,
     from: Option<&str>,
     to: Option<&str>,
+    tz: Option<&str>,
 ) -> Result<(ResolvedRevision, Option<ResolvedRevision>), GitError> {
     let to_input = to.unwrap_or("HEAD");
-    let to_rev = resolve_revision(ctx, to_input, "HEAD", true).await?;
+    let to_rev = resolve_revision(ctx, to_input, "HEAD", true, tz).await?;
     let from_rev = match from {
-        Some(input) => Some(resolve_revision(ctx, input, &to_rev.resolved_hash, false).await?),
+        Some(input) => Some(resolve_revision(ctx, input, &to_rev.resolved_hash, false, tz).await?),
         None => None,
     };
     Ok((to_rev, from_rev))
@@ -965,7 +1058,7 @@ pub async fn git_log(entry: &RepoEntry, params: super::GitLogParams) -> String {
         }
     }
     let rev_input = params.rev.as_deref().unwrap_or("HEAD");
-    let rev = match resolve_revision(&ctx, rev_input, "HEAD", true).await {
+    let rev = match resolve_revision(&ctx, rev_input, "HEAD", true, params.tz.as_deref()).await {
         Ok(rev) => rev,
         Err(e) => return e.to_json(),
     };
@@ -1040,11 +1133,17 @@ pub async fn git_changed_files(entry: &RepoEntry, params: super::GitChangedFiles
         Ok(limit) => limit,
         Err(e) => return e.to_json(),
     };
-    let (to_rev, from_rev) =
-        match resolve_range(&ctx, params.from.as_deref(), params.to.as_deref()).await {
-            Ok(pair) => pair,
-            Err(e) => return e.to_json(),
-        };
+    let (to_rev, from_rev) = match resolve_range(
+        &ctx,
+        params.from.as_deref(),
+        params.to.as_deref(),
+        params.tz.as_deref(),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => return e.to_json(),
+    };
     let from_rev = match from_rev {
         Some(rev) => rev,
         None => to_rev.clone(),
@@ -1217,11 +1316,17 @@ pub async fn git_changes_by_object(
         Err(e) => return e.to_json(),
     };
     let include_files = params.include_files.unwrap_or(false);
-    let (to_rev, from_rev) =
-        match resolve_range(&ctx, params.from.as_deref(), params.to.as_deref()).await {
-            Ok(pair) => pair,
-            Err(e) => return e.to_json(),
-        };
+    let (to_rev, from_rev) = match resolve_range(
+        &ctx,
+        params.from.as_deref(),
+        params.to.as_deref(),
+        params.tz.as_deref(),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => return e.to_json(),
+    };
     let from_rev = match from_rev {
         Some(rev) => rev,
         None => to_rev.clone(),
@@ -1265,7 +1370,7 @@ pub async fn git_changes_by_object(
         let matched = match metadata.get(&index_path) {
             // object_name записан как есть (множественное имя категории);
             // meta_type — только из известного соответствия категории.
-            Some(name) => Some((Some(name.clone()), meta_type_for_category(name))),
+            Some(name) => Some((Some(name.clone()), meta_type_for_qualified(name))),
             None => parse_layout(&index_path).map(|(name, meta_type)| (Some(name), meta_type)),
         };
         let Some((object_name, meta_type)) = matched else {
@@ -1383,11 +1488,17 @@ pub async fn git_diff(entry: &RepoEntry, params: super::GitDiffParams) -> String
         Ok(value) => value,
         Err(e) => return e.to_json(),
     };
-    let (to_rev, from_rev) =
-        match resolve_range(&ctx, params.from.as_deref(), params.to.as_deref()).await {
-            Ok(pair) => pair,
-            Err(e) => return e.to_json(),
-        };
+    let (to_rev, from_rev) = match resolve_range(
+        &ctx,
+        params.from.as_deref(),
+        params.to.as_deref(),
+        params.tz.as_deref(),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => return e.to_json(),
+    };
     let from_rev = match from_rev {
         Some(rev) => rev,
         None => to_rev.clone(),
@@ -1547,7 +1658,7 @@ pub async fn git_show_file(entry: &RepoEntry, params: super::GitShowFileParams) 
     }
 
     let rev_input = params.rev.as_deref().unwrap_or("HEAD");
-    let rev = match resolve_revision(&ctx, rev_input, "HEAD", true).await {
+    let rev = match resolve_revision(&ctx, rev_input, "HEAD", true, params.tz.as_deref()).await {
         Ok(rev) => rev,
         Err(e) => return e.to_json(),
     };
@@ -1762,6 +1873,7 @@ mod tests {
             rev: None,
             path: None,
             limit: None,
+            tz: None,
         }
     }
 
@@ -1772,6 +1884,7 @@ mod tests {
             to: Some(to.to_string()),
             path_glob: None,
             limit: None,
+            tz: None,
         }
     }
 
@@ -1906,6 +2019,7 @@ mod tests {
                     line_start: None,
                     line_end: None,
                     max_chars: None,
+                    tz: None,
                 },
             )
             .await,
@@ -1934,6 +2048,7 @@ mod tests {
                     rev: Some("2020-01-02".to_string()),
                     path: None,
                     limit: None,
+                    tz: None,
                 },
             )
             .await,
@@ -1961,6 +2076,7 @@ mod tests {
                     rev: Some("2010-01-01".to_string()),
                     path: None,
                     limit: None,
+                    tz: None,
                 },
             )
             .await,
@@ -2018,6 +2134,7 @@ mod tests {
                     to: Some("HEAD".to_string()),
                     limit: None,
                     include_files: None,
+                    tz: None,
                 },
             )
             .await,
@@ -2100,6 +2217,7 @@ mod tests {
                     to: Some("HEAD".to_string()),
                     path_glob: None,
                     limit: Some(1),
+                    tz: None,
                 },
             )
             .await,
@@ -2125,6 +2243,7 @@ mod tests {
             line_start: start,
             line_end: end,
             max_chars: None,
+            tz: None,
         };
 
         let out = parse(&git_show_file(&entry(dir.path(), true), show(Some(2), Some(3))).await);
@@ -2162,6 +2281,7 @@ mod tests {
             to: Some("HEAD".to_string()),
             context_lines: None,
             max_chars: None,
+            tz: None,
         };
 
         let out = parse(&git_diff(&entry(dir.path(), true), diff("a.bsl")).await);
@@ -2185,5 +2305,57 @@ mod tests {
                 .contains("отсутствует в обоих снимках"),
             "{missing}"
         );
+    }
+
+    #[test]
+    fn meta_type_from_qualified_name() {
+        assert_eq!(
+            meta_type_for_qualified("Documents.ЗаказКлиента"),
+            Some("Document".to_string())
+        );
+        assert_eq!(
+            meta_type_for_qualified("Catalogs.Номенклатура.Form.ФормаЭлемента"),
+            Some("Catalog".to_string())
+        );
+        assert_eq!(meta_type_for_qualified("Неизвестное.Имя"), None);
+        assert_eq!(meta_type_for_qualified("External/Имя"), None);
+    }
+
+    #[tokio::test]
+    async fn git_tz_offset_resolves_dates() {
+        if !git_available() {
+            return;
+        }
+        let dir = init_repo();
+        // 22:00 по Москве 1 января — это 19:00 UTC.
+        write_file(&dir.path().join("a.bsl"), "Процедура А()\n");
+        commit_at(dir.path(), "поздний", "2020-01-01T22:00:00+03:00");
+        // 02:00 по Москве — уже 2 января, это 23:00 UTC 1 января.
+        write_file(&dir.path().join("a.bsl"), "Процедура А()\n// правка\n");
+        commit_at(dir.path(), "ночной", "2020-01-02T02:00:00+03:00");
+
+        let log = |tz: Option<&str>| GitLogParams {
+            repo: "demo".to_string(),
+            rev: Some("2020-01-01".to_string()),
+            path: None,
+            limit: None,
+            tz: tz.map(str::to_string),
+        };
+
+        let msk = parse(&git_log(&entry(dir.path(), true), log(Some("+03:00"))).await);
+        assert_eq!(
+            msk["commits"][0]["subject"].as_str(),
+            Some("поздний"),
+            "{msk}"
+        );
+        assert_eq!(msk["rev"]["timezone"].as_str(), Some("+03:00"), "{msk}");
+
+        let utc = parse(&git_log(&entry(dir.path(), true), log(Some("UTC"))).await);
+        assert_eq!(
+            utc["commits"][0]["subject"].as_str(),
+            Some("ночной"),
+            "{utc}"
+        );
+        assert_eq!(utc["rev"]["timezone"].as_str(), Some("+00:00"), "{utc}");
     }
 }
