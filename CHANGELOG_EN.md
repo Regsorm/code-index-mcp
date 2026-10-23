@@ -5,6 +5,19 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.15.1] — 2026-10-23
+
+**Dependency fixes and two git-layer improvements.**
+
+### Fixed
+
+- `webpki-roots` 1.0.10 and `rustls-webpki` 0.103.16 close RUSTSEC-2026-0381 and RUSTSEC-2026-0382 (certificate paths through distrusted emSign intermediates). CI failed on `cargo deny`; API and the dependency tree are unchanged.
+
+### Changed
+
+- `git_changes_by_object`: `meta_type` is now derived for `metadata_modules` rows as well — from the first part of the qualified name (`Documents.Name` → `Document`, `Catalogs.Name.Form.Form` → `Catalog`); for form modules this is the owner type.
+- All five git tools accept `tz` — an offset for naive dates (`+03:00`, `UTC`). Without it the local zone of the executing machine is used, as before; `timezone` in the response shows the applied offset.
+
 ## [1.15.0] — 2026-10-22
 
 **Git layer: history, changes and file content by revision straight from MCP.**
