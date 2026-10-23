@@ -10,9 +10,24 @@
 // `LanguageProcessor::schema_extensions()` при первом открытии БД
 // репозитория с `language = "bsl"`.
 
-/// DDL таблицы `metadata_modules` — отдельной константой, потому что
-/// используется и в SCHEMA_EXTENSIONS, и в миграции `index_metadata_modules`
-/// (пересоздание таблицы при старом UNIQUE-ключе без extension_name).
+/// DDL подписок, общий для новой базы и миграции ключа владельца.
+pub const EVENT_SUBSCRIPTIONS_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS event_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        name TEXT NOT NULL,
+        event TEXT NOT NULL,
+        handler_module TEXT NOT NULL,
+        handler_proc TEXT NOT NULL,
+        sources_json TEXT,
+        owner TEXT NOT NULL DEFAULT '',
+        source_path TEXT NOT NULL DEFAULT '',
+        type_sets_json TEXT NOT NULL DEFAULT '[]',
+        warnings_json TEXT NOT NULL DEFAULT '[]',
+        UNIQUE(repo, owner, name)
+    );";
+
+/// DDL модулей, общий для новой базы и миграции ключа расширения.
 pub const METADATA_MODULES_DDL: &str = "
     CREATE TABLE IF NOT EXISTS metadata_modules (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,20 +173,17 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     // Подписка на события — связь «событие → процедура общего модуля».
     // Используется при построении графа вызовов: edge типа `subscription`
     // соединяет триггер платформы с реальным обработчиком.
-    "
-    CREATE TABLE IF NOT EXISTS event_subscriptions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        repo TEXT NOT NULL,
-        name TEXT NOT NULL,
-        event TEXT NOT NULL,
-        handler_module TEXT NOT NULL,
-        handler_proc TEXT NOT NULL,
-        sources_json TEXT,
-        UNIQUE(repo, name)
-    );
-    ",
+    EVENT_SUBSCRIPTIONS_DDL,
     "CREATE INDEX IF NOT EXISTS idx_event_subscriptions_repo ON event_subscriptions(repo);",
     "CREATE INDEX IF NOT EXISTS idx_event_subscriptions_handler ON event_subscriptions(repo, handler_module, handler_proc);",
+    "CREATE INDEX IF NOT EXISTS idx_event_subscriptions_path ON event_subscriptions(repo, source_path);",
+    "CREATE TABLE IF NOT EXISTS subscription_defined_types (
+        repo TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        name TEXT NOT NULL,
+        types_json TEXT NOT NULL,
+        PRIMARY KEY(repo, owner, name)
+    );",
 
     // ── proc_call_graph ───────────────────────────────────────────────────
     // Граф вызовов процедур/функций. Ребро — `(caller_proc_key, callee_*) +
@@ -696,6 +708,7 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
 /// `apply_schema_extensions`. Вызывать ДО применения `SCHEMA_EXTENSIONS`.
 /// Безопасно на свежей БД (таблиц ещё нет — ALTER пропускается) и при повторе.
 pub fn migrate_extensions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    migrate_event_subscriptions(conn)?;
     ensure_column(
         conn,
         "data_links",
@@ -766,6 +779,37 @@ pub fn migrate_extensions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
                WHERE override_type IS NOT NULL;",
         )?;
     }
+    Ok(())
+}
+
+/// Preserve the old rows while changing the uniqueness scope. The new data
+/// version marks indexes that still need sets and configuration owners rebuilt.
+fn migrate_event_subscriptions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='event_subscriptions' AND type='table')",
+        [], |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
+    let mut columns = conn.prepare("PRAGMA table_info(event_subscriptions)")?;
+    let has_owner = columns
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|s| s == "owner");
+    drop(columns);
+    if has_owner {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("ALTER TABLE event_subscriptions RENAME TO event_subscriptions_legacy;")?;
+    tx.execute_batch(EVENT_SUBSCRIPTIONS_DDL)?;
+    tx.execute_batch("INSERT INTO event_subscriptions
+        (id,repo,name,event,handler_module,handler_proc,sources_json)
+        SELECT id,repo,name,event,handler_module,handler_proc,sources_json FROM event_subscriptions_legacy;
+        DROP TABLE event_subscriptions_legacy;")?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1323,5 +1367,38 @@ mod tests {
             rusqlite::params!["ut", "Catalog.Контрагенты", "Catalog", "Контрагенты"],
         );
         assert!(dup.is_err(), "UNIQUE-ограничение должно сработать");
+    }
+
+    #[test]
+    fn subscription_migration_preserves_rows_and_separates_owners() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE event_subscriptions (
+            id INTEGER PRIMARY KEY, repo TEXT NOT NULL, name TEXT NOT NULL,
+            event TEXT NOT NULL, handler_module TEXT NOT NULL, handler_proc TEXT NOT NULL,
+            sources_json TEXT, UNIQUE(repo,name));
+            INSERT INTO event_subscriptions VALUES(7,'default','Same','OnWrite','Base','Proc','[]');").unwrap();
+        super::migrate_event_subscriptions(&conn).unwrap();
+        super::migrate_event_subscriptions(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO event_subscriptions(repo,name,event,handler_module,handler_proc,owner)
+            VALUES('default','Same','OnWrite','Extension','Proc','src/cfe/Test')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM event_subscriptions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT handler_module FROM event_subscriptions WHERE id=7",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "Base"
+        );
     }
 }

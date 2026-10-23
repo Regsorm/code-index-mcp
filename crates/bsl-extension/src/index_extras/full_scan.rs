@@ -1578,10 +1578,10 @@ pub(crate) fn index_event_subscriptions(
     scan: &RepoScan,
     conn: &rusqlite::Connection,
 ) -> Result<()> {
+    index_subscription_defined_types(scan, conn)?;
     // Подписки на события могут быть в нескольких sub-config'ах
     // (base/EventSubscriptions/, extensions/<EF_X>/EventSubscriptions/...).
-    // Список файлов уже собран единым обходом с прежним ограничением глубины
-    // и проверкой каталога-родителя.
+    // Список файлов уже собран единым обходом с проверкой корня области.
     let mut count = 0usize;
     let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
     conn.execute("BEGIN", [])?;
@@ -1589,30 +1589,16 @@ pub(crate) fn index_event_subscriptions(
         "DELETE FROM event_subscriptions WHERE repo = ?",
         params![REPO_DEFAULT],
     )?;
-    let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO event_subscriptions (repo, name, event, handler_module, handler_proc, sources_json) \
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )?;
-
     for path in &scan.event_sub_xmls {
         match parse_event_subscription_file(path) {
             Ok(Some(sub)) => {
-                let sources_json = serde_json::to_string(&sub.sources)?;
-                stmt.execute(params![
-                    REPO_DEFAULT,
-                    &sub.name,
-                    &sub.event,
-                    &sub.handler_module,
-                    &sub.handler_proc,
-                    &sources_json,
-                ])?;
+                insert_event_subscription(&scan.repo_root, conn, path, &sub)?;
                 count += 1;
             }
             Ok(None) => {}
             Err(e) => tracing::warn!("parse_event_subscription_file({}): {}", path.display(), e),
         }
     }
-    drop(stmt);
     conn.execute("COMMIT", [])?;
 
     code_index_core::logging::stage_detail(code_index_core::logging::plural(

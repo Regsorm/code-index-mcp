@@ -371,6 +371,7 @@ fn update_dcs_for_config_template(
 /// Per-file обновление строки `event_subscriptions` по её XML. Слой
 /// `subscription` графа пересобирается отдельно (после всех подписок батча).
 pub(crate) fn update_event_subscription_for_file(
+    repo_root: &Path,
     conn: &rusqlite::Connection,
     xml_path: &Path,
 ) -> Result<()> {
@@ -384,27 +385,12 @@ pub(crate) fn update_event_subscription_for_file(
     }
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
+    conn.execute("DELETE FROM event_subscriptions WHERE repo=?1 AND (source_path=?2 OR (owner=?3 AND name=?4))",
+        params![REPO_DEFAULT,rel_path(repo_root,xml_path),subscription_owner(repo_root,xml_path),xml_path.file_stem().and_then(|s| s.to_str()).unwrap_or("")])?;
     if xml_path.is_file() {
         match parse_event_subscription_file(xml_path) {
             Ok(Some(sub)) => {
-                let sources_json = serde_json::to_string(&sub.sources)?;
-                conn.execute(
-                    "DELETE FROM event_subscriptions WHERE repo = ? AND name = ?",
-                    params![REPO_DEFAULT, &sub.name],
-                )?;
-                conn.execute(
-                    "INSERT OR IGNORE INTO event_subscriptions \
-                     (repo, name, event, handler_module, handler_proc, sources_json) \
-                     VALUES (?, ?, ?, ?, ?, ?)",
-                    params![
-                        REPO_DEFAULT,
-                        &sub.name,
-                        &sub.event,
-                        &sub.handler_module,
-                        &sub.handler_proc,
-                        &sources_json
-                    ],
-                )?;
+                insert_event_subscription(repo_root, conn, xml_path, &sub)?;
             }
             Ok(None) => {}
             Err(e) => tracing::warn!(
@@ -412,16 +398,6 @@ pub(crate) fn update_event_subscription_for_file(
                 xml_path.display(),
                 e
             ),
-        }
-    } else {
-        // Файл удалён — имя подписки прочитать неоткуда; в выгрузке 1С имя
-        // подписки совпадает с именем файла (EventSubscriptions/<Name>.xml),
-        // удаляем по stem как приближению.
-        if let Some(stem) = xml_path.file_stem().and_then(|s| s.to_str()) {
-            conn.execute(
-                "DELETE FROM event_subscriptions WHERE repo = ? AND name = ?",
-                params![REPO_DEFAULT, stem],
-            )?;
         }
     }
     conn.execute("COMMIT", [])?;
@@ -683,7 +659,7 @@ pub fn run_incremental_extras(
     }
     for p in &sub_xmls {
         let t = std::time::Instant::now();
-        update_event_subscription_for_file(conn, p)?;
+        update_event_subscription_for_file(repo_root, conn, p)?;
         code_index_core::logging::stage_add("подписки", t.elapsed());
     }
     for (имя, сколько) in [
@@ -849,6 +825,7 @@ pub fn run_incremental_extras(
         let scan = RepoScan::build(repo_root);
         if refs_dirty {
             let t = std::time::Instant::now();
+            index_subscription_defined_types(&scan, conn)?;
             index_metadata_refs(&scan, conn)?;
             code_index_core::logging::stage_add("связи конфигурации", t.elapsed());
         }

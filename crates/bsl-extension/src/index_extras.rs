@@ -30,6 +30,7 @@ mod incremental;
 mod modules;
 mod resume;
 mod scan;
+mod subscriptions;
 
 pub(crate) use call_graph::*;
 pub(crate) use common::*;
@@ -41,6 +42,7 @@ pub(crate) use incremental::*;
 pub(crate) use modules::*;
 pub(crate) use resume::*;
 pub(crate) use scan::*;
+pub(crate) use subscriptions::*;
 
 /// Выполнить одну фазу надстройки, отметив её длительность для итоговой
 /// строки по папке. Ошибка фазы не фатальна: базовая индексация уже сохранена,

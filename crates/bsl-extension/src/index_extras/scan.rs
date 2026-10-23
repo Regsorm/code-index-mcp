@@ -7,14 +7,9 @@
 //! `stat`-ом на Windows. Здесь дерево обходится ОДИН раз, а фазы получают
 //! готовые списки файлов по категориям.
 //!
-//! Набор категорий и правила классификации повторяют ровно те выборки, что
-//! делали фазы своими обходами (см. `full_scan.rs` / `modules.rs`): множества
-//! файлов совпадают, поэтому результаты записи в БД не меняются.
-//!
-//! Обход конфигураций (`Configuration.xml`, глубина ≤ 3) вынесен в отдельный
-//! проход с `max_depth(3)`: так сохраняется прежний ПОРЯДОК находок, от
-//! которого зависит, чья запись побеждает в `INSERT OR IGNORE` при
-//! заимствованных объектах (`base/` должен идти раньше `extensions/`).
+//! Области выгрузки определяются соседним `Configuration.xml` независимо от
+//! глубины. Основные области идут перед расширениями, сохраняя приоритет
+//! основной конфигурации при заимствовании объектов.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,7 +21,7 @@ use super::common::DirFilter;
 /// Результат одного обхода: пути файлов, разложенные по категориям.
 pub(crate) struct RepoScan {
     pub(crate) repo_root: PathBuf,
-    /// `Configuration.xml` на глубине ≤ 3, в порядке обхода.
+    /// `Configuration.xml` областей выгрузки, в порядке обхода.
     pub(crate) config_paths: Vec<PathBuf>,
     /// Корни sub-config (родители `config_paths`), base-first.
     pub(crate) sub_roots: Vec<PathBuf>,
@@ -52,7 +47,7 @@ pub(crate) struct RepoScan {
     /// Описания форм `<...>/Forms/<Имя>.xml` (сосед папки формы) — источник
     /// UUID формы для перечня модулей, когда `Form.xml` лежит глубже.
     pub(crate) form_descriptors: Vec<PathBuf>,
-    /// `<...>/EventSubscriptions/<Имя>.xml` (глубина ≤ 4, как в прежнем обходе).
+    /// Подписки в корне области выгрузки, независимо от глубины области.
     pub(crate) event_sub_xmls: Vec<PathBuf>,
     /// Описания макетов `<...>/Templates/<Имя>.xml`.
     pub(crate) template_descriptors: Vec<PathBuf>,
@@ -73,29 +68,8 @@ impl RepoScan {
     pub(crate) fn build(repo_root: &Path) -> Self {
         let filter = DirFilter::load(repo_root);
 
-        // 1. Конфигурации — отдельным проходом с прежней глубиной: порядок
-        //    находок определяет приоритет при заимствовании объектов.
+        // Конфигурации собираются тем же обходом, что остальные XML.
         let mut config_paths: Vec<PathBuf> = Vec::new();
-        for entry in WalkDir::new(repo_root)
-            .max_depth(3)
-            .into_iter()
-            .filter_entry(|e| filter.allows(e))
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file()
-                && entry.file_name().to_str() == Some("Configuration.xml")
-            {
-                config_paths.push(entry.path().to_path_buf());
-            }
-        }
-
-        // 2. Корни sub-config, base-first (как `sub_config_roots`).
-        let mut sub_roots: Vec<PathBuf> = config_paths
-            .iter()
-            .filter_map(|p| p.parent().map(Path::to_path_buf))
-            .collect();
-        sub_roots.sort_by_key(|p| u8::from(p.components().any(|c| c.as_os_str() == "extensions")));
-        let sub_root_set: HashSet<PathBuf> = sub_roots.iter().cloned().collect();
 
         // 3. Один полный обход: собираем только нужные расширения.
         let mut xml_all: Vec<PathBuf> = Vec::new();
@@ -110,6 +84,9 @@ impl RepoScan {
                 continue;
             }
             let path = entry.path();
+            if entry.file_name().to_str() == Some("Configuration.xml") {
+                config_paths.push(path.to_path_buf());
+            }
             match path.extension().and_then(|e| e.to_str()) {
                 Some(ext) if ext.eq_ignore_ascii_case("xml") => xml_all.push(path.to_path_buf()),
                 Some(ext) if ext.eq_ignore_ascii_case("bsl") => bsl_files.push(path.to_path_buf()),
@@ -131,6 +108,20 @@ impl RepoScan {
                 }
             }
         }
+
+        // Корни определяются по Configuration.xml, а не глубине пути.
+        let mut sub_roots: Vec<PathBuf> = config_paths
+            .iter()
+            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .collect();
+        sub_roots.sort_by_key(|p| {
+            u8::from(p.components().any(|c| {
+                c.as_os_str().to_str().is_some_and(|s| {
+                    s.eq_ignore_ascii_case("extensions") || s.eq_ignore_ascii_case("cfe")
+                })
+            }))
+        });
+        let sub_root_set = sub_roots.iter().cloned().collect();
 
         // 4. Классификация. Файл может попадать в НЕСКОЛЬКО категорий: корневой
         //    XML типа одновременно читают связи данных, структура, синонимы и
@@ -191,7 +182,7 @@ impl RepoScan {
                 "Forms" => scan.form_descriptors.push(path.clone()),
                 "Templates" => scan.template_descriptors.push(path.clone()),
                 "EventSubscriptions" => {
-                    if rel_depth(repo_root, path) <= 4 {
+                    if in_root_xml || rel_depth(repo_root, path) <= 4 {
                         scan.event_sub_xmls.push(path.clone());
                     }
                 }

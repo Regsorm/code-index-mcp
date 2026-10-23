@@ -48,6 +48,92 @@ pub struct EventSubscription {
     /// Источники: типы объектов, к которым привязана подписка.
     /// Полные строки как в XML (`cfg:DocumentRef.РеализацияТоваровУслуг`).
     pub sources: Vec<String>,
+    /// Наборы типов, включая ссылки на определяемые типы.
+    pub type_sets: Vec<String>,
+    /// Неизвестные элементы описания источника: не скрывать неполноту.
+    pub source_warnings: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SourceTypes {
+    pub sources: Vec<String>,
+    pub type_sets: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Сохраняет исходные типы без потери Object/Manager/RecordSet и TypeSet.
+/// Подходит и для Source подписки, и для корневого Type определяемого типа.
+pub fn parse_source_types(content: &str, container: &str) -> Result<SourceTypes> {
+    let mut reader = Reader::from_str(content);
+    let mut stack: Vec<String> = Vec::new();
+    let mut active = None;
+    let mut out = SourceTypes::default();
+    let mut acc = String::new();
+    loop {
+        match reader.read_event()? {
+            Event::Start(e) => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let local = local_name(raw.as_bytes());
+                if local == container && stack.last().is_some_and(|s| s == "Properties") {
+                    active = Some(stack.len());
+                } else if active.is_some() && !matches!(local.as_str(), "Type" | "TypeSet") {
+                    // Qualifiers describe primitive values; they are not source types.
+                    if !matches!(
+                        local.as_str(),
+                        "StringQualifiers"
+                            | "NumberQualifiers"
+                            | "DateQualifiers"
+                            | "BinaryDataQualifiers"
+                            | "Length"
+                            | "AllowedLength"
+                            | "Digits"
+                            | "FractionDigits"
+                            | "AllowedSign"
+                            | "DateFractions"
+                    ) {
+                        out.warnings.push(format!("unknown source element: {raw}"));
+                    }
+                }
+                stack.push(local);
+                acc.clear();
+            }
+            Event::Empty(e) if active.is_some() => {
+                let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                out.warnings.push(format!("empty source element: {raw}"));
+            }
+            Event::Text(t) if active.is_some() => acc.push_str(
+                &t.unescape()
+                    .map_err(|()| anyhow::anyhow!("invalid source text"))?,
+            ),
+            Event::GeneralRef(r) if active.is_some() => acc.push_str(&general_ref_text(&r)),
+            Event::CData(t) if active.is_some() => acc.push_str(&String::from_utf8_lossy(&t)),
+            Event::End(_) => {
+                if active.is_some() {
+                    let value = std::mem::take(&mut acc).trim().to_string();
+                    if !value.is_empty() {
+                        match stack.last().map(String::as_str) {
+                            Some("Type") => out.sources.push(value),
+                            Some("TypeSet") => out.type_sets.push(value),
+                            _ => {}
+                        }
+                    }
+                    if active == Some(stack.len() - 1) {
+                        active = None;
+                    }
+                }
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out.sources.sort();
+    out.sources.dedup();
+    out.type_sets.sort();
+    out.type_sets.dedup();
+    out.warnings.sort();
+    out.warnings.dedup();
+    Ok(out)
 }
 
 /// Нормализует имя события подписки к русскому виду (как в конфигураторе 1С).
@@ -101,7 +187,6 @@ pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscri
     let mut name: Option<String> = None;
     let mut event_value: Option<String> = None;
     let mut handler_value: Option<String> = None;
-    let mut sources: Vec<String> = Vec::new();
     let mut in_subscription = false;
     let mut acc = String::new();
 
@@ -131,9 +216,6 @@ pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscri
                                 }
                             }
                             "Handler" => handler_value = Some(value),
-                            "Type" if tag_stack.iter().any(|t| t == "Source") => {
-                                sources.push(value);
-                            }
                             _ => {}
                         }
                     }
@@ -151,7 +233,7 @@ pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscri
                     continue;
                 }
                 let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
-                if matches!(parent, "Name" | "Event" | "Handler" | "Type") {
+                if matches!(parent, "Name" | "Event" | "Handler") {
                     let txt = text.unescape().map(|s| s.into_owned()).unwrap_or_default();
                     acc.push_str(&txt);
                 }
@@ -159,7 +241,7 @@ pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscri
             Ok(Event::GeneralRef(r)) => {
                 if in_subscription {
                     let parent = tag_stack.last().map(|s| s.as_str()).unwrap_or("");
-                    if matches!(parent, "Name" | "Event" | "Handler" | "Type") {
+                    if matches!(parent, "Name" | "Event" | "Handler") {
                         acc.push_str(&general_ref_text(&r));
                     }
                 }
@@ -190,13 +272,16 @@ pub fn parse_event_subscription_xml(content: &str) -> Result<Option<EventSubscri
         None => (String::new(), handler),
     };
 
+    let source_types = parse_source_types(content, "Source")?;
     Ok(Some(EventSubscription {
         name,
         // Нормализуем событие к русскому виду (англ. `OnWrite` → `ПриЗаписи`).
         event: event_to_russian(&event).to_string(),
         handler_module: module,
         handler_proc: proc_,
-        sources,
+        sources: source_types.sources,
+        type_sets: source_types.type_sets,
+        source_warnings: source_types.warnings,
     }))
 }
 
@@ -220,6 +305,37 @@ fn local_name(name: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sources_preserve_sets_defined_types_and_unknown_elements() {
+        let xml = r#"<MetaDataObject xmlns:v8="urn:v8"><EventSubscription><Properties>
+          <Name>Подписка</Name><Source>
+            <v8:Type>cfg:DocumentManager.Заказ</v8:Type>
+            <v8:TypeSet>cfg:DocumentObject</v8:TypeSet>
+            <v8:TypeSet>cfg:DefinedType.Набор</v8:TypeSet>
+            <v8:FutureSource>cfg:DocumentObject.Заказ</v8:FutureSource>
+          </Source><Event>BeforeWrite</Event><Handler>Модуль.Обработчик</Handler>
+        </Properties></EventSubscription></MetaDataObject>"#;
+        let sub = super::parse_event_subscription_xml(xml).unwrap().unwrap();
+        assert_eq!(sub.sources, ["cfg:DocumentManager.Заказ"]);
+        assert_eq!(
+            sub.type_sets,
+            ["cfg:DefinedType.Набор", "cfg:DocumentObject"]
+        );
+        assert_eq!(sub.source_warnings.len(), 1);
+        assert!(sub.source_warnings[0].contains("FutureSource"));
+    }
+
+    #[test]
+    fn defined_type_parser_preserves_roles_entities_and_sets() {
+        let xml = r#"<MetaDataObject xmlns:v8="urn:v8"><DefinedType><Properties>
+          <Type><v8:Type>cfg:DocumentObject.А&amp;Б</v8:Type>
+          <v8:TypeSet><![CDATA[cfg:CatalogObject]]></v8:TypeSet></Type>
+        </Properties></DefinedType></MetaDataObject>"#;
+        let types = super::parse_source_types(xml, "Type").unwrap();
+        assert_eq!(types.sources, ["cfg:DocumentObject.А&Б"]);
+        assert_eq!(types.type_sets, ["cfg:CatalogObject"]);
+        assert!(types.warnings.is_empty());
+    }
     use super::*;
 
     const SAMPLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>

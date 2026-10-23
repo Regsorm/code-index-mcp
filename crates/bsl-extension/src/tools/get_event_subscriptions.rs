@@ -12,9 +12,12 @@
 // безфильтровый вызов на крупной конфигурации (сотни подписок, каждая с
 // sources_json) переполнял контекст агента.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 
+use super::subscription_sources::{is_extension, SourceResolver};
+use crate::xml::event_subscriptions::SourceTypes;
 use code_index_core::extension::{IndexTool, ToolContext};
 use serde_json::{json, Value};
 
@@ -27,39 +30,25 @@ const MAX_LIMIT: i64 = 2000;
 
 /// Допустимые параметры tool'а — неизвестные ключи отклоняются с подсказкой
 /// (агент передавал object=… и молча получал ВСЕ подписки вместо фильтра).
-const KNOWN_PARAMS: &[&str] = &["repo", "handler_module", "event", "source", "limit"];
+const KNOWN_PARAMS: &[&str] = &[
+    "repo",
+    "handler_module",
+    "event",
+    "source",
+    "exact_only",
+    "limit",
+];
 
 /// Совпадает ли подписка с фильтром source по её источникам
 /// (sources — JSON-массив строк вида "cfg:DocumentObject.ЗаказКлиента").
 /// Принимает 'Document.ЗаказКлиента', 'DocumentObject.ЗаказКлиента' или
 /// короткое имя 'ЗаказКлиента'; регистр не учитывается (Unicode).
+#[cfg(test)]
 fn source_matches(sources: &Value, filter: &str) -> bool {
-    let filter = filter.trim().trim_start_matches("cfg:");
-    // 'Документ.X' → 'Document.X': источники в БД хранятся с английским типом.
-    let filter_norm = crate::code_usages::normalize_object_ref(filter);
-    let filter = filter_norm.as_ref();
-    let (f_type, f_name) = match filter.split_once('.') {
-        Some((t, n)) => (Some(t.to_lowercase()), n.to_lowercase()),
-        None => (None, filter.to_lowercase()),
-    };
-    let Some(arr) = sources.as_array() else {
-        return false;
-    };
-    arr.iter().filter_map(|v| v.as_str()).any(|entry| {
-        let entry = entry.trim_start_matches("cfg:");
-        let (e_type, e_name) = match entry.split_once('.') {
-            Some((t, n)) => (t.to_lowercase(), n.to_lowercase()),
-            None => (String::new(), entry.to_lowercase()),
-        };
-        if e_name != f_name {
-            return false;
-        }
-        match &f_type {
-            None => true,
-            // 'Document' матчит 'DocumentObject' (в sources тип хранится
-            // с суффиксом Object), точное совпадение — тоже.
-            Some(ft) => e_type == *ft || e_type == format!("{}object", ft),
-        }
+    sources.as_array().is_some_and(|a| {
+        a.iter()
+            .filter_map(Value::as_str)
+            .any(|entry| super::subscription_sources::exact_matches(entry, filter))
     })
 }
 
@@ -74,6 +63,10 @@ impl IndexTool for GetEventSubscriptionsTool {
         "Возвращает список подписок на события 1С: name, event, handler_module, \
          handler_proc, sources. Опциональные фильтры: handler_module, event, \
          source (объект-источник: 'Document.ЗаказКлиента' или короткое имя). \
+         Учитывает TypeSet, определяемые типы и расширения; Document.X включает \
+         Object/Manager/RecordSet, явный суффикс ограничивает вид. exact_only=true \
+         оставляет явные источники. matched_via объясняет совпадение, owner — область. \
+         complete=false и warnings показывают нераскрытые источники/старый индекс. \
          Ответ ограничен limit (default 50, max 2000); при превышении рядом — \
          total и truncated=true (сузьте фильтр или дошлите больший limit). \
          For BSL/1C repositories only."
@@ -104,6 +97,11 @@ impl IndexTool for GetEventSubscriptionsTool {
                     "description": "Потолок строк (default 50, max 2000). При превышении — первые limit + total + truncated=true.",
                     "default": 50,
                     "minimum": 1
+                },
+                "exact_only": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "С source возвращать только явные типы, без TypeSet и определяемых типов"
                 }
             },
             "required": ["repo"]
@@ -133,7 +131,7 @@ impl IndexTool for GetEventSubscriptionsTool {
                         "error": format!("неизвестные параметры: {}", unknown.join(", ")),
                         "hint": "Допустимые фильтры: handler_module (модуль-обработчик), \
                                  event (событие, рус./англ.), source (объект-источник, \
-                                 например 'Document.ЗаказКлиента' или короткое имя), limit.",
+                                 например 'Document.ЗаказКлиента' или короткое имя), exact_only, limit.",
                     }));
                 }
             }
@@ -159,6 +157,10 @@ impl IndexTool for GetEventSubscriptionsTool {
                 .get("source")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let exact_only = args
+                .get("exact_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let limit: i64 = args
                 .get("limit")
                 .and_then(|v| v.as_i64())
@@ -174,6 +176,23 @@ impl IndexTool for GetEventSubscriptionsTool {
                 }
             };
             let conn = storage.conn();
+            let resolver = match source
+                .as_deref()
+                .map(|s| SourceResolver::load(conn, s))
+                .transpose()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return crate::tools::wrap_error(
+                        json!({"error":format!("source resolution: {e}")}),
+                    )
+                }
+            };
+            let mut warnings = BTreeSet::new();
+            let built = code_index_core::storage::schema::index_data_version(conn);
+            if built < code_index_core::storage::schema::INDEX_DATA_VERSION {
+                warnings.insert("reindex_required: source sets and configuration owners may be missing; rebuild the index with index --force".to_string());
+            }
 
             // Динамический WHERE для опциональных фильтров.
             let mut where_parts: Vec<&str> = vec!["repo = ?"];
@@ -202,13 +221,13 @@ impl IndexTool for GetEventSubscriptionsTool {
                 v
             };
 
-            // Берём limit+1, чтобы отличить «ровно limit» от «есть ещё».
-            // С фильтром source SQL-LIMIT снимается (LIMIT -1 = без предела в
-            // SQLite): фильтрация идёт после выборки, обрезать раньше нельзя.
-            let lim_plus = if source.is_some() { -1 } else { limit + 1 };
+            // Inspect all rows even without source: omitted rows can contain
+            // warnings that affect the completeness of this answer.
+            let lim_plus: i64 = -1;
             let data_sql = format!(
-                "SELECT name, event, handler_module, handler_proc, sources_json \
-                 FROM event_subscriptions WHERE {} ORDER BY name LIMIT ?",
+                "SELECT name, event, handler_module, handler_proc, sources_json, \
+                 owner, source_path, type_sets_json, warnings_json \
+                 FROM event_subscriptions WHERE {} ORDER BY name, owner LIMIT ?",
                 where_sql
             );
             let mut data_params = base_params();
@@ -229,6 +248,10 @@ impl IndexTool for GetEventSubscriptionsTool {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
                 ))
             });
 
@@ -237,15 +260,45 @@ impl IndexTool for GetEventSubscriptionsTool {
                 Ok(iter) => {
                     for row in iter {
                         match row {
-                            Ok((name, event, module, proc_, sources)) => {
-                                let sources_v = sources
-                                    .as_deref()
-                                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                                    .unwrap_or(Value::Array(Vec::new()));
-                                if let Some(ref f) = source {
-                                    if !source_matches(&sources_v, f) {
+                            Ok((
+                                name,
+                                event,
+                                module,
+                                proc_,
+                                sources,
+                                owner,
+                                source_path,
+                                sets,
+                                source_warnings,
+                            )) => {
+                                let types = (|| -> serde_json::Result<SourceTypes> {
+                                    Ok(SourceTypes {
+                                        sources: serde_json::from_str(
+                                            sources.as_deref().unwrap_or("[]"),
+                                        )?,
+                                        type_sets: serde_json::from_str(&sets)?,
+                                        warnings: serde_json::from_str(&source_warnings)?,
+                                    })
+                                })();
+                                let types = match types {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        warnings.insert(format!("{owner}/{name}: invalid stored source description: {e}"));
                                         continue;
                                     }
+                                };
+                                let mut row_warnings = BTreeSet::new();
+                                row_warnings.extend(types.warnings.iter().cloned());
+                                let matched = resolver.as_ref().and_then(|r| {
+                                    r.matches(&types, &owner, exact_only, &mut row_warnings)
+                                });
+                                warnings.extend(
+                                    row_warnings
+                                        .into_iter()
+                                        .map(|w| format!("{owner}/{name}: {w}")),
+                                );
+                                if resolver.is_some() && matched.is_none() {
+                                    continue;
                                 }
                                 // При заданном source полный список источников НЕ печатаем:
                                 // мы уже знаем, что запрошенный объект в нём есть, а у глобальных
@@ -257,13 +310,24 @@ impl IndexTool for GetEventSubscriptionsTool {
                                     "event": event,
                                     "handler_module": module,
                                     "handler_proc": proc_,
+                                    "owner": owner,
                                 });
-                                if source.is_some() {
-                                    let n = sources_v.as_array().map(|a| a.len()).unwrap_or(0);
+                                if is_extension(&owner) {
+                                    entry["extension"] = json!(owner);
+                                }
+                                if let Some(matched) = matched {
+                                    let n = types.sources.len() + types.type_sets.len();
                                     entry["sources_count"] = json!(n);
                                     entry["matches_source"] = json!(true);
+                                    entry["matched_via"] = json!(matched.via);
+                                    entry["matched_source"] = json!(matched.source);
+                                    if let Some(name) = matched.defined_type {
+                                        entry["defined_type"] = json!(name);
+                                    }
                                 } else {
-                                    entry["sources"] = sources_v;
+                                    entry["source_path"] = json!(source_path);
+                                    entry["sources"] = json!(types.sources);
+                                    entry["type_sets"] = json!(types.type_sets);
                                 }
                                 out.push(entry);
                             }
@@ -287,20 +351,8 @@ impl IndexTool for GetEventSubscriptionsTool {
             if truncated {
                 out.truncate(limit as usize);
             }
-            // total: с source выборка была полной — total известен из full_len;
-            // без source при обрезке — отдельный COUNT по тому же WHERE.
-            let total = if source.is_some() {
-                full_len
-            } else if truncated {
-                let count_sql = format!(
-                    "SELECT COUNT(*) FROM event_subscriptions WHERE {}",
-                    where_sql
-                );
-                conn.query_row(&count_sql, base_params().as_slice(), |r| r.get::<_, i64>(0))
-                    .unwrap_or(out.len() as i64)
-            } else {
-                out.len() as i64
-            };
+            // total считается после сопоставления источника и до обрезки.
+            let total = full_len;
 
             let count = out.len();
             crate::tools::wrap_with_meta(
@@ -311,6 +363,9 @@ impl IndexTool for GetEventSubscriptionsTool {
                     "total": total,
                     "truncated": truncated,
                     "limit": limit,
+                    "complete": warnings.is_empty(),
+                    "warnings_count": warnings.len(),
+                    "warnings": warnings.into_iter().take(80).collect::<Vec<_>>(),
                 }),
                 Vec::new(),
             )

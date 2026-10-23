@@ -32,6 +32,7 @@ pub mod get_role_rights;
 pub mod posting_map;
 pub mod search_terms;
 pub mod structure;
+mod subscription_sources;
 
 pub use bsl_sql::BslSqlTool;
 pub use find_data_path::FindDataPathTool;

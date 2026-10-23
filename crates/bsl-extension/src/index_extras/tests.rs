@@ -21,6 +21,61 @@ fn write(path: &Path, content: &str) {
 }
 
 #[test]
+fn subscription_scopes_survive_deep_scan_incremental_rename_and_delete() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    let base = repo.join("src/cf");
+    let extension = repo.join("src/cfe/Feature");
+    for root in [&base, &extension] {
+        write(&root.join("Configuration.xml"), "<Configuration/>");
+    }
+    let xml = |handler: &str| {
+        format!(
+            r#"<MetaDataObject xmlns:v8="urn:v8"><EventSubscription><Properties>
+        <Name>Same</Name><Source><v8:TypeSet>cfg:DocumentObject</v8:TypeSet></Source>
+        <Event>OnWrite</Event><Handler>{handler}.Proc</Handler></Properties></EventSubscription></MetaDataObject>"#
+        )
+    };
+    let base_sub = base.join("EventSubscriptions/Same.xml");
+    let ext_sub = extension.join("EventSubscriptions/Same.xml");
+    write(&base_sub, &xml("Base"));
+    write(&ext_sub, &xml("Extension"));
+    let storage = fresh_storage(&tmp);
+    let scan = RepoScan::build(&repo);
+    assert_eq!(scan.event_sub_xmls.len(), 2);
+    index_event_subscriptions(&scan, storage.conn()).unwrap();
+    let rows = || {
+        storage
+            .conn()
+            .query_row("SELECT count(*) FROM event_subscriptions", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(rows(), 2);
+    write(
+        &ext_sub,
+        &xml("Changed").replace("<Name>Same</Name>", "<Name>Renamed</Name>"),
+    );
+    update_event_subscription_for_file(&repo, storage.conn(), &ext_sub).unwrap();
+    assert_eq!(rows(), 2);
+    assert_eq!(
+        storage
+            .conn()
+            .query_row(
+                "SELECT handler_module FROM event_subscriptions WHERE owner='src/cf'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "Base"
+    );
+    std::fs::remove_file(&ext_sub).unwrap();
+    update_event_subscription_for_file(&repo, storage.conn(), &ext_sub).unwrap();
+    assert_eq!(rows(), 1);
+}
+
+#[test]
 fn incremental_config_change_adds_new_object() {
     // Фаза 3: добавление объекта в состав. Опись (ConfigDumpInfo.xml) в
     // батче — триггер сверки реестра; сам объект индексируется своим

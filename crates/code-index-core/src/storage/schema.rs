@@ -306,7 +306,9 @@ pub fn bulk_load_in_progress(conn: &rusqlite::Connection) -> bool {
 /// метаданных (`<MainDataCompositionSchema>` отчёта → его макет). База версии 3
 /// читается, но в ней этих рёбер нет, и макеты регламентированных отчётов
 /// попадают в список неиспользуемых объектов — пересобрать: `index --force`.
-pub const INDEX_DATA_VERSION: u32 = 4;
+/// 5 — подписки сохраняют наборы типов, состав определяемых типов и владельца
+/// конфигурации; глубокие области выгрузки больше не отсекаются.
+pub const INDEX_DATA_VERSION: u32 = 5;
 
 /// Ключ номера версии данных в таблице `index_state`.
 pub const DATA_VERSION_KEY: &str = "index_data_version";

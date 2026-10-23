@@ -5,6 +5,12 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `get_event_subscriptions`: `source` now resolves `TypeSet` sets, nested defined types and Object/Manager/RecordSet sources. Extension subscriptions are read regardless of configuration-root depth; same-named subscriptions in different scopes no longer collide. Responses add `matched_via`, `matched_source`, `defined_type`, `owner`, `extension`, `complete` and warnings for unresolved sources; `exact_only` restricts matching to explicit types. Existing rows are preserved during schema migration; rebuild older indexes for the new data (data version 5). Fixes #24.
+
 ## [1.15.1] — 2026-10-23
 
 **Dependency fixes and two git-layer improvements.**
