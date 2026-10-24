@@ -177,8 +177,14 @@ pub fn function_body_cap() -> usize {
 
 /// Дефолтный набор инструментов под cap_response (если `[mcp].cap_tools` пуст).
 /// list-подобные BSL-tools, где обрез до сэмпла + total приемлем.
+///
+/// `get_event_subscriptions` здесь БОЛЬШЕ НЕТ: инструмент отдаёт собственную
+/// страницу (`offset` + бюджет ответа) и ставит честные `subscriptions_shown/
+/// _total/_offset/_has_more`. Слепой обрез вдвое дрался с этим: при 97 подписях
+/// он оставлял 48 записей и `count: 97`, а пути к остатку не было (issue #25).
+/// Инструмент со своей постраничной выдачей в этот список не входит — как
+/// `get_data_links` и структурные tools.
 pub const DEFAULT_CAP_TOOLS: &[&str] = &[
-    "get_event_subscriptions",
     "bsl_sql",
     "find_references",
     "get_register_writers",
@@ -785,7 +791,8 @@ mod tests {
         let set = default_cap_set();
         assert!(set.contains("find_references"));
         assert!(set.contains("get_register_writers"));
-        assert!(set.contains("get_event_subscriptions"));
+        // Инструмент со своей страницей — вне слепого обреза (issue #25).
+        assert!(!set.contains("get_event_subscriptions"));
         assert!(set.contains("bsl_sql"));
     }
 

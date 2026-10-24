@@ -5,12 +5,14 @@
 // `index_extras::index_event_subscriptions` (этап 4c) из
 // EventSubscriptions/<Name>.xml.
 //
-// Защита контекста: ответ ограничен `limit` строками (default 200, max 2000).
-// При превышении возвращаются первые `limit` подписок, рядом — `total`
-// (полное число) и `truncated=true`, чтобы модель сузила фильтр
-// (handler_module/event) или дослала больший limit. Без этого
-// безфильтровый вызов на крупной конфигурации (сотни подписок, каждая с
-// sources_json) переполнял контекст агента.
+// Защита контекста: отдаётся СТРАНИЦА набора, а не весь список. Размер страницы
+// задаёт бюджет ответа (`[mcp].max_response_bytes` либо параметр вызова
+// `max_response_bytes`), `limit` — потолок строк на страницу. Смещение — `offset`;
+// рядом с массивом идут `subscriptions_shown/_total/_offset/_has_more`, а в `hint`
+// — готовая строка следующего вызова. Без этого полный список (97 подписок на
+// центральный документ — около 60 КБ на кириллице) терялся на слепом обрезе
+// массивов в `cap_response`: тот делил массив вдвое и оставлял 48 записей из 97
+// при счётчике `count: 97` — второго способа получить остаток не было.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -37,6 +39,8 @@ const KNOWN_PARAMS: &[&str] = &[
     "source",
     "exact_only",
     "limit",
+    "offset",
+    "max_response_bytes",
 ];
 
 /// Совпадает ли подписка с фильтром source по её источникам
@@ -67,8 +71,12 @@ impl IndexTool for GetEventSubscriptionsTool {
          Object/Manager/RecordSet, явный суффикс ограничивает вид. exact_only=true \
          оставляет явные источники. matched_via объясняет совпадение, owner — область. \
          complete=false и warnings показывают нераскрытые источники/старый индекс. \
-         Ответ ограничен limit (default 50, max 2000); при превышении рядом — \
-         total и truncated=true (сузьте фильтр или дошлите больший limit). \
+         Выдача ПОСТРАНИЧНАЯ: в ответе subscriptions_shown/_total/_offset/_has_more, \
+         а в hint — готовый следующий вызов с offset. Размер страницы ограничен \
+         бюджетом ответа ([mcp].max_response_bytes, либо параметр max_response_bytes \
+         на один вызов); limit (default 50, max 2000) — потолок строк на страницу. \
+         Полный список обходится по offset; одним вызовом — с max_response_bytes \
+         и limit побольше. \
          For BSL/1C repositories only."
     }
 
@@ -102,6 +110,17 @@ impl IndexTool for GetEventSubscriptionsTool {
                     "type": "boolean",
                     "default": false,
                     "description": "С source возвращать только явные типы, без TypeSet и определяемых типов"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Смещение в отфильтрованном наборе (по умолчанию 0). Берётся из subscriptions_offset/hint предыдущей страницы",
+                    "default": 0,
+                    "minimum": 0
+                },
+                "max_response_bytes": {
+                    "type": "integer",
+                    "description": "Бюджет ЭТОГО ответа в байтах: перекрывает [mcp].max_response_bytes, но не выше [cap].max_response_bytes_hard. Позволяет забрать весь список одним вызовом",
+                    "minimum": 1
                 }
             },
             "required": ["repo"]
@@ -166,6 +185,16 @@ impl IndexTool for GetEventSubscriptionsTool {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(DEFAULT_LIMIT)
                 .clamp(1, MAX_LIMIT);
+            // Смещение по отфильтрованному набору и бюджет одной страницы.
+            // Бюджет разрешается тем же способом, что у find_references и
+            // get_data_links: клиентский `max_response_bytes` главнее серверного,
+            // но не выше потолка `[cap].max_response_bytes_hard`.
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let budget = code_index_core::mcp::cap::resolve_request_budget(
+                args.get("max_response_bytes")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize),
+            );
 
             let storage = match ctx.storage.get().await {
                 Ok(s) => s,
@@ -346,37 +375,182 @@ impl IndexTool for GetEventSubscriptionsTool {
                 }
             }
 
-            let full_len = out.len() as i64;
-            let truncated = full_len > limit;
-            if truncated {
-                out.truncate(limit as usize);
-            }
-            // total считается после сопоставления источника и до обрезки.
-            let total = full_len;
+            // Страница набора: окно [offset, offset+limit) разрезается по бюджету
+            // ответа. `total` и `has_more` считаются по ПОЛНОМУ набору, а не по
+            // окну — иначе страница объявила бы конец набора раньше срока.
+            let mut page = subscription_page(out, offset, limit, budget.applied);
+            let shown = page.shown;
+            let next_offset = page.next_offset();
+            let items = std::mem::take(&mut page.items);
 
-            let count = out.len();
-            crate::tools::wrap_with_meta(
-                "get_event_subscriptions",
-                json!({
-                    "subscriptions": out,
-                    "count": count,
-                    "total": total,
-                    "truncated": truncated,
-                    "limit": limit,
-                    "complete": warnings.is_empty(),
-                    "warnings_count": warnings.len(),
-                    "warnings": warnings.into_iter().take(80).collect::<Vec<_>>(),
-                }),
-                Vec::new(),
-            )
+            let mut result = json!({
+                "subscriptions": items,
+                // count — РЕАЛЬНОЕ число отданных записей (было числом до обрезки:
+                // при срабатывании стража ответ говорил 97 при 48 элементах).
+                "count": shown,
+                "total": page.total,
+                "truncated": page.has_more,
+                "limit": limit,
+                "complete": warnings.is_empty(),
+                "warnings_count": warnings.len(),
+                "warnings": warnings.into_iter().take(80).collect::<Vec<_>>(),
+            });
+            if let Some(obj) = result.as_object_mut() {
+                page.annotate(obj, "subscriptions");
+                if budget.requested.is_some() {
+                    obj.insert("response_budget_applied".to_string(), json!(budget.applied));
+                }
+                if let Some(next) = next_offset {
+                    // Подсказка обязана нести фильтры текущего вызова: без них
+                    // следующая страница была бы страницей ДРУГОГО набора.
+                    let mut call: Vec<(&str, Value)> = vec![("repo", json!(ctx.repo))];
+                    if let Some(ref s) = source {
+                        call.push(("source", json!(s)));
+                    }
+                    if let Some(ref e) = event {
+                        call.push(("event", json!(e)));
+                    }
+                    if let Some(ref m) = handler_module {
+                        call.push(("handler_module", json!(m)));
+                    }
+                    if exact_only {
+                        call.push(("exact_only", json!(true)));
+                    }
+                    call.push(("offset", json!(next)));
+                    obj.insert(
+                        "hint".to_string(),
+                        json!(format!(
+                            "Показано {} из {} (со смещения {}). Следующая страница — 1 вызов:\n{}",
+                            shown,
+                            page.total,
+                            offset,
+                            code_index_core::mcp::cap::next_call_hint(
+                                "get_event_subscriptions",
+                                &call
+                            )
+                        )),
+                    );
+                }
+            }
+
+            crate::tools::wrap_with_meta("get_event_subscriptions", result, Vec::new())
         })
     }
 }
 
+/// Одна страница подписок: окно `[offset, offset+limit)` набора, разрезанное по
+/// бюджету байт. `total` и `has_more` считаются по ПОЛНОМУ набору — страница
+/// видит только своё окно и иначе объявила бы конец набора раньше срока.
+/// Первый элемент окна берётся всегда (`page_by_bytes`): пустая страница не
+/// сдвинула бы `offset`, и обход зациклился бы на одном вызове.
+fn subscription_page(
+    out: Vec<Value>,
+    offset: usize,
+    limit: i64,
+    budget: usize,
+) -> code_index_core::mcp::cap::Page {
+    let total = out.len();
+    let offset = offset.min(total);
+    let window: Vec<Value> = out
+        .into_iter()
+        .skip(offset)
+        .take(limit.max(1) as usize)
+        .collect();
+    let mut page = code_index_core::mcp::cap::page_by_bytes(window, 0, budget);
+    page.offset = offset;
+    page.total = total;
+    page.has_more = offset + page.shown < total;
+    page
+}
+
 #[cfg(test)]
 mod tests {
-    use super::source_matches;
-    use serde_json::json;
+    use super::{source_matches, subscription_page};
+    use serde_json::{json, Value};
+
+    /// Запись подписки без source-фильтра: те же поля, что отдаёт инструмент.
+    fn subs(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                json!({
+                    "name": format!("Подписка_{}", i),
+                    "event": "ПриЗаписи",
+                    "handler_module": "CommonModule.Обмен",
+                    "handler_proc": format!("Обработчик{}", i),
+                    "owner": "cfg",
+                })
+            })
+            .collect()
+    }
+
+    /// Регрессия по #25: набор из 97 подписок обходится страницами целиком —
+    /// без пропусков, повторов и зацикливания на одном смещении.
+    #[test]
+    fn page_walks_whole_set_without_gaps_or_repeats() {
+        let items = subs(97);
+        let mut offset = 0usize;
+        let mut seen: Vec<String> = Vec::new();
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages < 20, "обход обязан завершиться");
+            let page = subscription_page(items.clone(), offset, 50, 6_000);
+            assert!(
+                page.shown > 0,
+                "пустая страница на offset={offset} — обход зациклится"
+            );
+            assert_eq!(page.total, 97, "total — размер всего набора");
+            for it in &page.items {
+                seen.push(it["name"].as_str().unwrap().to_string());
+            }
+            match page.next_offset() {
+                Some(next) => {
+                    assert!(next > offset, "курсор двигается вперёд");
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 97, "весь набор собран");
+        let unique: std::collections::BTreeSet<&String> = seen.iter().collect();
+        assert_eq!(unique.len(), 97, "повторов нет");
+    }
+
+    /// `limit` — потолок строк на страницу, а не размер набора: маркеры должны
+    /// говорить правду (97 в total, has_more=true, next=limit).
+    #[test]
+    fn limit_caps_rows_and_markers_stay_honest() {
+        let page = subscription_page(subs(97), 0, 10, 1_000_000);
+        assert_eq!(page.shown, 10, "limit — потолок строк на страницу");
+        assert_eq!(page.total, 97, "total — размер всего набора");
+        assert!(page.has_more);
+        assert_eq!(page.next_offset(), Some(10));
+    }
+
+    /// Бюджет режет страницу ниже limit — иначе крупный sources-набор рвал бы
+    /// ответ клиента (прежнее поведение: 48 записей из 97 без пути к остатку).
+    #[test]
+    fn budget_shrinks_the_page_below_limit() {
+        let page = subscription_page(subs(97), 0, 2_000, 4_000);
+        assert!(
+            page.shown > 0 && page.shown < 97,
+            "страница по бюджету: {}",
+            page.shown
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_offset(), Some(page.shown));
+    }
+
+    /// Смещение за концом набора — пустая страница с честным offset, без паники
+    /// и без ложного has_more.
+    #[test]
+    fn offset_past_the_end_is_empty_and_terminal() {
+        let page = subscription_page(subs(5), 99, 50, 48_000);
+        assert_eq!(page.shown, 0);
+        assert_eq!(page.offset, 5);
+        assert!(!page.has_more);
+        assert_eq!(page.next_offset(), None);
+    }
 
     #[test]
     fn source_filter_matches_all_accepted_forms() {
