@@ -209,7 +209,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-daemon-autostart.ps1 `
 |---|---|---|---|
 | `cap_enabled` | bool | `true` | Глобальный выключатель стража |
 | `max_response_bytes` | usize | `48000` | Бюджет размера JSON-ответа; сверх него усекается самый тяжёлый массив |
-| `cap_tools` | array | `get_event_subscriptions`, `bsl_sql`, `find_references`, `get_register_writers` | Инструменты под капом массивов |
+| `cap_tools` | array | `bsl_sql`, `find_references`, `get_register_writers` | Инструменты под капом массивов (инструменты со своей постраничной выдачей сюда не входят) |
 | `max_function_body_chars` | usize | `15000` | Порог тела функции для навигационного стаба (`get_function`/`get_class`) |
 
 #### Секция `[[cache_targets]]` (v0.42.0) — канал инвалидации кэша
