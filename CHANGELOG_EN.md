@@ -5,6 +5,18 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.15.4] — 2026-10-24
+
+**Dependency update driven by the security gate: `tokio` bumped from 1.53.1 to 1.54.1.**
+
+### Changed
+
+- **`tokio` 1.53.1 → 1.54.1.** The `cargo deny` (`advisories`) gate in CI flagged RUSTSEC-2026-0386: `AsyncFd::new` and related constructors violate I/O safety (unsound). The fix requires 1.53.3 or newer; the advisory appeared after the green 1.15.2 run, so the change ships as its own patch release.
+
+### Compatibility
+
+- Only the dependency lock file changes: the source code, the database schema and the storage format are untouched, so no reindex is required. Tool behaviour is identical to 1.15.3.
+
 ## [1.15.3] — 2026-10-24
 
 **The full subscription list of an object now arrives in full: `get_event_subscriptions` gained pages and a response budget.**
