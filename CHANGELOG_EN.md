@@ -5,6 +5,18 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.15.3] — 2026-10-24
+
+**The full subscription list of an object now arrives in full: `get_event_subscriptions` gained pages and a response budget.**
+
+### Fixed
+
+- `get_event_subscriptions`: the output is now paged — `offset` and `max_response_bytes` parameters, `subscriptions_shown`/`_total`/`_offset`/`_has_more` markers next to the array, and a `hint` with the ready next call (the filters of the current call are carried into it). Before this, the full subscription list of an object could not be obtained: `limit` (50 by default) cut the set, while the size guard halved the heaviest array — on a base with 97 subscriptions 48 records remained with `count: 97`, and there was no way to reach the rest. `count` now equals the number of records actually returned, and the page size is set by the response budget. The tool is no longer in `DEFAULT_CAP_TOOLS`: it manages its own size, like `get_data_links`. Fixes #25.
+
+### Compatibility
+
+- No reindex required: the database schema, the storage format and the indexer are unchanged — the change lives in the response layer. The parameters are additive, and `limit` keeps its meaning of rows per page.
+
 ## [1.15.2] — 2026-10-23
 
 ### Fixed
