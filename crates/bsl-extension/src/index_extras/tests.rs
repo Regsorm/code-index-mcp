@@ -1425,6 +1425,56 @@ fn maybe_analyze_runs_when_graph_grows() {
     );
 }
 
+/// Регресс #27: `analyzed_row_count` брал первую строку `sqlite_stat1`, а ею
+/// оказывался частичный индекс — его число записей меньше строк таблицы, и
+/// `stats_drifted` находил дрейф ≥1.5× на неизменных данных. Здесь 1000 рёбер,
+/// из них 600 с известным адресом цели: частичный `idx_pcg_callee_key` даёт
+/// 600, полный `idx_pcg_caller` — 1000.
+#[test]
+fn analyzed_row_count_ignores_partial_index_rows() {
+    let tmp = TempDir::new().unwrap();
+    let storage = fresh_storage(&tmp);
+    let conn = storage.conn();
+    for i in 0..1000 {
+        let callee: Option<String> = (i < 600).then(|| format!("P{}", i % 50));
+        conn.execute(
+            "INSERT INTO proc_call_graph \
+             (repo, caller_proc_key, callee_proc_name, callee_proc_key, call_type) \
+             VALUES (?, ?, ?, ?, 'direct')",
+            params![
+                REPO_DEFAULT,
+                format!("M::C{}", i),
+                format!("C{}", i),
+                callee
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute("ANALYZE", []).unwrap();
+
+    // Первой в sqlite_stat1 лежит строка частичного индекса — ровно то, что
+    // раньше принималось за размер таблицы.
+    let first: String = conn
+        .query_row(
+            "SELECT stat FROM sqlite_stat1 WHERE tbl = 'proc_call_graph' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let first_rows: i64 = first.split_whitespace().next().unwrap().parse().unwrap();
+    assert_eq!(first_rows, 600, "частичный индекс содержит 600 строк");
+
+    assert_eq!(
+        analyzed_row_count(conn, "proc_call_graph"),
+        Some(1000),
+        "размер таблицы берётся по полному индексу, а не по частичному"
+    );
+    assert!(
+        !stats_drifted(1000, analyzed_row_count(conn, "proc_call_graph")),
+        "неизменённые данные не дают ложного дрейфа"
+    );
+}
+
 #[test]
 fn idempotent_repeated_runs_dont_dupe() {
     let tmp = TempDir::new().unwrap();

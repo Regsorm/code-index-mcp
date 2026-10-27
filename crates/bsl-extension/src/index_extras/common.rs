@@ -469,19 +469,25 @@ pub(crate) fn object_sub_config(
 /// Число строк в таблице, записанное в `sqlite_stat1` на момент последнего
 /// `ANALYZE` (первый токен колонки `stat`). `None` — статистики нет (таблицу
 /// ни разу не анализировали, либо самой `sqlite_stat1` ещё нет).
+///
+/// Берём максимум по всем строкам таблицы, а не первую попавшуюся: в
+/// `sqlite_stat1` лежит по строке на КАЖДЫЙ индекс, и первое число в `stat` —
+/// это число записей в конкретном индексе. У частичного индекса оно меньше
+/// числа строк таблицы: `idx_pcg_callee_key` хранит только рёбра с известным
+/// адресом цели (~⅔ строк), `idx_pcg_call_type_nd` — только НЕ-direct рёбра.
+/// `LIMIT 1` отдавал такое заниженное число, и `stats_drifted` находил дрейф
+/// ≥1.5× на неизменных данных — полный `ANALYZE` запускался после каждой правки
+/// `.bsl` и ничем не помогал (частичный индекс и после него остаётся меньше
+/// таблицы). Полный индекс (или автоиндекс) содержит все строки таблицы,
+/// поэтому максимум равен `count(*)`.
 pub(crate) fn analyzed_row_count(conn: &rusqlite::Connection, table: &str) -> Option<i64> {
-    let stat: Option<String> = conn
-        .query_row(
-            "SELECT stat FROM sqlite_stat1 WHERE tbl = ?1 LIMIT 1",
-            params![table],
-            |r| r.get(0),
-        )
-        .ok();
-    stat.and_then(|s| {
-        s.split_whitespace()
-            .next()
-            .and_then(|t| t.parse::<i64>().ok())
-    })
+    conn.query_row(
+        "SELECT max(CAST(stat AS INTEGER)) FROM sqlite_stat1 WHERE tbl = ?1",
+        params![table],
+        |r| r.get::<_, Option<i64>>(0),
+    )
+    .ok()
+    .flatten()
 }
 
 /// Разошлась ли реальная величина таблицы со статистикой настолько, что пора
@@ -507,25 +513,33 @@ pub(crate) fn stats_drifted(current: i64, recorded: Option<i64>) -> bool {
 /// Пересчитать `ANALYZE`, если величина графовых таблиц (`data_links`,
 /// `proc_call_graph`) разошлась со статистикой в ≥1.5× — иначе рекурсивные
 /// обходы `find_data_path` / `find_path_bsl` деградируют (планировщик без свежей
-/// `sqlite_stat1` перебирает все рёбра вместо seek). Полный `ANALYZE` дёшев
-/// (~0.6 с) относительно этой деградации (сек→минуты), но зовём его лишь при
-/// реальном дрейфе, а не на каждый батч. `ANALYZE` идёт по всей БД (не только
-/// по этим двум таблицам) — это штатно и дёшево.
+/// `sqlite_stat1` перебирает все рёбра вместо seek). Зовём его лишь при реальном
+/// дрейфе, а не на каждый батч, и анализируем только те таблицы, по которым
+/// дрейф найден: полный `ANALYZE` по всей БД на базе 5.7 ГБ идёт ~5 с на
+/// свободной машине и до минуты под нагрузкой, тогда как две графовые таблицы —
+/// ~1.4 с. Остальные таблицы получают свежую статистику от полного `ANALYZE` в
+/// конце полной переиндексации (`run_index_extras`).
 pub(crate) fn maybe_analyze_graph_tables(conn: &rusqlite::Connection) -> Result<()> {
-    let mut need = false;
+    let mut drifted: Vec<&str> = Vec::new();
     for table in ["data_links", "proc_call_graph"] {
         let current: i64 = conn
             .query_row(&format!("SELECT count(*) FROM {}", table), [], |r| r.get(0))
             .unwrap_or(0);
         if stats_drifted(current, analyzed_row_count(conn, table)) {
-            need = true;
-            break;
+            drifted.push(table);
         }
     }
-    if need {
-        let _ = conn.execute("ROLLBACK", []); // ANALYZE не может идти внутри транзакции
-        conn.execute("ANALYZE", [])?;
-        tracing::info!("ANALYZE: статистика графовых таблиц пересчитана (дрейф ≥1.5×)");
+    if drifted.is_empty() {
+        return Ok(());
     }
+    let _ = conn.execute("ROLLBACK", []); // ANALYZE не может идти внутри транзакции
+    for table in &drifted {
+        // Имя таблицы — константа из списка выше, а не пользовательский ввод.
+        conn.execute(&format!("ANALYZE {}", table), [])?;
+    }
+    tracing::info!(
+        tables = ?drifted,
+        "ANALYZE: статистика графовых таблиц пересчитана (дрейф ≥1.5×)"
+    );
     Ok(())
 }
