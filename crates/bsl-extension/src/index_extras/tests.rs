@@ -21,6 +21,89 @@ fn write(path: &Path, content: &str) {
 }
 
 #[test]
+fn unicode_decomposed_filename_joins_configuration_and_forms() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    let name_nfd = "Тестовыи\u{306}Документ";
+    write(
+        &repo.join("Configuration.xml"),
+        r#"<MetaDataObject><Configuration><ChildObjects><Document>ТестовыйДокумент</Document></ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    let object_xml = repo.join("Documents").join(format!("{name_nfd}.xml"));
+    write(
+        &object_xml,
+        r#"<MetaDataObject><Document uuid="test-uuid"><Properties><Name>ТестовыйДокумент</Name><RegisterRecords><xr:Item>AccumulationRegister.ТестовыйРегистр</xr:Item></RegisterRecords></Properties><ChildObjects><Attribute><Properties><Name>Реквизит</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties></Attribute></ChildObjects></Document></MetaDataObject>"#,
+    );
+    write(
+        &repo
+            .join("Documents")
+            .join(name_nfd)
+            .join("Forms/ФормаДокумента/Ext/Form.xml"),
+        r#"<Form><Events><Event name="ПриОткрытии">ПриОткрытии</Event></Events></Form>"#,
+    );
+    write(
+        &repo
+            .join("Documents")
+            .join(name_nfd)
+            .join("Ext/ObjectModule.bsl"),
+        "Процедура ОбработкаПроведения() Экспорт\nКонецПроцедуры",
+    );
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+    let conn = storage.conn();
+    let structure: Option<String> = conn
+        .query_row(
+            "SELECT attributes_json FROM metadata_objects WHERE full_name = 'Document.ТестовыйДокумент'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(structure.as_deref().is_some_and(|s| s.contains("Реквизит")));
+    let forms: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM metadata_forms WHERE owner_full_name = 'Documents.ТестовыйДокумент'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(forms, 1);
+    let modules: i64 = conn.query_row(
+        "SELECT count(*) FROM metadata_modules WHERE object_name = 'Documents.ТестовыйДокумент'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(modules, 1);
+    let recorders: i64 = conn.query_row(
+        "SELECT count(*) FROM data_links WHERE from_object = 'Document.ТестовыйДокумент' AND to_object = 'AccumulationRegister.ТестовыйРегистр' AND link_kind = 'recorder'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(recorders, 1);
+    run_incremental_extras(&repo, &mut storage, &[object_xml], &[]).unwrap();
+    let structure: Option<String> = storage.conn().query_row(
+        "SELECT attributes_json FROM metadata_objects WHERE full_name = 'Document.ТестовыйДокумент'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert!(structure.as_deref().is_some_and(|s| s.contains("Реквизит")));
+    let recorders: i64 = storage.conn().query_row(
+        "SELECT count(*) FROM data_links WHERE from_object = 'Document.ТестовыйДокумент' AND to_object = 'AccumulationRegister.ТестовыйРегистр' AND link_kind = 'recorder'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(recorders, 1);
+}
+
+#[test]
+fn unicode_equivalent_path_finds_ascii_equivalent() {
+    let tmp = TempDir::new().unwrap();
+    let actual = tmp.path().join("K.xml");
+    write(&actual, "<x/>");
+    let found = equivalent_path(&tmp.path().join("K.xml")).unwrap();
+    assert_eq!(std::fs::read_to_string(found).unwrap(), "<x/>");
+}
+
+#[test]
 fn subscription_scopes_survive_deep_scan_incremental_rename_and_delete() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().join("repo");

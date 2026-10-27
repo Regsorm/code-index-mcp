@@ -25,6 +25,8 @@ One static binary for Windows/Linux/macOS — no runtime, no dependencies. Index
 
 Connects to Claude Code, Cursor, any MCP client over HTTP.
 
+Object names and paths account for Unicode NFC and NFD forms, including those found on macOS. Physical paths retain their on-disk spelling; when several files share a normalized name, use the exact path. To recover structures and links missed by an older indexer in an NFD export, run `bsl-indexer index <path> --force` (data version 6) after stopping processes using the index.
+
 ## Problem
 
 AI models waste enormous time on repeated grep/find calls just to locate a single symbol. A real example: finding `RuntimeErrorProcessing` in a Java project required 14 sequential grep/find calls, each scanning thousands of files. With Code Index, that is one query returning results in under a millisecond.

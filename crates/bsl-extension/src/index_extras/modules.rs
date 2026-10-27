@@ -287,6 +287,8 @@ fn build_module_row_with(
             map.get(&object_id).cloned()
         }
     };
+    let object_name: String =
+        unicode_normalization::UnicodeNormalization::nfc(object_name.as_str()).collect();
     let full_name = format!("{}.{}", object_name, effective_type);
     let code_path = bsl_path
         .strip_prefix(repo_root)
@@ -458,6 +460,8 @@ pub(crate) fn build_module_row_edt(
         .to_string_lossy()
         .replace('\\', "/");
 
+    let object_name: String =
+        unicode_normalization::UnicodeNormalization::nfc(object_name.as_str()).collect();
     Some(ModuleRow {
         full_name: format!("{}.{}", object_name, effective_type),
         object_name,
@@ -565,7 +569,11 @@ pub(crate) fn update_metadata_modules_for_object(
         Some(s) => s.to_string(),
         None => return Ok(()),
     };
-    let object_name = format!("{}.{}", folder, stem);
+    let object_name = format!(
+        "{}.{}",
+        folder,
+        unicode_normalization::UnicodeNormalization::nfc(stem.as_str()).collect::<String>()
+    );
     let like = format!("{}.%", object_name);
 
     let _ = conn.execute("ROLLBACK", []);
@@ -579,7 +587,9 @@ pub(crate) fn update_metadata_modules_for_object(
     )?;
     let filter = DirFilter::load(repo_root);
     for root in roots {
-        let obj_dir = root.join(&folder).join(&stem);
+        let Some(obj_dir) = equivalent_path(&root.join(&folder).join(&stem)) else {
+            continue;
+        };
         if !obj_dir.is_dir() {
             continue;
         }

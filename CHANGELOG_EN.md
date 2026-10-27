@@ -5,6 +5,18 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.15.5] — 2026-10-27
+
+### Fixed
+
+- Exports with NFD file names: object, form and module names match NFC names from XML, preserving structures and posting links. File paths retain their original spelling while path and glob searches account for Unicode normalization. An ambiguous normalized path requires the exact file name. Fixes #26.
+- The indexer logs structures that could not be matched to the object registry instead of counting them as successfully filled.
+- Upgraded `zstd` to 0.14.3, `zstd-safe` to 8.2.0 and `zstd-sys` to 2.1.2 to address RUSTSEC-2026-0391, -0398, -0403 and -0410.
+
+### Compatibility
+
+- Index data version is 6. Recovering structures and links missing from an older NFD export requires a full `bsl-indexer index <path> --force` reindex, after stopping processes using that index.
+
 ## [1.15.4] — 2026-10-24
 
 **Dependency update driven by the security gate: `tokio` bumped from 1.53.1 to 1.54.1.**

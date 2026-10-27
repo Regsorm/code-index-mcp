@@ -9,6 +9,7 @@ pub use pool::{PoolConfig, PooledStorage, StoragePool};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
+use unicode_normalization::UnicodeNormalization;
 
 use models::*;
 
@@ -165,6 +166,16 @@ fn register_unicode_case(conn: &Connection) -> Result<()> {
 fn register_sql_functions(conn: &Connection) -> Result<()> {
     register_regexp(conn)?;
     register_unicode_case(conn)?;
+    conn.create_scalar_function(
+        "unicode_nfc",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let value: String = ctx.get(0)?;
+            Ok(value.nfc().collect::<String>())
+        },
+    )?;
     Ok(())
 }
 
@@ -212,6 +223,35 @@ pub struct DataVersionStatus {
 }
 
 impl Storage {
+    /// Resolve a user-supplied path without changing stored or on-disk names.
+    /// Exact paths take precedence; ambiguous canonical equivalents are rejected.
+    pub fn resolve_user_path(&self, path: &str) -> Result<Option<String>> {
+        let exact: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT path FROM files WHERE path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exact.is_some() {
+            return Ok(exact);
+        }
+        let normalized: String = path.nfc().collect();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM files WHERE unicode_nfc(path) = ?1 LIMIT 2")?;
+        let matches = stmt
+            .query_map(params![normalized], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match matches.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(one.clone())),
+            _ => anyhow::bail!(
+                "Unicode-эквивалентному пути соответствуют несколько файлов; укажите точное имя"
+            ),
+        }
+    }
     // ── Конструкторы ────────────────────────────────────────────────────────
 
     /// Открыть (или создать) файловую базу данных
@@ -1315,7 +1355,7 @@ impl Storage {
             let variants = expand_glob_variants(g);
             conds.push(format!(
                 "({})",
-                vec!["fi.path GLOB ?"; variants.len()].join(" OR ")
+                vec!["unicode_nfc(fi.path) GLOB ?"; variants.len()].join(" OR ")
             ));
             for v in variants {
                 params_dyn.push(Box::new(normalize_glob(&v)));
@@ -1683,6 +1723,17 @@ impl Storage {
              FROM functions WHERE name = ?1",
         )?;
         let rows = stmt.query_map(params![name], row_to_function)?;
+        let exact: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        let normalized: String = name.nfc().collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, qualified_name, line_start, line_end,
+                    args, return_type, docstring, body, is_async, node_hash
+             FROM functions WHERE unicode_nfc(name) = ?1",
+        )?;
+        let rows = stmt.query_map(params![normalized], row_to_function)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
@@ -1694,6 +1745,17 @@ impl Storage {
              FROM classes WHERE name = ?1",
         )?;
         let rows = stmt.query_map(params![name], row_to_class)?;
+        let exact: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        let normalized: String = name.nfc().collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, line_start, line_end,
+                    bases, docstring, body, node_hash
+             FROM classes WHERE unicode_nfc(name) = ?1",
+        )?;
+        let rows = stmt.query_map(params![normalized], row_to_class)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
@@ -1918,7 +1980,7 @@ impl Storage {
             let variants = expand_glob_variants(g);
             conds.push(format!(
                 "({})",
-                vec!["fi.path GLOB ?"; variants.len()].join(" OR ")
+                vec!["unicode_nfc(fi.path) GLOB ?"; variants.len()].join(" OR ")
             ));
             for v in variants {
                 params_dyn.push(Box::new(normalize_glob(&v)));
@@ -2437,7 +2499,10 @@ impl Storage {
 
     /// Сводная информация о файле по пути
     pub fn get_file_summary(&self, path: &str) -> Result<Option<FileSummary>> {
-        let file = match self.get_file_by_path(path)? {
+        let Some(path) = self.resolve_user_path(path)? else {
+            return Ok(None);
+        };
+        let file = match self.get_file_by_path(&path)? {
             Some(f) => f,
             None => return Ok(None),
         };
@@ -2524,6 +2589,8 @@ impl Storage {
     /// stat_file: метаданные одного файла из таблицы `files`.
     /// Возвращает `exists=false` если файл не индексирован.
     pub fn stat_file_meta(&self, path: &str) -> Result<StatFileResult> {
+        let resolved = self.resolve_user_path(path)?;
+        let path = resolved.as_deref().unwrap_or(path);
         let row: Option<StatFileRow> = self
             .conn
             .query_row(
@@ -2630,7 +2697,7 @@ impl Storage {
             let variants = expand_glob_variants(g);
             conds.push(format!(
                 "({})",
-                vec!["path GLOB ?"; variants.len()].join(" OR ")
+                vec!["unicode_nfc(path) GLOB ?"; variants.len()].join(" OR ")
             ));
             for v in variants {
                 params_dyn.push(Box::new(normalize_glob(&v)));
@@ -2642,8 +2709,9 @@ impl Storage {
             // считает обратный слэш обычным символом и ищет путь, в котором он
             // буквально стоит, — совпадений не бывает никогда, отказ молчаливый
             // (H-5). До правки экранирование не помогало, а само создавало дефект.
-            conds.push("path LIKE ? ESCAPE '\\'".to_string());
-            let escaped = p
+            conds.push("unicode_nfc(path) LIKE ? ESCAPE '\\'".to_string());
+            let normalized: String = p.nfc().collect();
+            let escaped = normalized
                 .replace('\\', "\\\\")
                 .replace('%', "\\%")
                 .replace('_', "\\_");
@@ -2735,6 +2803,9 @@ impl Storage {
         path: &str,
         options: ReadFileOptions,
     ) -> Result<Option<ReadFileResult>> {
+        let Some(path) = self.resolve_user_path(path)? else {
+            return Ok(None);
+        };
         let ReadFileOptions {
             line_start,
             line_end,
@@ -2931,7 +3002,7 @@ impl Storage {
             let variants = expand_glob_variants(g);
             conds.push(format!(
                 "({})",
-                vec!["fi.path GLOB ?"; variants.len()].join(" OR ")
+                vec!["unicode_nfc(fi.path) GLOB ?"; variants.len()].join(" OR ")
             ));
             for v in variants {
                 params_dyn.push(Box::new(normalize_glob(&v)));
@@ -3000,7 +3071,7 @@ impl Storage {
         if !glob_variants.is_empty() {
             extra_conds.push(format!(
                 "({})",
-                vec!["fi.path GLOB ?"; glob_variants.len()].join(" OR ")
+                vec!["unicode_nfc(fi.path) GLOB ?"; glob_variants.len()].join(" OR ")
             ));
         }
         let extra_clause_str = if extra_conds.is_empty() {
@@ -3647,7 +3718,7 @@ fn body_substring_param(pattern: &str) -> String {
 /// с привычным синтаксисом, не меняя семантику.
 pub(crate) fn normalize_glob(pattern: &str) -> String {
     // Многократная замена для последовательностей `***` и т.п.
-    let mut s = pattern.to_string();
+    let mut s: String = pattern.nfc().collect();
     while s.contains("**") {
         s = s.replace("**", "*");
     }
@@ -4286,6 +4357,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unicode_path_lookup_and_glob_preserve_physical_name() {
+        let storage = Storage::open_in_memory().unwrap();
+        let physical = "dir/Тестовыи\u{306}.py";
+        let file_id = storage.upsert_file(&make_file(physical)).unwrap();
+        storage
+            .upsert_file_content(file_id, "needle", 4096)
+            .unwrap();
+        let stat = storage.stat_file_meta("dir/Тестовый.py").unwrap();
+        assert!(stat.exists);
+        assert_eq!(stat.path, physical);
+        let (matches, _, _) = storage
+            .grep_code_filtered("needle", Some("dir/Тестовый.py"), None, 10, 0, 1000)
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, physical);
+        let (matches, _, _) = storage
+            .grep_code_filtered("needle", Some("dir/Тестовы?.py"), None, 10, 0, 1000)
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn unicode_path_lookup_rejects_ambiguous_equivalent_names() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_file(&make_file("й/ё.py")).unwrap();
+        storage
+            .upsert_file(&make_file("и\u{306}/е\u{308}.py"))
+            .unwrap();
+        assert!(storage.resolve_user_path("й/е\u{308}.py").is_err());
+        assert_eq!(
+            storage.resolve_user_path("й/ё.py").unwrap().as_deref(),
+            Some("й/ё.py")
+        );
+    }
+
+    #[test]
+    fn unicode_path_lookup_supports_non_ascii_equivalent_of_ascii() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_file(&make_file("dir/K.py")).unwrap();
+        assert_eq!(
+            storage.resolve_user_path("dir/K.py").unwrap().as_deref(),
+            Some("dir/K.py")
+        );
+    }
+
     /// Вспомогательный FunctionRecord для тестов
     fn make_function(file_id: i64, name: &str) -> FunctionRecord {
         FunctionRecord {
@@ -4303,6 +4420,26 @@ mod tests {
             node_hash: "hash123".to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unicode_function_name_lookup_accepts_both_forms() {
+        let storage = Storage::open_in_memory().unwrap();
+        let file_id = storage.upsert_file(&make_file("sample.py")).unwrap();
+        storage
+            .insert_functions(&[
+                make_function(file_id, "Первый"),
+                make_function(file_id, "Второи\u{306}"),
+            ])
+            .unwrap();
+        assert_eq!(
+            storage.get_function_by_name("Первыи\u{306}").unwrap()[0].name,
+            "Первый"
+        );
+        assert_eq!(
+            storage.get_function_by_name("Второй").unwrap()[0].name,
+            "Второи\u{306}"
+        );
     }
 
     #[test]

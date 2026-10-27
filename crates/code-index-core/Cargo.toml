@@ -51,6 +51,7 @@ rusqlite = { workspace = true }
 
 # Сжатие content code-файлов (Phase 2: file_contents)
 zstd = { workspace = true }
+unicode-normalization = { workspace = true }
 
 # Сериализация
 serde = { workspace = true }

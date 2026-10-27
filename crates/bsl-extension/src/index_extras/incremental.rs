@@ -12,6 +12,7 @@ use anyhow::Result;
 use code_index_core::storage::Storage;
 use rusqlite::params;
 use std::path::Path;
+use unicode_normalization::UnicodeNormalization;
 
 use super::*;
 
@@ -56,7 +57,10 @@ pub(crate) fn update_data_links_for_object(
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )?;
         for root in roots {
-            let cand = root.join(&folder).join(format!("{}.xml", stem));
+            let Some(cand) = equivalent_path(&root.join(&folder).join(format!("{}.xml", stem)))
+            else {
+                continue;
+            };
             if !cand.is_file() {
                 continue;
             }
@@ -67,7 +71,7 @@ pub(crate) fn update_data_links_for_object(
                             REPO_DEFAULT,
                             &owner_full,
                             &edge.from_path,
-                            &edge.to_object,
+                            edge.to_object.nfc().collect::<String>(),
                             edge.link_kind,
                             edge.is_composite as i64,
                             edge.is_universal as i64,
@@ -169,7 +173,10 @@ pub(crate) fn upsert_metadata_object(
     let mut owner_is_base = false;
     let mut any_copy = false;
     for sub_root in roots {
-        let cand = sub_root.join(&folder).join(format!("{}.xml", stem));
+        let Some(cand) = equivalent_path(&sub_root.join(&folder).join(format!("{}.xml", stem)))
+        else {
+            continue;
+        };
         if !cand.is_file() {
             continue;
         }
@@ -215,7 +222,14 @@ pub(crate) fn upsert_metadata_object(
              name = excluded.name, \
              synonym = excluded.synonym, \
              sub_config = excluded.sub_config",
-        params![REPO_DEFAULT, &full_name, meta_type, &stem, synonym, &owner],
+        params![
+            REPO_DEFAULT,
+            &full_name,
+            meta_type,
+            stem.nfc().collect::<String>(),
+            synonym,
+            &owner
+        ],
     )?;
     crate::schema::backfill_metadata_object_keys(conn)?;
     conn.execute("COMMIT", [])?;
@@ -276,7 +290,7 @@ pub(crate) fn update_object_template_for_file(
     let Some(stem) = template_xml_path.file_stem().and_then(|s| s.to_str()) else {
         return Ok(());
     };
-    let full_name = format!("{}.Template.{}", owner, stem);
+    let full_name = format!("{}.Template.{}", owner, stem.nfc().collect::<String>());
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
     conn.execute(

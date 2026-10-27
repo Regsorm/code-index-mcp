@@ -78,8 +78,11 @@ impl IndexTool for GetFormHandlersTool {
         ctx: ToolContext<'a>,
     ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
         Box::pin(async move {
+            use unicode_normalization::UnicodeNormalization;
             let owner = match args.get("owner_full_name").and_then(|v| v.as_str()) {
-                Some(s) => crate::code_usages::normalize_object_ref(s).into_owned(),
+                Some(s) => crate::code_usages::normalize_object_ref(s)
+                    .nfc()
+                    .collect::<String>(),
                 None => {
                     return crate::tools::wrap_error(json!({
                         "error": "missing required parameter 'owner_full_name' (string)"
@@ -89,7 +92,7 @@ impl IndexTool for GetFormHandlersTool {
             let form_name = args
                 .get("form_name")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(|s| s.nfc().collect::<String>());
             let budget = resolve_request_budget(
                 args.get("max_response_bytes")
                     .and_then(|v| v.as_u64())

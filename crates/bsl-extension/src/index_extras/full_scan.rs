@@ -18,6 +18,7 @@ use crate::xml::object_attributes::{
 use anyhow::Result;
 use rusqlite::params;
 use std::path::Path;
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use super::*;
@@ -155,9 +156,9 @@ pub(crate) fn index_metadata_objects(scan: &RepoScan, conn: &rusqlite::Connectio
             };
             stmt.execute(params![
                 REPO_DEFAULT,
-                &obj.full_name,
+                obj.full_name.nfc().collect::<String>(),
                 &obj.meta_type,
-                &obj.name,
+                obj.name.nfc().collect::<String>(),
                 &sub_config,
             ])?;
             total += 1;
@@ -209,9 +210,9 @@ pub(crate) fn index_metadata_objects(scan: &RepoScan, conn: &rusqlite::Connectio
             };
             nested_subsystems += stmt.execute(params![
                 REPO_DEFAULT,
-                &format!("Subsystem.{}", stem),
+                &format!("Subsystem.{}", stem.nfc().collect::<String>()),
                 "Subsystem",
-                stem,
+                stem.nfc().collect::<String>(),
                 &sub_config,
             ])?;
         }
@@ -296,7 +297,7 @@ pub(crate) fn index_data_links(
                         REPO_DEFAULT,
                         &owner_full,
                         &edge.from_path,
-                        &edge.to_object,
+                        edge.to_object.nfc().collect::<String>(),
                         edge.link_kind,
                         edge.is_composite as i64,
                         edge.is_universal as i64,
@@ -374,7 +375,7 @@ pub(crate) fn index_metadata_refs(scan: &RepoScan, conn: &rusqlite::Connection) 
                     Some(s) => s,
                     None => continue,
                 };
-                let from_object = format!("Subsystem.{}", stem);
+                let from_object = format!("Subsystem.{}", stem.nfc().collect::<String>());
                 match parse_subsystem_content_file(path) {
                     Ok(items) => {
                         for to_object in items {
@@ -433,7 +434,7 @@ pub(crate) fn index_metadata_refs(scan: &RepoScan, conn: &rusqlite::Connection) 
                     Some(n) => n,
                     None => continue,
                 };
-                let from_object = format!("ExchangePlan.{}", name);
+                let from_object = format!("ExchangePlan.{}", name.nfc().collect::<String>());
                 match parse_exchange_plan_content_file(path) {
                     Ok(items) => {
                         for to_object in items {
@@ -466,7 +467,7 @@ pub(crate) fn index_metadata_refs(scan: &RepoScan, conn: &rusqlite::Connection) 
                     Some(s) => s,
                     None => continue,
                 };
-                let from_object = format!("DefinedType.{}", stem);
+                let from_object = format!("DefinedType.{}", stem.nfc().collect::<String>());
                 match parse_defined_type_targets_file(path) {
                     Ok(targets) => {
                         let is_composite = targets.len() > 1;
@@ -500,7 +501,7 @@ pub(crate) fn index_metadata_refs(scan: &RepoScan, conn: &rusqlite::Connection) 
                     Some(s) => s,
                     None => continue,
                 };
-                let from_object = format!("FunctionalOption.{}", stem);
+                let from_object = format!("FunctionalOption.{}", stem.nfc().collect::<String>());
                 match parse_functional_option_location_file(path) {
                     Ok(Some((to_object, raw_location))) => {
                         stmt.execute(params![
@@ -914,19 +915,31 @@ pub(crate) fn index_object_attributes(
         "UPDATE metadata_objects SET attributes_json = ? WHERE repo = ? AND full_name = ?",
     )?;
     let mut filled: usize = 0;
+    let mut missing = Vec::new();
     for (full_name, structure) in &acc {
         if structure.is_empty() {
             continue;
         }
-        stmt.execute(params![
+        let changed = stmt.execute(params![
             structure.to_json().to_string(),
             REPO_DEFAULT,
             full_name,
         ])?;
-        filled += 1;
+        if changed == 0 {
+            missing.push(full_name.clone());
+        } else {
+            filled += changed;
+        }
     }
     drop(stmt);
     conn.execute("COMMIT", [])?;
+    if !missing.is_empty() {
+        tracing::warn!(
+            "object_attributes: {} объектов отсутствуют в реестре, примеры: {:?}",
+            missing.len(),
+            missing.iter().take(5).collect::<Vec<_>>()
+        );
+    }
 
     code_index_core::logging::stage_detail(code_index_core::logging::plural(
         filled as u64,
@@ -1571,7 +1584,11 @@ pub(crate) fn template_owner_from_path(path: &Path) -> Option<String> {
         .iter()
         .find(|(plural, _)| *plural == folder)
         .map(|(_, singular)| *singular)?;
-    Some(format!("{}.{}", meta_type, object))
+    Some(format!(
+        "{}.{}",
+        meta_type,
+        object.nfc().collect::<String>()
+    ))
 }
 
 pub(crate) fn index_event_subscriptions(

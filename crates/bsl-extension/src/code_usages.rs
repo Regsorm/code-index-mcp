@@ -401,12 +401,19 @@ pub(crate) fn canonical_meta_type(meta_type: &str) -> Option<&'static str> {
 /// без нормализации запрос с русским префиксом не находит ничего. Неизвестный или
 /// уже канонический тип, как и имя без точки, возвращаются без изменений.
 pub(crate) fn normalize_object_ref(name: &str) -> std::borrow::Cow<'_, str> {
-    match name.split_once('.') {
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = name.nfc().collect();
+    let value = match normalized.split_once('.') {
         Some((t, rest)) => match canonical_meta_type(t) {
-            Some(canon) if canon != t => std::borrow::Cow::Owned(format!("{canon}.{rest}")),
-            _ => std::borrow::Cow::Borrowed(name),
+            Some(canon) if canon != t => format!("{canon}.{rest}"),
+            _ => normalized.clone(),
         },
-        None => std::borrow::Cow::Borrowed(name),
+        None => normalized,
+    };
+    if value == name {
+        std::borrow::Cow::Borrowed(name)
+    } else {
+        std::borrow::Cow::Owned(value)
     }
 }
 
@@ -1052,6 +1059,7 @@ pub fn extract_code_usages(content: &str) -> Vec<CodeUsage> {
 /// модулей, общих форм и прочих объектов, которые макетов не имеют, ссылку
 /// собирать не из чего.
 pub fn owner_ref_from_path(rel_path: &str) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization;
     let parts: Vec<&str> = rel_path.split('/').collect();
     let mut found: Option<String> = None;
     for (i, seg) in parts.iter().enumerate() {
@@ -1060,7 +1068,11 @@ pub fn owner_ref_from_path(rel_path: &str) -> Option<String> {
             .iter()
             .find(|m| m.ru_plural.to_lowercase() == low || m.en_plural.to_lowercase() == low);
         if let (Some(m), Some(name)) = (hit, parts.get(i + 1)) {
-            found = Some(format!("{}.{}", m.canonical, name));
+            found = Some(format!(
+                "{}.{}",
+                m.canonical,
+                name.nfc().collect::<String>()
+            ));
         }
     }
     found

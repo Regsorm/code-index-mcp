@@ -12,7 +12,7 @@ members = [
 
 # Общие метаданные пакетов воркспейса. Каждый крейт может переопределить.
 [workspace.package]
-version = "1.15.4"
+version = "1.15.5"
 edition = "2021"
 license = "MIT"
 description = "Rust-native code index MCP server with first-class 1C:Enterprise (BSL) support. Static binary, 42 tools, tree-sitter AST for 14 languages, sub-ms search."
@@ -57,7 +57,8 @@ quick-xml = "0.41"
 rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
 
 # Сжатие content code-файлов (Phase 2: file_contents)
-zstd = "0.13"
+zstd = "0.14.3"
+unicode-normalization = "0.1.25"
 
 # Сериализация
 serde = { version = "1", features = ["derive"] }

@@ -18,8 +18,8 @@ use bsl_extension::{
     schema::SCHEMA_EXTENSIONS,
     tools::{
         FindDataPathTool, FindPathBslTool, GetDataLinksTool, GetDcsSchemaTool,
-        GetEventSubscriptionsTool, GetFormHandlersTool, GetObjectStructureTool,
-        GetRegisterWritersTool, SearchTermsTool,
+        GetEventSubscriptionsTool, GetFormHandlersTool, GetObjectProfileTool,
+        GetObjectStructureTool, GetRegisterWritersTool, PostingMapTool, SearchTermsTool,
     },
 };
 use code_index_core::extension::{IndexTool, ToolContext};
@@ -322,6 +322,71 @@ async fn object_structure_found_despite_name_case() {
         "имя с иным регистром должно резолвиться, а не давать ошибку: {res}"
     );
     assert_eq!(res["name"].as_str(), Some("Организации"));
+}
+
+#[tokio::test]
+async fn object_and_form_accept_decomposed_input() {
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        s.conn().execute(
+            "INSERT INTO metadata_objects (repo, full_name, meta_type, name, full_name_key, attributes_json) VALUES ('default', 'Document.ТестовыйДокумент', 'Document', 'ТестовыйДокумент', 'document.тестовыйдокумент', '{}')",
+            [],
+        ).unwrap();
+        s.conn().execute(
+            "INSERT INTO metadata_forms (repo, owner_full_name, form_name, handlers_json) VALUES ('default', 'Documents.ТестовыйДокумент', 'ФормаВыбора', '[]')",
+            [],
+        ).unwrap();
+        s.conn().execute(
+            "INSERT INTO metadata_modules (repo, full_name, object_name, module_type, object_id, property_id, code_path, extension_name) VALUES ('default', 'Documents.ТестовыйДокумент.ObjectModule', 'Documents.ТестовыйДокумент', 'ObjectModule', 'obj', 'prop', 'Documents/ТестовыйДокумент/Ext/ObjectModule.bsl', '')",
+            [],
+        ).unwrap();
+        s.conn().execute(
+            "INSERT INTO data_links (repo, from_object, from_path, to_object, link_kind) VALUES ('default', 'Document.ТестовыйДокумент', '', 'AccumulationRegister.ТестовыйРегистр', 'recorder')",
+            [],
+        ).unwrap();
+    }
+    let name = "Document.Тестовыи\u{306}Документ";
+    let object = run_tool(
+        &GetObjectStructureTool,
+        &storage,
+        serde_json::json!({"full_name": name}),
+    )
+    .await;
+    assert_eq!(object["full_name"], "Document.ТестовыйДокумент");
+    let form = run_tool(
+        &GetFormHandlersTool,
+        &storage,
+        serde_json::json!({"owner_full_name": name, "form_name": "ФормаВыбора"}),
+    )
+    .await;
+    assert!(form["error"].is_null(), "{form}");
+    let profile = run_tool(
+        &GetObjectProfileTool,
+        &storage,
+        serde_json::json!({"full_name": name}),
+    )
+    .await;
+    assert_eq!(profile["forms_total"], 1);
+    assert_eq!(profile["modules_total"], 1);
+    assert_eq!(
+        profile["data_links"]["writes_to_registers"][0],
+        "AccumulationRegister.ТестовыйРегистр"
+    );
+    let posting_nfc = run_tool(
+        &PostingMapTool,
+        &storage,
+        serde_json::json!({"object": "Document.ТестовыйДокумент"}),
+    )
+    .await;
+    let posting_nfd = run_tool(
+        &PostingMapTool,
+        &storage,
+        serde_json::json!({"object": name}),
+    )
+    .await;
+    assert!(posting_nfc["error"].is_null(), "{posting_nfc}");
+    assert_eq!(posting_nfc, posting_nfd);
 }
 
 #[tokio::test]

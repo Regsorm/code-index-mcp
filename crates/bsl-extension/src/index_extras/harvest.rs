@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::xml::object_attributes::parse_object_header_xml;
 use crate::xml::object_attributes::{
@@ -113,7 +114,8 @@ impl XmlHarvest {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
-                    .to_string();
+                    .nfc()
+                    .collect();
                 let (header, synonym) = match parse_object_header_xml(&content) {
                     Some((mt, nm, syn)) => (Some((mt, nm)), syn),
                     None => (None, None),

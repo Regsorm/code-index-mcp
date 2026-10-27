@@ -782,10 +782,11 @@ pub(crate) fn lookup_path(storage: &crate::storage::Storage, file_id: i64) -> St
 }
 
 pub(crate) fn matches_with(matcher: &globset::GlobSet, path: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
     if path.is_empty() {
         return false;
     }
-    matcher.is_match(path)
+    matcher.is_match(path.nfc().collect::<String>())
 }
 
 /// Добавка к ПУСТОМУ ответу поиска (M-8).
@@ -2148,6 +2149,7 @@ pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
     let storage = acquire_storage!(entry);
     match storage.get_file_summary(&path) {
         Ok(Some(s)) => {
+            let indexed_path = s.file.path.clone();
             // Это КАРТА/оглавление файла, а не исходник: тела функций/классов
             // НЕ включаем. На больших BSL-модулях (десятки тысяч строк) полный
             // summary с телами раздувал ответ до мегабайт и упирался в лимит
@@ -2238,7 +2240,7 @@ pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
             // конкретную функцию бери get_function(name) / grep_body.
             let (payload, _capped) =
                 crate::mcp::cap::cap_response(payload, crate::mcp::cap::response_cap());
-            wrap_with_meta(&storage, &payload, vec![path.clone()])
+            wrap_with_meta(&storage, &payload, vec![indexed_path])
         }
         Ok(None) => format!("{{\"error\": \"Файл '{}' не найден\"}}", path),
         Err(e) => format!("{{\"error\": \"get_file_summary: {}\"}}", e),
@@ -2776,6 +2778,11 @@ pub async fn read_file(
 ) -> String {
     bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    let path = match storage.resolve_user_path(&path) {
+        Ok(Some(path)) => path,
+        Ok(None) => path,
+        Err(e) => return format!("{{\"error\": \"read_file: {}\"}}", e),
+    };
     match storage.read_file_text(
         &path,
         crate::storage::ReadFileOptions::new(

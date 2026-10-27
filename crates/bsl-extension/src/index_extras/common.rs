@@ -110,10 +110,37 @@ pub(crate) const ALL_OBJECT_FOLDERS: &[(&str, &str)] = &[
 /// связки нет на стороне индексер — пишем как «default».
 pub(crate) const REPO_DEFAULT: &str = "default";
 
+/// Find the actual on-disk spelling of a file or directory. Do not pick an
+/// arbitrary entry when a filesystem contains multiple canonical equivalents.
+pub(crate) fn equivalent_path(path: &Path) -> Option<std::path::PathBuf> {
+    use unicode_normalization::UnicodeNormalization;
+    if path.exists() {
+        return Some(path.to_path_buf());
+    }
+    let name = path.file_name()?.to_str()?;
+    let wanted: String = name.nfc().collect();
+    let mut found = None;
+    for entry in std::fs::read_dir(path.parent()?).ok()?.flatten() {
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        if entry_name.nfc().eq(wanted.chars()) {
+            if found.is_some() {
+                tracing::warn!("ambiguous Unicode-equivalent path: {}", path.display());
+                return None;
+            }
+            found = Some(entry.path());
+        }
+    }
+    found
+}
+
 /// По пути к корневому XML объекта определить `(meta_type, full_name)`.
 /// Возвращает `None`, если файл не лежит прямо в одной из `OBJECT_FOLDERS`
 /// (т.е. это не корневой XML объекта со ссылочными реквизитами/структурой).
 pub(crate) fn object_full_name_from_path(xml_path: &Path) -> Option<(&'static str, String)> {
+    use unicode_normalization::UnicodeNormalization;
     if xml_path.extension().and_then(|e| e.to_str()) != Some("xml") {
         return None;
     }
@@ -121,7 +148,10 @@ pub(crate) fn object_full_name_from_path(xml_path: &Path) -> Option<(&'static st
     let parent_name = xml_path.parent()?.file_name()?.to_str()?;
     for (folder, meta_type) in OBJECT_FOLDERS {
         if *folder == parent_name {
-            return Some((meta_type, format!("{}.{}", meta_type, stem)));
+            return Some((
+                meta_type,
+                format!("{}.{}", meta_type, stem.nfc().collect::<String>()),
+            ));
         }
     }
     None
@@ -132,6 +162,7 @@ pub(crate) fn object_full_name_from_path(xml_path: &Path) -> Option<(&'static st
 /// Используется upsert-веткой перечня/синонима, которая должна вести те же
 /// типы, что попадают в `metadata_objects` из Configuration.xml.
 pub(crate) fn object_full_name_any(xml_path: &Path) -> Option<(&'static str, String)> {
+    use unicode_normalization::UnicodeNormalization;
     if xml_path.extension().and_then(|e| e.to_str()) != Some("xml") {
         return None;
     }
@@ -139,7 +170,10 @@ pub(crate) fn object_full_name_any(xml_path: &Path) -> Option<(&'static str, Str
     let parent_name = xml_path.parent()?.file_name()?.to_str()?;
     for (folder, meta_type) in ALL_OBJECT_FOLDERS {
         if *folder == parent_name {
-            return Some((meta_type, format!("{}.{}", meta_type, stem)));
+            return Some((
+                meta_type,
+                format!("{}.{}", meta_type, stem.nfc().collect::<String>()),
+            ));
         }
     }
     None
@@ -295,6 +329,9 @@ pub(crate) fn merged_object_structure(
     let mut acc: Option<ObjectStructure> = None;
     for root in roots {
         let path = root.join(folder).join(format!("{}.xml", stem));
+        let Some(path) = equivalent_path(&path) else {
+            continue;
+        };
         match parse_object_structure_file(&path) {
             Ok(Some(s)) if !s.is_empty() => match acc.as_mut() {
                 Some(a) => a.merge_from(&s),
@@ -309,6 +346,7 @@ pub(crate) fn merged_object_structure(
 /// Извлечь (`owner_full_name`, `form_name`) из пути к Form.xml.
 /// Возвращает None, если структура каталогов не похожа на выгрузку 1С.
 pub(crate) fn decode_form_path(repo_root: &Path, form_xml_path: &Path) -> Option<(String, String)> {
+    use unicode_normalization::UnicodeNormalization;
     // Берём отрезок пути относительно корня репо и разбираем сегменты.
     let rel = form_xml_path.strip_prefix(repo_root).ok()?;
     let segments: Vec<&str> = rel
@@ -326,7 +364,8 @@ pub(crate) fn decode_form_path(repo_root: &Path, form_xml_path: &Path) -> Option
     // `CommonForms.<Имя>`: под ней же лежит её модуль в перечне модулей.
     if let Some(idx) = segments.iter().position(|s| *s == "CommonForms") {
         let name = segments.get(idx + 1)?;
-        return Some((format!("CommonForms.{}", name), name.to_string()));
+        let name: String = name.nfc().collect();
+        return Some((format!("CommonForms.{}", name), name));
     }
     // Ищем индекс "Forms" — он точно есть в правильной структуре.
     let forms_idx = segments.iter().position(|s| *s == "Forms")?;
@@ -337,8 +376,8 @@ pub(crate) fn decode_form_path(repo_root: &Path, form_xml_path: &Path) -> Option
     let meta_type = segments[forms_idx - 2];
     let owner_name = segments[forms_idx - 1];
     let form_name = segments.get(forms_idx + 1)?;
-    let owner_full = format!("{}.{}", meta_type, owner_name);
-    Some((owner_full, form_name.to_string()))
+    let owner_full = format!("{}.{}", meta_type, owner_name.nfc().collect::<String>());
+    Some((owner_full, form_name.nfc().collect()))
 }
 
 /// Ближайший предок пути (в пределах `repo_root`), содержащий `Configuration.xml`
@@ -402,7 +441,10 @@ pub(crate) fn object_sub_config(
         if owner_is_base {
             break;
         }
-        let cand = sub_root.join(folder).join(format!("{}.xml", stem));
+        let Some(cand) = equivalent_path(&sub_root.join(folder).join(format!("{}.xml", stem)))
+        else {
+            continue;
+        };
         if !cand.is_file() {
             continue;
         }

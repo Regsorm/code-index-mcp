@@ -248,13 +248,15 @@ pub(crate) fn expand_object_criterion(
 /// по ключу `full_name_key` (= lower(full_name), индекс `idx_mo_full_key`).
 pub(crate) fn resolve_object_name(conn: &rusqlite::Connection, input: &str) -> Option<String> {
     use rusqlite::OptionalExtension;
+    use unicode_normalization::UnicodeNormalization;
     if input.is_empty() {
         return None;
     }
+    let input: String = input.nfc().collect();
     let exact: Option<String> = conn
         .query_row(
             "SELECT full_name FROM metadata_objects WHERE repo = 'default' AND full_name = ?1",
-            rusqlite::params![input],
+            rusqlite::params![&input],
             |r| r.get(0),
         )
         .optional()
@@ -278,7 +280,8 @@ pub(crate) fn resolve_object_name(conn: &rusqlite::Connection, input: &str) -> O
 /// передали. Обёртка над [`resolve_object_name`] для мест, где нужна строка,
 /// а не признак «нашёлся ли объект».
 pub(crate) fn canonical_object_name(conn: &rusqlite::Connection, input: &str) -> String {
-    resolve_object_name(conn, input).unwrap_or_else(|| input.to_string())
+    use unicode_normalization::UnicodeNormalization;
+    resolve_object_name(conn, input).unwrap_or_else(|| input.nfc().collect())
 }
 
 #[cfg(test)]
