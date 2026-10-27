@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "bsl-extension"
-version = "1.15.5"
+version = "1.15.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "bsl-indexer"
-version = "1.15.5"
+version = "1.15.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -339,7 +339,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "code-index"
-version = "1.15.5"
+version = "1.15.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "code-index-copy"
-version = "1.15.5"
+version = "1.15.6"
 dependencies = [
  "anyhow",
  "bsl-extension",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "code-index-core"
-version = "1.15.5"
+version = "1.15.6"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "code-index-guard"
-version = "1.15.5"
+version = "1.15.6"
 dependencies = [
  "rusqlite",
  "serde_json",
