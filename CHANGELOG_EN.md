@@ -5,6 +5,17 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [1.15.6] — 2026-10-27
+
+### Fixed
+
+- Incremental indexing no longer reports a false "drift ≥1.5×" and no longer runs a full `ANALYZE` after every `.bsl` edit. The table size was read from the first `sqlite_stat1` row, which belongs to a partial index (`idx_pcg_callee_key` holds only edges with a resolved callee), so unchanged data looked like a 1.5× growth. The size is now the maximum across the table's index rows; a full index matches `count(*)`. Fixes #27.
+- When drift is real, statistics are recalculated only for the drifted graph tables (`proc_call_graph`, `data_links`) instead of the whole database: about 1.4 s instead of 4.9 s on a 5.7 GB database.
+
+### Compatibility
+
+- The database schema, storage format and indexer are unchanged; no reindex is required.
+
 ## [1.15.5] — 2026-10-27
 
 ### Fixed
