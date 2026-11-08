@@ -1,0 +1,23 @@
+# systemd-юнит общего MCP-сервера (serve --transport http) — пара к bsl-indexer-daemon.service.
+# Список баз берётся из [[paths]] daemon.toml при старте; панель перезапускает юнит после изменений.
+#
+# Расположение: /etc/systemd/system/bsl-indexer-serve.service
+
+[Unit]
+Description=bsl-indexer MCP HTTP server (read-only)
+After=bsl-indexer-daemon.service
+Requires=bsl-indexer-daemon.service
+
+[Service]
+Type=simple
+User=codeindex
+Group=codeindex
+Environment="CODE_INDEX_HOME=/opt/code-index/home"
+# Имена хостов, под которыми клиенты обращаются к /mcp через прокси:
+Environment="CODE_INDEX_ALLOWED_HOSTS=code-index.example.com"
+ExecStart=/usr/local/bin/bsl-indexer serve --transport http --host 127.0.0.1 --port 8011 --config /opt/code-index/home/daemon.toml
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

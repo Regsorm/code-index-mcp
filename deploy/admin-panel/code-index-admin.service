@@ -1,0 +1,37 @@
+# systemd-юнит веб-панели администрирования баз code-index / bsl-indexer.
+#
+# Расположение: /etc/systemd/system/code-index-admin.service
+# Пути и пользователь — пример, подставьте свои (тот же пользователь, что у демона:
+# панель пишет daemon.toml и создаёт каталоги баз).
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now code-index-admin
+#   journalctl -u code-index-admin -f
+
+[Unit]
+Description=code-index admin panel
+After=network-online.target bsl-indexer-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codeindex
+Group=codeindex
+ExecStart=/usr/bin/python3 /opt/code-index/admin-panel/app.py
+
+Environment="CODE_INDEX_HOME=/opt/code-index/home"
+Environment="ADMIN_REPOS_ROOT=/srv/repos"
+Environment="ADMIN_HOST=127.0.0.1"
+Environment="ADMIN_PORT=8080"
+# Адрес MCP, как его видят клиенты (для блока подключения в панели):
+Environment="ADMIN_MCP_URL=https://code-index.example.com/mcp"
+# Необязательно — токен, который проверяет обратный прокси (показывается в блоке подключения):
+#Environment="ADMIN_MCP_TOKEN_FILE=/opt/code-index/admin-panel/mcp_token"
+# serve читает список баз при старте; юнит перезапускается панелью через sudo (см. sudoers.example):
+Environment="ADMIN_SERVE_UNIT=bsl-indexer-serve.service"
+
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target

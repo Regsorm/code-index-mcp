@@ -1,0 +1,3 @@
+# /etc/sudoers.d/code-index-admin — разрешает панели перезапускать только serve.
+# Проверка синтаксиса: visudo -cf /etc/sudoers.d/code-index-admin
+codeindex ALL=(root) NOPASSWD: /usr/bin/systemctl restart bsl-indexer-serve.service, /usr/bin/systemctl stop bsl-indexer-serve.service
