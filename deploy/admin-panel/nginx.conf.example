@@ -1,0 +1,34 @@
+# Обратный прокси для панели и MCP: TLS, basic auth для панели, Bearer-токен для /mcp.
+# Пароль: printf 'admin:%s\n' "$(openssl passwd -apr1)" > /etc/nginx/code-index.htpasswd
+
+server {
+    # nginx 1.25+ понимает "http2 on;"; в 1.24 (Ubuntu 24.04) — только так:
+    listen 443 ssl http2;
+    server_name code-index.example.com;
+    ssl_certificate     /etc/letsencrypt/live/code-index.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/code-index.example.com/privkey.pem;
+
+    # MCP (serve --transport http). Имя хоста добавьте в CODE_INDEX_ALLOWED_HOSTS у serve.
+    location /mcp {
+        if ($http_authorization != "Bearer <ТОКЕН>") { return 401; }
+        proxy_pass http://127.0.0.1:8011;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+
+    # Панель. Большие ZIP-выгрузки — потоком, без буферизации на диске прокси.
+    location / {
+        auth_basic "code-index";
+        auth_basic_user_file /etc/nginx/code-index.htpasswd;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        client_max_body_size 20g;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}

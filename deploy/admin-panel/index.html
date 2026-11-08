@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>code-index · базы</title>
+<style>
+:root {
+	--bg: #f5f6f8; --card: #fff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+	--accent: #2f6fde; --ok: #1f9d55; --warn: #c98a00; --err: #d23c3c; --code: #f0f2f5;
+}
+@media (prefers-color-scheme: dark) {
+	:root { --bg: #14171c; --card: #1c2027; --text: #e6e8ec; --muted: #8b93a3; --line: #2c313a;
+		--accent: #5b92f0; --ok: #3cc47c; --warn: #e2b23b; --err: #ef6464; --code: #252a33; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+	font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 48px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 0 0 12px; }
+.sub { color: var(--muted); margin-bottom: 18px; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); margin-bottom: 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+.grid .card { margin: 0; }
+.k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.v { font-size: 20px; font-weight: 600; margin-top: 2px; }
+.bar { height: 6px; background: var(--line); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num, th.num { text-align: right; white-space: nowrap; }
+.tablewrap { overflow-x: auto; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 500;
+	border: 1px solid currentColor; white-space: nowrap; }
+.s-ready, .s-running { color: var(--ok); }
+.s-indexing, .s-pending, .s-job, .s-starting { color: var(--warn); }
+.s-error, .s-failed, .s-unavailable, .s-unknown { color: var(--err); }
+.small { font-size: 12px; color: var(--muted); }
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--text);
+	padding: 5px 12px; border-radius: 7px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger:hover { border-color: var(--err); color: var(--err); }
+input { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px;
+	background: var(--bg); color: var(--text); width: 100%; }
+.tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+.tabs button.on { border-color: var(--accent); color: var(--accent); }
+.form { display: grid; gap: 10px; grid-template-columns: 180px 1fr 160px auto; align-items: end; }
+.form label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+@media (max-width: 760px) { .form { grid-template-columns: 1fr; } }
+pre { background: var(--code); border-radius: 8px; padding: 10px 12px; overflow: auto; margin: 6px 0 0;
+	font: 12px/1.4 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
+#log { max-height: 360px; }
+.err { color: var(--err); margin-top: 8px; white-space: pre-wrap; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+progress { width: 100%; }
+</style>
+</head>
+<body>
+<main>
+	<h1>code-index — базы</h1>
+	<div class="sub" id="sub">загрузка…</div>
+
+	<div class="grid">
+		<div class="card"><div class="k">Диск</div><div class="v" id="disk">—</div>
+			<div class="bar"><i id="diskbar" style="width:0"></i></div><div class="small" id="diskd"></div></div>
+		<div class="card"><div class="k">Память</div><div class="v" id="mem">—</div>
+			<div class="bar"><i id="membar" style="width:0"></i></div><div class="small" id="memd"></div></div>
+		<div class="card"><div class="k">Базы</div><div class="v" id="cnt">—</div><div class="small" id="cntd"></div></div>
+	</div>
+
+	<div class="card">
+		<div class="row"><h2>Базы</h2><button onclick="refresh()">Обновить</button></div>
+		<div class="tablewrap"><table>
+			<thead><tr><th>Алиас</th><th>Статус</th><th>Источник</th><th class="num">Файлов</th>
+				<th class="num">Исходники</th><th class="num">Индекс</th><th></th></tr></thead>
+			<tbody id="repos"></tbody>
+		</table></div>
+	</div>
+
+	<div class="card">
+		<h2>Добавить базу</h2>
+		<div class="tabs">
+			<button data-tab="git" class="on">Из git</button>
+			<button data-tab="zip">ZIP-архив</button>
+			<button data-tab="folder">Готовый каталог</button>
+		</div>
+		<div class="form" id="f-git">
+			<div><label>Алиас</label><input id="g-alias" placeholder="ut"></div>
+			<div><label>URL репозитория (для приватного — https://токен@…)</label>
+				<input id="g-url" placeholder="https://example.com/org/repo.git"></div>
+			<div><label>Ветка (необязательно)</label><input id="g-branch" placeholder="main"></div>
+			<div><button class="primary" onclick="addGit()">Клонировать</button></div>
+		</div>
+		<div class="form" id="f-zip" hidden>
+			<div><label>Алиас</label><input id="z-alias" placeholder="bp"></div>
+			<div><label>ZIP с исходниками (например, XML-выгрузка конфигурации)</label>
+				<input id="z-file" type="file" accept=".zip"></div>
+			<div></div>
+			<div><button class="primary" onclick="addZip()">Загрузить</button></div>
+			<div style="grid-column:1/-1" hidden id="z-prog"><progress id="z-bar" max="100" value="0"></progress>
+				<span class="small" id="z-txt"></span></div>
+		</div>
+		<div class="form" id="f-folder" hidden>
+			<div><label>Алиас (= имя каталога)</label><input id="d-alias" placeholder="erp"></div>
+			<div class="small" style="padding-bottom:8px">Для больших выгрузок: скопируйте файлы на сервер в
+				<span class="mono" id="root-hint">&lt;корень&gt;/&lt;алиас&gt;</span> (rsync/scp) и подключите здесь.</div>
+			<div></div>
+			<div><button class="primary" onclick="addFolder()">Подключить</button></div>
+		</div>
+		<div class="err" id="add-err"></div>
+	</div>
+
+	<div class="card">
+		<h2>Подключение MCP</h2>
+		<div class="small">Блок для <span class="mono">.mcp.json</span>. Инструменты принимают параметр
+			<span class="mono">repo=&lt;алиас&gt;</span>.</div>
+		<pre id="mcp"></pre>
+		<div style="margin-top:8px" class="actions">
+			<button onclick="copyMcp()">Скопировать</button>
+			<button onclick="toggleToken()" id="tokbtn" hidden>Показать токен</button>
+		</div>
+	</div>
+
+	<div class="card">
+		<div class="row"><h2>Журнал демона</h2><button onclick="loadLog()">Обновить</button></div>
+		<pre id="log">—</pre>
+	</div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let state = null, showToken = false;
+
+function fmt(b) {
+	if (b == null) return "…";
+	if (!b) return "0";
+	const u = ["Б", "КБ", "МБ", "ГБ", "ТБ"]; let i = 0;
+	while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+	return (b >= 100 || i === 0 ? b.toFixed(0) : b.toFixed(1)) + " " + u[i];
+}
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function badge(s, title) { return `<span class="badge s-${esc(s)}" title="${esc(title || "")}">${esc(s)}</span>`; }
+function ago(iso) {
+	if (!iso) return "";
+	const s = (Date.now() - new Date(iso)) / 1000;
+	if (s < 90) return "только что"; if (s < 5400) return Math.round(s / 60) + " мин назад";
+	if (s < 129600) return Math.round(s / 3600) + " ч назад"; return new Date(iso).toLocaleString("ru-RU");
+}
+
+async function api(path, opts = {}) {
+	const r = await fetch(path, { ...opts, headers: { "X-Admin": "1", "Content-Type": "application/json", ...(opts.headers || {}) } });
+	const data = await r.json().catch(() => ({ error: "HTTP " + r.status }));
+	if (!r.ok) throw new Error(data.error || "HTTP " + r.status);
+	return data;
+}
+
+async function refresh() {
+	try { state = await api("/api/overview"); } catch (e) { $("sub").textContent = "Ошибка: " + e.message; return; }
+	const d = state.daemon;
+	$("sub").innerHTML = `${esc(d.version ? "версия " + d.version : "")} · демон ${badge(d.status, d.error)}` +
+		(d.uptime_sec ? ` · работает ${Math.round(d.uptime_sec / 3600)} ч` : "") +
+		` · базы в <span class="mono">${esc(state.repos_root)}</span>`;
+	$("root-hint").textContent = state.repos_root + "/<алиас>";
+	const dk = state.disk;
+	$("disk").textContent = fmt(dk.free) + " свободно";
+	$("diskbar").style.width = (dk.total ? dk.used / dk.total * 100 : 0) + "%";
+	$("diskd").textContent = `занято ${fmt(dk.used)} из ${fmt(dk.total)}`;
+	const m = state.memory;
+	$("mem").textContent = fmt(m.available) + " свободно";
+	$("membar").style.width = (m.total ? (m.total - m.available) / m.total * 100 : 0) + "%";
+	$("memd").textContent = `из ${fmt(m.total)}`;
+	const rs = state.repos, tot = rs.reduce((a, r) => a + (r.src_bytes || 0) + (r.index_bytes || 0), 0);
+	$("cnt").textContent = rs.length; $("cntd").textContent = "на диске " + fmt(tot);
+
+	$("repos").innerHTML = rs.length ? rs.map(r => {
+		const job = r.job, h = r.health || {};
+		let st = badge(job ? (job.state === "error" ? "error" : "job") : r.status, h.error || "");
+		if (job) st += `<div class="small">${esc(job.message)}</div>`;
+		else if (h.error) st += `<div class="small">${esc(h.error)}</div>`;
+		else if (h.last_ready_at) st += `<div class="small">готов ${esc(ago(h.last_ready_at))}</div>`;
+		const src = r.source === "git" ? `git${r.branch ? " · " + esc(r.branch) : ""}<div class="small mono">${esc(r.url)}</div>` +
+			(r.head ? `<div class="small mono">${esc(r.head)}</div>` : "") : esc(r.source || "каталог");
+		const btns = [];
+		if (r.git && !job) btns.push(`<button data-action="pull" data-alias="${esc(r.alias)}">git pull</button>`);
+		if (job && job.state === "error") btns.push(`<button data-action="clear" data-alias="${esc(r.alias)}">Скрыть ошибку</button>`);
+		if (!job || job.state === "error") btns.push(`<button class="danger" data-action="delete" data-alias="${esc(r.alias)}">Удалить</button>`);
+		return `<tr><td><b class="mono">${esc(r.alias)}</b><div class="small mono">${esc(r.path)}</div></td>
+			<td>${st}</td><td>${src}</td><td class="num">${r.files == null ? "…" : r.files.toLocaleString("ru-RU")}</td>
+			<td class="num">${fmt(r.src_bytes)}</td><td class="num">${fmt(r.index_bytes)}</td>
+			<td><div class="actions">${btns.join("")}</div></td></tr>`;
+	}).join("") : `<tr><td colspan="7" class="small">Баз пока нет — добавьте первую ниже.</td></tr>`;
+	renderMcp();
+}
+
+function mcpJson(token) {
+	const srv = { type: "http", url: state.mcp.url || "http://<адрес-сервера>/mcp" };
+	if (state.mcp.token) srv.headers = { Authorization: "Bearer " + token };
+	return JSON.stringify({ mcpServers: { "code-index": srv } }, null, 2);
+}
+function renderMcp() {
+	if (!state) return;
+	$("tokbtn").hidden = !state.mcp.token;
+	$("mcp").textContent = mcpJson(showToken ? state.mcp.token : "••••••••");
+}
+function toggleToken() { showToken = !showToken; $("tokbtn").textContent = showToken ? "Скрыть токен" : "Показать токен"; renderMcp(); }
+function copyMcp() { navigator.clipboard.writeText(mcpJson(state.mcp.token)); }
+
+async function act(fn) {
+	$("add-err").textContent = "";
+	try { await fn(); await refresh(); } catch (e) { $("add-err").textContent = e.message; }
+}
+function post(path, body) { return api(path, { method: "POST", body: JSON.stringify(body) }); }
+function addGit() {
+	act(() => post("/api/repos/git", { alias: $("g-alias").value.trim(), url: $("g-url").value.trim(),
+		branch: $("g-branch").value.trim() }).then(() => { $("g-alias").value = $("g-url").value = $("g-branch").value = ""; }));
+}
+async function addFolder() {
+	$("add-err").textContent = "";
+	try {
+		const r = await post("/api/repos/folder", { alias: $("d-alias").value.trim() });
+		if (r.warning) $("add-err").textContent = r.warning;
+		$("d-alias").value = "";
+		await refresh();
+	} catch (e) { $("add-err").textContent = e.message; }
+}
+function pull(a) { act(() => post("/api/repos/pull", { alias: a })); }
+function clearJob(a) { act(() => post("/api/jobs/clear", { alias: a })); }
+function del(a) {
+	if (!confirm(`Удалить базу «${a}»? Каталог с исходниками и индексом будет удалён.`)) return;
+	act(() => post("/api/repos/delete", { alias: a }));
+}
+$("repos").addEventListener("click", e => {
+	const b = e.target.closest("button[data-action]");
+	if (!b) return;
+	const alias = b.dataset.alias || "";
+	if (b.dataset.action === "pull") pull(alias);
+	else if (b.dataset.action === "clear") clearJob(alias);
+	else if (b.dataset.action === "delete") del(alias);
+});
+function addZip() {
+	const alias = $("z-alias").value.trim(), file = $("z-file").files[0];
+	$("add-err").textContent = "";
+	if (!alias || !file) { $("add-err").textContent = "Укажите алиас и выберите ZIP"; return; }
+	const x = new XMLHttpRequest();
+	x.open("PUT", "/api/repos/zip?alias=" + encodeURIComponent(alias));
+	x.setRequestHeader("X-Admin", "1");
+	$("z-prog").hidden = false;
+	x.upload.onprogress = e => { if (e.lengthComputable) { $("z-bar").value = e.loaded / e.total * 100;
+		$("z-txt").textContent = `${fmt(e.loaded)} из ${fmt(e.total)}`; } };
+	x.onload = () => {
+		$("z-prog").hidden = true;
+		if (x.status >= 300) { try { $("add-err").textContent = JSON.parse(x.responseText).error; } catch { $("add-err").textContent = "HTTP " + x.status; } }
+		else { $("z-alias").value = ""; $("z-file").value = ""; }
+		refresh();
+	};
+	x.onerror = () => { $("z-prog").hidden = true; $("add-err").textContent = "Ошибка сети при загрузке"; };
+	x.send(file);
+}
+async function loadLog() {
+	try { const r = await api("/api/log?lines=200"); $("log").textContent = r.log || "(пусто)"; $("log").scrollTop = 1e9; }
+	catch (e) { $("log").textContent = e.message; }
+}
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
+	document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x === b));
+	["git", "zip", "folder"].forEach(t => $("f-" + t).hidden = t !== b.dataset.tab);
+});
+refresh(); loadLog(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>

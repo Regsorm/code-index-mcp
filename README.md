@@ -95,6 +95,12 @@ cargo build --release -p bsl-indexer --features enrichment   # с поддерж
 
 Нужен Rust 1.77+.
 
+### Сервер для команды
+
+Готовые варианты развёртывания на Linux — в [`deploy/`](deploy): [Docker](deploy/docker/README.md),
+[systemd](deploy/systemd/bsl-indexer-daemon.service) и [веб-панель администрирования баз](deploy/admin-panel/README.md),
+чтобы добавлять и удалять базы из браузера.
+
 ## Подключение к клиенту
 
 Общий процесс по HTTP — один индекс на все сессии и все проекты. HTTP-сервер
