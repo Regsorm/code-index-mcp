@@ -284,6 +284,8 @@ For stdio, each folder in `--path` must be listed in `daemon.toml` (path letter 
 
 In HTTP mode, if `--config` is provided, aliases are taken from `[[paths]]` entries of `daemon.toml`: explicit `alias = "..."`, or derived from the path's last segment (lowercased, spaces → `_`) when not set. CLI `--path` takes precedence over the config file.
 
+For a shared HTTP server on a dedicated machine there is a [repository admin web panel](deploy/admin-panel/README_EN.md): repositories with status and sizes, adding from git, ZIP or a directory, deletion — without editing `daemon.toml` by hand.
+
 ## Connecting to Claude Code
 
 Add to `.mcp.json` in your project root. For `stdio` (daemon running, project folder listed in `daemon.toml`):
