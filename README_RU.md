@@ -988,6 +988,8 @@ MIT. См. [LICENSE](LICENSE).
 
 ## Благодарности
 
+Список участников проекта — [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
 - [tree-sitter](https://tree-sitter.github.io/) — инкрементальный парсер для множества языков
 - [tree-sitter-bsl](https://github.com/1c-syntax/tree-sitter-bsl) — грамматика BSL от сообщества 1c-syntax
 - [rusqlite](https://github.com/rusqlite/rusqlite) — SQLite для Rust

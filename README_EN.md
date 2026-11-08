@@ -961,6 +961,8 @@ MIT. See [LICENSE](LICENSE).
 
 ## Acknowledgements
 
+Project contributors are listed in [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
 - [tree-sitter](https://tree-sitter.github.io/tree-sitter/) — incremental parsing library
 - [tree-sitter-bsl](https://github.com/1c-syntax/tree-sitter-bsl) — BSL grammar by the 1c-syntax community
 - [rusqlite](https://github.com/rusqlite/rusqlite) — SQLite bindings for Rust
