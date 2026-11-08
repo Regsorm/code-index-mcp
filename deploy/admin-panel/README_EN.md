@@ -20,10 +20,15 @@ machine for a team, the panel lets you manage repositories from a browser — no
 
 - [`app.py`](app.py) — Python 3.11+, standard library only; [`index.html`](index.html) — a single
   page, no build step, no external dependencies.
-- Only the `[[paths]]` sections of `daemon.toml` are rewritten: everything before them and any other
-  fields of the sections are kept. The daemon picks up the file change by itself.
+- Only the `[[paths]]` blocks of `daemon.toml` are rewritten: sections before and after them and
+  their fields are kept; comments inside a changed block may be lost. The alias may be omitted — it
+  is derived from the directory name exactly as `serve` does. The result is parsed again before the
+  file is replaced: if the repository list or any other section differs, the file is left untouched.
+  The daemon picks up the file change by itself.
 - Repository directories are created and deleted only inside `ADMIN_REPOS_ROOT`; ZIP entries are
-  checked for path traversal.
+  checked for path traversal, and extraction is capped by file count and free space.
+- `admin-meta.json` stores git URLs with tokens and is created with mode `0600`; the unit sets
+  `UMask=0077`.
 - `serve` reads the repository list at startup, so after adding or removing a repository the panel
   restarts its unit (`ADMIN_SERVE_UNIT`, via `sudo -n`). MCP clients then need to reconnect
   (in Claude Code: `/mcp` → Reconnect).
@@ -46,6 +51,9 @@ sudo cp sudoers.example /etc/sudoers.d/code-index-admin && sudo visudo -cf /etc/
 sudo systemctl daemon-reload
 sudo systemctl enable --now bsl-indexer-serve code-index-admin
 ```
+
+The panel user must be able to write `daemon.toml` (the daemon and the panel run as the same user)
+and `ADMIN_REPOS_ROOT`.
 
 Reverse proxy — see [`nginx.conf.example`](nginx.conf.example): basic auth for the panel, a Bearer
 token for `/mcp`, streaming upload of large ZIP files.
@@ -79,7 +87,17 @@ sudo sysctl --system
 sudo systemctl restart bsl-indexer-daemon
 ```
 
+## Tests
+
+```bash
+cd deploy/admin-panel
+python3 -m unittest test_app.py
+```
+
+They cover `daemon.toml` section preservation, alias derivation, rejection of unsafe ZIP files and
+insufficient space, and refusal to delete through a symlink.
+
 ## Tested on
 
 Ubuntu 24.04, Python 3.12, `bsl-indexer` 1.15.6; repositories — XML dumps of standard 1C
-configurations, the largest about 125k files.
+configurations, the largest about 125k files. Plus the panel unit tests.

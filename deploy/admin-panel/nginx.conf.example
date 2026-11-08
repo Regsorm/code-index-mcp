@@ -2,8 +2,8 @@
 # Пароль: printf 'admin:%s\n' "$(openssl passwd -apr1)" > /etc/nginx/code-index.htpasswd
 
 server {
-    listen 443 ssl;
-    http2 on;
+    # nginx 1.25+ понимает "http2 on;"; в 1.24 (Ubuntu 24.04) — только так:
+    listen 443 ssl http2;
     server_name code-index.example.com;
     ssl_certificate     /etc/letsencrypt/live/code-index.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/code-index.example.com/privkey.pem;

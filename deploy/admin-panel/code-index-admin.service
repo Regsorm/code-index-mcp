@@ -17,6 +17,7 @@ Wants=network-online.target
 Type=simple
 User=codeindex
 Group=codeindex
+UMask=0077
 ExecStart=/usr/bin/python3 /opt/code-index/admin-panel/app.py
 
 Environment="CODE_INDEX_HOME=/opt/code-index/home"

@@ -166,10 +166,12 @@ async function refresh() {
 		` · базы в <span class="mono">${esc(state.repos_root)}</span>`;
 	$("root-hint").textContent = state.repos_root + "/<алиас>";
 	const dk = state.disk;
-	$("disk").textContent = fmt(dk.free) + " свободно"; $("diskbar").style.width = (dk.used / dk.total * 100) + "%";
+	$("disk").textContent = fmt(dk.free) + " свободно";
+	$("diskbar").style.width = (dk.total ? dk.used / dk.total * 100 : 0) + "%";
 	$("diskd").textContent = `занято ${fmt(dk.used)} из ${fmt(dk.total)}`;
 	const m = state.memory;
-	$("mem").textContent = fmt(m.available) + " свободно"; $("membar").style.width = ((m.total - m.available) / m.total * 100) + "%";
+	$("mem").textContent = fmt(m.available) + " свободно";
+	$("membar").style.width = (m.total ? (m.total - m.available) / m.total * 100 : 0) + "%";
 	$("memd").textContent = `из ${fmt(m.total)}`;
 	const rs = state.repos, tot = rs.reduce((a, r) => a + (r.src_bytes || 0) + (r.index_bytes || 0), 0);
 	$("cnt").textContent = rs.length; $("cntd").textContent = "на диске " + fmt(tot);
@@ -183,9 +185,9 @@ async function refresh() {
 		const src = r.source === "git" ? `git${r.branch ? " · " + esc(r.branch) : ""}<div class="small mono">${esc(r.url)}</div>` +
 			(r.head ? `<div class="small mono">${esc(r.head)}</div>` : "") : esc(r.source || "каталог");
 		const btns = [];
-		if (r.git && !job) btns.push(`<button onclick="pull('${esc(r.alias)}')">git pull</button>`);
-		if (job && job.state === "error") btns.push(`<button onclick="clearJob('${esc(r.alias)}')">Скрыть ошибку</button>`);
-		if (!job || job.state === "error") btns.push(`<button class="danger" onclick="del('${esc(r.alias)}')">Удалить</button>`);
+		if (r.git && !job) btns.push(`<button data-action="pull" data-alias="${esc(r.alias)}">git pull</button>`);
+		if (job && job.state === "error") btns.push(`<button data-action="clear" data-alias="${esc(r.alias)}">Скрыть ошибку</button>`);
+		if (!job || job.state === "error") btns.push(`<button class="danger" data-action="delete" data-alias="${esc(r.alias)}">Удалить</button>`);
 		return `<tr><td><b class="mono">${esc(r.alias)}</b><div class="small mono">${esc(r.path)}</div></td>
 			<td>${st}</td><td>${src}</td><td class="num">${r.files == null ? "…" : r.files.toLocaleString("ru-RU")}</td>
 			<td class="num">${fmt(r.src_bytes)}</td><td class="num">${fmt(r.index_bytes)}</td>
@@ -216,13 +218,29 @@ function addGit() {
 	act(() => post("/api/repos/git", { alias: $("g-alias").value.trim(), url: $("g-url").value.trim(),
 		branch: $("g-branch").value.trim() }).then(() => { $("g-alias").value = $("g-url").value = $("g-branch").value = ""; }));
 }
-function addFolder() { act(() => post("/api/repos/folder", { alias: $("d-alias").value.trim() }).then(() => { $("d-alias").value = ""; })); }
+async function addFolder() {
+	$("add-err").textContent = "";
+	try {
+		const r = await post("/api/repos/folder", { alias: $("d-alias").value.trim() });
+		if (r.warning) $("add-err").textContent = r.warning;
+		$("d-alias").value = "";
+		await refresh();
+	} catch (e) { $("add-err").textContent = e.message; }
+}
 function pull(a) { act(() => post("/api/repos/pull", { alias: a })); }
 function clearJob(a) { act(() => post("/api/jobs/clear", { alias: a })); }
 function del(a) {
 	if (!confirm(`Удалить базу «${a}»? Каталог с исходниками и индексом будет удалён.`)) return;
 	act(() => post("/api/repos/delete", { alias: a }));
 }
+$("repos").addEventListener("click", e => {
+	const b = e.target.closest("button[data-action]");
+	if (!b) return;
+	const alias = b.dataset.alias || "";
+	if (b.dataset.action === "pull") pull(alias);
+	else if (b.dataset.action === "clear") clearJob(alias);
+	else if (b.dataset.action === "delete") del(alias);
+});
 function addZip() {
 	const alias = $("z-alias").value.trim(), file = $("z-file").files[0];
 	$("add-err").textContent = "";
