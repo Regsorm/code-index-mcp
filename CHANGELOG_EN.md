@@ -9,7 +9,7 @@ Versioning — [SemVer](https://semver.org/).
 
 ### Added
 
-- Repository admin web panel for server deployments — `deploy/admin-panel`. Shows repositories from `daemon.toml` with daemon status, source and index sizes, free disk space; adds a repository from git, a ZIP archive or an existing directory, runs `git pull`, deletes a repository; shows the daemon log and an MCP connection block. Python 3.11+ with no dependencies, meant to run behind a reverse proxy; sample systemd units, sudoers and nginx config included. Binaries unchanged. Discussion — #28.
+- Repository admin web panel for server deployments — `deploy/admin-panel`. Shows repositories from `daemon.toml` with daemon status, source and index sizes, free disk space; adds a repository from git, a ZIP archive or an existing directory, runs `git pull`, deletes a repository; shows the daemon log and an MCP connection block. Python 3.11+ (on 3.10 — with the `tomli` package), meant to run behind a reverse proxy; sample systemd units, sudoers and nginx config included. Binaries unchanged. Discussion — #28.
 - Note on the Linux inotify limit for large dumps (`create_watcher: OS file watch limit reached`) — in the panel README.
 
 ## [1.15.6] — 2026-10-27

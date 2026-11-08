@@ -23,7 +23,12 @@ import shutil
 import subprocess
 import threading
 import time
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10: tomllib появился только в 3.11
+    import tomli as tomllib
+
 import urllib.request
 import zipfile
 from datetime import datetime, timezone

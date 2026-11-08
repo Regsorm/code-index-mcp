@@ -18,8 +18,9 @@ machine for a team, the panel lets you manage repositories from a browser — no
 
 ## Design
 
-- [`app.py`](app.py) — Python 3.11+, standard library only; [`index.html`](index.html) — a single
-  page, no build step, no external dependencies.
+- [`app.py`](app.py) — Python 3.11+ (on 3.10 install `tomli`: `sudo apt install python3-tomli`),
+  otherwise standard library only; [`index.html`](index.html) — a single page, no build step, no
+  external dependencies.
 - Only the `[[paths]]` blocks of `daemon.toml` are rewritten: sections before and after them and
   their fields are kept; comments inside a changed block may be lost. The alias may be omitted — it
   is derived from the directory name exactly as `serve` does. The result is parsed again before the
@@ -100,4 +101,5 @@ insufficient space, and refusal to delete through a symlink.
 ## Tested on
 
 Ubuntu 24.04, Python 3.12, `bsl-indexer` 1.15.6; repositories — XML dumps of standard 1C
-configurations, the largest about 125k files. Plus the panel unit tests.
+configurations, the largest about 125k files. Plus the panel unit tests. Also checked on Ubuntu
+22.04 with Python 3.10 (`python3-tomli`): startup, HTTP endpoints and unit tests.
