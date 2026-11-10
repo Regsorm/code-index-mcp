@@ -13,9 +13,9 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResult, Content, CustomRequest, CustomResult, ErrorCode,
-        Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
-        Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CustomRequest,
+        CustomResult, ErrorCode, Implementation, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerConfig, Tool,
     },
     service::{NotificationContext, Peer, RequestContext},
     tool, tool_router, ErrorData, RoleServer, ServerHandler,
@@ -2664,14 +2664,14 @@ impl CodeIndexServer {
         self.finish(
             session_id,
             dedup_scope,
-            Ok(CallToolResult::error(vec![Content::text(text)])),
+            Ok(CallToolResult::error(vec![ContentBlock::text(text)])),
             &UnknownParams::default(),
         )
     }
 }
 
 impl ServerHandler for CodeIndexServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // enable_tool_list_changed: даём клиенту знать, что мы способны
         // отправлять `notifications/tools/list_changed`. Сама отправка
         // подключится на этапе 1.7 (file-watch на daemon.toml вызовет
@@ -2680,7 +2680,7 @@ impl ServerHandler for CodeIndexServer {
             .enable_tools()
             .enable_tool_list_changed()
             .build();
-        ServerInfo::new(caps).with_server_info(Implementation::new(
+        ServerConfig::new(caps).with_server_info(Implementation::new(
             "code-index-mcp",
             env!("CARGO_PKG_VERSION"),
         ))
@@ -2729,6 +2729,7 @@ impl ServerHandler for CodeIndexServer {
             tools,
             meta: None,
             next_cursor: None,
+            ..Default::default()
         })
     }
 
@@ -2736,7 +2737,7 @@ impl ServerHandler for CodeIndexServer {
         &self,
         mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         // Session id из HTTP-заголовка `mcp-session-id`: rmcp вкладывает
         // `http::request::Parts` в `context.extensions` (tower.rs), а оттуда оно
         // попадает в `RequestContext.extensions`. Нужен для сессионного дедупа
@@ -2857,7 +2858,9 @@ impl ServerHandler for CodeIndexServer {
                 let repo = repo_opt.as_deref().unwrap_or("");
                 if !self.response_is_stale(repo, &payload) {
                     if let Ok(res) = serde_json::from_str::<CallToolResult>(&payload) {
-                        return self.finish(&session_id, &dedup_scope, Ok(res), &unknown);
+                        return self
+                            .finish(&session_id, &dedup_scope, Ok(res), &unknown)
+                            .map(Into::into);
                     }
                 }
             }
@@ -2874,8 +2877,14 @@ impl ServerHandler for CodeIndexServer {
             // Вызов под общим пределом времени: не уложился — прерываем и
             // отвечаем ошибкой, соединение возвращается в пул.
             let r = match with_tool_timeout(self.tool_timeout, call).await {
-                Ok(r) => r,
-                Err(limit) => return self.tool_timeout_result(&session_id, &dedup_scope, limit),
+                Ok(Ok(CallToolResponse::Complete(result))) => Ok(result),
+                Ok(Ok(intermediate)) => return Ok(intermediate),
+                Ok(Err(error)) => Err(error),
+                Err(limit) => {
+                    return self
+                        .tool_timeout_result(&session_id, &dedup_scope, limit)
+                        .map(Into::into)
+                }
             };
             self.maybe_cache(
                 &cache_key,
@@ -2883,7 +2892,9 @@ impl ServerHandler for CodeIndexServer {
                 &r,
                 epoch_before,
             );
-            return self.finish(&session_id, &dedup_scope, r, &unknown);
+            return self
+                .finish(&session_id, &dedup_scope, r, &unknown)
+                .map(Into::into);
         }
         // 2. Иначе — extension-tools. Ищем по имени.
         let tool_name = request.name.as_ref();
@@ -2951,12 +2962,14 @@ impl ServerHandler for CodeIndexServer {
             .await;
             let value: serde_json::Value =
                 serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"raw": body}));
-            return self.finish(
-                &session_id,
-                &dedup_scope,
-                Ok(CallToolResult::structured(value)),
-                &unknown,
-            );
+            return self
+                .finish(
+                    &session_id,
+                    &dedup_scope,
+                    Ok(CallToolResult::structured(value)),
+                    &unknown,
+                )
+                .map(Into::into);
         }
         // Раньше локальные extension-tools не проверяли готовность; удалённую ветку проверяет нода.
         // Демон помечает файлы грязными до пачки; после COMMIT идёт надстройка, затем
@@ -2969,12 +2982,14 @@ impl ServerHandler for CodeIndexServer {
         if let Some(json) = tools::check_path_status(&entry).await {
             let value: serde_json::Value =
                 serde_json::from_str(&json).unwrap_or_else(|_| serde_json::json!({"raw": json}));
-            return self.finish(
-                &session_id,
-                &dedup_scope,
-                Ok(CallToolResult::structured(value)),
-                &unknown,
-            );
+            return self
+                .finish(
+                    &session_id,
+                    &dedup_scope,
+                    Ok(CallToolResult::structured(value)),
+                    &unknown,
+                )
+                .map(Into::into);
         }
         let storage = entry.storage_pool();
         // Тяжёлый слой надстройки ещё строится: extension-tools не должны
@@ -2983,12 +2998,14 @@ impl ServerHandler for CodeIndexServer {
         // в самой базе репо. Отсутствие флага = слой завершён: база прежней
         // версии или репозиторий без надстройки.
         if let Some(value) = crate::mcp::tools::extras_building_response(storage).await {
-            return self.finish(
-                &session_id,
-                &dedup_scope,
-                Ok(CallToolResult::structured(value)),
-                &unknown,
-            );
+            return self
+                .finish(
+                    &session_id,
+                    &dedup_scope,
+                    Ok(CallToolResult::structured(value)),
+                    &unknown,
+                )
+                .map(Into::into);
         }
         let root_path: Option<&Path> = entry.root_path.as_deref();
         let language: Option<&str> = entry.language.as_deref();
@@ -3017,7 +3034,11 @@ impl ServerHandler for CodeIndexServer {
         {
             Ok(value) => value,
             // Не уложился в предел — отвечаем ошибкой, соединение возвращается в пул.
-            Err(limit) => return self.tool_timeout_result(&session_id, &dedup_scope, limit),
+            Err(limit) => {
+                return self
+                    .tool_timeout_result(&session_id, &dedup_scope, limit)
+                    .map(Into::into)
+            }
         };
         let r = Ok(CallToolResult::structured(value));
         self.maybe_cache(
@@ -3027,6 +3048,7 @@ impl ServerHandler for CodeIndexServer {
             epoch_before,
         );
         self.finish(&session_id, &dedup_scope, r, &unknown)
+            .map(Into::into)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

@@ -29,7 +29,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 
 # MCP протокол
-rmcp = { version = "1.4", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "3.9", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 
 # Парсинг AST
 tree-sitter = "0.25"
@@ -54,7 +54,7 @@ tree-sitter-swift = "0.7"
 quick-xml = "0.41"
 
 # База данных
-rusqlite = { version = "0.39", features = ["bundled", "backup", "functions"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup", "functions"] }
 
 # Сжатие content code-файлов (Phase 2: file_contents)
 zstd = "0.14.3"

@@ -1925,6 +1925,9 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().expect("временный каталог");
+        // TEMP may be inside another worktree: prevent discovering its parent Git.
+        std::fs::write(dir.path().join(".git"), "gitdir: missing-git-directory\n")
+            .expect("invalid git marker");
         let out = parse(&git_log(&entry(dir.path(), true), log_params()).await);
         assert!(
             out["error"]

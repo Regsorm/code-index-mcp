@@ -5,6 +5,12 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- Updated `rmcp` to 3.9 and `rusqlite` to 0.41 (`libsqlite3-sys` 0.39 / SQLite 3.54), addressing RUSTSEC-2026-0462 (unbounded MCP client HTTP response buffering) and RUSTSEC-2026-0459 (uninitialized memory exposure when opening a database with an incompatible WAL). The index schema is unchanged; no reindex is required.
+
 ## [1.16.0] — 2026-11-08
 
 ### Added

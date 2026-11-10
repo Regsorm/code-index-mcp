@@ -695,7 +695,7 @@ fn collect_rows(
     bound: Vec<SqlValue>,
     limit: u64,
 ) -> rusqlite::Result<(Vec<String>, Vec<Value>, bool)> {
-    let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let columns: Vec<String> = stmt.column_names().map(str::to_owned).collect();
     let col_count = columns.len();
 
     let mut rows = stmt.query(params_from_iter(bound.iter()))?;

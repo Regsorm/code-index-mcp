@@ -432,7 +432,11 @@ impl Storage {
         }
         // Connection::backup() открывает dst сам и не требует &mut dst
         self.conn
-            .backup(rusqlite::MAIN_DB, db_path, None)
+            .backup(
+                rusqlite::MAIN_DB,
+                db_path,
+                None::<fn(rusqlite::backup::Progress)>,
+            )
             .with_context(|| format!("Ошибка flush_to_disk: {}", db_path.display()))?;
         Ok(())
     }
