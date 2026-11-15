@@ -1963,7 +1963,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body). path_glob (синоним glob=) ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки."
+        description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body); приоритет непустых критериев regex → query → pattern, конфликт виден в search_param_conflict. path_glob (синоним glob=) ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки."
     )]
     async fn grep_text(&self, Parameters(mut p): Parameters<GrepTextParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
@@ -2008,7 +2008,7 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body): ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob (синоним glob=) ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки."
+        description = "Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body); приоритет непустых критериев regex → query → pattern, конфликт виден в search_param_conflict: ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob (синоним glob=) ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки."
     )]
     async fn grep_code(&self, Parameters(mut p): Parameters<GrepCodeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) {
@@ -2368,29 +2368,78 @@ fn meta_dependent_files(meta: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Ключи аргументов, которых нет в схеме инструмента (issue #22).
+/// Диагностика неизвестных и проигнорированных ключей аргументов (#22, #34).
 ///
 /// Сервер такие ключи не применяет (serde отбрасывает их молча), но и не
 /// отбивает вызов: ответ получает поля `unknown_params` и
 /// `unknown_params_note`, чтобы «отбор не сработал» было видно из самого
 /// ответа, а не выяснялось чтением схемы инструмента.
 #[derive(Debug, Clone, Default)]
-struct UnknownParams {
+struct ParamDiagnostics {
     /// Имена нераспознанных ключей (отсортированы).
     names: Vec<String>,
     /// Ключи, которые инструмент принимает (отсортированы): называем их в
     /// примечании, чтобы вызов можно было исправить, не заглядывая в схему.
     allowed: Vec<String>,
+    /// Конфликт известных ключей поиска, вычисленный до нормализации (issue #34).
+    search_conflict: Option<serde_json::Value>,
 }
 
-/// Дописать в готовый ответ перечень нераспознанных ключей.
+/// Показать фактически выбранный ключ полнотекстовых grep до нормализации.
+/// Пустые строки пропускаются; приоритет совпадает с grep_regex_from_params.
+fn grep_search_conflict(
+    tool: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if !matches!(tool, "grep_code" | "grep_text") {
+        return None;
+    }
+    let keys = ["regex", "query", "pattern"];
+    // Неверные типы отвергает обычный разбор аргументов, а не диагностика.
+    if keys.iter().any(|key| {
+        arguments
+            .get(*key)
+            .is_some_and(|v| !v.is_null() && !v.is_string())
+    }) {
+        return None;
+    }
+    let mut supplied = keys.into_iter().filter_map(|key| {
+        let value = arguments.get(key)?.as_str()?;
+        (!value.trim().is_empty()).then_some((key, value))
+    });
+    let (used_key, used_value) = supplied.next()?;
+    let ignored: Vec<_> = supplied.collect();
+    if ignored.is_empty() {
+        return None;
+    }
+    // Не удваивать произвольно большие входные строки в служебном ответе.
+    let describe = |key: &str, value: &str| {
+        let preview: String = value.chars().take(256).collect();
+        serde_json::json!({
+            "key": key, "value": preview, "value_truncated": preview.len() < value.len(),
+        })
+    };
+    Some(serde_json::json!({
+        "used": describe(used_key, used_value),
+        "ignored": ignored.iter().map(|(key, value)| describe(key, value)).collect::<Vec<_>>(),
+        "note": format!(
+            "Одновременно заданы ключи поиска. Использован {}=; проигнорированы: {}. Передайте один ключ поиска.",
+            used_key, ignored.iter().map(|(key, _)| *key).collect::<Vec<_>>().join(", "),
+        ),
+    }))
+}
+
+/// Дописать в готовый ответ неизвестные ключи и конфликт критериев поиска.
 ///
 /// Формы ответа те же, что у `strip_meta`: вложенный JSON в `content[*].text`
 /// (ответы core-tools) и `structuredContent` (structured output). Правка идёт
 /// по сериализованному `CallToolResult`; при любой неожиданности возвращается
 /// исходный результат — предупреждение не должно ломать ответ.
-fn annotate_unknown_params(result: CallToolResult, unknown: &UnknownParams) -> CallToolResult {
-    if unknown.names.is_empty() {
+fn annotate_param_diagnostics(
+    result: CallToolResult,
+    unknown: &ParamDiagnostics,
+) -> CallToolResult {
+    if unknown.names.is_empty() && unknown.search_conflict.is_none() {
         return result;
     }
     let mut value = match serde_json::to_value(&result) {
@@ -2405,7 +2454,7 @@ fn annotate_unknown_params(result: CallToolResult, unknown: &UnknownParams) -> C
             unknown.allowed.join(", ")
         )
     };
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "unknown_params": &unknown.names,
         "unknown_params_note": format!(
             "Ключ(и) не распознаны сервером и не применены: {}. Ответ мог быть построен без \
@@ -2414,6 +2463,12 @@ fn annotate_unknown_params(result: CallToolResult, unknown: &UnknownParams) -> C
             allowed_note
         ),
     });
+    if unknown.names.is_empty() {
+        payload = serde_json::json!({});
+    }
+    if let Some(conflict) = &unknown.search_conflict {
+        payload["search_param_conflict"] = conflict.clone();
+    }
     let mut patched = false;
     if let Some(content) = value.get_mut("content").and_then(|c| c.as_array_mut()) {
         for item in content.iter_mut() {
@@ -2637,39 +2692,44 @@ impl CodeIndexServer {
     }
 
     /// Остальные extension-tools сохраняют свободные объектные ключи.
-    fn unknown_params(
+    fn param_diagnostics(
         &self,
         name: &str,
         arguments: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> UnknownParams {
+    ) -> ParamDiagnostics {
         let Some(arguments) = arguments else {
-            return UnknownParams::default();
+            return ParamDiagnostics::default();
         };
         if !self.tool_router.has_route(name) && !multi_repo::supports_multi_repo(name) {
-            return UnknownParams::default();
+            return ParamDiagnostics::default();
         }
         let Some(tool) = self.get_tool(name) else {
-            return UnknownParams::default();
+            return ParamDiagnostics::default();
         };
         let Some(props) = tool
             .input_schema
             .get("properties")
             .and_then(|p| p.as_object())
         else {
-            return UnknownParams::default();
+            return ParamDiagnostics::default();
         };
         let mut names: Vec<String> = arguments
             .keys()
             .filter(|k| !props.contains_key(*k))
             .cloned()
             .collect();
-        if names.is_empty() {
-            return UnknownParams::default();
+        let search_conflict = grep_search_conflict(name, arguments);
+        if names.is_empty() && search_conflict.is_none() {
+            return ParamDiagnostics::default();
         }
         names.sort();
         let mut allowed: Vec<String> = props.keys().cloned().collect();
         allowed.sort();
-        UnknownParams { names, allowed }
+        ParamDiagnostics {
+            names,
+            allowed,
+            search_conflict,
+        }
     }
 
     /// Финальная обработка результата перед отдачей клиенту: сессионный дедуп
@@ -2682,7 +2742,7 @@ impl CodeIndexServer {
         session_id: &Option<String>,
         dedup_scope: &str,
         result: Result<CallToolResult, ErrorData>,
-        unknown: &UnknownParams,
+        unknown: &ParamDiagnostics,
     ) -> Result<CallToolResult, ErrorData> {
         self.finish_with_budget(session_id, dedup_scope, result, unknown, None)
     }
@@ -2692,7 +2752,7 @@ impl CodeIndexServer {
         session_id: &Option<String>,
         dedup_scope: &str,
         result: Result<CallToolResult, ErrorData>,
-        unknown: &UnknownParams,
+        unknown: &ParamDiagnostics,
         multi_budget: Option<usize>,
     ) -> Result<CallToolResult, ErrorData> {
         let Ok(res) = &result else {
@@ -2703,7 +2763,7 @@ impl CodeIndexServer {
         }
         // Нераспознанные ключи дописываем ДО дедупа и среза `_meta`: ответ на
         // повторный вызов тоже должен их нести.
-        let annotated = annotate_unknown_params(res.clone(), unknown);
+        let annotated = annotate_param_diagnostics(res.clone(), unknown);
         let mut delivery = None;
         let mut preparation_error = None;
         if let Ok(value) = serde_json::to_value(&annotated) {
@@ -2818,7 +2878,7 @@ impl CodeIndexServer {
             session_id,
             dedup_scope,
             Ok(CallToolResult::error(vec![ContentBlock::text(text)])),
-            &UnknownParams::default(),
+            &ParamDiagnostics::default(),
         )
     }
 }
@@ -2911,7 +2971,7 @@ impl ServerHandler for CodeIndexServer {
         // ответ выглядит исправным, а отбор не сработал (issue #22). Считаем их
         // до разбора аргументов — и дописываем в каждый ответ этого вызова
         // (включая ответ из кэша и ответ extension-tool).
-        let unknown = self.unknown_params(request.name.as_ref(), request.arguments.as_ref());
+        let unknown = self.param_diagnostics(request.name.as_ref(), request.arguments.as_ref());
 
         // 0. Whitelist-проверка ДО router-диспетча. Модель может вызвать
         // tool, отсутствующий в `tools/list` (из системного промпта, из
@@ -3998,6 +4058,140 @@ mod unknown_params_tests {
         value.as_object().cloned().expect("объект аргументов")
     }
 
+    #[test]
+    fn search_conflict_reports_actual_precedence_and_values() {
+        for tool in ["grep_code", "grep_text"] {
+            for (input, key, ignored_count) in [
+                (
+                    serde_json::json!({"pattern": "needle", "regex": "true"}),
+                    "regex",
+                    1,
+                ),
+                (
+                    serde_json::json!({"pattern": "needle", "query": "true"}),
+                    "query",
+                    1,
+                ),
+                (
+                    serde_json::json!({"regex": "true", "query": "false"}),
+                    "regex",
+                    1,
+                ),
+                (
+                    serde_json::json!({"pattern": "needle", "regex": "true", "query": "false"}),
+                    "regex",
+                    2,
+                ),
+                (
+                    serde_json::json!({"pattern": "needle", "regex": "needle"}),
+                    "regex",
+                    1,
+                ),
+            ] {
+                let diagnostics = server().param_diagnostics(tool, Some(&args(input.clone())));
+                assert!(diagnostics.names.is_empty());
+                let conflict = diagnostics.search_conflict.unwrap();
+                assert_eq!(conflict["used"]["key"], key, "{tool}: {input}");
+                assert_eq!(conflict["used"]["value"], input[key]);
+                assert_eq!(conflict["used"]["value_truncated"], false);
+                let ignored = conflict["ignored"].as_array().unwrap();
+                assert_eq!(ignored.len(), ignored_count);
+                for entry in ignored {
+                    assert_ne!(entry["key"], key);
+                    assert_eq!(entry["value"], input[entry["key"].as_str().unwrap()]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_conflict_respects_empty_null_and_invalid_arguments() {
+        for tool in ["grep_code", "grep_text"] {
+            for input in [
+                serde_json::json!({"pattern": "needle"}),
+                serde_json::json!({"query": "true", "regex": null}),
+                serde_json::json!({}),
+                serde_json::json!({"pattern": "needle", "regex": true}),
+            ] {
+                assert!(grep_search_conflict(tool, &args(input)).is_none());
+            }
+            let input = args(serde_json::json!({"pattern": "needle", "regex": " \t", "query": ""}));
+            assert!(grep_search_conflict(tool, &input).is_none());
+        }
+        for tool in ["list_files", "grep_body"] {
+            assert!(grep_search_conflict(
+                tool,
+                &args(serde_json::json!({"pattern": "needle", "regex": "true"}))
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn search_conflict_bounds_unicode_previews() {
+        let conflict = grep_search_conflict(
+            "grep_code",
+            &args(serde_json::json!({
+                "pattern": "Ж".repeat(100000), "regex": "🦀".repeat(257)
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            conflict["used"]["value"].as_str().unwrap().chars().count(),
+            256
+        );
+        assert_eq!(conflict["used"]["value_truncated"], true);
+        assert_eq!(conflict["ignored"][0]["value"], "Ж".repeat(256));
+        assert_eq!(conflict["ignored"][0]["value_truncated"], true);
+        assert!(serde_json::to_vec(&conflict).unwrap().len() < 3000);
+    }
+
+    #[test]
+    fn search_conflict_survives_repeated_delivery_and_multi_cap() {
+        let server = server();
+        let diagnostics = server.param_diagnostics(
+            "grep_code",
+            Some(&args(serde_json::json!({
+                "pattern": "needle", "regex": "true", "unrecognized": true
+            }))),
+        );
+        let source = serde_json::json!({"result": {
+            "repos": [{"repo": "alpha", "status": "ok", "payload": {"result": {
+                "files": {"sample.rs": [format!("1: {}", "x".repeat(10000))]}, "shown": 1
+            }}}], "shown": 1, "complete": true, "truncated": false
+        }});
+        for _ in 0..2 {
+            let result = server
+                .finish_with_budget(
+                    &Some("conflict".into()),
+                    "grep_code",
+                    Ok(CallToolResult::structured(source.clone())),
+                    &diagnostics,
+                    Some(5000),
+                )
+                .unwrap();
+            assert!(serde_json::to_vec(&result).unwrap().len() <= 5000);
+            let payload = synchronized_payload(&result);
+            assert_eq!(
+                payload["search_param_conflict"],
+                *diagnostics.search_conflict.as_ref().unwrap()
+            );
+            assert_eq!(
+                payload["unknown_params"],
+                serde_json::json!(["unrecognized"])
+            );
+            assert_eq!(payload["result"]["truncated"], true);
+        }
+        // Core/router text-only ответы несут ту же диагностику, включая пустую выдачу.
+        let text = CallToolResult::success(vec![ContentBlock::text("{\"result\":{\"shown\":0}}")]);
+        let result = annotate_param_diagnostics(text, &diagnostics);
+        let value = serde_json::to_value(result).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["search_param_conflict"]["used"]["value"], "true");
+        assert_eq!(payload["result"]["shown"], 0);
+    }
+
     fn finalization_payload() -> serde_json::Value {
         serde_json::json!({
             "result": {
@@ -4034,7 +4228,7 @@ mod unknown_params_tests {
         }));
         let huge = "x".repeat(100000);
         arguments.insert(huge.clone(), serde_json::json!(true));
-        let unknown = server.unknown_params("list_files", Some(&arguments));
+        let unknown = server.param_diagnostics("list_files", Some(&arguments));
         assert!(unknown.names.contains(&huge));
         let bytes = multi_repo::resolve_response_bytes(&arguments).unwrap();
         let value = server
@@ -4065,7 +4259,7 @@ mod unknown_params_tests {
     #[test]
     fn multi_finalization_caps_after_unknown_warning_dedup_and_internal_cleanup() {
         let server = server();
-        let unknown = server.unknown_params(
+        let unknown = server.param_diagnostics(
             "list_files",
             Some(&args(serde_json::json!({"ordinary_unknown": true}))),
         );
@@ -4164,7 +4358,7 @@ mod unknown_params_tests {
                 &session,
                 "list_files|alpha",
                 Ok(CallToolResult::structured(old_alpha)),
-                &UnknownParams::default(),
+                &ParamDiagnostics::default(),
             )
             .unwrap();
         payload["result"]["repos"][0]["payload"]["result"]
@@ -4176,7 +4370,7 @@ mod unknown_params_tests {
                 &session,
                 "list_files",
                 Ok(CallToolResult::structured(payload.clone())),
-                &UnknownParams::default(),
+                &ParamDiagnostics::default(),
                 Some(1),
             )
             .unwrap_err();
@@ -4192,7 +4386,7 @@ mod unknown_params_tests {
                 &session,
                 "list_files",
                 Ok(CallToolResult::structured(payload.clone())),
-                &UnknownParams::default(),
+                &ParamDiagnostics::default(),
                 Some(budget),
             )
             .unwrap();
@@ -4216,7 +4410,7 @@ mod unknown_params_tests {
                 &session,
                 "list_files",
                 Ok(CallToolResult::structured(payload)),
-                &UnknownParams::default(),
+                &ParamDiagnostics::default(),
                 Some(budget),
             )
             .unwrap();
@@ -4267,7 +4461,7 @@ mod unknown_params_tests {
                 &session,
                 "list_files",
                 Ok(CallToolResult::structured(payload.clone())),
-                &UnknownParams::default(),
+                &ParamDiagnostics::default(),
                 Some(10000),
             )
             .unwrap();
@@ -4298,7 +4492,7 @@ mod unknown_params_tests {
                 &session,
                 "list_files",
                 Ok(CallToolResult::structured(payload)),
-                &UnknownParams::default(),
+                &ParamDiagnostics::default(),
                 Some(budget),
             )
             .unwrap();
@@ -4326,7 +4520,7 @@ mod unknown_params_tests {
                         &session,
                         "list_files",
                         Ok(CallToolResult::structured(payload.clone())),
-                        &UnknownParams::default(),
+                        &ParamDiagnostics::default(),
                         Some(5000),
                     )
                     .unwrap();
@@ -4369,7 +4563,7 @@ mod unknown_params_tests {
                     &other_session,
                     "list_files",
                     Ok(CallToolResult::structured(other_payload)),
-                    &UnknownParams::default(),
+                    &ParamDiagnostics::default(),
                     Some(5000),
                 );
                 done_tx.send(result).unwrap();
@@ -4402,7 +4596,7 @@ mod unknown_params_tests {
                     &session,
                     "list_files",
                     Ok(CallToolResult::structured(payload)),
-                    &UnknownParams::default(),
+                    &ParamDiagnostics::default(),
                     Some(5000),
                 )
                 .unwrap();
@@ -4424,7 +4618,7 @@ mod unknown_params_tests {
         for single_first in [false, true] {
             let server = server();
             let session = Some("shared-cache".to_string());
-            let unknown = UnknownParams::default();
+            let unknown = ParamDiagnostics::default();
             let original = CallToolResult::structured(serde_json::json!({
                 "result": ["cached.rs"], "_meta": {}
             }));
@@ -4507,7 +4701,7 @@ mod unknown_params_tests {
                 &None,
                 "list_files",
                 Ok(CallToolResult::structured(payload.clone())),
-                &UnknownParams::default(),
+                &ParamDiagnostics::default(),
                 Some(48000),
             )
             .unwrap();
@@ -4517,7 +4711,7 @@ mod unknown_params_tests {
                 &None,
                 "list_files",
                 Ok(CallToolResult::structured(payload)),
-                &UnknownParams::default(),
+                &ParamDiagnostics::default(),
                 Some(1),
             )
             .unwrap_err();
@@ -4528,7 +4722,7 @@ mod unknown_params_tests {
     // — нет: схема ядра порождается из params-структуры и потому полна.
     #[test]
     fn неизвестный_ключ_отличается_от_известного() {
-        let unknown = server().unknown_params(
+        let unknown = server().param_diagnostics(
             "grep_code",
             Some(&args(serde_json::json!({
                 "repo": "cs", "regex": "Bootstrap", "file_pattern": "**/Core/**"
@@ -4542,7 +4736,7 @@ mod unknown_params_tests {
         );
 
         // Синоним, объявленный полем структуры, — уже «известный» ключ.
-        let known = server().unknown_params(
+        let known = server().param_diagnostics(
             "grep_code",
             Some(&args(
                 serde_json::json!({"repo": "cs", "regex": "x", "glob": "**/Core/**"}),
@@ -4555,7 +4749,7 @@ mod unknown_params_tests {
     // core-tool (вложенный JSON в content[*].text).
     #[test]
     fn ответ_несёт_неизвестные_ключи_и_допустимые() {
-        let unknown = server().unknown_params(
+        let unknown = server().param_diagnostics(
             "read_file",
             Some(&args(
                 serde_json::json!({"repo": "cs", "path": "a.cs", "line_from": 1}),
@@ -4569,7 +4763,7 @@ mod unknown_params_tests {
         }))
         .expect("CallToolResult из JSON");
 
-        let patched = annotate_unknown_params(res, &unknown);
+        let patched = annotate_param_diagnostics(res, &unknown);
         let value = serde_json::to_value(&patched).expect("сериализация ответа");
         let text = value["content"][0]["text"]
             .as_str()
@@ -4592,7 +4786,7 @@ mod unknown_params_tests {
     // на каждом ответе.
     #[test]
     fn корректный_вызов_предупреждения_не_получает() {
-        let unknown = server().unknown_params(
+        let unknown = server().param_diagnostics(
             "read_file",
             Some(&args(serde_json::json!({
                 "repo": "cs", "path": "a.cs", "line_start": 1, "line_end": 5
@@ -4605,22 +4799,23 @@ mod unknown_params_tests {
         }))
         .expect("CallToolResult из JSON");
         let before = serde_json::to_value(&res).unwrap();
-        let after = serde_json::to_value(annotate_unknown_params(res, &unknown)).unwrap();
+        let after = serde_json::to_value(annotate_param_diagnostics(res, &unknown)).unwrap();
         assert_eq!(before, after);
     }
 
     // Ответ не в форме JSON (или вообще текст) правкой не ломается.
     #[test]
     fn не_json_ответ_проходит_без_изменений() {
-        let unknown = UnknownParams {
+        let unknown = ParamDiagnostics {
             names: vec!["junk".to_string()],
             allowed: vec!["repo".to_string()],
+            ..Default::default()
         };
         let res: CallToolResult = serde_json::from_value(serde_json::json!({
             "content": [{"type": "text", "text": "не json"}],
         }))
         .expect("CallToolResult из JSON");
-        let value = serde_json::to_value(annotate_unknown_params(res, &unknown)).unwrap();
+        let value = serde_json::to_value(annotate_param_diagnostics(res, &unknown)).unwrap();
         assert_eq!(value["content"][0]["text"], serde_json::json!("не json"));
     }
 }
