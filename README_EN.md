@@ -951,9 +951,117 @@ Diagnostic tools (`health`, `get_stats`, `stat_file`) are not wrapped — their 
 
 **Data version number (1.4.1).** A database carries a number describing how its data was built, and that number is compared with the one baked into the binary. The release number is unrelated: the data number is raised only when a change alters what is collected or how it is parsed, so upgrading by itself does not mark a database stale. The number is stored only after a pass that parsed every file (`index <path> --force` or building an empty database) — a routine update over changed files does not raise it, since the remaining files were parsed the old way.
 
-`get_stats` and `health` return a `data_version` block — what built the database, what the binary has, and whether they differ; on a mismatch an explanation and a ready-to-run rebuild command are added. BSL tool responses that **ended in an error** carry the same set under `stale_index`; successful responses are untouched. For a remote node's folders the decision is made against that node's own database. A rebuild never starts on its own — when to run it is the operator's call.
+`get_stats` and `health` return a `data_version` block — what built the database, what the binary has, and whether they differ; on a mismatch an explanation and a ready-to-run rebuild command are added. Responses of tools that read **extracted facts** (symbols, graphs, 1C object structure) carry the mismatch mark on errors **and** on success: next to `result` you get `data_version_stale: true`, `data_version` (`built`, `current`, `message`, plus a ready-to-run `command` for a local repository) and a short `data_version_hint`. The legacy `result.stale_index` field on errors is kept for compatibility and the tool's own `hint` is never replaced. On a fresh index none of these fields appear. For a remote node's folders the decision is made against that node's own database, and the remote machine's path is never handed to the client as an executable command. A rebuild never starts on its own — when to run it is the operator's call.
 
-No hint is attached to empty responses: an empty list is very often legitimate, and telling "data was not collected" from "this is not in the configuration" is impossible without reading the source files. In those cases the mismatch is still visible in `get_stats`.
+Cache hits recheck the data version, removing the warning after a rebuild. In a set,
+the annotation belongs to its own group; an empty `list_files` alone does not
+warn about extracted facts.
+
+The mark exists precisely because "nothing found" on a stale database is indistinguishable from an honest zero: an empty list is very often legitimate, and telling "data was not collected" from "this is not in the configuration" is impossible without reading the source files.
+
+## Searching multiple repositories (#32)
+
+Exactly five tools support a set: `grep_code`, `grep_text`, `list_files`,
+`find_symbol` and `get_object_structure`. Pass `repos: ["app", "app-test"]`
+or a registered-alias mask such as `repo: "app-*"` (`*`, `?`).
+An exact registered alias takes precedence over a mask. Lists must be nonempty
+and contain at most eight entries; duplicates are removed in input order.
+Masks expand in alphabetical order to at most eight repositories; a mask with
+no literal part is rejected. Conflicting `repo`/`repos`, invalid types,
+empty entries, unknown aliases and invalid or overly broad masks are rejected
+before execution with the available aliases listed. A selector never opens a
+path or address. Other tools reject `repos`.
+
+A list or mask, including a one-repository set, returns `result.repos`:
+each group contains `repo`, `status` and the original single-search `payload`.
+Statuses `ok`, `partial`, `error`, `skipped` and `truncated` distinguish
+success, incompleteness, failures and stops. When byte limits omit findings,
+warnings remain in `warnings` alongside the reason. Top-level `shown`,
+`limit`, `truncated` and `complete` cover the entire set; an exact overall
+`total` is not promised. An ordinary single alias or an omitted selector with
+`default_repo` keeps the single-repository response. Sets are not cached;
+deduplication is scoped to each tool/repository pair. `content.text` and
+`structuredContent` carry identical data.
+
+Fan-out is sequential: repository concurrency is 1. The shared `limit`
+defaults to 100 and accepts 1–500; object searches default to and allow at most
+50. A unit is a matching grep line, file, symbol location or object; context
+lines do not count. Shared scan limits are 4096 files, 64 MiB compressed and
+64 MiB uncompressed, including the opposite-category pass. The deadline is
+at most 30 seconds and no greater than `tool_timeout`.
+`max_response_bytes` bounds the entire response: the normal server budget
+(default 48,000 bytes), clamped by the server ceiling. Sets still have the
+finite standard budget when the server cap is disabled. A budget too small to
+retain groups and warnings produces an explicit error. For the four core tools
+this parameter applies only to sets; `get_object_structure` also supports it
+for single-repository responses. Limits are not multiplied by repository count.
+Measured usage appears in `search_usage` and `header_usage`.
+An older federated node without the internal `bounded_search` endpoint produces
+an explicit group error, with no unbounded fallback.
+
+**Zero-result grep (#31).** With initial `shown=0`, one opposite-category pass
+uses the same normalized regex/glob/language: at most 256 files, 8 MiB compressed,
+8 MiB uncompressed and 20 matching lines. Next to `result`,
+`other_category` reports `category`, `tool`, `matched`, `complete` and reasons
+for incompleteness. With `complete=false`, the count is only a lower bound.
+An incomplete zero means an area not fully checked; a complete zero in both
+categories adds neither the field nor a new hint. Existing hints, regex/query/
+pattern precedence, literal pattern semantics and XML classification are retained.
+
+## Response annotations: criterion case, derived files, data version
+
+**The `name_like` criterion of `get_object_structure` (#30).** The substring is
+normalized to NFC and compared Unicode-case-insensitively: Cyrillic and Latin match in any case
+(`контрагенты` = `Контрагенты` = `КОНТРАГЕНТЫ`). The former SQL `LIKE` folded
+case for ASCII only, so a Cyrillic criterion silently found nothing.
+
+`LIKE` semantics are preserved and remain a **search inside** the name or
+synonym:
+
+- `%` — any sequence of characters, including an empty one;
+- `_` — exactly one Unicode character;
+- every other character is literal, a backslash does **not** escape;
+- both the object name and its synonym are matched.
+
+The reason of the match travels in every found object as `matched_by`: `["name"]`,
+`["synonym"]` or `["name", "synonym"]` (in that order). An object that matched both by name
+and by synonym is returned **once**. The 50-object cap and `truncated` are
+unchanged, as are `full_name`/`full_names`, `names_only`, `sections`, `offset`
+and response budgeting. `get_object_profile` does not extend the criterion.
+
+**Derived files in searches (#35).** `grep_code`, `grep_text`, `grep_body`,
+`search_function`, `search_class`, `search_text`, `find_symbol` and `list_files`
+add `file_annotations` to their response — keyed by the **source** paths of the
+returned findings:
+
+- `{"derived": true, "header_line": N}` — the file declares itself derived with
+  an explicit phrase in its leading comment block (`НЕ редактировать`,
+  `DO NOT EDIT`, `auto-generated`, `generated file`, `derived file`,
+  `АВТОИЗВЛЕЧЕНИЕ`);
+- `{"derived": false}` — the header was read, no explicit phrase found;
+- `{"derived_status": "unknown", "derived_reason": "…"}` — verification failed
+  (no stored content, `oversize`, corrupt blob, exhausted budget). A false
+  `derived: false` never appears in that case.
+
+The header is read from the index only (`file_contents` for code,
+`text_contents` for text); nothing is read from disk and no migrations run.
+Limits: at most 20 physical lines and 4 KiB of uncompressed text per file, at
+most 64 KiB of compressed prefix per file, at most 100 paths, 256 KiB compressed
+and 256 KiB uncompressed per request. Multi-repo groups share these limits. BOM, CRLF, indentation, line (`//`, `#`, `--`) and block
+(`/* … */`) comments and a skipped shebang are handled; scanning stops at the
+first executable text. Therefore the following are **not** signs: the file name,
+a lone `derived` word, a marker inside code (a `"DO NOT EDIT"` string literal)
+and a deep comment below the header. `source_path` is not emitted: a reliable
+link to the source is not established yet. The hint (`file_annotations_hint`) is
+emitted only for confirmed derived files; incomplete header verification is
+reported separately in `file_annotations_incomplete` and is never passed off as
+confirmed derivedness.
+
+**Counters and limits.** `shown`, `matched` and similar numbers say how much was
+found and returned, not how much exists: with `truncated: true` or a budget stop
+the number is a **lower bound**. `complete: false` means the area was not
+verified to the end (unreadable or `oversize` files, exhausted budget), and an
+empty tail of the response does not prove absence of data.
 
 ## License
 
