@@ -979,6 +979,13 @@ pub async fn search_function(
                 .iter()
                 .map(|fr| function_search_hit(fr, &lookup_path(&storage, fr.file_id)))
                 .collect();
+            // #35: пометки производных файлов по исходным путям находок.
+            let extra = collect_derived_annotations(
+                &storage,
+                crate::storage::search_support::IndexedCategory::Code,
+                deps.clone(),
+            )
+            .merge_into_extra(extra);
             wrap_with_meta_extra(&storage, &hits, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"search_function: {}\"}}", e),
@@ -1027,6 +1034,13 @@ pub async fn search_class(
                 .iter()
                 .map(|cr| class_search_hit(cr, &lookup_path(&storage, cr.file_id)))
                 .collect();
+            // #35: пометки производных файлов по исходным путям находок.
+            let extra = collect_derived_annotations(
+                &storage,
+                crate::storage::search_support::IndexedCategory::Code,
+                deps.clone(),
+            )
+            .merge_into_extra(extra);
             wrap_with_meta_extra(&storage, &hits, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"search_class: {}\"}}", e),
@@ -2008,7 +2022,14 @@ pub async fn find_symbol(
 ) -> String {
     bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
-    match storage.find_symbol(&name, language.as_deref()) {
+    let search_limit = crate::storage::search_support::search_limit();
+    let found = match search_limit {
+        Some(limit) => {
+            storage.find_symbol_limited(&name, language.as_deref(), path_glob.as_deref(), limit)
+        }
+        None => storage.find_symbol(&name, language.as_deref()),
+    };
+    match found {
         Ok(mut r) => {
             if let Some(ref g) = path_glob {
                 let matcher = match build_path_matcher(g) {
@@ -2024,10 +2045,42 @@ pub async fn find_symbol(
                 r.imports
                     .retain(|ir| matches_with(&matcher, &lookup_path(&storage, ir.file_id)));
             }
+            let location_cap = search_limit.unwrap_or(LOCATION_CAP);
+            let mut annotation_paths = collect_paths_via(
+                &storage,
+                &r.functions[..r.functions.len().min(location_cap)],
+                |fr| fr.file_id,
+            );
+            annotation_paths.extend(collect_paths_via(
+                &storage,
+                &r.classes[..r.classes.len().min(location_cap)],
+                |cr| cr.file_id,
+            ));
+            annotation_paths.extend(collect_paths_via(
+                &storage,
+                &r.variables[..r.variables.len().min(location_cap)],
+                |vr| vr.file_id,
+            ));
+            annotation_paths.extend(collect_paths_via(
+                &storage,
+                &r.imports[..r.imports.len().min(location_cap)],
+                |ir| ir.file_id,
+            ));
             let mut deps = collect_paths_via(&storage, &r.functions, |fr| fr.file_id);
             deps.extend(collect_paths_via(&storage, &r.classes, |cr| cr.file_id));
             deps.extend(collect_paths_via(&storage, &r.variables, |vr| vr.file_id));
             deps.extend(collect_paths_via(&storage, &r.imports, |ir| ir.file_id));
+            crate::storage::search_support::record_usage(
+                &crate::storage::search_support::SearchUsage {
+                    files: deps.iter().collect::<std::collections::HashSet<_>>().len(),
+                    matches: r.functions.len()
+                        + r.classes.len()
+                        + r.variables.len()
+                        + r.imports.len(),
+                    dependent_files: deps.clone(),
+                    ..Default::default()
+                },
+            );
             let empty = r.functions.is_empty()
                 && r.classes.is_empty()
                 && r.variables.is_empty()
@@ -2051,21 +2104,44 @@ pub async fn find_symbol(
             let functions: Vec<serde_json::Value> = r
                 .functions
                 .iter()
-                .take(LOCATION_CAP)
+                .take(location_cap)
                 .map(|fr| function_search_hit(fr, &lookup_path(&storage, fr.file_id)))
                 .collect();
             let classes: Vec<serde_json::Value> = r
                 .classes
                 .iter()
-                .take(LOCATION_CAP)
+                .take(location_cap)
                 .map(|cr| class_search_hit(cr, &lookup_path(&storage, cr.file_id)))
                 .collect();
-            let variables: Vec<&_> = r.variables.iter().take(LOCATION_CAP).collect();
-            let imports: Vec<&_> = r.imports.iter().take(LOCATION_CAP).collect();
-            let truncated = f_total > LOCATION_CAP
-                || c_total > LOCATION_CAP
-                || v_total > LOCATION_CAP
-                || i_total > LOCATION_CAP;
+            let variables: Vec<serde_json::Value> = r
+                .variables
+                .iter()
+                .take(location_cap)
+                .map(|record| {
+                    let mut value = serde_json::to_value(record).unwrap_or(serde_json::Value::Null);
+                    if search_limit.is_some() {
+                        value["path"] = serde_json::json!(lookup_path(&storage, record.file_id));
+                    }
+                    value
+                })
+                .collect();
+            let imports: Vec<serde_json::Value> = r
+                .imports
+                .iter()
+                .take(location_cap)
+                .map(|record| {
+                    let mut value = serde_json::to_value(record).unwrap_or(serde_json::Value::Null);
+                    if search_limit.is_some() {
+                        value["path"] = serde_json::json!(lookup_path(&storage, record.file_id));
+                    }
+                    value
+                })
+                .collect();
+            let truncated = f_total > location_cap
+                || c_total > location_cap
+                || v_total > location_cap
+                || i_total > location_cap
+                || search_limit.is_some_and(|n| f_total + c_total + v_total + i_total >= n);
             let mut payload = serde_json::Map::new();
             payload.insert("functions".into(), serde_json::Value::Array(functions));
             payload.insert("classes".into(), serde_json::Value::Array(classes));
@@ -2077,13 +2153,21 @@ pub async fn find_symbol(
                 "imports".into(),
                 serde_json::to_value(&imports).unwrap_or(serde_json::Value::Null),
             );
-            let payload = serde_json::Value::Object(payload);
+            let mut payload = serde_json::Value::Object(payload);
+            // #35: проверяются только пути возвращённых локаций, без хвоста cap.
+            annotate_derived_files(
+                &mut payload,
+                &storage,
+                crate::storage::search_support::IndexedCategory::Code,
+                annotation_paths,
+            );
             let extra = if let Some(h) = hint {
                 Some(serde_json::json!({ "hint": h }))
             } else if truncated {
                 Some(serde_json::json!({
                     "truncated": true,
-                    "shown_cap": LOCATION_CAP,
+                    "shown_cap": location_cap,
+                    "lower_bound_only": search_limit.is_some(),
                     "totals": { "functions": f_total, "classes": c_total, "variables": v_total, "imports": i_total },
                     "hint": "Локаций больше cap — показаны первые по каждой категории. Сузьте path_glob к нужному файлу.",
                 }))
@@ -2356,26 +2440,119 @@ pub fn attach_stale_note(
     value
 }
 
-/// Дописать подсказку о расхождении версий данных в ответ инструмента.
+/// Короткая подсказка о расхождении версий данных. Живёт рядом с `result`, а не
+/// внутри него: собственные `hint` инструментов она не заменяет.
+const DATA_VERSION_HINT: &str = "Индекс собран прежней версией сборщика: часть извлечённых \
+фактов (символы, графы, структура объектов 1С) может отсутствовать, и пустой ответ не значит \
+«в конфигурации этого нет». Версии и пояснение — в поле `data_version`; для локального репо там \
+же готовая команда пересбора.";
+
+/// Дописать пометку о расхождении версий данных в ответ инструмента.
 ///
-/// Соединение берётся из пула ТОЛЬКО после дешёвой проверки «в `result` есть
-/// `error`»: подсказка адресована ошибке, и на успешном ответе пул не занимается.
+/// Пометка ставится и на успешный, и на ошибочный ответ: инструменты, читающие
+/// ИЗВЛЕЧЁННЫЕ факты (символы, графы, структуру объектов 1С), неполны в обоих
+/// случаях, и «ничего не найдено» на устаревшей базе неотличимо от честного
+/// нуля. На свежем индексе полей нет вовсе.
+///
+/// Существующая форма ошибки (`result.stale_index`) сохраняется ради
+/// совместимости; рядом появляются `data_version_stale`, `data_version` и
+/// `data_version_hint`.
 pub(crate) async fn annotate_stale_index(
     value: serde_json::Value,
     pool: &std::sync::Arc<crate::storage::StoragePool>,
     root: Option<&std::path::Path>,
 ) -> serde_json::Value {
-    if !result_has_error(&value) {
-        return value;
-    }
     let storage = match pool.get().await {
         Ok(s) => s,
         Err(_) => return value,
     };
-    match stale_index_note(storage.data_version_status(), root) {
-        Some(note) => attach_stale_note(value, note),
-        None => value,
+    let status = storage.data_version_status();
+    let value = clear_data_version_annotation(value);
+    if !status.stale {
+        return value;
     }
+    annotate_data_version(value, status, root)
+}
+
+/// Проставить пометку расхождения версий на готовом ответе инструмента.
+/// Отдельная синхронная функция — её же зовут федеративный узел и группы
+/// multi-repo, где своего пула под рукой нет.
+pub fn annotate_data_version(
+    mut value: serde_json::Value,
+    status: crate::storage::DataVersionStatus,
+    root: Option<&std::path::Path>,
+) -> serde_json::Value {
+    if value.get("content").is_some_and(|v| v.is_array()) {
+        return map_response_payload(value, |payload| {
+            annotate_data_version(payload, status, root)
+        });
+    }
+    if !status.stale {
+        return clear_data_version_annotation(value);
+    }
+    value = attach_stale_note(value, data_version_block(status, root));
+    let block = data_version_block(status, root);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("data_version_stale".to_string(), serde_json::json!(true));
+        obj.insert("data_version".to_string(), block);
+        obj.insert(
+            "data_version_hint".to_string(),
+            serde_json::json!(DATA_VERSION_HINT),
+        );
+    }
+    value
+}
+
+/// Снять прежнюю пометку расхождения версий данных (#33).
+///
+/// Кэшированный ответ мог быть построен на устаревшей базе: после пересбора
+/// предупреждение обязано исчезнуть, поэтому перед повторной проверкой версии
+/// поля снимаются. Совместимая форма `result.stale_index` снимается там же.
+pub fn clear_data_version_annotation(mut value: serde_json::Value) -> serde_json::Value {
+    if value.get("content").is_some_and(|v| v.is_array()) {
+        return map_response_payload(value, clear_data_version_annotation);
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("data_version_stale");
+        obj.remove("data_version");
+        obj.remove("data_version_hint");
+        if let Some(res) = obj.get_mut("result").and_then(|v| v.as_object_mut()) {
+            res.remove("stale_index");
+        }
+    }
+    value
+}
+
+/// Обновить единственный payload и синхронно отразить его в обеих формах MCP.
+pub(crate) fn map_response_payload(
+    mut response: serde_json::Value,
+    transform: impl FnOnce(serde_json::Value) -> serde_json::Value,
+) -> serde_json::Value {
+    if !response.get("content").is_some_and(|v| v.is_array()) {
+        return transform(response);
+    }
+    let payload = response
+        .get("structuredContent")
+        .filter(|v| !v.is_null())
+        .cloned()
+        .or_else(|| {
+            response
+                .get("content")?
+                .as_array()?
+                .iter()
+                .find_map(|c| serde_json::from_str(c.get("text")?.as_str()?).ok())
+        });
+    let Some(payload) = payload else {
+        return response;
+    };
+    let payload = transform(payload);
+    if let Some(content) = response.get_mut("content").and_then(|v| v.as_array_mut()) {
+        if let Some(text) = content.iter_mut().find(|c| c.get("text").is_some()) {
+            text["text"] = serde_json::json!(payload.to_string());
+        }
+    }
+    response["structuredContent"] = payload;
+    response
 }
 
 /// Статистика по одному репо: читает локальный SQLite. Для remote — паника
@@ -2604,13 +2781,20 @@ pub async fn search_text(
                 .into_iter()
                 .map(|(path, snippet)| serde_json::json!({ "path": path, "snippet": snippet }))
                 .collect();
-            let extra = search_extra(
+            let mut extra = search_extra(
                 HINT_SEARCH_TEXT_EMPTY,
                 path_glob.is_some(),
                 prefetched,
                 sql_limit,
                 items.len(),
             );
+            // #35: пометки производных файлов по исходным путям находок.
+            extra = collect_derived_annotations(
+                &storage,
+                crate::storage::search_support::IndexedCategory::Text,
+                deps.clone(),
+            )
+            .merge_into_extra(extra);
             wrap_with_meta_extra(&storage, &items, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"search_text: {}\"}}", e),
@@ -2669,12 +2853,18 @@ pub async fn grep_body(
             // Компактная выдача: значение files[path] — массив локаторных строк
             // "<name> (<kind>) L<start>-<end>: <строки>(+N)" (см. compact_body_matches).
             let files = compact_body_matches(&matches);
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "files": files,
                 "shown": shown,
                 "limit": want,
                 "truncated": truncated,
             });
+            annotate_derived_files(
+                &mut payload,
+                &storage,
+                crate::storage::search_support::IndexedCategory::Code,
+                matches.iter().map(|m| m.file_path.clone()),
+            );
             let declarative = (1..=DECLARATIVE_HINT_MAX_HITS)
                 .contains(&shown)
                 .then(|| {
@@ -2717,7 +2907,57 @@ pub async fn list_files(
 ) -> String {
     bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
+    list_files_with(&storage, pattern, path_prefix, language, limit)
+}
+
+fn list_files_with(
+    storage: &crate::storage::Storage,
+    pattern: Option<String>,
+    path_prefix: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+) -> String {
     let want = limit.unwrap_or(LIST_FILES_DEFAULT_LIMIT);
+    if let Some(scope_limit) = crate::storage::search_support::search_limit() {
+        use crate::storage::search_support::{
+            record_usage, remaining_budget, SearchBudget, SearchStop,
+        };
+        let want = want.min(scope_limit);
+        return match storage.list_files_filtered_budgeted(
+            pattern.as_deref(),
+            path_prefix.as_deref(),
+            language.as_deref(),
+            want,
+            remaining_budget(SearchBudget::multi_repo()),
+        ) {
+            Ok(result) => {
+                record_usage(&result.usage);
+                let deps = result.usage.dependent_files.clone();
+                let reason = match result.usage.stopped {
+                    Some(SearchStop::Matches) => Some("limit"),
+                    Some(SearchStop::Cancelled) => Some("timeout"),
+                    Some(_) => Some("scan_budget"),
+                    None => None,
+                };
+                let mut extra = serde_json::json!({
+                    "complete": result.complete,
+                    "truncated": !result.complete,
+                    "shown": result.files.len(),
+                    "limit": want,
+                    "reason": reason,
+                    "search_usage": result.usage.to_json(),
+                });
+                if result.complete && result.files.is_empty() {
+                    extra["hint"] = serde_json::json!(HINT_LIST_FILES_EMPTY);
+                }
+                let listed = compact_listed_files(&result.files);
+                let extra = collect_derived_annotations_any(storage, deps.clone())
+                    .merge_into_extra(Some(extra));
+                wrap_with_meta_extra(storage, &listed, deps, extra)
+            }
+            Err(e) => serde_json::json!({"error": format!("list_files: {e}")}).to_string(),
+        };
+    }
     match storage.list_files_filtered(
         pattern.as_deref(),
         path_prefix.as_deref(),
@@ -2726,6 +2966,14 @@ pub async fn list_files(
     ) {
         Ok(r) => {
             let deps: Vec<String> = r.iter().map(|lf| lf.path.clone()).collect();
+            crate::storage::search_support::record_usage(
+                &crate::storage::search_support::SearchUsage {
+                    files: r.len(),
+                    matches: r.len(),
+                    dependent_files: deps.clone(),
+                    ..Default::default()
+                },
+            );
             // Компактная выдача: каждый файл — строка "path | lang | N lines | size"
             // (mtime не дублируем — он в _meta.file_mtimes).
             let listed = compact_listed_files(&r);
@@ -2764,7 +3012,11 @@ pub async fn list_files(
             } else {
                 None
             };
-            wrap_with_meta_extra(&storage, &listed, deps, extra)
+            // #35: пометки производных файлов по исходным путям (и code-, и
+            // text-файлы: list_files не делит их по категориям).
+            let extra =
+                collect_derived_annotations_any(storage, deps.clone()).merge_into_extra(extra);
+            wrap_with_meta_extra(storage, &listed, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"list_files: {}\"}}", e),
     }
@@ -2819,16 +3071,17 @@ pub async fn grep_text(
             100
         }
     });
-    match storage.grep_text_filtered(
+    match storage.grep_text_filtered_budgeted(
         &regex,
         path_glob.as_deref(),
         language.as_deref(),
         want,
         context_lines.unwrap_or(0),
-        GREP_TOTAL_BYTES_CAP,
+        crate::storage::search_support::search_response_bytes(GREP_TOTAL_BYTES_CAP),
+        crate::storage::search_support::SearchBudget::UNLIMITED,
     ) {
-        Ok((matches, truncated, unreadable)) => {
-            let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
+        Ok((matches, truncated, unreadable, usage)) => {
+            let mut deps = usage.dependent_files.clone();
             let shown = matches.len();
             // Компактная выдача: значение files[path] — плоский массив строк
             // "N: content" (см. compact_text_matches). Путь — один раз как ключ.
@@ -2838,14 +3091,49 @@ pub async fn grep_text(
                 "shown": shown,
                 "limit": want,
                 "truncated": truncated,
+                "complete": usage.complete() && !truncated,
+                "search_usage": usage.to_json(),
             });
             annotate_unreadable(&mut payload, unreadable);
-            let hint = if shown == 0 {
-                Some(HINT_GREP_TEXT_EMPTY)
+            annotate_derived_files(
+                &mut payload,
+                &storage,
+                crate::storage::search_support::IndexedCategory::Text,
+                matches.iter().map(|m| m.path.clone()),
+            );
+            let mut hint = if shown == 0 {
+                Some(HINT_GREP_TEXT_EMPTY.to_string())
             } else {
                 None
             };
-            wrap_with_meta_hint(&storage, &payload, deps, hint)
+            let mut other = None;
+            if shown == 0 {
+                // #31: ноль в text-категории не значит ноль в индексе — один
+                // ограниченный проход по code-файлам тем же шаблоном.
+                if let Some(probe) = probe_other_category(
+                    &storage,
+                    crate::storage::search_support::IndexedCategory::Text,
+                    &regex,
+                    path_glob.as_deref(),
+                    language.as_deref(),
+                    &mut deps,
+                ) {
+                    hint = Some(match hint.take() {
+                        Some(h) => format!("{} {}", h, other_category_hint(&probe)),
+                        None => other_category_hint(&probe),
+                    });
+                    other = Some(probe);
+                }
+            }
+            let mut extra = serde_json::Map::new();
+            if let Some(h) = hint {
+                extra.insert("hint".to_string(), serde_json::json!(h));
+            }
+            if let Some(p) = other {
+                extra.insert("other_category".to_string(), p);
+            }
+            let extra = (!extra.is_empty()).then_some(serde_json::Value::Object(extra));
+            wrap_with_meta_extra(&storage, &payload, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"grep_text: {}\"}}", e),
     }
@@ -2960,16 +3248,17 @@ pub async fn grep_code(
     bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
     let want = limit.unwrap_or(GREP_CODE_DEFAULT_LIMIT);
-    match storage.grep_code_filtered(
+    match storage.grep_code_filtered_budgeted(
         &regex,
         path_glob.as_deref(),
         language.as_deref(),
         want,
         context_lines.unwrap_or(0),
-        GREP_TOTAL_BYTES_CAP,
+        crate::storage::search_support::search_response_bytes(GREP_TOTAL_BYTES_CAP),
+        crate::storage::search_support::SearchBudget::UNLIMITED,
     ) {
-        Ok((matches, truncated, unreadable)) => {
-            let deps: Vec<String> = matches.iter().map(|m| m.path.clone()).collect();
+        Ok((matches, truncated, unreadable, usage)) => {
+            let mut deps = usage.dependent_files.clone();
             let shown = matches.len();
             // Компактная выдача: значение files[path] — плоский массив строк
             // "N: content" (см. compact_text_matches). Путь — один раз как ключ.
@@ -2979,8 +3268,16 @@ pub async fn grep_code(
                 "shown": shown,
                 "limit": want,
                 "truncated": truncated,
+                "complete": usage.complete() && !truncated,
+                "search_usage": usage.to_json(),
             });
             annotate_unreadable(&mut payload, unreadable);
+            annotate_derived_files(
+                &mut payload,
+                &storage,
+                crate::storage::search_support::IndexedCategory::Code,
+                matches.iter().map(|m| m.path.clone()),
+            );
             let declarative = (1..=DECLARATIVE_HINT_MAX_HITS)
                 .contains(&shown)
                 .then(|| declarative_binding_hint(entry, &storage, &regex))
@@ -2989,7 +3286,7 @@ pub async fn grep_code(
                 // Сколько файлов в области поиска реально пропущено по размеру:
                 // общая фраза «oversize пропускаются» уводила в сторону при
                 // честном нуле (issue #23). Число называем прямо.
-                let oversize = storage.count_oversize_files(language.as_deref());
+                let oversize = usage.oversize;
                 let base = empty_hint
                     .as_deref()
                     .unwrap_or_else(|| grep_code_empty_hint(entry.language.as_deref()));
@@ -3006,9 +3303,152 @@ pub async fn grep_code(
             } else {
                 declarative
             };
-            wrap_with_meta_hint(&storage, &payload, deps, hint.as_deref())
+            let mut hint = hint;
+            let mut other = None;
+            if shown == 0 {
+                // #31: ноль в code-категории не значит ноль в индексе — один
+                // ограниченный проход по text-файлам тем же шаблоном.
+                if let Some(probe) = probe_other_category(
+                    &storage,
+                    crate::storage::search_support::IndexedCategory::Code,
+                    &regex,
+                    path_glob.as_deref(),
+                    language.as_deref(),
+                    &mut deps,
+                ) {
+                    hint = Some(match hint.take() {
+                        Some(h) => format!("{} {}", h, other_category_hint(&probe)),
+                        None => other_category_hint(&probe),
+                    });
+                    other = Some(probe);
+                }
+            }
+            let mut extra = serde_json::Map::new();
+            if let Some(h) = hint {
+                extra.insert("hint".to_string(), serde_json::json!(h));
+            }
+            if let Some(p) = other {
+                extra.insert("other_category".to_string(), p);
+            }
+            let extra = (!extra.is_empty()).then_some(serde_json::Value::Object(extra));
+            wrap_with_meta_extra(&storage, &payload, deps, extra)
         }
         Err(e) => format!("{{\"error\": \"grep_code: {}\"}}", e),
+    }
+}
+
+/// Дополнительный проход по ПРОТИВОПОЛОЖНОЙ категории (#31).
+///
+/// `grep_code` не видит text-файлы (`text_contents`), `grep_text` — code
+/// (`file_contents`), поэтому ноль в своей категории не означает нуля в
+/// индексе. Проход идёт через ТУ ЖЕ реализацию хранилища (не через повторный
+/// вызов MCP-инструмента) и ограничен [`SearchBudget::other_category`]:
+/// 256 файлов, 8 MiB сжатых и 8 MiB распакованных данных, 20 строк.
+///
+/// `None` — полный ноль в обеих категориях: поля `other_category` в ответе не
+/// появляется вовсе.
+fn probe_other_category(
+    storage: &crate::storage::Storage,
+    main: crate::storage::search_support::IndexedCategory,
+    regex: &str,
+    path_glob: Option<&str>,
+    language: Option<&str>,
+    deps: &mut Vec<String>,
+) -> Option<serde_json::Value> {
+    use crate::storage::search_support::{IndexedCategory, SearchBudget};
+    let (other, tool) = match main {
+        IndexedCategory::Code => (IndexedCategory::Text, "grep_text"),
+        IndexedCategory::Text => (IndexedCategory::Code, "grep_code"),
+    };
+    let budget = SearchBudget::other_category();
+    let run = match other {
+        IndexedCategory::Code => storage.grep_code_filtered_budgeted(
+            regex,
+            path_glob,
+            language,
+            budget.max_matches,
+            0,
+            budget.max_uncompressed_bytes,
+            budget,
+        ),
+        IndexedCategory::Text => storage.grep_text_filtered_budgeted(
+            regex,
+            path_glob,
+            language,
+            budget.max_matches,
+            0,
+            budget.max_uncompressed_bytes,
+            budget,
+        ),
+    };
+    // Невалидный regex уже отвергнут основным поиском — здесь молча выходим.
+    let (matches, truncated, unreadable, usage) = match run {
+        Ok(run) => run,
+        Err(error) => {
+            deps.extend(crate::storage::search_support::current_usage().dependent_files);
+            return Some(serde_json::json!({
+                "category": other.as_str(), "tool": tool, "matched": 0,
+                "complete": false, "stop_reason": "storage_error", "reason": error.to_string(),
+            }));
+        }
+    };
+    deps.extend(usage.dependent_files.iter().cloned());
+    let matched = matches.len();
+    // Полнота: обход дошёл до конца, обрезки по limit/байтам не было,
+    // непрочитанных файлов нет.
+    let complete = usage.complete() && !truncated && unreadable == 0;
+    if matched == 0 && complete {
+        return None;
+    }
+    Some(serde_json::json!({
+        "category": other.as_str(),
+        "tool": tool,
+        "matched": matched,
+        // При complete=false `matched` — только НИЖНЯЯ ГРАНИЦА.
+        "lower_bound_only": !complete,
+        "complete": complete,
+        "stop_reason": usage.reason(),
+        "truncated": truncated,
+        "files_unreadable": unreadable,
+        "files_oversize": usage.oversize,
+    }))
+}
+
+/// Понятная подсказка к дополнительному проходу (#31). Существующие подсказки
+/// инструмента она ДОПИСЫВАЕТ, а не заменяет.
+fn other_category_hint(probe: &serde_json::Value) -> String {
+    let tool = probe
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or("grep_code");
+    let matched = probe.get("matched").and_then(|v| v.as_u64()).unwrap_or(0);
+    let complete = probe
+        .get("complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let reason = probe
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("budget");
+    if matched == 0 {
+        format!(
+            "В противоположной категории тоже пусто, но проход по ней остановлен досрочно ({}) — эта \
+             область проверена НЕ ДО КОНЦА, и ноль здесь не означает отсутствия совпадений. Сузьте \
+             path_glob/language и повторите вызов с {}.",
+            reason, tool
+        )
+    } else if complete {
+        format!(
+            "В текущей категории совпадений нет, но в ДРУГОЙ категории их {} — тот же шаблон ищется \
+             инструментом {} (те же regex/path_glob/language). Подробности — в поле other_category.",
+            matched, tool
+        )
+    } else {
+        format!(
+            "В текущей категории совпадений нет; в ДРУГОЙ категории найдено не меньше {} (проход \
+             остановлен: {}), то есть это НИЖНЯЯ ГРАНИЦА. Повторите вызов с {}.",
+            matched, reason, tool
+        )
     }
 }
 
@@ -3033,6 +3473,123 @@ fn annotate_unreadable(payload: &mut serde_json::Value, unreadable: usize) {
             )),
         );
     }
+}
+
+/// Пометки производных файлов по ИСХОДНЫМ путям находок (#35).
+///
+/// Признак ставится по явной фразе в начальном блоке комментариев и только по
+/// индексированному содержимому (`file_contents`/`text_contents`): имя файла,
+/// одиночное слово `derived`, строковый литерал и глубокий комментарий
+/// признаком не являются. Непроверенная шапка даёт `derived_status: "unknown"`
+/// с причиной — ложного `derived: false` не бывает.
+///
+/// Бюджет проверки шапок (100 путей, 256 KiB текста) — на ОДИН ответ; в
+/// multi-repo он общий, поэтому `probe` можно передать снаружи.
+fn annotate_derived_files(
+    payload: &mut serde_json::Value,
+    storage: &crate::storage::Storage,
+    category: crate::storage::search_support::IndexedCategory,
+    paths: impl IntoIterator<Item = String>,
+) {
+    let ann = collect_derived_annotations(storage, category, paths);
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    ann.apply_to(obj);
+}
+
+/// Собранные пометки производных файлов — до размещения в ответе.
+struct DerivedAnnotations {
+    annotations: serde_json::Map<String, serde_json::Value>,
+    hint: Option<String>,
+    incomplete: Option<serde_json::Value>,
+}
+
+impl DerivedAnnotations {
+    fn from_probe(probe: &crate::storage::search_support::HeaderProbe) -> Self {
+        let annotations = probe.annotations();
+        let derived: Vec<String> = annotations
+            .iter()
+            .filter(|(_, v)| v.get("derived").and_then(|d| d.as_bool()) == Some(true))
+            .map(|(p, _)| p.clone())
+            .collect();
+        // Подсказка — только для ПОДТВЕРЖДЁННЫХ производных файлов: правки в
+        // них теряются при перегенерации.
+        let hint = (!derived.is_empty()).then(|| {
+            format!(
+                "Файлы помечены как ПРОИЗВОДНЫЕ (явная фраза в шапке — «не редактировать»/\
+                 DO NOT EDIT/auto-generated): {}. Правки в них будут потеряны при перегенерации.",
+                derived.join(", ")
+            )
+        });
+        // Неполнота проверки шапок обозначается ОТДЕЛЬНО от подтверждённой
+        // производности: иначе «шапку не прочитали» читалось бы как «файл свой».
+        let incomplete = probe.incomplete().then(|| probe.incomplete_summary());
+        Self {
+            annotations,
+            hint,
+            incomplete,
+        }
+    }
+
+    /// Разместить пометки в объекте ответа (payload).
+    fn apply_to(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
+        if !self.annotations.is_empty() {
+            obj.insert(
+                "file_annotations".to_string(),
+                serde_json::Value::Object(self.annotations.clone()),
+            );
+        }
+        if let Some(hint) = &self.hint {
+            obj.insert("file_annotations_hint".to_string(), serde_json::json!(hint));
+        }
+        if let Some(summary) = &self.incomplete {
+            obj.insert("file_annotations_incomplete".to_string(), summary.clone());
+        }
+    }
+
+    /// Дописать пометки в `extra` ответа, форма которого — массив, а не объект
+    /// (search_function/search_class/search_text/list_files).
+    fn merge_into_extra(self, extra: Option<serde_json::Value>) -> Option<serde_json::Value> {
+        let mut map = match extra {
+            Some(serde_json::Value::Object(m)) => m,
+            Some(other) => {
+                let mut m = serde_json::Map::new();
+                m.insert("extra".to_string(), other);
+                m
+            }
+            None => serde_json::Map::new(),
+        };
+        self.apply_to(&mut map);
+        (!map.is_empty()).then_some(serde_json::Value::Object(map))
+    }
+}
+
+/// Проверить шапки путей одной категории и собрать пометки (#35).
+fn collect_derived_annotations(
+    storage: &crate::storage::Storage,
+    category: crate::storage::search_support::IndexedCategory,
+    paths: impl IntoIterator<Item = String>,
+) -> DerivedAnnotations {
+    use crate::storage::search_support::HeaderProbe;
+    let mut probe = HeaderProbe::new();
+    for path in paths {
+        let _ = probe.probe(storage.conn(), category, &path);
+    }
+    DerivedAnnotations::from_probe(&probe)
+}
+
+/// То же для смешанного списка (list_files: и code-, и text-файлы).
+fn collect_derived_annotations_any(
+    storage: &crate::storage::Storage,
+    paths: impl IntoIterator<Item = String>,
+) -> DerivedAnnotations {
+    use crate::storage::search_support::HeaderProbe;
+    let mut probe = HeaderProbe::new();
+    for path in paths {
+        let _ = probe.probe_any(storage.conn(), &path);
+    }
+    DerivedAnnotations::from_probe(&probe)
 }
 
 /// Живость MCP + демон по каждому репо.
@@ -3122,6 +3679,149 @@ mod tests {
     use super::*;
     use crate::storage::{PoolConfig, Storage, StoragePool};
     use std::time::{Duration, Instant};
+
+    fn list_files_fixture(
+        count: usize,
+        expire: bool,
+    ) -> (Storage, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let storage = Storage::open_in_memory().unwrap();
+        for i in 0..count {
+            storage
+                .upsert_file(&crate::storage::models::FileRecord {
+                    id: None,
+                    path: format!("/src/{i:05}.rs"),
+                    content_hash: format!("{i}"),
+                    language: "rust".into(),
+                    lines_total: 1,
+                    indexed_at: "2026-11-15".into(),
+                    mtime: None,
+                    file_size: Some(1),
+                })
+                .unwrap();
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        storage
+            .conn()
+            .create_scalar_function(
+                "unicode_nfc",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |ctx| {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 && expire {
+                        crate::storage::search_support::expire_search_deadline_for_test();
+                    }
+                    ctx.get::<String>(0)
+                },
+            )
+            .unwrap();
+        (storage, count)
+    }
+
+    fn listed_value(storage: &Storage, pattern: &str, limit: usize) -> serde_json::Value {
+        serde_json::from_str(&list_files_with(
+            storage,
+            Some(pattern.into()),
+            None,
+            None,
+            Some(limit),
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bounded_list_files_never_counts_all_matches() {
+        use crate::storage::search_support::{search_scope, single_search_scope, SearchBudget};
+        use std::sync::atomic::Ordering;
+        let (storage, count) = list_files_fixture(4100, false);
+        let (bounded, usage) = search_scope(
+            SearchBudget::multi_repo(),
+            Duration::from_secs(30),
+            1,
+            async { listed_value(&storage, "*.rs", 1) },
+        )
+        .await;
+        assert_eq!(usage.files, 1);
+        assert_eq!(usage.matches, 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(bounded["complete"], false);
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["reason"], "limit");
+        assert!(bounded.get("total").is_none());
+        count.store(0, Ordering::SeqCst);
+        let single = single_search_scope(None, async { listed_value(&storage, "*.rs", 1) }).await;
+        assert_eq!(single["total"], 4100);
+        assert!(count.load(Ordering::SeqCst) > 4100);
+    }
+
+    #[tokio::test]
+    async fn bounded_list_files_shares_candidate_budget_between_repositories() {
+        use crate::storage::search_support::{search_scope, SearchBudget};
+        use std::sync::atomic::Ordering;
+        let (first, first_count) = list_files_fixture(3, false);
+        let (second, second_count) = list_files_fixture(10, false);
+        let budget = SearchBudget::new(5, usize::MAX, usize::MAX, usize::MAX);
+        let ((one, two, three), usage) = search_scope(budget, Duration::from_secs(30), 10, async {
+            (
+                listed_value(&first, "*.missing", 10),
+                listed_value(&second, "*00009.rs", 10),
+                listed_value(&second, "*.rs", 10),
+            )
+        })
+        .await;
+        assert_eq!(one["complete"], true);
+        assert_eq!(one["hint"], HINT_LIST_FILES_EMPTY);
+        assert_eq!(two["complete"], false);
+        assert_eq!(two["truncated"], true);
+        assert_eq!(two["reason"], "scan_budget");
+        assert!(two.get("hint").is_none());
+        assert_eq!(three["search_usage"]["files"], 0);
+        assert_eq!(usage.files, 5);
+        assert_eq!(first_count.load(Ordering::SeqCst), 3);
+        assert_eq!(second_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_list_files_small_result_and_deadlines() {
+        use crate::storage::search_support::{search_scope, SearchBudget};
+        use std::sync::atomic::Ordering;
+        let (storage, count) = list_files_fixture(2, false);
+        let (small, usage) = search_scope(
+            SearchBudget::multi_repo(),
+            Duration::from_secs(30),
+            10,
+            async { listed_value(&storage, "*.rs", 10) },
+        )
+        .await;
+        assert_eq!(small["complete"], true);
+        assert_eq!(small["truncated"], false);
+        assert_eq!(small["shown"], 2);
+        assert_eq!(usage.files, 2);
+        count.store(0, Ordering::SeqCst);
+        let (expired, usage) =
+            search_scope(SearchBudget::multi_repo(), Duration::ZERO, 10, async {
+                listed_value(&storage, "*.rs", 10)
+            })
+            .await;
+        assert_eq!(usage.files, 0);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(expired["reason"], "timeout");
+        assert!(expired.get("hint").is_none());
+        let (storage, count) = list_files_fixture(10, true);
+        let (during, usage) = search_scope(
+            SearchBudget::multi_repo(),
+            Duration::from_secs(30),
+            10,
+            async { listed_value(&storage, "*.rs", 10) },
+        )
+        .await;
+        assert_eq!(usage.files, 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(during["reason"], "timeout");
+        assert!(during.get("hint").is_none());
+    }
 
     /// Ожидание пачки включается только для `ReindexingBatch` и только пока не
     /// исчерпан предел: иначе serve задерживал бы ответ впустую.

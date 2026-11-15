@@ -54,6 +54,10 @@ rusqlite = { workspace = true }
 # Обход дерева репо при index_extras (этап 4c).
 walkdir = { workspace = true }
 
+# Unicode-регистронезависимое сравнение критерия name_like (#30): LIKE-шаблон
+# транслируется в regex, потому что SQLite сворачивает регистр только для ASCII.
+regex = { workspace = true }
+
 # Параллельный разбор XML-слоя (объектные XML, формы, макеты): файлы
 # независимы, порядок результатов сохраняется par_iter/collect.
 rayon = { workspace = true }

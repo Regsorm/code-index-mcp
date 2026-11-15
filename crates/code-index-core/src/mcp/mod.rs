@@ -34,6 +34,7 @@ use crate::storage::{PoolConfig, Storage, StoragePool};
 pub mod cap;
 pub mod config_watch;
 pub mod git_tools;
+pub mod multi_repo;
 pub mod tools;
 
 /// Настройки git-слоя одной локальной записи репозитория.
@@ -2481,6 +2482,32 @@ impl CodeIndexServer {
     /// Per-file свежесть: НЕ кэшируем ответ, построенный на не догнавшем индексе
     /// (хоть один файл-источник «грязный»). Зависимые файлы регистрируются в
     /// обратном индексе для точечной инвалидации.
+    /// Перепроверить расхождение версий данных на готовом ответе core-tool (#33).
+    ///
+    /// Кэшированный ответ мог быть построен на устаревшей базе: после пересбора
+    /// предупреждение обязано исчезнуть, поэтому прежние поля снимаются и
+    /// ставятся заново по ТЕКУЩЕМУ состоянию базы этого repo. На свежем индексе
+    /// полей в ответе нет.
+    ///
+    /// Remote-репо не трогаем: версию ставит исполняющая нода, иначе на origin
+    /// появились бы данные чужого repo.
+    async fn annotate_repo_response(
+        &self,
+        repo: &str,
+        value: serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(entry) = self.repos.load().get(repo).cloned() else {
+            return value;
+        };
+        if !entry.is_local {
+            return value;
+        }
+        let storage = entry.storage_pool();
+        let root = entry.root_path.as_deref();
+        let value = crate::mcp::tools::clear_data_version_annotation(value);
+        crate::mcp::tools::annotate_stale_index(value, storage, root).await
+    }
+
     fn maybe_cache(
         &self,
         key: &Option<String>,
@@ -2557,13 +2584,59 @@ impl CodeIndexServer {
         false
     }
 
-    /// Ключи аргументов, которых нет в схеме инструмента.
-    ///
-    /// Проверяются только core-tools: их схема порождается из params-структуры
-    /// и потому полна — всё, что сервер умеет прочесть, в ней объявлено. У
-    /// extension-tools схема написана руками, а у части из них имя ключа вообще
-    /// не значимо (`tools::object_value` берёт значение первого неслужебного
-    /// параметра) — предупреждение там было бы ложным.
+    /// Единая схема пяти поисков для list/get и проверки неизвестных параметров.
+    fn effective_search_schema(&self, mut tool: Tool) -> Tool {
+        if !multi_repo::supports_multi_repo(tool.name.as_ref()) {
+            return tool;
+        }
+        let is_object = tool.name.as_ref() == "get_object_structure";
+        let schema = Arc::make_mut(&mut tool.input_schema);
+        if let Some(properties) = schema.get_mut("properties").and_then(|v| v.as_object_mut()) {
+            properties.insert("repo".into(), serde_json::json!({
+                "type": "string",
+                "description": format!("Зарегистрированный алиас либо маска алиасов (*, ?). Точный алиас имеет приоритет; максимум восемь repo. Несовместим с repos. Доступные: {}. Умолчание: {}.",
+                    format_repo_list(&self.repo_aliases()), self.effective_default_repo().as_deref().unwrap_or("нет"))
+            }));
+            properties.insert("repos".into(), serde_json::json!({
+                "type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 8,
+                "description": "Непустой список зарегистрированных алиасов; повторы удаляются с сохранением порядка. Несовместим с repo. Ответ набора: result.repos с repo/status/payload."
+            }));
+            properties
+                .entry("limit")
+                .or_insert_with(|| serde_json::json!({"type": "integer"}));
+            properties.insert("max_response_bytes".into(), serde_json::json!({
+                "type": "integer", "minimum": 1,
+                "description": if is_object { "Бюджет одиночного ответа либо всего набора repo в байтах; зажимается серверным потолком." }
+                    else { "Только multi-repo: общий бюджет всего ответа в байтах, зажимается серверным потолком." }
+            }));
+            if let Some(limit) = properties.get_mut("limit").and_then(|v| v.as_object_mut()) {
+                limit.insert("description".into(), serde_json::json!(if is_object {
+                    "Multi-repo: общий лимит объектов 1–50, default 50."
+                } else {
+                    "Multi-repo: общий лимит находок 1–500, default 100. В одиночном repo действуют прежние пределы инструмента."
+                }));
+            }
+        }
+        if let Some(required) = schema.get_mut("required").and_then(|v| v.as_array_mut()) {
+            required.retain(|v| v.as_str() != Some("repo"));
+        }
+        schema.insert(
+            "not".into(),
+            serde_json::json!({"required": ["repo", "repos"]}),
+        );
+        if self.effective_default_repo().is_none() {
+            schema.insert(
+                "anyOf".into(),
+                serde_json::json!([{"required": ["repo"]}, {"required": ["repos"]}]),
+            );
+        }
+        schema.insert("description".into(), serde_json::json!(
+            "Multi-repo: последовательное выполнение; общий бюджет 4096 файлов, 64 MiB сжатых и 64 MiB распакованных данных, до 30 секунд и tool_timeout. Дополнительный grep расходует тот же бюджет."
+        ));
+        tool
+    }
+
+    /// Остальные extension-tools сохраняют свободные объектные ключи.
     fn unknown_params(
         &self,
         name: &str,
@@ -2572,7 +2645,10 @@ impl CodeIndexServer {
         let Some(arguments) = arguments else {
             return UnknownParams::default();
         };
-        let Some(tool) = self.tool_router.get(name) else {
+        if !self.tool_router.has_route(name) && !multi_repo::supports_multi_repo(name) {
+            return UnknownParams::default();
+        }
+        let Some(tool) = self.get_tool(name) else {
             return UnknownParams::default();
         };
         let Some(props) = tool
@@ -2608,6 +2684,17 @@ impl CodeIndexServer {
         result: Result<CallToolResult, ErrorData>,
         unknown: &UnknownParams,
     ) -> Result<CallToolResult, ErrorData> {
+        self.finish_with_budget(session_id, dedup_scope, result, unknown, None)
+    }
+
+    fn finish_with_budget(
+        &self,
+        session_id: &Option<String>,
+        dedup_scope: &str,
+        result: Result<CallToolResult, ErrorData>,
+        unknown: &UnknownParams,
+        multi_budget: Option<usize>,
+    ) -> Result<CallToolResult, ErrorData> {
         let Ok(res) = &result else {
             return result;
         };
@@ -2617,6 +2704,72 @@ impl CodeIndexServer {
         // Нераспознанные ключи дописываем ДО дедупа и среза `_meta`: ответ на
         // повторный вызов тоже должен их нести.
         let annotated = annotate_unknown_params(res.clone(), unknown);
+        let mut delivery = None;
+        let mut preparation_error = None;
+        if let Ok(value) = serde_json::to_value(&annotated) {
+            let value = tools::map_response_payload(value, |mut payload| {
+                if let Some(groups) = payload
+                    .get_mut("result")
+                    .and_then(|r| r.get_mut("repos"))
+                    .and_then(|v| v.as_array_mut())
+                {
+                    let delivery =
+                        delivery.insert(self.dedup.begin_delivery(session_id.as_deref()));
+                    let prepared = (|| -> Result<(), serde_json::Error> {
+                        for group in groups {
+                            let repo = group
+                                .get("repo")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some(single) = group.get_mut("payload") {
+                                let response = CallToolResult::structured(single.take());
+                                let serialized = serde_json::to_string(&response)?;
+                                let scope = format!("{}|{}", dedup_scope, repo);
+                                let (serialized, _) = delivery.process(&scope, &serialized);
+                                let response: serde_json::Value =
+                                    serde_json::from_str(&serialized)?;
+                                *single = response
+                                    .get("structuredContent")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                            }
+                        }
+                        Ok(())
+                    })();
+                    preparation_error = prepared.err();
+                    multi_repo::strip_internal(&mut payload);
+                }
+                payload
+            });
+            if let Some(delivery) = delivery {
+                if let Some(error) = preparation_error {
+                    return Err(ErrorData::internal_error(error.to_string(), None));
+                }
+                let mut value = value;
+                if let Some(bytes) = multi_budget {
+                    multi_repo::fit_multi_response(&mut value, dedup_scope, bytes)
+                        .map_err(|e| ErrorData::invalid_params(e, None))?;
+                }
+                let scopes: Vec<String> = value["structuredContent"]["result"]["repos"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|group| group.get("payload").is_some())
+                    .map(|group| {
+                        format!(
+                            "{}|{}",
+                            dedup_scope,
+                            group.get("repo").and_then(|v| v.as_str()).unwrap_or("")
+                        )
+                    })
+                    .collect();
+                let response: CallToolResult = serde_json::from_value(value)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                delivery.commit(scopes.iter().map(String::as_str));
+                return Ok(response);
+            }
+        }
         let Ok(s) = serde_json::to_string(&annotated) else {
             return result;
         };
@@ -2723,6 +2876,10 @@ impl ServerHandler for CodeIndexServer {
                 annotate_repo_param(tool, &repo_aliases, default_repo.as_deref());
             }
         }
+        tools = tools
+            .into_iter()
+            .map(|tool| self.effective_search_schema(tool))
+            .collect();
         // Стабильный порядок (как у tool_router::list_all): по имени.
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(ListToolsResult {
@@ -2800,6 +2957,53 @@ impl ServerHandler for CodeIndexServer {
                 }
             }
         }
+        // Набор распознаётся после whitelist/mass-mode, до подстановки repo и кэша.
+        let search_snapshot = self.repos.load_full();
+        let selector_args = request.arguments.clone().unwrap_or_default();
+        if !multi_repo::supports_multi_repo(request.name.as_ref())
+            && selector_args.contains_key("repos")
+        {
+            return Err(ErrorData::invalid_params(
+                "repos не поддерживается этим инструментом",
+                None,
+            ));
+        }
+        if multi_repo::supports_multi_repo(request.name.as_ref()) {
+            let aliases: Vec<String> = search_snapshot.keys().cloned().collect();
+            let selected = multi_repo::resolve_repo_selector(&selector_args, &aliases)
+                .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            if let Some(selected) = selected {
+                if selected.is_single() {
+                    request
+                        .arguments
+                        .get_or_insert_with(Default::default)
+                        .insert("repo".to_string(), serde_json::json!(selected.repos[0]));
+                } else {
+                    let bytes = multi_repo::resolve_response_bytes(&selector_args)
+                        .map_err(|e| ErrorData::invalid_params(e, None))?;
+                    let value = self
+                        .execute_multi_repo(
+                            request.name.as_ref(),
+                            serde_json::Value::Object(selector_args),
+                            selected.repos,
+                            search_snapshot.clone(),
+                            bytes,
+                        )
+                        .await
+                        .map_err(|e| ErrorData::invalid_params(e, None))?;
+                    return self
+                        .finish_with_budget(
+                            &session_id,
+                            request.name.as_ref(),
+                            Ok(CallToolResult::structured(value)),
+                            &unknown,
+                            Some(bytes),
+                        )
+                        .map(Into::into);
+                }
+            }
+        }
+
         // 0c. Параметр `repo` не передан? Подставляем алиас по умолчанию
         // (`[mcp].default_repo`, иначе единственный репозиторий) — до разбора
         // аргументов и расчёта ключа кэша, чтобы кэш и сессионный отсев
@@ -2857,17 +3061,69 @@ impl ServerHandler for CodeIndexServer {
                 // индексе (файл-источник «грязный»); иначе — отдать из кэша.
                 let repo = repo_opt.as_deref().unwrap_or("");
                 if !self.response_is_stale(repo, &payload) {
-                    if let Ok(res) = serde_json::from_str::<CallToolResult>(&payload) {
-                        return self
-                            .finish(&session_id, &dedup_scope, Ok(res), &unknown)
-                            .map(Into::into);
+                    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&payload) {
+                        // #33: версия перепроверяется и на кэшированной выдаче —
+                        // предупреждение не должно переживать устранение
+                        // устаревания базы.
+                        value = if request.name.as_ref() == "list_files" {
+                            tools::clear_data_version_annotation(value)
+                        } else {
+                            self.annotate_repo_response(repo, value).await
+                        };
+                        if let Ok(res) = serde_json::from_value::<CallToolResult>(value) {
+                            return self
+                                .finish(&session_id, &dedup_scope, Ok(res), &unknown)
+                                .map(Into::into);
+                        }
                     }
                 }
             }
         }
 
+        if multi_repo::supports_multi_repo(request.name.as_ref()) {
+            let repo = repo_opt.as_deref().unwrap_or("");
+            let entry = search_snapshot.get(repo).cloned().ok_or_else(|| {
+                ErrorData::invalid_params(unknown_repo_message(repo, &self.repo_aliases()), None)
+            })?;
+            let call = crate::storage::pool::CHECKOUT_LABEL.scope(
+                dedup_scope.clone(),
+                crate::storage::search_support::single_search_scope(self.tool_timeout, async {
+                    let value = self
+                        .execute_single_search(request.name.as_ref(), args_val, &entry, false)
+                        .await;
+                    if entry.is_local && request.name.as_ref() != "list_files" {
+                        tools::annotate_stale_index(
+                            value,
+                            entry.storage_pool(),
+                            entry.root_path.as_deref(),
+                        )
+                        .await
+                    } else {
+                        value
+                    }
+                }),
+            );
+            let value = match with_tool_timeout(self.tool_timeout, call).await {
+                Ok(value) => value,
+                Err(limit) => {
+                    return self
+                        .tool_timeout_result(&session_id, &dedup_scope, limit)
+                        .map(Into::into)
+                }
+            };
+            let result = Ok(CallToolResult::structured(value));
+            self.maybe_cache(&cache_key, repo, &result, epoch_before);
+            return self
+                .finish(&session_id, &dedup_scope, result, &unknown)
+                .map(Into::into);
+        }
+
         // 1. Сначала core-tools — они есть всегда.
         if self.tool_router.has_route(request.name.as_ref()) {
+            // Диагностические health/get_stats несут собственный блок версии
+            // данных — общую пометку к ним не добавляем.
+            let skip_data_version =
+                matches!(request.name.as_ref(), "health" | "get_stats" | "list_files");
             let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
             // Метка выдачи — «инструмент|репо»: пул ведёт по ней учёт и называет
             // виновника затянувшегося соединения в журнале.
@@ -2884,6 +3140,25 @@ impl ServerHandler for CodeIndexServer {
                     return self
                         .tool_timeout_result(&session_id, &dedup_scope, limit)
                         .map(Into::into)
+                }
+            };
+            // #33: пометка расхождения версий ставится на КАЖДЫЙ core-ответ,
+            // читающий извлечённые факты, — до выдачи и до кэширования.
+            let r = if skip_data_version {
+                r
+            } else {
+                match (r, repo_opt.as_deref()) {
+                    (Ok(res), Some(repo)) => match serde_json::to_value(&res) {
+                        Ok(v) => {
+                            let v = self.annotate_repo_response(repo, v).await;
+                            match serde_json::from_value::<CallToolResult>(v) {
+                                Ok(annotated) => Ok(annotated),
+                                Err(_) => Ok(res),
+                            }
+                        }
+                        Err(_) => Ok(res),
+                    },
+                    (other, _) => other,
                 }
             };
             self.maybe_cache(
@@ -2982,6 +3257,12 @@ impl ServerHandler for CodeIndexServer {
         if let Some(json) = tools::check_path_status(&entry).await {
             let value: serde_json::Value =
                 serde_json::from_str(&json).unwrap_or_else(|_| serde_json::json!({"raw": json}));
+            let value = tools::annotate_stale_index(
+                value,
+                entry.storage_pool(),
+                entry.root_path.as_deref(),
+            )
+            .await;
             return self
                 .finish(
                     &session_id,
@@ -2998,6 +3279,8 @@ impl ServerHandler for CodeIndexServer {
         // в самой базе репо. Отсутствие флага = слой завершён: база прежней
         // версии или репозиторий без надстройки.
         if let Some(value) = crate::mcp::tools::extras_building_response(storage).await {
+            let value =
+                tools::annotate_stale_index(value, storage, entry.root_path.as_deref()).await;
             return self
                 .finish(
                     &session_id,
@@ -3018,9 +3301,11 @@ impl ServerHandler for CodeIndexServer {
         };
 
         // Прогон через `IndexTool::execute` и обёртка результата.
-        // Единственная общая точка всех extension-tools: ответ с ошибкой
-        // дополняется подсказкой о расхождении версий данных (ни один инструмент
-        // по отдельности не правится). Успешные ответы подсказку не получают.
+        // Единственная общая точка всех extension-tools: ответ помечается
+        // расхождением версии данных (ни один инструмент по отдельности не
+        // правится). Пометка ставится и на успешный, и на ошибочный ответ:
+        // «ничего не найдено» на устаревшей базе неотличимо от честного нуля.
+        // На свежем индексе полей нет.
         // Один scope на оба обращения к пулу: и `execute`, и `annotate_stale_index`
         // ходят в хранилище, поэтому метка выдачи должна охватывать их оба.
         let value = match with_tool_timeout(
@@ -3052,14 +3337,43 @@ impl ServerHandler for CodeIndexServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        if let Some(t) = self.tool_router.get(name) {
-            return Some(t.clone());
+        if !multi_repo::supports_multi_repo(name) {
+            return self.tool_router.get(name).cloned().or_else(|| {
+                self.extension_tools
+                    .load()
+                    .iter()
+                    .find(|t| t.name() == name)
+                    .map(|t| extension_tool_to_rmcp(t.as_ref()))
+            });
         }
-        self.extension_tools
-            .load()
-            .iter()
-            .find(|t| t.name() == name)
-            .map(|t| extension_tool_to_rmcp(t.as_ref()))
+        if self
+            .allowed_tools
+            .as_ref()
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(name))
+        {
+            return None;
+        }
+        let mut tool = self.tool_router.get(name).cloned().or_else(|| {
+            self.extension_tools
+                .load()
+                .iter()
+                .find(|t| t.name() == name)
+                .map(|t| extension_tool_to_rmcp(t.as_ref()))
+        })?;
+        for (tool_name, plural) in MASS_MODE_PARAMS {
+            if name == *tool_name && !self.mass_mode_tools.contains(name) {
+                strip_mass_mode_param(&mut tool, plural);
+            }
+        }
+        if schema_declares_repo(&tool.input_schema) {
+            annotate_repo_param(
+                &mut tool,
+                &self.repo_aliases(),
+                self.effective_default_repo().as_deref(),
+            );
+        }
+        Some(self.effective_search_schema(tool))
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
@@ -3682,6 +3996,532 @@ mod unknown_params_tests {
 
     fn args(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         value.as_object().cloned().expect("объект аргументов")
+    }
+
+    fn finalization_payload() -> serde_json::Value {
+        serde_json::json!({
+            "result": {
+                "repos": [
+                    {"repo": "alpha", "status": "ok", "payload": {
+                        "result": ["/α/\"quoted\"\\full.rs | rust | 1 lines | 1B"],
+                        "_meta": {"dependent_files": ["/α/\"quoted\"\\full.rs"]}
+                    }},
+                    {"repo": "beta", "status": "ok", "payload": {
+                        "result": [format!("/{}.rs | rust | 1 lines | 1B", "Ж\"\\".repeat(10000))],
+                        "hint": "Сохранить это предупреждение полностью"
+                    }}
+                ],
+                "shown": 2, "complete": true, "truncated": false
+            },
+            "_meta": {}
+        })
+    }
+
+    fn synchronized_payload(result: &CallToolResult) -> serde_json::Value {
+        let value = serde_json::to_value(result).unwrap();
+        let text: serde_json::Value =
+            serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, value["structuredContent"]);
+        assert!(text.get("_meta").is_none());
+        text
+    }
+
+    #[tokio::test]
+    async fn multi_finalization_rejects_huge_unknown_key_after_execution() {
+        let server = server();
+        let mut arguments = args(serde_json::json!({
+            "repos": ["alpha", "beta"], "max_response_bytes": 48000, "limit": 1
+        }));
+        let huge = "x".repeat(100000);
+        arguments.insert(huge.clone(), serde_json::json!(true));
+        let unknown = server.unknown_params("list_files", Some(&arguments));
+        assert!(unknown.names.contains(&huge));
+        let bytes = multi_repo::resolve_response_bytes(&arguments).unwrap();
+        let value = server
+            .execute_multi_repo(
+                "list_files",
+                serde_json::Value::Object(arguments),
+                vec!["alpha".into(), "beta".into()],
+                server.repos.load_full(),
+                bytes,
+            )
+            .await
+            .unwrap();
+        let error = server
+            .finish_with_budget(
+                &None,
+                "list_files",
+                Ok(CallToolResult::structured(value)),
+                &unknown,
+                Some(bytes),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("диагностики неизвестных параметров"));
+        assert!(!error.message.contains(&huge));
+        assert!(serde_json::to_vec(&error).unwrap().len() < 1000);
+    }
+
+    #[test]
+    fn multi_finalization_caps_after_unknown_warning_dedup_and_internal_cleanup() {
+        let server = server();
+        let unknown = server.unknown_params(
+            "list_files",
+            Some(&args(serde_json::json!({"ordinary_unknown": true}))),
+        );
+        let result = server
+            .finish_with_budget(
+                &Some("cap-session".into()),
+                "list_files",
+                Ok(CallToolResult::structured(finalization_payload())),
+                &unknown,
+                Some(5000),
+            )
+            .unwrap();
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 5000);
+        let payload = synchronized_payload(&result);
+        assert_eq!(
+            payload["unknown_params"],
+            serde_json::json!(["ordinary_unknown"])
+        );
+        assert!(payload["unknown_params_note"]
+            .as_str()
+            .unwrap()
+            .contains("ordinary_unknown"));
+        let groups = &payload["result"]["repos"];
+        assert_eq!(groups[0]["repo"], "alpha");
+        assert_eq!(groups[1]["repo"], "beta");
+        assert_eq!(
+            groups[0]["payload"]["result"][0],
+            "/α/\"quoted\"\\full.rs | rust | 1 lines | 1B",
+        );
+        assert!(groups[0]["payload"].get("_meta").is_none());
+        assert_eq!(
+            groups[1]["warnings"]["hint"],
+            "Сохранить это предупреждение полностью",
+        );
+        assert_eq!(payload["result"]["shown"], 1);
+        assert_eq!(payload["result"]["complete"], false);
+        assert_eq!(payload["result"]["truncated"], true);
+
+        assert!(groups[1].get("payload").is_none());
+        let wide_budget = serde_json::to_vec(&CallToolResult::structured(finalization_payload()))
+            .unwrap()
+            .len()
+            + 5000;
+        let repeated = server
+            .finish_with_budget(
+                &Some("cap-session".into()),
+                "list_files",
+                Ok(CallToolResult::structured(finalization_payload())),
+                &unknown,
+                Some(wide_budget),
+            )
+            .unwrap();
+        assert!(serde_json::to_vec(&repeated).unwrap().len() <= wide_budget);
+        let payload = synchronized_payload(&repeated);
+        assert_eq!(payload["result"]["shown"], 1);
+        assert_eq!(
+            payload["unknown_params"],
+            serde_json::json!(["ordinary_unknown"])
+        );
+        assert_eq!(payload["result"]["repos"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            payload["result"]["repos"][0]["payload"]["rows_elided_already_delivered"],
+            1
+        );
+        assert_eq!(
+            payload["result"]["repos"][1]["payload"]["result"],
+            finalization_payload()["result"]["repos"][1]["payload"]["result"]
+        );
+
+        let third = server
+            .finish_with_budget(
+                &Some("cap-session".into()),
+                "list_files",
+                Ok(CallToolResult::structured(finalization_payload())),
+                &unknown,
+                Some(wide_budget),
+            )
+            .unwrap();
+        assert!(serde_json::to_vec(&third).unwrap().len() <= wide_budget);
+        let payload = synchronized_payload(&third);
+        assert_eq!(payload["result"]["shown"], 0);
+        for group in payload["result"]["repos"].as_array().unwrap() {
+            assert_eq!(group["payload"]["result"], serde_json::json!([]));
+            assert_eq!(group["payload"]["rows_elided_already_delivered"], 1);
+        }
+    }
+
+    #[test]
+    fn multi_finalization_cap_error_preserves_delivery_state() {
+        let server = server();
+        let session = Some("failed-cap".to_string());
+        let mut payload = finalization_payload();
+        let old_alpha = payload["result"]["repos"][0]["payload"].clone();
+        server
+            .finish(
+                &session,
+                "list_files|alpha",
+                Ok(CallToolResult::structured(old_alpha)),
+                &UnknownParams::default(),
+            )
+            .unwrap();
+        payload["result"]["repos"][0]["payload"]["result"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("new-alpha.rs"));
+        let error = server
+            .finish_with_budget(
+                &session,
+                "list_files",
+                Ok(CallToolResult::structured(payload.clone())),
+                &UnknownParams::default(),
+                Some(1),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(server.dedup.stats(), (1, 0));
+
+        let budget = serde_json::to_vec(&CallToolResult::structured(payload.clone()))
+            .unwrap()
+            .len()
+            + 5000;
+        let delivered = server
+            .finish_with_budget(
+                &session,
+                "list_files",
+                Ok(CallToolResult::structured(payload.clone())),
+                &UnknownParams::default(),
+                Some(budget),
+            )
+            .unwrap();
+        assert!(serde_json::to_vec(&delivered).unwrap().len() <= budget);
+        let delivered = synchronized_payload(&delivered);
+        assert_eq!(delivered["result"]["shown"], 2);
+        let groups = &delivered["result"]["repos"];
+        assert_eq!(
+            groups[0]["payload"]["result"],
+            serde_json::json!(["new-alpha.rs"])
+        );
+        assert_eq!(groups[0]["payload"]["rows_elided_already_delivered"], 1);
+        assert_eq!(
+            groups[1]["payload"]["result"],
+            payload["result"]["repos"][1]["payload"]["result"]
+        );
+        assert_eq!(server.dedup.stats(), (1, 1));
+
+        let repeated = server
+            .finish_with_budget(
+                &session,
+                "list_files",
+                Ok(CallToolResult::structured(payload)),
+                &UnknownParams::default(),
+                Some(budget),
+            )
+            .unwrap();
+        let repeated = synchronized_payload(&repeated);
+        assert_eq!(repeated["result"]["shown"], 0);
+        assert_eq!(
+            repeated["result"]["repos"][0]["payload"]["rows_elided_already_delivered"],
+            2
+        );
+        assert_eq!(
+            repeated["result"]["repos"][1]["payload"]["rows_elided_already_delivered"],
+            1
+        );
+    }
+
+    #[test]
+    fn multi_finalization_preserves_mixed_groups_and_warnings() {
+        let server = server();
+        let session = Some("mixed-groups".to_string());
+        let mut payload = finalization_payload();
+        let annotations = serde_json::json!({
+            "stale_index": {"stale": true},
+            "file_annotations": {"generated.rs": {"derived": true}},
+            "file_annotations_hint": "Не редактировать производный файл",
+            "file_annotations_incomplete": {"complete": false}
+        });
+        for group in payload["result"]["repos"].as_array_mut().unwrap() {
+            for (key, value) in annotations.as_object().unwrap() {
+                group["payload"][key] = value.clone();
+            }
+        }
+        let non_tabular = serde_json::json!({
+            "repo": "summary", "status": "ok", "payload": {"result": {"summary": "ready"}}
+        });
+        let skipped =
+            serde_json::json!({"repo": "skipped", "status": "skipped", "reason": "limit"});
+        let error = serde_json::json!({
+            "repo": "failed", "status": "error", "payload": {"result": {"error": "unavailable"}}
+        });
+        let groups = payload["result"]["repos"].as_array_mut().unwrap();
+        groups.insert(1, non_tabular.clone());
+        groups.insert(2, error.clone());
+        groups.push(skipped.clone());
+        payload["result"]["complete"] = serde_json::json!(false);
+        payload["result"]["truncated"] = serde_json::json!(true);
+        let capped = server
+            .finish_with_budget(
+                &session,
+                "list_files",
+                Ok(CallToolResult::structured(payload.clone())),
+                &UnknownParams::default(),
+                Some(10000),
+            )
+            .unwrap();
+        assert!(serde_json::to_vec(&capped).unwrap().len() <= 10000);
+        let capped = synchronized_payload(&capped);
+        let groups = &capped["result"]["repos"];
+        assert_eq!(groups[1], non_tabular);
+        assert_eq!(groups[2], error);
+        assert_eq!(groups[4], skipped);
+        assert_eq!(groups[0]["repo"], "alpha");
+        assert_eq!(groups[3]["repo"], "beta");
+        assert!(groups[0].get("payload").is_some());
+        assert!(groups[3].get("payload").is_none());
+        for (key, value) in annotations.as_object().unwrap() {
+            assert_eq!(&groups[0]["payload"][key], value);
+            assert_eq!(&groups[3]["warnings"][key], value);
+        }
+        assert_eq!(capped["result"]["shown"], 1);
+        assert_eq!(capped["result"]["complete"], false);
+        assert_eq!(capped["result"]["truncated"], true);
+
+        let budget = serde_json::to_vec(&CallToolResult::structured(payload.clone()))
+            .unwrap()
+            .len()
+            + 5000;
+        let repeated = server
+            .finish_with_budget(
+                &session,
+                "list_files",
+                Ok(CallToolResult::structured(payload)),
+                &UnknownParams::default(),
+                Some(budget),
+            )
+            .unwrap();
+        let repeated = synchronized_payload(&repeated);
+        let groups = &repeated["result"]["repos"];
+        assert_eq!(groups[0]["payload"]["rows_elided_already_delivered"], 1);
+        assert_eq!(groups[3]["payload"]["result"].as_array().unwrap().len(), 1);
+        assert_eq!(groups[1], non_tabular);
+        assert_eq!(groups[2], error);
+        assert_eq!(groups[4], skipped);
+    }
+
+    #[test]
+    fn multi_finalization_without_session_or_dedup_keeps_rows() {
+        for (enabled, session) in [(true, None), (false, Some("disabled".to_string()))] {
+            let mut server = server();
+            server.dedup = Arc::new(SessionDedup::new(enabled));
+            let payload = serde_json::json!({"result": {
+                "repos": [{"repo": "alpha", "status": "ok", "payload": {"result": ["A"]}}],
+                "shown": 1, "complete": true, "truncated": false
+            }});
+            for _ in 0..2 {
+                let result = server
+                    .finish_with_budget(
+                        &session,
+                        "list_files",
+                        Ok(CallToolResult::structured(payload.clone())),
+                        &UnknownParams::default(),
+                        Some(5000),
+                    )
+                    .unwrap();
+                assert_eq!(synchronized_payload(&result), payload);
+            }
+            assert_eq!(server.dedup.stats(), (0, 0));
+        }
+    }
+
+    #[test]
+    fn multi_finalization_waits_for_delivery_commit_or_abort() {
+        use std::sync::mpsc;
+
+        for commit in [false, true] {
+            let server = Arc::new(server());
+            let session = Some("concurrent-finalization".to_string());
+            let mut delivery = server.dedup.begin_delivery(session.as_deref());
+            for (repo, row) in [("alpha", "A"), ("beta", "B")] {
+                let response = CallToolResult::structured(serde_json::json!({"result": [row]}));
+                delivery.process(
+                    &format!("list_files|{repo}"),
+                    &serde_json::to_string(&response).unwrap(),
+                );
+            }
+            let payload = serde_json::json!({"result": {
+                "repos": [
+                    {"repo": "alpha", "status": "ok", "payload": {"result": ["A", "C"]}},
+                    {"repo": "beta", "status": "ok", "payload": {"result": ["B"]}}
+                ],
+                "shown": 3, "complete": true, "truncated": false
+            }});
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let other = Arc::clone(&server);
+            let other_session = session.clone();
+            let other_payload = payload.clone();
+            let worker = std::thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let result = other.finish_with_budget(
+                    &other_session,
+                    "list_files",
+                    Ok(CallToolResult::structured(other_payload)),
+                    &UnknownParams::default(),
+                    Some(5000),
+                );
+                done_tx.send(result).unwrap();
+            });
+            ready_rx.recv().unwrap();
+            assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            if commit {
+                delivery.commit(["list_files|alpha"]);
+            } else {
+                drop(delivery);
+            }
+            let delivered = done_rx.recv().unwrap().unwrap();
+            worker.join().unwrap();
+            let delivered = synchronized_payload(&delivered);
+            let groups = &delivered["result"]["repos"];
+            assert_eq!(
+                groups[0]["payload"]["result"],
+                if commit {
+                    serde_json::json!(["C"])
+                } else {
+                    serde_json::json!(["A", "C"])
+                }
+            );
+            assert_eq!(groups[1]["payload"]["result"], serde_json::json!(["B"]));
+            if commit {
+                assert_eq!(groups[0]["payload"]["rows_elided_already_delivered"], 1);
+            }
+            let repeated = server
+                .finish_with_budget(
+                    &session,
+                    "list_files",
+                    Ok(CallToolResult::structured(payload)),
+                    &UnknownParams::default(),
+                    Some(5000),
+                )
+                .unwrap();
+            let repeated = synchronized_payload(&repeated);
+            assert_eq!(repeated["result"]["shown"], 0);
+            assert_eq!(
+                repeated["result"]["repos"][0]["payload"]["rows_elided_already_delivered"],
+                2
+            );
+            assert_eq!(
+                repeated["result"]["repos"][1]["payload"]["rows_elided_already_delivered"],
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn multi_and_single_share_dedup_with_original_cached_response() {
+        for single_first in [false, true] {
+            let server = server();
+            let session = Some("shared-cache".to_string());
+            let unknown = UnknownParams::default();
+            let original = CallToolResult::structured(serde_json::json!({
+                "result": ["cached.rs"], "_meta": {}
+            }));
+            let key = Some("alpha|list_files|delivery-regression".to_string());
+            server.maybe_cache(
+                &key,
+                "alpha",
+                &Ok(original.clone()),
+                server.cache.epoch("alpha"),
+            );
+            let cache_key = key.as_deref().unwrap();
+            let cached = server.cache.get(cache_key).unwrap();
+            let from_cache: CallToolResult = serde_json::from_str(&cached).unwrap();
+            assert_eq!(
+                serde_json::to_value(&from_cache).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+            let multi_payload = serde_json::json!({"result": {
+                "repos": [{
+                    "repo": "alpha", "status": "ok",
+                    "payload": {"result": ["cached.rs"], "_meta": {}}
+                }],
+                "shown": 1, "complete": true, "truncated": false
+            }});
+            if single_first {
+                let single = server
+                    .finish(
+                        &session,
+                        "list_files|alpha",
+                        Ok(from_cache.clone()),
+                        &unknown,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    synchronized_payload(&single)["result"],
+                    serde_json::json!(["cached.rs"])
+                );
+            }
+            let multi = server
+                .finish_with_budget(
+                    &session,
+                    "list_files",
+                    Ok(CallToolResult::structured(multi_payload)),
+                    &unknown,
+                    Some(5000),
+                )
+                .unwrap();
+            let multi = synchronized_payload(&multi);
+            assert_eq!(multi["result"]["shown"], usize::from(!single_first));
+            if single_first {
+                assert_eq!(
+                    multi["result"]["repos"][0]["payload"]["rows_elided_already_delivered"],
+                    1
+                );
+            } else {
+                assert_eq!(
+                    multi["result"]["repos"][0]["payload"]["result"],
+                    serde_json::json!(["cached.rs"])
+                );
+            }
+            let single = server
+                .finish(&session, "list_files|alpha", Ok(from_cache), &unknown)
+                .unwrap();
+            let single = synchronized_payload(&single);
+            assert_eq!(single["result"], serde_json::json!([]));
+            assert_eq!(single["rows_elided_already_delivered"], 1);
+            assert_eq!(server.cache.get(cache_key).unwrap(), cached);
+        }
+    }
+
+    #[test]
+    fn multi_finalization_preserves_normal_response_and_rejects_tiny_budget() {
+        let server = server();
+        let payload = serde_json::json!({"result": {
+            "repos": [{"repo": "alpha", "status": "ok", "payload": {"result": ["complete.rs"]}}],
+            "shown": 1, "complete": true, "truncated": false
+        }});
+        let normal = server
+            .finish_with_budget(
+                &None,
+                "list_files",
+                Ok(CallToolResult::structured(payload.clone())),
+                &UnknownParams::default(),
+                Some(48000),
+            )
+            .unwrap();
+        assert_eq!(synchronized_payload(&normal), payload);
+        let error = server
+            .finish_with_budget(
+                &None,
+                "list_files",
+                Ok(CallToolResult::structured(payload)),
+                &UnknownParams::default(),
+                Some(1),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
     }
 
     // Ключ вне схемы инструмента попадает в список нераспознанных, ключи схемы

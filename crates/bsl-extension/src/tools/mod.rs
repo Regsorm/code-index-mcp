@@ -190,46 +190,165 @@ pub(crate) fn meta_type_to_folder(meta_type: &str) -> Option<String> {
 /// а не форма списка (`full_names[]` модель спонтанно не собирает).
 ///
 /// `cap` — потолок объектов (защита от широкого критерия вроде LIKE '%а%').
-/// Берём `cap + 1` строк, чтобы отличить «ровно cap» от «больше cap».
-/// Возвращает `(full_names ≤ cap, truncated)`. Регистр LIKE для кириллицы
-/// значим (SQLite case-insensitive только для ASCII).
+/// Останавливаемся на `cap + 1`-м подходящем объекте, чтобы отличить «ровно cap»
+/// от «больше cap». Возвращает `(full_names ≤ cap, truncated)`.
+///
+/// Совпадение проверяется в Rust, а не в SQL: SQLite сворачивает регистр только
+/// для ASCII, и кириллица `LIKE` регистрозначима. Здесь работает
+/// Unicode-регистронезависимое сравнение (см. [`LikePattern`]).
+///
+/// Адаптер «только имена» — для тестов критерия: рабочему пути нужна ещё и
+/// причина совпадения, поэтому он зовёт [`expand_object_criterion_matched`].
+#[cfg(test)]
 pub(crate) fn expand_object_criterion(
     conn: &rusqlite::Connection,
     name_like: &str,
     meta_type: Option<&str>,
     cap: usize,
 ) -> rusqlite::Result<(Vec<String>, bool)> {
+    let (rows, truncated) = expand_object_criterion_matched(conn, name_like, meta_type, cap)?;
+    Ok((rows.into_iter().map(|(fqn, _)| fqn).collect(), truncated))
+}
+
+/// Причина совпадения объекта с критерием-селектором.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchedBy {
+    /// Совпало имя объекта (`metadata_objects.name`).
+    Name,
+    /// Совпал синоним (`metadata_objects.synonym`) при несовпавшем имени.
+    Synonym,
+    /// Совпали и имя, и синоним — объект всё равно возвращается один раз.
+    NameAndSynonym,
+}
+
+impl MatchedBy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MatchedBy::Name => "name",
+            MatchedBy::Synonym => "synonym",
+            MatchedBy::NameAndSynonym => "name+synonym",
+        }
+    }
+}
+
+/// LIKE-шаблон критерия, скомпилированный в Unicode-регистронезависимый regex.
+///
+/// Семантика сохранена фактическая (SQLite `LIKE`), но регистр сворачивается
+/// по-юникодному:
+/// - `%` — произвольная последовательность символов (в том числе пустая);
+/// - `_` — ровно один Unicode-символ;
+/// - всё остальное — буквально, включая `\` (обратная косая черта НЕ экранирует);
+/// - сравнение — поиск ВНУТРИ строки, а не полное совпадение;
+/// - обе строки предварительно приводятся к NFC: имена 1С приходят в разных
+///   формах нормализации, и без этого «й» из двух кодовых точек не совпадала.
+///
+/// Сворачивание регистра делает regex (`case_insensitive`), а не SQLite
+/// `lower`/`NOCASE` — те знают только ASCII.
+pub(crate) struct LikePattern {
+    re: regex::Regex,
+}
+
+impl LikePattern {
+    pub(crate) fn new(pattern: &str) -> Result<Self, regex::Error> {
+        use unicode_normalization::UnicodeNormalization;
+        let mut src = String::with_capacity(pattern.len() * 2 + 8);
+        let mut literal = String::new();
+        for ch in pattern.nfc() {
+            match ch {
+                '%' | '_' => {
+                    if !literal.is_empty() {
+                        src.push_str(&regex::escape(&literal));
+                        literal.clear();
+                    }
+                    src.push_str(if ch == '%' { ".*" } else { "." });
+                }
+                other => literal.push(other),
+            }
+        }
+        if !literal.is_empty() {
+            src.push_str(&regex::escape(&literal));
+        }
+        // `(?s)` — `_`/`%` захватывают и перевод строки (как в SQLite).
+        let re = regex::RegexBuilder::new(&format!("(?s){src}"))
+            .case_insensitive(true)
+            .build()?;
+        Ok(Self { re })
+    }
+
+    /// Есть ли совпадение внутри `haystack` (поиск, не полное совпадение).
+    pub(crate) fn is_match(&self, haystack: &str) -> bool {
+        use unicode_normalization::UnicodeNormalization;
+        let normalized: String = haystack.nfc().collect();
+        self.re.is_match(&normalized)
+    }
+}
+
+/// Развернуть критерий в список `full_name` вместе с причиной совпадения.
+///
+/// Чтение потоковое: SQL отбирает строки по `repo='default'` (и `meta_type`,
+/// если он задан) в порядке `full_name`, совпадение по имени/синониму считается
+/// в Rust, обход останавливается на `cap + 1`-м подходящем объекте — весь
+/// `metadata_objects` в память не поднимается.
+pub(crate) fn expand_object_criterion_matched(
+    conn: &rusqlite::Connection,
+    name_like: &str,
+    meta_type: Option<&str>,
+    cap: usize,
+) -> rusqlite::Result<(Vec<(String, MatchedBy)>, bool)> {
     // meta_type канонизируем (RU→EN, как resolve_one); неизвестный тип оставляем
     // как есть — SQL просто вернёт 0 строк (критерий ни с чем не совпал).
     let canon = meta_type.map(|t| match crate::code_usages::canonical_meta_type(t) {
         Some(c) => c.to_string(),
         None => t.to_string(),
     });
-    let limit = (cap + 1) as i64;
-    let rows: Vec<String> = if let Some(mt) = &canon {
-        let mut stmt = conn.prepare(
-            "SELECT full_name FROM metadata_objects \
-             WHERE repo = 'default' AND name LIKE '%' || ?1 || '%' AND meta_type = ?2 \
-             ORDER BY full_name LIMIT ?3",
-        )?;
-        let it = stmt.query_map(rusqlite::params![name_like, mt, limit], |r| {
-            r.get::<_, String>(0)
-        })?;
-        it.collect::<rusqlite::Result<Vec<String>>>()?
-    } else {
-        let mut stmt = conn.prepare(
-            "SELECT full_name FROM metadata_objects \
-             WHERE repo = 'default' AND name LIKE '%' || ?1 || '%' \
-             ORDER BY full_name LIMIT ?2",
-        )?;
-        let it = stmt.query_map(rusqlite::params![name_like, limit], |r| {
-            r.get::<_, String>(0)
-        })?;
-        it.collect::<rusqlite::Result<Vec<String>>>()?
+    let pattern = match LikePattern::new(name_like) {
+        Ok(p) => p,
+        // Трансляция LIKE→regex не может не собраться, но паниковать в поиске
+        // незачем: невалидный шаблон = «ничего не совпало».
+        Err(_) => return Ok((Vec::new(), false)),
     };
-    let truncated = rows.len() > cap;
-    let full_names = rows.into_iter().take(cap).collect();
-    Ok((full_names, truncated))
+    let sql = if canon.is_some() {
+        "SELECT full_name, name, synonym FROM metadata_objects \
+         WHERE repo = 'default' AND meta_type = ?1 ORDER BY full_name"
+    } else {
+        "SELECT full_name, name, synonym FROM metadata_objects \
+         WHERE repo = 'default' ORDER BY full_name"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = match &canon {
+        Some(mt) => stmt.query(rusqlite::params![mt])?,
+        None => stmt.query([])?,
+    };
+    let mut out: Vec<(String, MatchedBy)> = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = rows.next()? {
+        if code_index_core::storage::search_support::deadline_expired() {
+            truncated = true;
+            break;
+        }
+        let full_name: String = row.get(0)?;
+        let name: Option<String> = row.get(1)?;
+        let synonym: Option<String> = row.get(2)?;
+        let name_hit = name.as_deref().is_some_and(|n| pattern.is_match(n));
+        let synonym_hit = synonym
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_some_and(|s| pattern.is_match(s));
+        let matched_by = match (name_hit, synonym_hit) {
+            (true, true) => MatchedBy::NameAndSynonym,
+            (true, false) => MatchedBy::Name,
+            (false, true) => MatchedBy::Synonym,
+            // NULL и пустой синоним просто не совпадают — пропускаем строку.
+            (false, false) => continue,
+        };
+        if out.len() >= cap {
+            // Нашли `cap + 1`-й подходящий объект — набор шире потолка.
+            truncated = true;
+            break;
+        }
+        out.push((full_name, matched_by));
+    }
+    Ok((out, truncated))
 }
 
 /// Привести имя объекта к тому, как оно записано в конфигурации: `Catalog.организации`

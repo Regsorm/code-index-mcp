@@ -3,6 +3,9 @@ pub mod memory;
 pub mod models;
 pub mod pool;
 pub mod schema;
+/// Общая инфраструктура ограниченного поиска: бюджет прохода, счётчики и
+/// чтение шапки файла из индекса (#31/#32/#35).
+pub mod search_support;
 
 pub use pool::{PoolConfig, PooledStorage, StoragePool};
 
@@ -12,6 +15,12 @@ use std::path::Path;
 use unicode_normalization::UnicodeNormalization;
 
 use models::*;
+
+pub struct BoundedFileList {
+    pub files: Vec<ListedFile>,
+    pub usage: search_support::SearchUsage,
+    pub complete: bool,
+}
 
 type StatFileRow = (
     String,
@@ -1127,210 +1136,6 @@ impl Storage {
     /// Файлы oversize=1 (без content) пропускаются.
     ///
     /// Параметры идентичны `grep_text_filtered` для совместимости в MCP-слое.
-    /// Общий пост-процессинг для grep_code/grep_text: стримом по строкам
-    /// (path, zstd-blob) разжимает контент, ищет regex построчно, набирает
-    /// context_lines, соблюдает потолки limit и max_total_bytes. Возвращает
-    /// (совпадения, truncated, число непрочитанных файлов). Стриминговый вход —
-    /// без материализации всех blob'ов в память: ранний выход по лимитам не
-    /// читает остаток.
-    ///
-    /// Непрочитанные файлы (битый blob, превышение лимита распаковки, не-UTF-8)
-    /// СЧИТАЮТСЯ: без счётчика неполный результат неотличим от честного «ничего
-    /// не найдено», и слой выдачи не может об этом предупредить.
-    fn grep_zstd_stream(
-        rows: impl Iterator<Item = rusqlite::Result<(String, Vec<u8>)>>,
-        compiled: &regex::Regex,
-        limit: usize,
-        context_lines: usize,
-        max_total_bytes: usize,
-    ) -> Result<(Vec<GrepTextMatch>, bool, usize)> {
-        // Распаковка zstd и разбор содержимого — счётная работа, и на полном
-        // переборе (совпадений мало или нет вовсе) она занимает практически всё
-        // время ответа. Идём порциями: внутри порции файлы разбираются на всех
-        // ядрах, порции — последовательно. Порядок выдачи, потолки limit и
-        // max_total_bytes, ранний выход и счётчик непрочитанных остаются ровно
-        // те же, что при пофайловом обходе; в памяти материализуется одна
-        // порция, а не весь репозиторий.
-        //
-        // Порция растёт от CHUNK_MIN к CHUNK_MAX. Маленькая первая порция
-        // оставляет дешёвым ранний выход на частом образце (совпадения
-        // набираются с первых же файлов). Дальше порция удваивается: на
-        // маленькой порции ядра простаивают на общем барьере, пока самый
-        // крупный файл разбирается, и полный перебор из-за этого теряет
-        // заметную часть выигрыша (замер на 40 тыс. файлов: порция 64 —
-        // 682 мс, порция 4096 — 448 мс при нижней границе 424 мс).
-        const CHUNK_MIN: usize = 64;
-        const CHUNK_MAX: usize = 4096;
-        let mut chunk_cap = CHUNK_MIN;
-
-        let mut results: Vec<GrepTextMatch> = Vec::new();
-        let mut total_bytes: usize = 0;
-        let mut unreadable: usize = 0;
-        let mut chunk: Vec<(String, Vec<u8>)> = Vec::with_capacity(chunk_cap);
-
-        for row in rows {
-            chunk.push(row?);
-            if chunk.len() < chunk_cap {
-                continue;
-            }
-            let (stop, u) = Self::grep_zstd_chunk(
-                &chunk,
-                compiled,
-                limit,
-                context_lines,
-                max_total_bytes,
-                &mut results,
-                &mut total_bytes,
-            );
-            unreadable += u;
-            chunk.clear();
-            chunk_cap = (chunk_cap * 2).min(CHUNK_MAX);
-            chunk.reserve(chunk_cap.saturating_sub(chunk.capacity()));
-            if stop {
-                return Ok((results, true, unreadable));
-            }
-        }
-        if !chunk.is_empty() {
-            let (stop, u) = Self::grep_zstd_chunk(
-                &chunk,
-                compiled,
-                limit,
-                context_lines,
-                max_total_bytes,
-                &mut results,
-                &mut total_bytes,
-            );
-            unreadable += u;
-            if stop {
-                return Ok((results, true, unreadable));
-            }
-        }
-        Ok((results, false, unreadable))
-    }
-
-    /// Одна порция файлов: распаковка и отсев идут параллельно, слияние в
-    /// результат — последовательно и строго в порядке путей, поэтому потолки
-    /// срабатывают на том же файле и той же строке, что и при обходе по одному.
-    /// Возвращает (упёрлись в потолок, число непрочитанных файлов ДО остановки).
-    fn grep_zstd_chunk(
-        chunk: &[(String, Vec<u8>)],
-        compiled: &regex::Regex,
-        limit: usize,
-        context_lines: usize,
-        max_total_bytes: usize,
-        results: &mut Vec<GrepTextMatch>,
-        total_bytes: &mut usize,
-    ) -> (bool, usize) {
-        use rayon::prelude::*;
-
-        // Параллельно делается только тяжёлая часть — распаковка и отсев по
-        // файлу целиком. Построчный разбор с набором контекста идёт ниже,
-        // последовательно и лишь для файлов, которые реально попадут в ответ:
-        // иначе на частом образце порция целиком обходится построчно, а в
-        // ответ уходит десяток строк. Файлы под разбор разжимаются второй раз,
-        // но их не больше `limit` штук — против десятков тысяч в порции.
-        let matched: Vec<Option<bool>> = chunk
-            .par_iter()
-            .map(|(_, blob)| Self::grep_zstd_probe(blob, compiled))
-            .collect();
-
-        let mut unreadable: usize = 0;
-        for ((path, blob), flag) in chunk.iter().zip(matched) {
-            let Some(has_match) = flag else {
-                unreadable += 1;
-                continue;
-            };
-            if !has_match {
-                continue;
-            }
-            let need = limit.saturating_sub(results.len()).max(1);
-            for m in Self::grep_zstd_lines(path, blob, compiled, context_lines, need) {
-                let row_bytes = m.content.len()
-                    + m.context.iter().map(|c| c.content.len()).sum::<usize>()
-                    + m.path.len();
-                *total_bytes = total_bytes.saturating_add(row_bytes);
-                if *total_bytes > max_total_bytes {
-                    // Упёрлись в байтовый потолок ответа — результат обрезан.
-                    return (true, unreadable);
-                }
-                results.push(m);
-                if results.len() >= limit {
-                    // Достигнут лимит совпадений — возможно, есть ещё.
-                    return (true, unreadable);
-                }
-            }
-        }
-        (false, unreadable)
-    }
-
-    /// Разжать blob и привести переводы строк к `\n`.
-    ///
-    /// H-2: файлы с окончаниями строк CRLF. Отсев применяет выражение к тексту
-    /// ЦЕЛИКОМ, где строка кончается на `\r\n`, а построчный обход — к строкам
-    /// из `lines()`, где `\r` уже убран. Из-за расхождения `$` не совпадал, и
-    /// файл отсекался целиком ещё до обхода. Нормализуем один раз; копия
-    /// делается, только если возврат каретки реально есть.
-    ///
-    /// `None` — файл не прочитан: битый blob, превышение лимита распаковки
-    /// (защита от zstd-bomb) или не-UTF-8 содержимое.
-    fn grep_zstd_text(blob: &[u8]) -> Option<String> {
-        let bytes = Self::decode_zstd_safe(blob).ok()?;
-        let content = String::from_utf8(bytes).ok()?;
-        Some(if content.contains('\r') {
-            content.replace("\r\n", "\n")
-        } else {
-            content
-        })
-    }
-
-    /// Отсев по файлу целиком: `None` — файл не прочитан, иначе есть ли в нём
-    /// хоть одно совпадение. Построчный обход для несовпавших не нужен.
-    fn grep_zstd_probe(blob: &[u8], compiled: &regex::Regex) -> Option<bool> {
-        Self::grep_zstd_text(blob).map(|c| compiled.is_match(&c))
-    }
-
-    /// Построчные совпадения одного файла с контекстом, не более `need` штук.
-    fn grep_zstd_lines(
-        path: &str,
-        blob: &[u8],
-        compiled: &regex::Regex,
-        context_lines: usize,
-        need: usize,
-    ) -> Vec<GrepTextMatch> {
-        let Some(content) = Self::grep_zstd_text(blob) else {
-            return Vec::new();
-        };
-        let lines: Vec<&str> = content.lines().collect();
-        let mut out: Vec<GrepTextMatch> = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if !compiled.is_match(line) {
-                continue;
-            }
-            let context = if context_lines > 0 {
-                let from = i.saturating_sub(context_lines);
-                let to = (i + context_lines + 1).min(lines.len());
-                (from..to)
-                    .map(|j| ContextLine {
-                        line: j + 1,
-                        content: lines[j].to_string(),
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            out.push(GrepTextMatch {
-                path: path.to_string(),
-                line: i + 1,
-                content: line.to_string(),
-                context,
-            });
-            if out.len() >= need {
-                break;
-            }
-        }
-        out
-    }
-
     pub fn grep_code_filtered(
         &self,
         regex_pattern: &str,
@@ -1340,22 +1145,50 @@ impl Storage {
         context_lines: usize,
         max_total_bytes: usize,
     ) -> Result<(Vec<GrepTextMatch>, bool, usize)> {
-        // Многострочный режим обязателен: то же выражение работает и как быстрый
-        // отказ по файлу целиком (grep_zstd_stream), и построчно. Без него `^`/`$`
-        // привязаны к границам всего файла, и отказ выбрасывает файлы, где
-        // построчный поиск нашёл бы совпадение (M-10).
+        self.grep_code_filtered_budgeted(
+            regex_pattern,
+            path_glob,
+            language,
+            limit,
+            context_lines,
+            max_total_bytes,
+            crate::storage::search_support::SearchBudget::UNLIMITED,
+        )
+        .map(|(matches, truncated, unreadable, _)| (matches, truncated, unreadable))
+    }
+
+    /// Общий каркас grep по сжатому содержимому С БЮДЖЕТОМ прохода (#31).
+    ///
+    /// Общая реализация основных и дополнительных проходов. Порции проходят
+    /// параллельный regex-отсев после резервирования и ограниченной распаковки.
+    /// Слияние идёт в порядке путей; наружу передаётся фактический расход.
+    #[allow(clippy::too_many_arguments)]
+    fn grep_zstd_budgeted(
+        &self,
+        from: &str,
+        alias: &str,
+        base_conds: &[&str],
+        regex_pattern: &str,
+        path_glob: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+        context_lines: usize,
+        max_total_bytes: usize,
+        budget: crate::storage::search_support::SearchBudget,
+    ) -> Result<(
+        Vec<GrepTextMatch>,
+        bool,
+        usize,
+        crate::storage::search_support::SearchUsage,
+    )> {
         let compiled = regex::RegexBuilder::new(regex_pattern)
             .multi_line(true)
             .build()
-            .context("grep_code: невалидный regex")?;
+            .context("grep: невалидный regex")?;
 
-        let mut conds: Vec<String> = vec![
-            "fc.oversize = 0".to_string(),
-            "fc.content_blob IS NOT NULL".to_string(),
-        ];
+        let mut conds: Vec<String> = base_conds.iter().map(|c| (*c).to_string()).collect();
         let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(g) = path_glob {
-            // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
             let variants = expand_glob_variants(g);
             conds.push(format!(
                 "({})",
@@ -1369,10 +1202,16 @@ impl Storage {
             conds.push("fi.language = ?".to_string());
             params_dyn.push(Box::new(l.to_string()));
         }
+        use crate::storage::search_support::{
+            deadline_expired, record_usage, remaining_budget, SearchStop, SearchUsage,
+        };
+        use std::io::Read;
+        let budget = remaining_budget(budget);
+        let limit = limit.max(1).min(budget.max_matches);
         let sql = format!(
-            "SELECT fi.path, fc.content_blob
-             FROM file_contents fc
-             JOIN files fi ON fi.id = fc.file_id
+            "SELECT fi.path, {alias}.content_blob, {alias}.oversize
+             FROM {from}
+             JOIN files fi ON fi.id = {alias}.file_id
              WHERE {}
              ORDER BY fi.path",
             conds.join(" AND ")
@@ -1382,10 +1221,218 @@ impl Storage {
             .iter()
             .map(|b| &**b as &dyn rusqlite::ToSql)
             .collect();
-        let rows = stmt.query_map(params_refs.as_slice(), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
-        Self::grep_zstd_stream(rows, &compiled, limit, context_lines, max_total_bytes)
+        let mut rows = stmt.query(params_refs.as_slice())?;
+        use rayon::prelude::*;
+        let mut results = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut usage = SearchUsage::new();
+        let mut chunk_cap = 64usize;
+        let mut exhausted = false;
+        let scan = (|| -> Result<()> {
+            while !exhausted && usage.stopped.is_none() {
+                let mut chunk: Vec<(String, String)> = Vec::new();
+                let mut chunk_bytes = 0usize;
+                let mut pending_stop = None;
+                // Расход и резерв распаковки определяются до передачи порции Rayon.
+                // Размер шапки zstd не предполагается известным: декодер ограничен
+                // фактическим остатком, а каждый файл распаковывается только один раз.
+                while chunk.len() < chunk_cap && chunk_bytes < 8 * 1024 * 1024 {
+                    if deadline_expired() {
+                        pending_stop = Some(SearchStop::Cancelled);
+                        break;
+                    }
+                    let Some(row) = rows.next()? else {
+                        exhausted = true;
+                        break;
+                    };
+                    if usage.files >= budget.max_files {
+                        pending_stop = Some(SearchStop::Files);
+                        break;
+                    }
+                    if results.len() >= limit {
+                        pending_stop = Some(SearchStop::Matches);
+                        break;
+                    }
+                    let path: String = row.get(0)?;
+                    usage.dependent_files.push(path.clone());
+                    let blob = row.get_ref(1)?.as_blob_or_null()?;
+                    let compressed = blob.map_or(0, <[u8]>::len);
+                    if compressed
+                        > budget
+                            .max_compressed_bytes
+                            .saturating_sub(usage.compressed_bytes)
+                    {
+                        pending_stop = Some(SearchStop::CompressedBytes);
+                        break;
+                    }
+                    let remaining = budget
+                        .max_uncompressed_bytes
+                        .saturating_sub(usage.uncompressed_bytes);
+                    if remaining == 0 {
+                        pending_stop = Some(SearchStop::UncompressedBytes);
+                        break;
+                    }
+                    usage.files += 1;
+                    usage.compressed_bytes += compressed;
+                    if row.get::<_, i64>(2)? != 0 {
+                        usage.oversize += 1;
+                        continue;
+                    }
+                    let Some(blob) = blob else {
+                        usage.unreadable += 1;
+                        continue;
+                    };
+                    let mut decoded = Vec::new();
+                    let decoded_ok =
+                        match zstd::stream::read::Decoder::new(blob) {
+                            Ok(decoder) => decoder
+                                .take(remaining.min(
+                                    Self::FILE_CONTENTS_MAX_DECOMPRESSED_BYTES.saturating_add(1),
+                                ) as u64)
+                                .read_to_end(&mut decoded)
+                                .is_ok(),
+                            Err(_) => false,
+                        };
+                    usage.uncompressed_bytes += decoded.len();
+                    if decoded.len() >= remaining {
+                        pending_stop = Some(SearchStop::UncompressedBytes);
+                        break;
+                    }
+                    if !decoded_ok || decoded.len() > Self::FILE_CONTENTS_MAX_DECOMPRESSED_BYTES {
+                        usage.unreadable += 1;
+                        continue;
+                    }
+                    let Ok(content) = String::from_utf8(decoded) else {
+                        usage.unreadable += 1;
+                        continue;
+                    };
+                    chunk_bytes += content.len();
+                    chunk.push((path, content.replace("\r\n", "\n")));
+                }
+                let flags: Vec<bool> = chunk
+                    .par_iter()
+                    .map(|(_, content)| compiled.is_match(content))
+                    .collect();
+                'merge: for ((path, content), has_match) in chunk.iter().zip(flags) {
+                    if deadline_expired() {
+                        usage.stopped = Some(SearchStop::Cancelled);
+                        break;
+                    }
+                    if !has_match {
+                        continue;
+                    }
+                    let lines: Vec<&str> = content.lines().collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        if !compiled.is_match(line) {
+                            continue;
+                        }
+                        let context: Vec<ContextLine> = if context_lines == 0 {
+                            Vec::new()
+                        } else {
+                            (i.saturating_sub(context_lines)
+                                ..i.saturating_add(context_lines)
+                                    .saturating_add(1)
+                                    .min(lines.len()))
+                                .map(|j| ContextLine {
+                                    line: j + 1,
+                                    content: lines[j].to_string(),
+                                })
+                                .collect()
+                        };
+                        let bytes = path.len()
+                            + line.len()
+                            + context.iter().map(|c| c.content.len()).sum::<usize>();
+                        if bytes > max_total_bytes.saturating_sub(total_bytes) {
+                            usage.stopped = Some(SearchStop::ResponseBytes);
+                            break 'merge;
+                        }
+                        total_bytes += bytes;
+                        results.push(GrepTextMatch {
+                            path: path.clone(),
+                            line: i + 1,
+                            content: line.to_string(),
+                            context,
+                        });
+                        usage.matches += 1;
+                        if results.len() >= limit {
+                            usage.stopped = Some(SearchStop::Matches);
+                            break 'merge;
+                        }
+                    }
+                }
+                if usage.stopped.is_none() {
+                    usage.stopped = pending_stop;
+                }
+                chunk_cap = (chunk_cap * 2).min(4096);
+            }
+            Ok(())
+        })();
+        record_usage(&usage);
+        scan?;
+        Ok((results, usage.stopped.is_some(), usage.unreadable, usage))
+    }
+
+    /// Ограниченный вариант [`Self::grep_code_filtered`] (#31): тот же отбор,
+    /// но с бюджетом прохода и сведениями о причинах остановки.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grep_code_filtered_budgeted(
+        &self,
+        regex_pattern: &str,
+        path_glob: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+        context_lines: usize,
+        max_total_bytes: usize,
+        budget: crate::storage::search_support::SearchBudget,
+    ) -> Result<(
+        Vec<GrepTextMatch>,
+        bool,
+        usize,
+        crate::storage::search_support::SearchUsage,
+    )> {
+        self.grep_zstd_budgeted(
+            "file_contents fc",
+            "fc",
+            &["1 = 1"],
+            regex_pattern,
+            path_glob,
+            language,
+            limit,
+            context_lines,
+            max_total_bytes,
+            budget,
+        )
+    }
+
+    /// Ограниченный вариант [`Self::grep_text_filtered`] (#31).
+    #[allow(clippy::too_many_arguments)]
+    pub fn grep_text_filtered_budgeted(
+        &self,
+        regex_pattern: &str,
+        path_glob: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+        context_lines: usize,
+        max_total_bytes: usize,
+        budget: crate::storage::search_support::SearchBudget,
+    ) -> Result<(
+        Vec<GrepTextMatch>,
+        bool,
+        usize,
+        crate::storage::search_support::SearchUsage,
+    )> {
+        self.grep_zstd_budgeted(
+            "text_contents tc",
+            "tc",
+            &["1 = 1"],
+            regex_pattern,
+            path_glob,
+            language,
+            limit,
+            context_lines,
+            max_total_bytes,
+            budget,
+        )
     }
 
     /// Сколько файлов в области поиска пропущено по размеру (`oversize`):
@@ -2464,6 +2511,83 @@ impl Storage {
         })
     }
 
+    /// Ограничение применяется в SQL до извлечения локаций и тел.
+    pub fn find_symbol_limited(
+        &self,
+        name: &str,
+        language: Option<&str>,
+        path_glob: Option<&str>,
+        limit: usize,
+    ) -> Result<SymbolSearchResult> {
+        let query = |columns: &str, table: &str, condition: &str, remaining: usize| {
+            let mut values: Vec<rusqlite::types::Value> = vec![
+                name.to_string().into(),
+                language.map_or(rusqlite::types::Value::Null, |s| s.to_string().into()),
+            ];
+            let mut sql = format!("SELECT {columns} FROM {table} s JOIN files fi ON fi.id=s.file_id WHERE ({condition}) AND (?2 IS NULL OR fi.language=?2)");
+            if let Some(glob) = path_glob {
+                let variants = expand_glob_variants(glob);
+                let clauses: Vec<String> = variants
+                    .into_iter()
+                    .map(|g| {
+                        values.push(normalize_glob(&g).into());
+                        format!("unicode_nfc(fi.path) GLOB ?{}", values.len())
+                    })
+                    .collect();
+                sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+            }
+            values.push((remaining as i64).into());
+            sql.push_str(&format!(" ORDER BY fi.path, s.id LIMIT ?{}", values.len()));
+            (sql, values)
+        };
+        let (sql, values) = query(
+            "s.id,s.file_id,s.name,s.qualified_name,s.line_start,s.line_end,s.args,s.return_type,s.docstring,'' AS body,s.is_async,s.node_hash",
+            "functions", "s.name=?1 OR s.qualified_name=?1", limit,
+        );
+        let functions = self
+            .conn
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(values), row_to_function)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut remaining = limit.saturating_sub(functions.len());
+        let (sql, values) = query("s.id,s.file_id,s.name,s.line_start,s.line_end,s.bases,s.docstring,'' AS body,s.node_hash", "classes", "s.name=?1", remaining);
+        let classes = self
+            .conn
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(values), row_to_class)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        remaining = remaining.saturating_sub(classes.len());
+        let (sql, values) = query(
+            "s.id,s.file_id,s.name,s.value,s.line",
+            "variables",
+            "s.name=?1",
+            remaining,
+        );
+        let variables = self
+            .conn
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(values), row_to_variable)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        remaining = remaining.saturating_sub(variables.len());
+        let (sql, values) = query(
+            "s.id,s.file_id,s.module,s.name,s.alias,s.line,s.kind",
+            "imports",
+            "s.name=?1 OR s.alias=?1",
+            remaining,
+        );
+        let imports = self
+            .conn
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(values), row_to_import)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(SymbolSearchResult {
+            functions,
+            classes,
+            variables,
+            imports,
+        })
+    }
+
     /// Получить все импорты файла
     pub fn get_imports_by_file(&self, file_id: i64) -> Result<Vec<ImportRecord>> {
         let mut stmt = self.conn.prepare(
@@ -2756,6 +2880,100 @@ impl Storage {
         Ok(total.max(0) as usize)
     }
 
+    fn bounded_files_query(
+        pattern: Option<&str>,
+        path_prefix: Option<&str>,
+        language: Option<&str>,
+        max_files: usize,
+    ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let (clause, mut params) = Self::files_filter_clause(pattern, path_prefix, language);
+        let predicate = clause.strip_prefix("WHERE ").unwrap_or("1");
+        // Фильтр в SELECT: отвергнутые строки тоже расходуют бюджет прохода.
+        let sql = format!(
+            "SELECT path, language, lines_total, file_size, mtime, ({predicate})
+             FROM files INDEXED BY idx_files_path ORDER BY path LIMIT ?"
+        );
+        params.push(Box::new(i64::try_from(max_files).unwrap_or(i64::MAX)));
+        (sql, params)
+    }
+
+    pub fn list_files_filtered_budgeted(
+        &self,
+        pattern: Option<&str>,
+        path_prefix: Option<&str>,
+        language: Option<&str>,
+        limit: usize,
+        budget: search_support::SearchBudget,
+    ) -> Result<BoundedFileList> {
+        use search_support::{deadline_expired, SearchStop, SearchUsage};
+        let mut result = BoundedFileList {
+            files: Vec::new(),
+            usage: SearchUsage::default(),
+            complete: false,
+        };
+        let stop = if deadline_expired() {
+            Some(SearchStop::Cancelled)
+        } else if budget.max_files == 0 {
+            Some(SearchStop::Files)
+        } else if limit == 0 || budget.max_matches == 0 {
+            Some(SearchStop::Matches)
+        } else {
+            None
+        };
+        if let Some(stop) = stop {
+            result.usage.stopped = Some(stop);
+            return Ok(result);
+        }
+        let (sql, params) =
+            Self::bounded_files_query(pattern, path_prefix, language, budget.max_files);
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        if deadline_expired() {
+            result.usage.stopped = Some(SearchStop::Cancelled);
+            return Ok(result);
+        }
+        let mut rows = stmt.query(refs.as_slice())?;
+        loop {
+            if deadline_expired() {
+                result.usage.stopped = Some(SearchStop::Cancelled);
+                break;
+            }
+            if result.usage.files >= budget.max_files {
+                result.usage.stopped = Some(SearchStop::Files);
+                break;
+            }
+            let row = rows.next()?;
+            if row.is_some() {
+                result.usage.files += 1;
+            }
+            if deadline_expired() {
+                result.usage.stopped = Some(SearchStop::Cancelled);
+                break;
+            }
+            let Some(row) = row else {
+                result.complete = true;
+                break;
+            };
+            if row.get::<_, bool>(5)? {
+                let file = ListedFile {
+                    path: row.get(0)?,
+                    language: row.get(1)?,
+                    lines_total: row.get::<_, i64>(2)? as usize,
+                    size: row.get(3)?,
+                    mtime: row.get(4)?,
+                };
+                result.usage.dependent_files.push(file.path.clone());
+                result.files.push(file);
+                result.usage.matches += 1;
+                if result.files.len() >= limit.min(budget.max_matches) {
+                    result.usage.stopped = Some(SearchStop::Matches);
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// list_files: список файлов с опциональными фильтрами (glob по пути,
     /// префикс пути, язык). Возвращает `Vec<ListedFile>` с метаданными.
     ///
@@ -2990,48 +3208,16 @@ impl Storage {
         context_lines: usize,
         max_total_bytes: usize,
     ) -> Result<(Vec<GrepTextMatch>, bool, usize)> {
-        // Многострочный режим — по той же причине, что в grep_code (M-10).
-        let compiled = regex::RegexBuilder::new(regex_pattern)
-            .multi_line(true)
-            .build()
-            .context("grep_text: невалидный regex")?;
-
-        // Контент text-файлов теперь сжат (zstd) в text_contents — SQL REGEXP по
-        // нему невозможен. SQL делает только pre-filter по path_glob/language,
-        // regex применяется к разжатому тексту в Rust (как в grep_code).
-        let mut conds: Vec<String> = vec!["tc.content_blob IS NOT NULL".to_string()];
-        let mut params_dyn: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(g) = path_glob {
-            // W12-mini: brace-альтернативы `{a,b}` → OR-группа GLOB-условий.
-            let variants = expand_glob_variants(g);
-            conds.push(format!(
-                "({})",
-                vec!["unicode_nfc(fi.path) GLOB ?"; variants.len()].join(" OR ")
-            ));
-            for v in variants {
-                params_dyn.push(Box::new(normalize_glob(&v)));
-            }
-        }
-        if let Some(l) = language {
-            conds.push("fi.language = ?".to_string());
-            params_dyn.push(Box::new(l.to_string()));
-        }
-        let sql = format!(
-            "SELECT fi.path, tc.content_blob
-             FROM text_contents tc JOIN files fi ON fi.id = tc.file_id
-             WHERE {}
-             ORDER BY fi.path",
-            conds.join(" AND ")
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_dyn
-            .iter()
-            .map(|b| &**b as &dyn rusqlite::ToSql)
-            .collect();
-        let rows = stmt.query_map(params_refs.as_slice(), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
-        Self::grep_zstd_stream(rows, &compiled, limit, context_lines, max_total_bytes)
+        self.grep_text_filtered_budgeted(
+            regex_pattern,
+            path_glob,
+            language,
+            limit,
+            context_lines,
+            max_total_bytes,
+            crate::storage::search_support::SearchBudget::UNLIMITED,
+        )
+        .map(|(matches, truncated, unreadable, _)| (matches, truncated, unreadable))
     }
 
     /// grep_body с поддержкой context_lines. Существующий `grep_body` без
@@ -5891,6 +6077,169 @@ mod tests {
         let r = storage.stat_file_meta("/nonexistent").unwrap();
         assert!(!r.exists);
         assert!(r.language.is_none());
+    }
+
+    fn counted_file_storage(
+        expire: bool,
+    ) -> (Storage, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let storage = Storage::open_in_memory().unwrap();
+        for i in 0..4100 {
+            storage
+                .upsert_file(&make_file_full(&format!("/src/{i:05}.rs"), "rust", 1))
+                .unwrap();
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        storage
+            .conn
+            .create_scalar_function(
+                "unicode_nfc",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |ctx| {
+                    let previous = counter.fetch_add(1, Ordering::SeqCst);
+                    if expire && previous == 0 {
+                        search_support::expire_search_deadline_for_test();
+                    }
+                    let path: String = ctx.get(0)?;
+                    Ok(path.nfc().collect::<String>())
+                },
+            )
+            .unwrap();
+        (storage, count)
+    }
+
+    #[test]
+    fn bounded_file_list_counts_candidates_and_stops_at_limit() {
+        use search_support::{SearchBudget, SearchStop};
+        use std::sync::atomic::Ordering;
+        let (storage, count) = counted_file_storage(false);
+        let result = storage
+            .list_files_filtered_budgeted(Some("*.rs"), None, None, 1, SearchBudget::multi_repo())
+            .unwrap();
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.usage.files, 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(result.usage.stopped, Some(SearchStop::Matches));
+        assert!(!result.complete);
+        for pattern in ["*.missing", "*04099.rs"] {
+            count.store(0, Ordering::SeqCst);
+            let budget = SearchBudget::new(7, usize::MAX, usize::MAX, usize::MAX);
+            let result = storage
+                .list_files_filtered_budgeted(Some(pattern), None, None, 1, budget)
+                .unwrap();
+            assert!(result.files.is_empty());
+            assert_eq!(result.usage.files, 7);
+            assert_eq!(count.load(Ordering::SeqCst), 7);
+            assert_eq!(result.usage.stopped, Some(SearchStop::Files));
+            assert!(!result.complete);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_file_list_deadline_limits_sqlite_steps() {
+        use search_support::{search_scope, SearchBudget, SearchStop};
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let (storage, count) = counted_file_storage(true);
+        let (expired, _) = search_scope(SearchBudget::multi_repo(), Duration::ZERO, 10, async {
+            storage
+                .list_files_filtered_budgeted(
+                    Some("*.rs"),
+                    None,
+                    None,
+                    10,
+                    SearchBudget::multi_repo(),
+                )
+                .unwrap()
+        })
+        .await;
+        assert_eq!(expired.usage.files, 0);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(expired.usage.stopped, Some(SearchStop::Cancelled));
+        let (during, _) = search_scope(
+            SearchBudget::multi_repo(),
+            Duration::from_secs(30),
+            10,
+            async {
+                storage
+                    .list_files_filtered_budgeted(
+                        Some("*.rs"),
+                        None,
+                        None,
+                        10,
+                        SearchBudget::multi_repo(),
+                    )
+                    .unwrap()
+            },
+        )
+        .await;
+        assert_eq!(during.usage.files, 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(during.usage.stopped, Some(SearchStop::Cancelled));
+        assert!(!during.complete);
+    }
+
+    #[test]
+    fn bounded_file_list_uses_path_index_without_sorting() {
+        let storage = Storage::open_in_memory().unwrap();
+        let (sql, params) =
+            Storage::bounded_files_query(Some("*.rs"), Some("/src_"), Some("rust"), 7);
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p).collect();
+        let mut stmt = storage
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let plan = stmt
+            .query_map(refs.as_slice(), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("idx_files_path"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    #[test]
+    fn bounded_file_list_preserves_single_filter_semantics() {
+        use search_support::SearchBudget;
+        let storage = Storage::open_in_memory().unwrap();
+        for (path, lang) in [
+            ("/src_100%/cafe\u{301}.rs", "rust"),
+            ("/src_100%/other.toml", "text"),
+            ("/srcX100z/other.rs", "rust"),
+            ("/src_100%/other.py", "python"),
+        ] {
+            storage.upsert_file(&make_file_full(path, lang, 1)).unwrap();
+        }
+        for (pattern, prefix, language) in [
+            (Some("*.{rs,toml}"), Some("/src_100%/"), None),
+            (Some("*café.rs"), None, Some("rust")),
+            (None, Some("/src_100%/café"), Some("rust")),
+            (Some("*.missing"), None, None),
+            (None, None, None),
+        ] {
+            let single = storage
+                .list_files_filtered(pattern, prefix, language, 20)
+                .unwrap();
+            let bounded = storage
+                .list_files_filtered_budgeted(
+                    pattern,
+                    prefix,
+                    language,
+                    20,
+                    SearchBudget::multi_repo(),
+                )
+                .unwrap();
+            assert!(bounded.complete);
+            assert_eq!(bounded.usage.files, 4);
+            assert_eq!(
+                bounded.files.iter().map(|f| &f.path).collect::<Vec<_>>(),
+                single.iter().map(|f| &f.path).collect::<Vec<_>>(),
+            );
+        }
     }
 
     #[test]

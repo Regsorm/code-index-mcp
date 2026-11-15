@@ -40,7 +40,7 @@ impl IndexTool for GetObjectStructureTool {
          (attributes/dimensions/resources/tabular_sections) присутствуют всегда (пустые — []). \
          Это единственный источник структуры объекта — XML объектов НЕ индексируется как \
          текст, не ищите его через list_files/grep_text. For BSL/1C repositories only. \
-         МАССОВЫЙ РЕЖИМ ('full_names'): батчи список ТОЛЬКО когда точно нужен ВЕСЬ набор и структура одного объекта не отменит надобность в остальных (например, разбираешь уже подтверждённый список). Если ОТБИРАЕШЬ, какие из объектов релевантны, или результат одного может сделать остальные ненужными — НЕ батчи, запрашивай по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в том же порядке. КРИТЕРИЙ-СЕЛЕКТОР ('name_like' + опц. 'meta_type'): когда нужны структуры ВСЕХ объектов одной темы — не зови по одному и не перечисляй имена, передай подстроку имени: name_like='ЭДО' вернёт структуры всех объектов, чьё имя содержит 'ЭДО', ОДНИМ вызовом. Сочетай с sections= (узкие секции на каждый объект). Лимит 50 объектов (truncated=true, если совпало больше — уточни критерий). Ответ — {matched:N, truncated, results:[...]}. РАЗМЕР ОТВЕТА: опознание найденного (full_name/meta_type/name/synonym) сохраняется всегда — при нехватке бюджета опускаются тяжёлые секции ВНУТРИ элементов (`<секция>_omitted` + `<секция>_count`), список объектов не пропадает. Дёшево искать — 'names_only=true' (только паспорта); нужны полные секции — повтори вызов с 'max_response_bytes' побольше."
+         МАССОВЫЙ РЕЖИМ ('full_names'): батчи список ТОЛЬКО когда точно нужен ВЕСЬ набор и структура одного объекта не отменит надобность в остальных (например, разбираешь уже подтверждённый список). Если ОТБИРАЕШЬ, какие из объектов релевантны, или результат одного может сделать остальные ненужными — НЕ батчи, запрашивай по одному с остановкой по ходу. Сомневаешься — по одному. Ответ на батч — {results:[...]} в том же порядке. КРИТЕРИЙ-СЕЛЕКТОР ('name_like' + опц. 'meta_type'): когда нужны структуры ВСЕХ объектов одной темы — не зови по одному и не перечисляй имена, передай подстроку имени: name_like='ЭДО' вернёт структуры всех объектов, чьё имя ИЛИ синоним содержит 'ЭДО', ОДНИМ вызовом. Совпадение Unicode-регистронезависимое (кириллица тоже), '%' и '_' работают как в LIKE, причина совпадения приходит в 'matched_by'. Сочетай с sections= (узкие секции на каждый объект). Лимит 50 объектов (truncated=true, если совпало больше — уточни критерий). Ответ — {matched:N, truncated, results:[...]}. РАЗМЕР ОТВЕТА: опознание найденного (full_name/meta_type/name/synonym) сохраняется всегда — при нехватке бюджета опускаются тяжёлые секции ВНУТРИ элементов (`<секция>_omitted` + `<секция>_count`), список объектов не пропадает. Дёшево искать — 'names_only=true' (только паспорта); нужны полные секции — повтори вызов с 'max_response_bytes' побольше."
     }
 
     fn input_schema(&self) -> Value {
@@ -62,7 +62,7 @@ impl IndexTool for GetObjectStructureTool {
                 },
                 "name_like": {
                     "type": "string",
-                    "description": "КРИТЕРИЙ-СЕЛЕКТОР: подстрока имени объекта (без префикса типа). Вернёт структуры ВСЕХ объектов, чьё имя содержит подстроку, ОДНИМ вызовом — вместо серии вызовов по одному. Применяй, когда нужны все объекты одной темы (name_like='ЭДО' → все объекты ЭДО). Сочетай с sections= (узкие секции) и при необходимости meta_type=. Лимит 50 объектов (truncated=true, если совпало больше — уточни подстроку). Регистр учитывается."
+                    "description": "КРИТЕРИЙ-СЕЛЕКТОР: подстрока имени ИЛИ синонима объекта (без префикса типа). Вернёт структуры ВСЕХ объектов, чьё имя либо синоним содержит подстроку, ОДНИМ вызовом — вместо серии вызовов по одному. Применяй, когда нужны все объекты одной темы (name_like='ЭДО' → все объекты ЭДО). Сочетай с sections= (узкие секции) и при необходимости meta_type=. Лимит 50 объектов (truncated=true, если совпало больше — уточни подстроку). Регистр НЕ учитывается, кириллица тоже (сравнение Unicode-регистронезависимое). '%' означает любую последовательность символов, '_' — ровно один символ, остальные символы буквальны (обратная косая черта НЕ экранирует). Причина совпадения приходит в каждом объекте полем 'matched_by': ['name'], ['synonym'] либо ['name', 'synonym']; объект возвращается один раз."
                 },
                 "meta_type": {
                     "type": "string",
@@ -142,6 +142,8 @@ impl IndexTool for GetObjectStructureTool {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.trim().is_empty());
                 // Развернуть критерий в список full_name (одно соединение, до mass_map).
+                // Вместе с именами приходит причина совпадения (`matched_by`): объект
+                // мог совпасть по имени, по синониму или по обоим сразу.
                 let expanded = {
                     let storage = match ctx.storage.get().await {
                         Ok(s) => s,
@@ -151,14 +153,16 @@ impl IndexTool for GetObjectStructureTool {
                             }));
                         }
                     };
-                    crate::tools::expand_object_criterion(
+                    crate::tools::expand_object_criterion_matched(
                         storage.conn(),
                         name_like,
                         meta_type,
-                        NAME_LIKE_CAP,
+                        code_index_core::storage::search_support::search_limit()
+                            .unwrap_or(NAME_LIKE_CAP)
+                            .min(NAME_LIKE_CAP),
                     )
                 };
-                let (full_names, truncated) = match expanded {
+                let (matched_objects, truncated) = match expanded {
                     Ok(t) => t,
                     Err(e) => {
                         return crate::tools::wrap_error(json!({
@@ -166,13 +170,18 @@ impl IndexTool for GetObjectStructureTool {
                         }));
                     }
                 };
-                if full_names.is_empty() {
+                if matched_objects.is_empty() {
                     json!({
                         "matched": 0,
                         "results": [],
+                        "truncated": truncated,
+                        "complete": !truncated,
                         "hint": format!(
-                            "Критерий name_like='{}'{} не нашёл объектов. Проверь подстроку/тип \
-                             (регистр учитывается) или используй search_terms для поиска по теме.",
+                            "Критерий name_like='{}'{} не нашёл объектов. Совпадение ищется \
+                             внутри имени ИЛИ синонима без учёта регистра (кириллица тоже); \
+                             '%' — любая последовательность, '_' — один символ, остальные \
+                             символы буквальны. Проверь подстроку/тип или используй \
+                             search_terms для поиска по теме.",
                             name_like,
                             meta_type
                                 .map(|m| format!(", meta_type='{}'", m))
@@ -180,9 +189,15 @@ impl IndexTool for GetObjectStructureTool {
                         )
                     })
                 } else {
-                    let matched = full_names.len();
+                    let matched = matched_objects.len();
+                    let (full_names, matched_by): (Vec<String>, Vec<&'static str>) =
+                        matched_objects
+                            .into_iter()
+                            .map(|(fqn, by)| (fqn, by.as_str()))
+                            .unzip();
                     let repo_label = ctx.repo.to_string();
                     let sections_c = sections.clone();
+                    let matched_names = full_names.clone();
                     let rows = code_index_core::mcp::tools::mass_map(
                         ctx.storage,
                         full_names,
@@ -202,16 +217,36 @@ impl IndexTool for GetObjectStructureTool {
                         },
                     )
                     .await;
+                    // `mass_map` сохраняет порядок и длину входа, поэтому причина
+                    // совпадения переносится в свой объект по позиции. Ошибка
+                    // (объект не прочитался) причины совпадения не несёт.
                     let results: Vec<Value> = rows
                         .into_iter()
-                        .map(|r| match r {
-                            Ok(v) => v,
-                            Err(e) => json!({ "error": e }),
+                        .zip(matched_by)
+                        .zip(matched_names)
+                        .map(|((r, by), full_name)| match r {
+                            Ok(mut v) => {
+                                if let Some(obj) = v.as_object_mut() {
+                                    obj.insert(
+                                        "matched_by".to_string(),
+                                        json!(by.split('+').collect::<Vec<_>>()),
+                                    );
+                                }
+                                v
+                            }
+                            Err(e) => json!({
+                                "error": e, "full_name": full_name,
+                                "matched_by": by.split('+').collect::<Vec<_>>(),
+                            }),
                         })
                         .collect();
                     json!({ "matched": matched, "truncated": truncated, "results": results })
                 }
             } else if let Some(arr) = args.get("full_names").and_then(|v| v.as_array()) {
+                let cap =
+                    code_index_core::storage::search_support::search_limit().unwrap_or(arr.len());
+                let truncated = arr.len() > cap;
+                let arr = &arr[..arr.len().min(cap)];
                 // Конкуррентно: каждый элемент берёт своё соединение из пула и
                 // исполняется в spawn_blocking (mass_map). Нестроковые элементы
                 // получают {error} на своей позиции без обращения к пулу.
@@ -257,7 +292,11 @@ impl IndexTool for GetObjectStructureTool {
                         Err(e) => json!({ "error": e }),
                     };
                 }
-                json!({ "results": results })
+                if code_index_core::storage::search_support::search_limit().is_some() {
+                    json!({ "results": results, "truncated": truncated })
+                } else {
+                    json!({ "results": results })
+                }
             } else if let Some(fqn) = crate::tools::object_value(&args) {
                 let storage = match ctx.storage.get().await {
                     Ok(s) => s,

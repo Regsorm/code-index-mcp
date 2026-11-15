@@ -67,6 +67,20 @@ pub struct SessionDedup {
     elided_total: AtomicU64,
 }
 
+pub(crate) struct DedupDelivery<'a> {
+    owner: &'a SessionDedup,
+    sessions: Option<std::sync::RwLockWriteGuard<'a, HashMap<String, HashSet<u64>>>>,
+    session_id: Option<String>,
+    seen: HashSet<u64>,
+    pending: HashMap<String, PendingScope>,
+}
+
+#[derive(Default)]
+struct PendingScope {
+    fingerprints: HashSet<u64>,
+    elided: usize,
+}
+
 impl SessionDedup {
     pub fn new(enabled: bool) -> Self {
         Self {
@@ -118,97 +132,27 @@ impl SessionDedup {
     /// `scope` — область строки («инструмент|репо»): строки разных репо и разных
     /// инструментов в одно множество не смешиваются (см. модульный комментарий).
     pub fn process(&self, session_id: Option<&str>, scope: &str, payload: &str) -> (String, usize) {
-        if !self.enabled {
-            return (payload.to_string(), 0);
-        }
-        let Some(sid) = session_id else {
-            return (payload.to_string(), 0);
-        };
-        let Ok(mut outer) = serde_json::from_str::<Value>(payload) else {
-            return (payload.to_string(), 0);
-        };
-
-        // Данные tool'а лежат в MCP CallToolResult: content[*].text — это
-        // вложенная JSON-строка `{result, _meta}`. Находим её, дедупим, кладём
-        // обратно. structuredContent (если есть) дублирует ТЕ ЖЕ данные.
-        let mut elided = 0usize;
-        // Отпечатки строк, опущенных первым проходом. Второй проход обязан
-        // опустить РОВНО их: память сессии он не трогает и своего решения не
-        // принимает. Иначе он увидит в памяти строки, только что запомненные
-        // первым проходом, и опустит весь ответ до единой строки.
-        let mut elided_fps: HashSet<u64> = HashSet::new();
-        let mut text_pass_done = false;
-
-        // 1) content[0].text (вложенный JSON-string)
-        if let Some(text_idx) = find_text_content_index(&outer) {
-            if let Some(text) = outer["content"][text_idx]["text"].as_str() {
-                if let Ok(mut inner) = serde_json::from_str::<Value>(text) {
-                    let (n, fps) = self.dedup_and_record(sid, scope, &mut inner);
-                    elided += n;
-                    elided_fps = fps;
-                    text_pass_done = true;
-                    if n > 0 {
-                        if let Ok(s) = serde_json::to_string(&inner) {
-                            outer["content"][text_idx]["text"] = Value::String(s);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2) structuredContent (rmcp structured output, дублирует данные)
-        if outer.get("structuredContent").is_some() {
-            let mut sc = outer["structuredContent"].take();
-            if text_pass_done {
-                // Дубль уже обработанного ответа — повторяем решение первого прохода.
-                self.apply_elision(&elided_fps, scope, &mut sc);
-            } else {
-                // Текстовой части не было: структурная форма — единственный
-                // источник, обрабатываем её полноценно.
-                elided += self.dedup_and_record(sid, scope, &mut sc).0;
-            }
-            outer["structuredContent"] = sc;
-        }
-
-        if elided == 0 {
-            return (payload.to_string(), 0);
-        }
-        self.elided_total
-            .fetch_add(elided as u64, Ordering::Relaxed);
-        match serde_json::to_string(&outer) {
-            Ok(s) => (s, elided),
-            Err(_) => (payload.to_string(), 0),
-        }
+        let mut delivery = self.begin_delivery(session_id);
+        let result = delivery.process(scope, payload);
+        delivery.commit([scope]);
+        result
     }
 
-    /// Первый проход: опустить уже отданные строки и ЗАПОМНИТЬ новые как
-    /// отданные. Возвращает (число опущенных, отпечатки опущенных строк).
-    fn dedup_and_record(&self, sid: &str, scope: &str, obj: &mut Value) -> (usize, HashSet<u64>) {
-        let mut elided_fps: HashSet<u64> = HashSet::new();
-        let mut guard = lock_w(&self.sessions);
-        // Защита от утечки: новая сессия при переполнении карты → полный сброс.
-        if !guard.contains_key(sid) && guard.len() >= self.max_sessions {
-            guard.clear();
+    /// Подготовить доставку под общим lock; до commit изменения только локальные.
+    pub(crate) fn begin_delivery(&self, session_id: Option<&str>) -> DedupDelivery<'_> {
+        let session_id = session_id.filter(|_| self.enabled);
+        let sessions = session_id.map(|_| lock_w(&self.sessions));
+        let seen = session_id
+            .and_then(|sid| sessions.as_ref()?.get(sid))
+            .cloned()
+            .unwrap_or_default();
+        DedupDelivery {
+            owner: self,
+            sessions,
+            session_id: session_id.map(str::to_string),
+            seen,
+            pending: HashMap::new(),
         }
-        let max_rows = self.max_rows_per_session;
-        let seen = guard.entry(sid.to_string()).or_default();
-        let elided = {
-            let fps = &mut elided_fps;
-            Self::rewrite_rows(obj, &mut |row| {
-                let fp = fingerprint(scope, row);
-                if seen.contains(&fp) {
-                    fps.insert(fp);
-                    true
-                } else {
-                    if seen.len() < max_rows {
-                        seen.insert(fp);
-                    }
-                    false
-                }
-            })
-        };
-        drop(guard);
-        (elided, elided_fps)
     }
 
     /// Повторный проход по ДУБЛИРУЮЩЕМУ представлению того же ответа
@@ -296,6 +240,121 @@ impl SessionDedup {
     }
 }
 
+impl DedupDelivery<'_> {
+    pub(crate) fn process(&mut self, scope: &str, payload: &str) -> (String, usize) {
+        if self.sessions.is_none() {
+            return (payload.to_string(), 0);
+        }
+        let Ok(mut outer) = serde_json::from_str::<Value>(payload) else {
+            return (payload.to_string(), 0);
+        };
+
+        // Данные tool'а лежат в MCP CallToolResult: content[*].text — это
+        // вложенная JSON-строка `{result, _meta}`. Находим её, дедупим, кладём
+        // обратно. structuredContent (если есть) дублирует ТЕ ЖЕ данные.
+        let mut elided = 0usize;
+        // Отпечатки строк, опущенных первым проходом. Второй проход обязан
+        // опустить РОВНО их: память сессии он не трогает и своего решения не
+        // принимает. Иначе он увидит в памяти строки, только что запомненные
+        // первым проходом, и опустит весь ответ до единой строки.
+        let mut elided_fps: HashSet<u64> = HashSet::new();
+        let mut text_pass_done = false;
+
+        // 1) content[0].text (вложенный JSON-string)
+        if let Some(text_idx) = find_text_content_index(&outer) {
+            if let Some(text) = outer["content"][text_idx]["text"].as_str() {
+                if let Ok(mut inner) = serde_json::from_str::<Value>(text) {
+                    let (n, fps) = self.dedup_and_record(scope, &mut inner);
+                    elided += n;
+                    elided_fps = fps;
+                    text_pass_done = true;
+                    if n > 0 {
+                        if let Ok(s) = serde_json::to_string(&inner) {
+                            outer["content"][text_idx]["text"] = Value::String(s);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2) structuredContent (rmcp structured output, дублирует данные)
+        if outer.get("structuredContent").is_some() {
+            let mut sc = outer["structuredContent"].take();
+            if text_pass_done {
+                // Дубль уже обработанного ответа — повторяем решение первого прохода.
+                self.owner.apply_elision(&elided_fps, scope, &mut sc);
+            } else {
+                // Текстовой части не было: структурная форма — единственный
+                // источник, обрабатываем её полноценно.
+                elided += self.dedup_and_record(scope, &mut sc).0;
+            }
+            outer["structuredContent"] = sc;
+        }
+
+        if elided == 0 {
+            return (payload.to_string(), 0);
+        }
+        match serde_json::to_string(&outer) {
+            Ok(s) => {
+                self.pending.entry(scope.to_string()).or_default().elided += elided;
+                (s, elided)
+            }
+            Err(_) => (payload.to_string(), 0),
+        }
+    }
+
+    fn dedup_and_record(&mut self, scope: &str, obj: &mut Value) -> (usize, HashSet<u64>) {
+        let mut elided_fps = HashSet::new();
+        let pending = self.pending.entry(scope.to_string()).or_default();
+        let seen = &mut self.seen;
+        let max_rows = self.owner.max_rows_per_session;
+        let elided = SessionDedup::rewrite_rows(obj, &mut |row| {
+            let fp = fingerprint(scope, row);
+            if seen.contains(&fp) {
+                elided_fps.insert(fp);
+                true
+            } else {
+                if seen.len() < max_rows {
+                    seen.insert(fp);
+                    pending.fingerprints.insert(fp);
+                }
+                false
+            }
+        });
+        (elided, elided_fps)
+    }
+
+    /// Фиксируются только группы, payload которых действительно дошёл до клиента.
+    pub(crate) fn commit<'s>(mut self, scopes: impl IntoIterator<Item = &'s str>) {
+        let (Some(sessions), Some(sid)) = (self.sessions.as_mut(), self.session_id.as_deref())
+        else {
+            return;
+        };
+        let mut committed = false;
+        for scope in scopes {
+            let Some(pending) = self.pending.remove(scope) else {
+                continue;
+            };
+            if !committed {
+                if !sessions.contains_key(sid) && sessions.len() >= self.owner.max_sessions {
+                    sessions.clear();
+                }
+                committed = true;
+            }
+            let seen = sessions.entry(sid.to_string()).or_default();
+            for fp in pending.fingerprints {
+                if seen.len() >= self.owner.max_rows_per_session {
+                    break;
+                }
+                seen.insert(fp);
+            }
+            self.owner
+                .elided_total
+                .fetch_add(pending.elided as u64, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Усечённый до u64 sha256 от ОБЛАСТИ и канонической (с сортировкой ключей)
 /// сериализации строки таблицы. Коллизия на 50k строк ≈ 1e-10 — пренебрежимо.
 ///
@@ -358,6 +417,167 @@ mod tests {
         let text = outer["content"][0]["text"].as_str().unwrap();
         let inner: Value = serde_json::from_str(text).unwrap();
         inner["result"]["rows"].as_array().unwrap().clone()
+    }
+
+    fn dual_payload(result: Value) -> String {
+        let inner = json!({ "result": result });
+        json!({
+            "content": [{"type": "text", "text": inner.to_string()}],
+            "structuredContent": inner
+        })
+        .to_string()
+    }
+
+    fn synchronized_inner(payload: &str) -> Value {
+        let outer: Value = serde_json::from_str(payload).unwrap();
+        let inner: Value =
+            serde_json::from_str(outer["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner, outer["structuredContent"]);
+        inner
+    }
+
+    #[test]
+    fn delivery_abort_and_commit_preserve_only_retained_scopes() {
+        for table in [false, true] {
+            let d = SessionDedup::new(true);
+            let make = |rows: Value| dual_payload(if table { json!({"rows": rows}) } else { rows });
+            let old = make(json!(["old"]));
+            let mixed = make(json!(["old", "new"]));
+            d.process(Some("s1"), "tool|alpha", &old);
+            d.process(Some("s1"), "tool|beta", &old);
+            {
+                let mut delivery = d.begin_delivery(Some("s1"));
+                assert_eq!(delivery.process("tool|alpha", &mixed).1, 1);
+                assert_eq!(delivery.process("tool|beta", &mixed).1, 1);
+                assert_eq!(delivery.sessions.as_ref().unwrap()["s1"].len(), 2);
+                assert_eq!(d.elided_total.load(Ordering::Relaxed), 0);
+            }
+            assert_eq!(d.stats(), (1, 0));
+            let mut delivery = d.begin_delivery(Some("s1"));
+            delivery.process("tool|alpha", &mixed);
+            delivery.process("tool|beta", &mixed);
+            delivery.commit(["tool|alpha"]);
+            assert_eq!(d.stats(), (1, 1));
+
+            let (alpha, elided) = d.process(Some("s1"), "tool|alpha", &mixed);
+            assert_eq!(elided, 2);
+            let alpha = synchronized_inner(&alpha);
+            let alpha = if table { &alpha["result"] } else { &alpha };
+            assert_eq!(alpha["rows_elided_already_delivered"], 2);
+            let (beta, elided) = d.process(Some("s1"), "tool|beta", &mixed);
+            assert_eq!(elided, 1);
+            let beta = synchronized_inner(&beta);
+            if table {
+                assert_eq!(beta["result"]["rows"], json!(["new"]));
+                assert_eq!(beta["result"]["rows_elided_already_delivered"], 1);
+            } else {
+                assert_eq!(beta["result"], json!(["new"]));
+                assert_eq!(beta["rows_elided_already_delivered"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_without_session_or_enabled_dedup_is_inert() {
+        for (enabled, session) in [(true, None), (false, Some("s1"))] {
+            let d = SessionDedup::new(enabled);
+            let payload = dual_payload(json!(["new"]));
+            let mut delivery = d.begin_delivery(session);
+            assert!(delivery.sessions.is_none());
+            assert_eq!(delivery.process(SCOPE, &payload), (payload.clone(), 0));
+            assert_eq!(delivery.process(SCOPE, &payload), (payload, 0));
+            assert!(delivery.pending.is_empty());
+            delivery.commit([SCOPE]);
+            assert_eq!(d.stats(), (0, 0));
+        }
+    }
+
+    #[test]
+    fn delivery_memory_limits_apply_only_on_commit() {
+        let mut d = SessionDedup::new(true);
+        d.max_rows_per_session = 2;
+        d.max_sessions = 1;
+        let payload = mcp_payload(json!(["A", "B", "C"]));
+        d.process(Some("old"), SCOPE, &payload);
+        assert_eq!(lock_r(&d.sessions)["old"].len(), 2);
+        for commit_empty in [false, true] {
+            let mut delivery = d.begin_delivery(Some("new"));
+            delivery.process(SCOPE, &payload);
+            assert_eq!(delivery.sessions.as_ref().unwrap().len(), 1);
+            assert!(delivery.sessions.as_ref().unwrap().contains_key("old"));
+            if commit_empty {
+                delivery.commit([]);
+            } else {
+                drop(delivery);
+            }
+            assert_eq!(d.stats(), (1, 0));
+            assert!(lock_r(&d.sessions).contains_key("old"));
+        }
+        let mut delivery = d.begin_delivery(Some("new"));
+        delivery.process(SCOPE, &payload);
+        delivery.commit([SCOPE]);
+        assert!(!lock_r(&d.sessions).contains_key("old"));
+        assert_eq!(lock_r(&d.sessions)["new"].len(), 2);
+        let (out, elided) = d.process(Some("new"), SCOPE, &payload);
+        assert_eq!(elided, 2);
+        assert_eq!(rows_of(&out), vec![json!("C")]);
+        assert_eq!(lock_r(&d.sessions)["new"].len(), 2);
+    }
+
+    #[test]
+    fn delivery_serializes_concurrent_writers_without_losing_rows() {
+        use std::sync::{mpsc, Arc};
+
+        for commit in [false, true] {
+            let d = Arc::new(SessionDedup::new(true));
+            let alpha = mcp_payload(json!(["A"]));
+            let beta = mcp_payload(json!(["B"]));
+            let mut delivery = d.begin_delivery(Some("s1"));
+            delivery.process("tool|alpha", &alpha);
+            delivery.process("tool|beta", &beta);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let other = Arc::clone(&d);
+            let worker = std::thread::spawn(move || {
+                assert!(other.sessions.try_write().is_err());
+                ready_tx.send(()).unwrap();
+                let mut delivery = other.begin_delivery(Some("s1"));
+                let alpha = delivery.process("tool|alpha", &mcp_payload(json!(["A", "C"])));
+                let beta = delivery.process("tool|beta", &mcp_payload(json!(["B"])));
+                delivery.commit(["tool|alpha", "tool|beta"]);
+                done_tx.send((alpha, beta)).unwrap();
+            });
+            ready_rx.recv().unwrap();
+            assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            if commit {
+                delivery.commit(["tool|alpha"]);
+            } else {
+                drop(delivery);
+            }
+            let ((alpha, elided), (beta, beta_elided)) = done_rx.recv().unwrap();
+            worker.join().unwrap();
+            assert_eq!(elided, usize::from(commit));
+            assert_eq!(
+                rows_of(&alpha),
+                if commit {
+                    vec![json!("C")]
+                } else {
+                    vec![json!("A"), json!("C")]
+                }
+            );
+            assert_eq!(beta_elided, 0);
+            assert_eq!(rows_of(&beta), vec![json!("B")]);
+            assert_eq!(
+                d.process(Some("s1"), "tool|alpha", &alpha).1,
+                if commit { 1 } else { 2 }
+            );
+            assert_eq!(
+                d.process(Some("s1"), "tool|alpha", &mcp_payload(json!(["A", "C"])))
+                    .1,
+                2
+            );
+            assert_eq!(d.process(Some("s1"), "tool|beta", &beta).1, 1);
+        }
     }
 
     #[test]

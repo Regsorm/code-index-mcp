@@ -65,6 +65,59 @@ impl RemoteServeClient {
         Ok(text)
     }
 
+    /// Ограниченный вход не имеет fallback на прежние неограниченные endpoints.
+    pub(crate) async fn call_bounded_search(
+        &self,
+        request: &crate::mcp::multi_repo::BoundedSearchRequest,
+        max_bytes: usize,
+        timeout: Duration,
+    ) -> anyhow::Result<crate::mcp::multi_repo::BoundedSearchResponse> {
+        tokio::time::timeout(timeout, async {
+            let mut response = self
+                .http
+                .post(format!("{}/federate/bounded_search", self.base_url))
+                .timeout(timeout)
+                .json(request)
+                .send()
+                .await?;
+            anyhow::ensure!(
+                response.status().is_success(),
+                "bounded_search HTTP {}",
+                response.status()
+            );
+            let ceiling = max_bytes.saturating_add(4096);
+            if let Some(size) = response.content_length() {
+                anyhow::ensure!(size <= ceiling as u64, "bounded_search response_bytes");
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                anyhow::ensure!(
+                    chunk.len() <= ceiling.saturating_sub(body.len()),
+                    "bounded_search response_bytes"
+                );
+                body.extend_from_slice(&chunk);
+            }
+            let response: crate::mcp::multi_repo::BoundedSearchResponse =
+                serde_json::from_slice(&body)?;
+            anyhow::ensure!(
+                response.usage.files <= request.budget.max_files
+                    && response.usage.compressed_bytes <= request.budget.max_compressed_bytes
+                    && response.usage.uncompressed_bytes <= request.budget.max_uncompressed_bytes
+                    && response.header_usage.files <= request.header_budget.max_files
+                    && response.header_usage.compressed_bytes
+                        <= request.header_budget.max_compressed_bytes
+                    && response.header_usage.uncompressed_bytes
+                        <= request.header_budget.max_uncompressed_bytes
+                    && crate::mcp::multi_repo::search_shown(&request.tool, &response.payload)
+                        <= request.limit,
+                "bounded_search: invalid SearchUsage or limit"
+            );
+            Ok(response)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("bounded_search timeout"))?
+    }
+
     /// Базовый URL — для логов и отладки.
     pub fn base_url(&self) -> &str {
         &self.base_url

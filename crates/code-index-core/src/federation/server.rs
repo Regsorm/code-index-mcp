@@ -35,6 +35,7 @@ type Server = Arc<CodeIndexServer>;
 /// `serve.toml` и ставится `merge` рядом с `/mcp`.
 pub fn federate_router(server: CodeIndexServer) -> Router {
     Router::new()
+        .route("/federate/bounded_search", post(handle_bounded_search))
         .route("/federate/search_function", post(handle_search_function))
         .route("/federate/search_class", post(handle_search_class))
         .route("/federate/get_function", post(handle_get_function))
@@ -114,6 +115,112 @@ fn resolve_local(
     Ok(entry)
 }
 
+async fn annotated_json(entry: &RepoEntry, body: String) -> axum::response::Response {
+    let value = serde_json::from_str(&body)
+        .unwrap_or_else(|_| serde_json::json!({"error": "invalid tool JSON"}));
+    let value = tools::annotate_stale_index(value, entry.storage_pool(), None).await;
+    ok_json(value.to_string())
+}
+
+async fn handle_bounded_search(
+    State(server): State<Server>,
+    Json(mut request): Json<crate::mcp::multi_repo::BoundedSearchRequest>,
+) -> axum::response::Response {
+    use crate::mcp::multi_repo::{supports_multi_repo, BoundedSearchResponse};
+    use crate::storage::search_support::{self, SearchBudget};
+    let fail = |message: &str| (StatusCode::BAD_REQUEST, message.to_string()).into_response();
+    if !supports_multi_repo(&request.tool) {
+        return fail("bounded_search: tool запрещён");
+    }
+    if server
+        .allowed_tools
+        .as_ref()
+        .as_ref()
+        .is_some_and(|allowed| !allowed.contains(&request.tool))
+    {
+        return fail("bounded_search: tool выключен whitelist");
+    }
+    if request.args.get("repos").is_some() || !request.args.is_object() {
+        return fail("bounded_search: вложенный fan-out запрещён");
+    }
+    if request.args.get("full_names").is_some_and(|v| !v.is_null())
+        && !server.mass_mode_tools.contains(&request.tool)
+    {
+        return fail("bounded_search: массовый режим выключен");
+    }
+    let Some(repo) = request.args.get("repo").and_then(serde_json::Value::as_str) else {
+        return fail("bounded_search: repo должен быть строковым алиасом");
+    };
+    let snapshot = server.repos.load_full();
+    let Some(entry) = snapshot.get(repo).filter(|entry| entry.is_local) else {
+        return fail("bounded_search: требуется зарегистрированный локальный repo");
+    };
+    let ceiling = SearchBudget::multi_repo();
+    let header_ceiling = SearchBudget::header_probe();
+    let max_limit = if request.tool == "get_object_structure" {
+        50
+    } else {
+        500
+    };
+    if request.limit == 0
+        || request.limit > max_limit
+        || request.budget.max_files > ceiling.max_files
+        || request.budget.max_compressed_bytes > ceiling.max_compressed_bytes
+        || request.budget.max_uncompressed_bytes > ceiling.max_uncompressed_bytes
+        || request.header_budget.max_files > header_ceiling.max_files
+        || request.header_budget.max_compressed_bytes > header_ceiling.max_compressed_bytes
+        || request.header_budget.max_uncompressed_bytes > header_ceiling.max_uncompressed_bytes
+        || request.max_response_bytes == 0
+        || request.max_response_bytes > crate::mcp::cap::response_cap_hard()
+        || request.timeout_ms == 0
+        || request.timeout_ms > 30_000
+    {
+        return fail("bounded_search: неверный бюджет");
+    }
+    request.args["limit"] = serde_json::json!(request.limit);
+    request.args["max_response_bytes"] = serde_json::json!(request.max_response_bytes);
+    let timeout = std::time::Duration::from_millis(request.timeout_ms).min(
+        server
+            .tool_timeout
+            .unwrap_or(std::time::Duration::from_secs(30)),
+    );
+    let ((payload, header_usage), mut usage) =
+        search_support::search_scope(request.budget, timeout, request.limit, async {
+            search_support::limit_header_budget(request.header_budget);
+            search_support::set_response_bytes(request.max_response_bytes / 2);
+            let run = async {
+                let payload = server
+                    .execute_single_search(&request.tool, request.args.clone(), entry, true)
+                    .await;
+                if request.tool == "list_files" {
+                    payload
+                } else {
+                    tools::annotate_stale_index(payload, entry.storage_pool(), None).await
+                }
+            };
+            let payload = match tokio::time::timeout(timeout, run).await {
+                Ok(value) => value,
+                Err(_) => serde_json::json!({"error": "tool_timeout", "complete": false}),
+            };
+            (payload, search_support::current_header_usage())
+        })
+        .await;
+    // Набор не кэшируется: пути удалённого индекса не нужны origin для invalidation.
+    usage.dependent_files.clear();
+    let mut payload = payload;
+    crate::mcp::multi_repo::strip_internal(&mut payload);
+    let response = BoundedSearchResponse {
+        payload,
+        usage,
+        header_usage,
+    };
+    let body = match serde_json::to_string(&response) {
+        Ok(body) if body.len() <= request.max_response_bytes.saturating_add(4096) => body,
+        _ => return fail("bounded_search: response_bytes"),
+    };
+    ok_json(body)
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 async fn handle_search_function(
@@ -124,7 +231,11 @@ async fn handle_search_function(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::search_function(&entry, p.query, p.limit, p.language, p.path_glob).await)
+    annotated_json(
+        &entry,
+        tools::search_function(&entry, p.query, p.limit, p.language, p.path_glob).await,
+    )
+    .await
 }
 
 async fn handle_search_class(
@@ -135,7 +246,11 @@ async fn handle_search_class(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::search_class(&entry, p.query, p.limit, p.language, p.path_glob).await)
+    annotated_json(
+        &entry,
+        tools::search_class(&entry, p.query, p.limit, p.language, p.path_glob).await,
+    )
+    .await
 }
 
 async fn handle_get_function(
@@ -146,7 +261,11 @@ async fn handle_get_function(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::get_function(&entry, p.name, p.path_glob).await)
+    annotated_json(
+        &entry,
+        tools::get_function(&entry, p.name, p.path_glob).await,
+    )
+    .await
 }
 
 async fn handle_get_class(
@@ -157,7 +276,7 @@ async fn handle_get_class(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::get_class(&entry, p.name, p.path_glob).await)
+    annotated_json(&entry, tools::get_class(&entry, p.name, p.path_glob).await).await
 }
 
 async fn handle_get_callers(
@@ -168,7 +287,11 @@ async fn handle_get_callers(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::get_callers(&entry, p.function_name, p.language, p.limit, p.path_glob).await)
+    annotated_json(
+        &entry,
+        tools::get_callers(&entry, p.function_name, p.language, p.limit, p.path_glob).await,
+    )
+    .await
 }
 
 async fn handle_get_callees(
@@ -179,7 +302,11 @@ async fn handle_get_callees(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::get_callees(&entry, p.function_name, p.language, p.limit, p.path_glob).await)
+    annotated_json(
+        &entry,
+        tools::get_callees(&entry, p.function_name, p.language, p.limit, p.path_glob).await,
+    )
+    .await
 }
 
 async fn handle_find_path(
@@ -190,7 +317,11 @@ async fn handle_find_path(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::find_path(&entry, p.from, p.to, p.max_depth, p.language).await)
+    annotated_json(
+        &entry,
+        tools::find_path(&entry, p.from, p.to, p.max_depth, p.language).await,
+    )
+    .await
 }
 
 async fn handle_get_call_tree(
@@ -201,7 +332,8 @@ async fn handle_get_call_tree(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(
+    annotated_json(
+        &entry,
         tools::get_call_tree(
             &entry,
             tools::CallTreeOptions {
@@ -216,6 +348,7 @@ async fn handle_get_call_tree(
         )
         .await,
     )
+    .await
 }
 
 async fn handle_find_symbol(
@@ -226,7 +359,11 @@ async fn handle_find_symbol(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::find_symbol(&entry, p.name, p.language, p.path_glob).await)
+    annotated_json(
+        &entry,
+        tools::find_symbol(&entry, p.name, p.language, p.path_glob).await,
+    )
+    .await
 }
 
 async fn handle_get_imports(
@@ -237,7 +374,11 @@ async fn handle_get_imports(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::get_imports(&entry, p.file_id, p.module, p.language, p.limit).await)
+    annotated_json(
+        &entry,
+        tools::get_imports(&entry, p.file_id, p.module, p.language, p.limit).await,
+    )
+    .await
 }
 
 async fn handle_get_file_summary(
@@ -248,7 +389,7 @@ async fn handle_get_file_summary(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::get_file_summary(&entry, p.path).await)
+    annotated_json(&entry, tools::get_file_summary(&entry, p.path).await).await
 }
 
 async fn handle_get_stats(
@@ -313,7 +454,11 @@ async fn handle_search_text(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::search_text(&entry, p.query, p.limit, p.language, p.path_glob).await)
+    annotated_json(
+        &entry,
+        tools::search_text(&entry, p.query, p.limit, p.language, p.path_glob).await,
+    )
+    .await
 }
 
 async fn handle_grep_body(
@@ -326,7 +471,8 @@ async fn handle_grep_body(
     };
     // `query` — алиас для `regex` (см. GrepBodyParams).
     let regex = p.regex.clone().or_else(|| p.query.clone());
-    ok_json(
+    annotated_json(
+        &entry,
         tools::grep_body(
             &entry,
             p.pattern,
@@ -338,6 +484,7 @@ async fn handle_grep_body(
         )
         .await,
     )
+    .await
 }
 
 // ── Phase 1 federation handlers ─────────────────────────────────────────────
@@ -372,7 +519,11 @@ async fn handle_read_file(
         Ok(e) => e,
         Err(r) => return *r,
     };
-    ok_json(tools::read_file(&entry, p.path, p.line_start, p.line_end).await)
+    annotated_json(
+        &entry,
+        tools::read_file(&entry, p.path, p.line_start, p.line_end).await,
+    )
+    .await
 }
 
 async fn handle_git_log(
@@ -449,7 +600,8 @@ async fn handle_grep_text(
             )
         }
     };
-    ok_json(
+    annotated_json(
+        &entry,
         tools::grep_text(
             &entry,
             regex,
@@ -460,6 +612,7 @@ async fn handle_grep_text(
         )
         .await,
     )
+    .await
 }
 
 async fn handle_grep_code(
@@ -481,7 +634,8 @@ async fn handle_grep_code(
             )
         }
     };
-    ok_json(
+    annotated_json(
+        &entry,
         tools::grep_code(
             &entry,
             regex,
@@ -495,6 +649,7 @@ async fn handle_grep_code(
         )
         .await,
     )
+    .await
 }
 
 /// Универсальный handler для extension-tools (v0.8.1).
@@ -553,6 +708,7 @@ async fn handle_extension_tool(
     // а не неполные метаданные/термы/граф. Без него федеративный вход обходил
     // прогрессивную готовность.
     if let Some(value) = crate::mcp::tools::extras_building_response(storage).await {
+        let value = tools::annotate_stale_index(value, storage, None).await;
         let body = serde_json::to_string(&value).unwrap_or_else(|e| {
             federation_error(&p.tool_name, &server.own_ip, format!("serialize: {}", e))
         });
@@ -572,7 +728,7 @@ async fn handle_extension_tool(
     // устаревшей базе нужна здесь так же, как в штатном `call_tool`: вызывающая
     // сторона отдаёт наш ответ клиенту как есть, ничего к нему не добавляя.
     // Решение принимается по базе ЭТОЙ ноды — она и собрана своим сборщиком.
-    let value = crate::mcp::tools::annotate_stale_index(value, storage, root_path).await;
+    let value = crate::mcp::tools::annotate_stale_index(value, storage, None).await;
     // Сериализуем результат — он уже валидный JSON.
     let body = serde_json::to_string(&value).unwrap_or_else(|e| {
         federation_error(&p.tool_name, &server.own_ip, format!("serialize: {}", e))

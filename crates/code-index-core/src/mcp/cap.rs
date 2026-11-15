@@ -450,6 +450,16 @@ pub fn shrink_search_results(mut value: Value, budget: usize) -> (Value, SearchS
     (value, out)
 }
 
+/// Ключи элемента результата, которые НЕ опускаются при ужатии ответа-поиска:
+/// опознание найденного объекта и причина его совпадения с критерием (#30).
+/// Без них ответ «нашлось N» бесполезен — клиент не знает, ЧТО найдено и ПОЧЕМУ.
+const PROTECTED_ITEM_KEYS: &[&str] = &["full_name", "meta_type", "name", "synonym", "matched_by"];
+
+/// Защищён ли ключ элемента от опускания при ужатии.
+fn is_protected_item_key(key: &str) -> bool {
+    PROTECTED_ITEM_KEYS.contains(&key)
+}
+
 /// Самая тяжёлая опускаемая секция среди ЭЛЕМЕНТОВ массива `results`.
 /// Сам массив кандидатом не является — в этом всё отличие от
 /// `heaviest_section`. Возвращает (pointer_родителя, ключ, count, ser_size),
@@ -459,6 +469,11 @@ fn heaviest_section_in_items(root: &Value) -> Option<(String, String, usize, usi
     let mut best: Option<(String, String, usize, usize)> = None;
     for (i, item) in items.iter().enumerate() {
         if let Some((parent, key, count, size)) = heaviest_section(item) {
+            // Опознание объекта и `matched_by` не снимаются никогда: они и есть
+            // тот минимум, ради которого ответ отдаётся.
+            if is_protected_item_key(&key) {
+                continue;
+            }
             if best.as_ref().is_none_or(|b| size > b.3) {
                 best = Some((
                     format!("/{}/{}{}", RESULTS_KEY, i, parent),
