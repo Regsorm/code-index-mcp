@@ -7,6 +7,12 @@ Versioning — [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.17.1] - 2026-11-15
+
+### Fixed
+
+- #34: `grep_code` and `grep_text` now expose conflicting criteria through `search_param_conflict`, naming the selected and ignored keys with bounded value previews. Reproduced on 1.17.0: `pattern` combined with `regex="true"` returned matches for `true` without explanation. Search priorities and results stay unchanged; booleans are still rejected. Diagnostics are included in final multi-repo response budgeting and survive empty results, cache hits, session deduplication, federation and multi-repo. Verified by 1198 workspace tests and 26 HTTP MCP check groups against local and remote indexes; the old server confirms the missing diagnostic.
+
 ## [1.17.0] - 2026-11-15
 
 ### Added
