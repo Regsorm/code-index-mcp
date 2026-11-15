@@ -396,6 +396,19 @@ git_path = "/srv/export"         # optional: where the work tree lives
 
 **Empty `grep_code` hint.** If the search went through `pattern=` and the value contains regex metacharacters (`|`, `(`, `[`, `.`, `{`, `?`, `\`), the hint says `pattern` is a literal substring and only `regex=` searches for an alternative. The oversize caveat now carries the number of files skipped by size (zero means size is not the reason).
 
+**Conflicting grep criteria (#34).** When `grep_code` or `grep_text`
+receives multiple search criteria, `search_param_conflict` appears next to
+`result`: `used` identifies the selected key and value, `ignored` lists ignored
+keys and values, and `note` explains the conflict. `grep_code` and `grep_text`
+keep the existing priority `regex` → `query` → `pattern`, skipping empty and
+whitespace-only strings. `null` means absent.
+Even identical values in two keys produce a warning. Diagnostic values are
+limited to 256 Unicode characters (`value_truncated` marks a shortened preview);
+the search uses the full value. Diagnostics survive empty results, cache hits,
+session deduplication, federation and the outer multi-repository response,
+including byte-budget truncation. A single criterion produces no warning.
+Booleans are still rejected; the string `"true"` remains a valid regex.
+
 ### Code-file content storage (v0.8.0)
 
 Starting with v0.8.0, code-file content is stored in the `file_contents` table (zstd-compressed) and returned by `read_file` and searched by `grep_code`. Large files can be excluded from storage via `max_code_file_size_bytes` (default **5 MB**):
