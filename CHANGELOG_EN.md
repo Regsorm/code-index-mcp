@@ -7,6 +7,14 @@ Versioning — [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.17.2] - 2026-11-24
+
+### Fixed
+
+- #36: `tools/list` schemas for `find_symbol`, `get_object_structure`, `grep_code`, `grep_text` and `list_files` compile with LLGuidance. In 1.17.1 the compiler rejected five schemas containing `not`, and clients converting the root `anyOf` produced an unsupported `oneOf`. The schema description explains how to choose `repo` or `repos`, and the server enforces the rule on each call.
+- Updated `url` to 2.5.9 to address RUSTSEC-2026-0592.
+- The daemon, logs, index, and Git MCP tools use `jiff` in place of `chrono`, preserving their existing date and time formats. The `rmcp` SDK uses a pinned revision with the changes from SDK PR #1474, with `chrono` support disabled (RUSTSEC-2026-0543).
+
 ## [1.17.1] - 2026-11-15
 
 ### Fixed
