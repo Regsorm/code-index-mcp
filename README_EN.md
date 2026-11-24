@@ -985,6 +985,10 @@ empty entries, unknown aliases and invalid or overly broad masks are rejected
 before execution with the available aliases listed. A selector never opens a
 path or address. Other tools reject `repos`.
 
+In `tools/list`, the schema description explains the selector rule. Pass
+either `repo` or `repos` when calling a tool. Omit both if a default repository
+is available.
+
 A list or mask, including a one-repository set, returns `result.repos`:
 each group contains `repo`, `status` and the original single-search `payload`.
 Statuses `ok`, `partial`, `error`, `skipped` and `truncated` distinguish
