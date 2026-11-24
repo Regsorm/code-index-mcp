@@ -997,7 +997,9 @@ impl<'a> Indexer<'a> {
             content_hash: content_hash.to_string(),
             language: language.to_string(),
             lines_total,
-            indexed_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            indexed_at: jiff::Timestamp::now()
+                .strftime("%Y-%m-%d %H:%M:%S")
+                .to_string(),
             mtime,
             file_size,
         };
@@ -1171,7 +1173,9 @@ impl<'a> Indexer<'a> {
             content_hash: content_hash.to_string(),
             language: "text".to_string(),
             lines_total,
-            indexed_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            indexed_at: jiff::Timestamp::now()
+                .strftime("%Y-%m-%d %H:%M:%S")
+                .to_string(),
             mtime,
             file_size,
         };
@@ -1215,7 +1219,9 @@ impl<'a> Indexer<'a> {
             content_hash: content_hash.to_string(),
             language: "text".to_string(),
             lines_total,
-            indexed_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            indexed_at: jiff::Timestamp::now()
+                .strftime("%Y-%m-%d %H:%M:%S")
+                .to_string(),
             mtime,
             file_size,
         };

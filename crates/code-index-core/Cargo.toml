@@ -86,7 +86,7 @@ sysinfo = { workspace = true }
 
 # Утилиты
 hex = { workspace = true }
-chrono = { workspace = true }
+jiff = { workspace = true }
 
 # HTTP
 axum = { workspace = true }

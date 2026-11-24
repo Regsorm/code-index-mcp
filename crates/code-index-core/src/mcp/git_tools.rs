@@ -19,7 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use chrono::{FixedOffset, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
+use jiff::civil::{Date, DateTime};
+use jiff::tz::{AmbiguousOffset, Offset, TimeZone};
+use jiff::{Timestamp, ZonedDateTime};
 use serde::Serialize;
 
 use super::RepoEntry;
@@ -636,16 +638,15 @@ fn parse_moment(
     end_of_day: bool,
     tz: Option<&str>,
 ) -> Result<(String, String), GitError> {
-    let naive: NaiveDateTime = if let Ok(date) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
-        let time = if end_of_day {
-            date.and_hms_opt(23, 59, 59)
+    let naive = if let Ok(date) = Date::strptime("%Y-%m-%d", input) {
+        if end_of_day {
+            date.at(23, 59, 59, 0)
         } else {
-            date.and_hms_opt(0, 0, 0)
-        };
-        time.ok_or_else(|| GitError::new(repo, format!("невозможная дата '{input}'")))?
-    } else if let Ok(dt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M") {
+            date.at(0, 0, 0, 0)
+        }
+    } else if let Ok(dt) = DateTime::strptime("%Y-%m-%d %H:%M", input) {
         dt
-    } else if let Ok(dt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%dT%H:%M") {
+    } else if let Ok(dt) = DateTime::strptime("%Y-%m-%dT%H:%M", input) {
         dt
     } else {
         return Err(GitError::new(
@@ -665,41 +666,61 @@ fn parse_moment(
                 )
                 .with_input(input)
             })?;
-            let moment = offset.from_local_datetime(&naive).single().ok_or_else(|| {
-                GitError::new(
-                    repo,
-                    format!("момент '{input}' не существует в поясе {text}"),
-                )
-                .with_input(input)
-            })?;
-            Ok((
-                moment.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
-                offset.to_string(),
-            ))
+            let moment = naive
+                .to_zoned_datetime(TimeZone::fixed(offset))
+                .map_err(|_| {
+                    GitError::new(
+                        repo,
+                        format!("момент '{input}' не существует в поясе {text}"),
+                    )
+                    .with_input(input)
+                })?;
+            Ok(format_git_moment(&moment))
         }
-        None => match Local.from_local_datetime(&naive) {
-            LocalResult::Single(dt) => Ok((
-                dt.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
-                dt.offset().to_string(),
-            )),
-            LocalResult::Ambiguous(_, _) => Err(GitError::new(
-                repo,
-                format!("локальный момент '{input}' неоднозначен из-за перехода часового пояса"),
-            )
-            .with_input(input)
-            .with_hint("укажите дату без времени, другое время или параметр tz")),
-            LocalResult::None => Err(GitError::new(
-                repo,
-                format!("локальный момент '{input}' не существует из-за перехода часового пояса"),
-            )
-            .with_input(input)
-            .with_hint("укажите параметр tz со смещением, например +03:00")),
-        },
+        None => local_git_moment(repo, input, naive, &TimeZone::system()),
     }
 }
 
+fn local_git_moment(
+    repo: &str,
+    input: &str,
+    naive: DateTime,
+    zone: &TimeZone,
+) -> Result<(String, String), GitError> {
+    let local = zone.to_ambiguous_zoned_datetime(naive);
+    match local.offset() {
+        AmbiguousOffset::Fold { .. } => Err(GitError::new(
+            repo,
+            format!("локальный момент '{input}' неоднозначен из-за перехода часового пояса"),
+        )
+        .with_input(input)
+        .with_hint("укажите дату без времени, другое время или параметр tz")),
+        AmbiguousOffset::Gap { .. } => Err(GitError::new(
+            repo,
+            format!("локальный момент '{input}' не существует из-за перехода часового пояса"),
+        )
+        .with_input(input)
+        .with_hint("укажите параметр tz со смещением, например +03:00")),
+        AmbiguousOffset::Unambiguous { .. } => local
+            .unambiguous()
+            .map(|dt| format_git_moment(&dt))
+            .map_err(|_| {
+                GitError::new(repo, format!("локальный момент '{input}' вне диапазона"))
+                    .with_input(input)
+            }),
+    }
+}
+
+fn format_git_moment(moment: &ZonedDateTime) -> (String, String) {
+    let mut offset = moment.offset().to_string();
+    if offset.len() == 3 {
+        offset.push_str(":00");
+    }
+    (moment.strftime("%Y-%m-%dT%H:%M:%S%:z").to_string(), offset)
+}
+
 /// Разобрать смещение часового пояса: `+03:00`, `-05:00`, `UTC`, `Z`.
-fn parse_offset(text: &str) -> Option<FixedOffset> {
+fn parse_offset(text: &str) -> Option<Offset> {
     let trimmed = text.trim();
     let body = if trimmed.eq_ignore_ascii_case("utc") || trimmed.eq_ignore_ascii_case("z") {
         "+00:00"
@@ -722,27 +743,17 @@ fn parse_offset(text: &str) -> Option<FixedOffset> {
         return None;
     }
     let sign = if head.starts_with('-') { -1 } else { 1 };
-    FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60))
+    Offset::from_seconds(sign * (hours * 3600 + minutes * 60)).ok()
 }
 
 /// Текущий момент и обозначение пояса для ответа инструмента.
 fn now_in(tz: Option<&str>) -> (String, String) {
-    match tz.and_then(parse_offset) {
-        Some(offset) => (
-            offset.to_string(),
-            chrono::Utc::now()
-                .with_timezone(&offset)
-                .format("%Y-%m-%dT%H:%M:%S%:z")
-                .to_string(),
-        ),
-        None => {
-            let now = Local::now();
-            (
-                now.offset().to_string(),
-                now.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
-            )
-        }
-    }
+    let zone = tz
+        .and_then(parse_offset)
+        .map_or_else(TimeZone::system, TimeZone::fixed);
+    let now = Timestamp::now().to_zoned_datetime(zone);
+    let (moment, offset) = format_git_moment(&now);
+    (offset, moment)
 }
 
 /// Раскрыть ревизию или дату в коммит.
@@ -1785,6 +1796,58 @@ mod tests {
     use serde_json::Value;
     use std::path::Path;
     use std::process::Command;
+
+    #[test]
+    fn git_dates_keep_explicit_offsets_and_range_boundaries() {
+        for (input, end_of_day, timezone, expected, offset) in [
+            (
+                "2024-02-29",
+                false,
+                "UTC",
+                "2024-02-29T00:00:00+00:00",
+                "+00:00",
+            ),
+            (
+                "2024-02-29",
+                true,
+                "+03:00",
+                "2024-02-29T23:59:59+03:00",
+                "+03:00",
+            ),
+            (
+                "2024-02-29 04:05",
+                false,
+                "-05:30",
+                "2024-02-29T04:05:00-05:30",
+                "-05:30",
+            ),
+            (
+                "2024-02-29T04:05",
+                false,
+                "Z",
+                "2024-02-29T04:05:00+00:00",
+                "+00:00",
+            ),
+        ] {
+            let (moment, label) = parse_moment("repo", input, end_of_day, Some(timezone)).unwrap();
+            assert_eq!((moment.as_str(), label.as_str()), (expected, offset));
+        }
+        assert!(parse_moment("repo", "2024-02-30", false, Some("UTC")).is_err());
+        assert!(parse_moment("repo", "2024-02-29T04:05:06", false, Some("UTC")).is_err());
+    }
+
+    #[test]
+    fn git_dates_distinguish_a_skipped_and_repeated_local_hour() {
+        let zone = TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        for (input, diagnostic) in [
+            ("2024-03-10T02:30", "не существует"),
+            ("2024-11-03T01:30", "неоднозначен"),
+        ] {
+            let civil = DateTime::strptime("%Y-%m-%dT%H:%M", input).unwrap();
+            let error = local_git_moment("repo", input, civil, &zone).unwrap_err();
+            assert!(error.error.contains(diagnostic));
+        }
+    }
 
     /// git есть в PATH? Без него проверки пропускаются, а не падают.
     fn git_available() -> bool {

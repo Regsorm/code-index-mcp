@@ -29,7 +29,8 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 
 # MCP протокол
-rmcp = { version = "3.9", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+# До выпуска SDK с опциональным chrono: https://github.com/modelcontextprotocol/rust-sdk/pull/1474
+rmcp = { version = "3.11.0", git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "9043cdfa8694d83bf506c2f3eb0313ec173edd7e", default-features = false, features = ["base64", "server", "transport-io", "transport-streamable-http-server", "macros"] }
 
 # Парсинг AST
 tree-sitter = "0.25"
@@ -93,7 +94,7 @@ sysinfo = "0.32"
 
 # Утилиты
 hex = "0.4"
-chrono = { version = "0.4", features = ["serde"] }
+jiff = "1.0"
 
 # HTTP-сервер демона и клиент
 axum = "0.8"

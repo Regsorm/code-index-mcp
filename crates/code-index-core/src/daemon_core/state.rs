@@ -6,11 +6,28 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
+use jiff::{tz::Offset, Timestamp};
 use tokio::sync::RwLock;
 
 use super::ipc::{PathHealth, PathStatus, Progress};
+
+pub(super) fn utc_rfc3339(timestamp: Timestamp) -> String {
+    let nanos = timestamp.subsec_nanosecond();
+    // Сохраняем прежнее представление RFC 3339: +00:00 и 0, 3, 6 или 9 знаков.
+    let precision = if nanos == 0 {
+        0
+    } else if nanos % 1_000_000 == 0 {
+        3
+    } else if nanos % 1_000 == 0 {
+        6
+    } else {
+        9
+    };
+    let utc = timestamp.display_with_offset(Offset::UTC);
+    format!("{utc:.precision$}")
+}
 
 /// Разделяемое состояние, которое демон держит в памяти.
 #[derive(Clone)]
@@ -73,12 +90,9 @@ pub struct PathPulse {
 
 impl DaemonState {
     pub fn new() -> Self {
-        let now = SystemTime::now();
-        let started_at_unix = now
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let started_at_rfc3339 = chrono::DateTime::<chrono::Utc>::from(now).to_rfc3339();
+        let now = Timestamp::now();
+        let started_at_unix = now.as_second().max(0) as u64;
+        let started_at_rfc3339 = utc_rfc3339(now);
         Self {
             inner: Arc::new(RwLock::new(DaemonStateInner {
                 started_at_unix,
@@ -143,7 +157,7 @@ impl DaemonState {
         entry.changed_at = Instant::now();
         if status == PathStatus::Ready {
             entry.progress = None;
-            entry.last_ready_at = Some(chrono::Utc::now().to_rfc3339());
+            entry.last_ready_at = Some(utc_rfc3339(Timestamp::now()));
         }
     }
 
@@ -235,6 +249,18 @@ impl Default for DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_timestamps_keep_rfc3339_precision_and_utc_offset() {
+        for (nanos, expected) in [
+            (0, "1970-01-01T00:00:00+00:00"),
+            (120_000_000, "1970-01-01T00:00:00.120+00:00"),
+            (120_340_000, "1970-01-01T00:00:00.120340+00:00"),
+            (120_340_560, "1970-01-01T00:00:00.120340560+00:00"),
+        ] {
+            assert_eq!(utc_rfc3339(Timestamp::new(0, nanos).unwrap()), expected);
+        }
+    }
 
     #[tokio::test]
     async fn apply_config_tracks_diff() {

@@ -27,7 +27,7 @@ use super::language_detect;
 use super::lock;
 use super::paths;
 use super::server::{build_router, AppState};
-use super::state::{DaemonState, PathPulse};
+use super::state::{utc_rfc3339, DaemonState, PathPulse};
 use super::worker;
 use crate::extension::ProcessorRegistry;
 use crate::watcher::is_config_change;
@@ -829,7 +829,7 @@ fn write_runtime_info(addr: &SocketAddr, pid: u32, version: &str) -> Result<()> 
         version: version.to_string(),
         http_host: addr.ip().to_string(),
         http_port: addr.port(),
-        started_at: chrono::Utc::now().to_rfc3339(),
+        started_at: utc_rfc3339(jiff::Timestamp::now()),
     };
     let text = serde_json::to_string_pretty(&info)?;
     std::fs::write(paths::runtime_info_file()?, text)?;

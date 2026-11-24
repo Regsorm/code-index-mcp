@@ -2675,18 +2675,10 @@ impl CodeIndexServer {
         if let Some(required) = schema.get_mut("required").and_then(|v| v.as_array_mut()) {
             required.retain(|v| v.as_str() != Some("repo"));
         }
-        schema.insert(
-            "not".into(),
-            serde_json::json!({"required": ["repo", "repos"]}),
-        );
-        if self.effective_default_repo().is_none() {
-            schema.insert(
-                "anyOf".into(),
-                serde_json::json!([{"required": ["repo"]}, {"required": ["repos"]}]),
-            );
-        }
+        // Селектор проверяется при вызове. Логические ограничения в схеме
+        // мешают некоторым клиентам скомпилировать весь список инструментов.
         schema.insert("description".into(), serde_json::json!(
-            "Multi-repo: последовательное выполнение; общий бюджет 4096 файлов, 64 MiB сжатых и 64 MiB распакованных данных, до 30 секунд и tool_timeout. Дополнительный grep расходует тот же бюджет."
+            "Multi-repo: укажите либо repo, либо repos. Оба поля можно опустить при наличии репозитория по умолчанию. Последовательное выполнение с общим бюджетом 4096 файлов, 64 MiB сжатых и 64 MiB распакованных данных, до 30 секунд и tool_timeout. Дополнительный grep расходует тот же бюджет."
         ));
         tool
     }
@@ -5365,6 +5357,37 @@ mod default_repo_tests {
         let desc = description_of_repo(&tool);
         assert!(desc.starts_with("ОБЯЗАТЕЛЕН"), "описание: {}", desc);
         assert!(desc.contains("ut"), "описание: {}", desc);
+    }
+
+    #[test]
+    fn multi_repo_search_schemas_use_plain_selectors() {
+        for server in [
+            server_with_aliases(&["a", "b"]),
+            server_with_aliases(&["a"]),
+        ] {
+            for name in multi_repo::MULTI_REPO_TOOLS {
+                let tool = if name == "get_object_structure" {
+                    let mut extension = tool_with_repo(true);
+                    extension.name = name.into();
+                    server.effective_search_schema(extension)
+                } else {
+                    server.get_tool(name).unwrap()
+                };
+                let schema = tool.input_schema.as_ref();
+                for keyword in ["not", "anyOf", "oneOf"] {
+                    assert!(!schema.contains_key(keyword), "{name}: {keyword}");
+                }
+                assert_eq!(schema["properties"]["repo"]["type"], "string");
+                assert_eq!(schema["properties"]["repos"]["type"], "array");
+                assert!(!required_of(&tool)
+                    .iter()
+                    .any(|key| key == "repo" || key == "repos"));
+                assert!(schema["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("либо repo, либо repos"));
+            }
+        }
     }
 
     #[test]

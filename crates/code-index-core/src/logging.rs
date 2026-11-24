@@ -298,15 +298,15 @@ impl FormatTime for LocalTime {
 
 /// Собственно отметка. Вынесено отдельной функцией ради модульного теста.
 fn local_timestamp() -> String {
-    chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S%.3f%:z")
+    jiff::ZonedDateTime::now()
+        .strftime("%Y-%m-%d %H:%M:%S%.3f%:z")
         .to_string()
 }
 
 /// Только время, по часам машины: «14:02:10». Для сводки, где дата уже стоит
 /// в начале каждой строки журнала и повторять её незачем.
 pub fn local_hms() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
+    jiff::ZonedDateTime::now().strftime("%H:%M:%S").to_string()
 }
 
 // ── Точки инициализации ─────────────────────────────────────────────────────
@@ -898,7 +898,9 @@ mod tests {
 
     #[test]
     fn отметка_времени_по_часам_машины_а_не_utc() {
+        let before = jiff::ZonedDateTime::now();
         let stamp = local_timestamp();
+        let after = jiff::ZonedDateTime::now();
         // Формат «2026-08-20 13:06:45.902+03:00»: без суффикса Z и без
         // разделителя T — это и отличает местное время от UTC в журнале.
         assert!(
@@ -910,23 +912,12 @@ mod tests {
 
         // Сверяем с местным временем до и после замера — иначе тест мигал бы
         // раз в минуту, попадая на смену минуты между двумя вызовами часов.
-        let now = chrono::Local::now();
-        let minute_now = now.format("%Y-%m-%d %H:%M").to_string();
-        let minute_before = (now - chrono::Duration::minutes(1))
-            .format("%Y-%m-%d %H:%M")
-            .to_string();
         assert!(
-            stamp.starts_with(&minute_now) || stamp.starts_with(&minute_before),
-            "отметка {} должна совпадать с местным временем {}",
-            stamp,
-            now
-        );
-        // Смещение печатается рядом, иначе присланный файл не прочитать
-        // с другой машины.
-        assert!(
-            stamp.ends_with(&now.format("%:z").to_string()),
-            "в отметке должно быть смещение часового пояса: {}",
-            stamp
+            [before, after].iter().any(|now| {
+                stamp.starts_with(&now.strftime("%Y-%m-%d %H:%M").to_string())
+                    && stamp.ends_with(&now.strftime("%:z").to_string())
+            }),
+            "в отметке должны быть местное время и смещение: {stamp}"
         );
     }
 
