@@ -184,7 +184,7 @@ impl IndexTool for GetObjectProfileTool {
             );
             timer.abort();
 
-            let (value, folded) = match result {
+            let (mut value, folded) = match result {
                 Ok(v) => v,
                 Err(e) => {
                     return crate::tools::wrap_error(json!({
@@ -192,6 +192,9 @@ impl IndexTool for GetObjectProfileTool {
                     }));
                 }
             };
+            if value["found"].as_bool() == Some(true) {
+                crate::tools::add_descriptor_freshness(&storage, ctx.root_path, &mut value);
+            }
             // Паспорт — СТРУКТУРНЫЙ ответ: слепой обрез массивов (cap_response)
             // исказил бы структуру объекта — «1 реквизит из 200». Поэтому
             // посекционный omit и обёртка без cap, как у get_object_structure.
@@ -201,7 +204,8 @@ impl IndexTool for GetObjectProfileTool {
                 value,
                 effective_budget(budget.applied, expand_handlers, expand_modules),
             );
-            let mut out = crate::tools::wrap_with_meta_structural(value, Vec::new(), omitted);
+            let paths = crate::tools::descriptor_paths(&value);
+            let mut out = crate::tools::wrap_with_meta_structural(value, paths, omitted);
             if let Some(obj) = out.as_object_mut() {
                 if let Some(info) = folded.as_ref() {
                     obj.insert(

@@ -3,7 +3,7 @@
 // Эндпоинты принимают/возвращают JSON. Транспорт — loopback HTTP по
 // фактическому порту, записанному в `runtime_info_file()`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -68,31 +68,9 @@ async fn path_status(
     State(app): State<Arc<AppState>>,
     Query(q): Query<PathQuery>,
 ) -> impl IntoResponse {
-    let target_key = normalize_path_key(&q.path);
     let tracked = app.state.tracked_paths().await;
 
-    // FS-free сопоставление по нормализованному ключу (симметрично /health,
-    // которая сравнивает ключи мапы напрямую). Старый код звал
-    // std::fs::canonicalize() на КАЖДЫЙ запрос: он FS-зависим и под нагрузкой
-    // реиндексации соседних репо промахивался, отдавая ложный «indexing».
-    let matched = tracked
-        .iter()
-        .find(|p| normalize_path_key(&p.to_string_lossy()) == target_key)
-        .cloned()
-        .or_else(|| {
-            // Вложенный путь (файл внутри проекта): ближайший родитель —
-            // самый длинный tracked-ключ, являющийся префиксом target.
-            tracked
-                .iter()
-                .filter(|p| {
-                    let k = normalize_path_key(&p.to_string_lossy());
-                    target_key == k || target_key.starts_with(&format!("{k}\\"))
-                })
-                .max_by_key(|p| p.to_string_lossy().len())
-                .cloned()
-        });
-
-    match matched {
+    match matching_tracked_path(&q.path, &tracked, PathBuf::as_path).cloned() {
         Some(p) => {
             let rt = app.state.get(&p).await.unwrap_or_default();
             let resp = PathStatusResponse {
@@ -181,6 +159,33 @@ async fn stop(State(app): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 // ── Вспомогательное ──────────────────────────────────────────────────────────
+
+/// Найти отслеживаемый путь или ближайшего отслеживаемого родителя.
+pub(crate) fn matching_tracked_path<'a, T>(
+    input: &str,
+    paths: &'a [T],
+    path_of: impl Fn(&T) -> &Path,
+) -> Option<&'a T> {
+    let target = normalize_path_key(input);
+    let mut nearest = None;
+    let mut nearest_len = 0;
+    for entry in paths {
+        let path = path_of(entry).to_string_lossy();
+        let key = normalize_path_key(&path);
+        if target == key {
+            return Some(entry);
+        }
+        if path.len() >= nearest_len
+            && target
+                .strip_prefix(&key)
+                .is_some_and(|suffix| suffix.starts_with('\\'))
+        {
+            nearest = Some(entry);
+            nearest_len = path.len();
+        }
+    }
+    nearest
+}
 
 /// FS-free нормализация пути в ключ сравнения: убрать расширенный префикс
 /// `\\?\`, унифицировать разделители в `\`, срезать хвостовой `\`, привести к

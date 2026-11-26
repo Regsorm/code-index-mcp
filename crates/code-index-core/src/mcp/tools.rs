@@ -9,13 +9,14 @@
 // Если папка не `Ready` — возвращается `ToolUnavailable` JSON, и реальный запрос
 // к БД не выполняется.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{CodeIndexServer, RepoEntry};
 use crate::daemon_core::client;
 use crate::daemon_core::ipc::{PathStatus, ToolUnavailable};
-use crate::storage::models::{CallRecord, ClassRecord, FunctionRecord};
+use crate::storage::models::{CallRecord, ClassRecord, FileRecord, FunctionRecord};
 
 /// Soft-cap: число строк в одном `read_file` (по умолчанию).
 pub(crate) const READ_FILE_SOFT_CAP_LINES: usize = 5_000;
@@ -1098,16 +1099,68 @@ fn cap_record_body(
 pub async fn get_function(entry: &RepoEntry, name: String, path_glob: Option<String>) -> String {
     bail_if_text_not_ready!(entry);
     let storage = acquire_storage!(entry);
-    get_function_with(&storage, name, path_glob)
+    get_function_with(&storage, entry.local_root(), name, path_glob)
+}
+
+/// Метаданные индексной записи и проверка соответствующего файла на диске.
+/// Если сравнить не удалось, отсутствие `stale` означает неизвестное состояние.
+pub fn file_freshness(
+    root: &Path,
+    file: &FileRecord,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    out.insert("indexed_at".into(), serde_json::json!(file.indexed_at));
+    if let Some(mtime) = file.mtime {
+        out.insert("mtime".into(), serde_json::json!(mtime));
+    }
+    let stale = match std::fs::metadata(root.join(&file.path)) {
+        Ok(disk) if disk.is_file() => {
+            let disk_mtime = disk
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|time| i64::try_from(time.as_secs()).ok());
+            let size_changed = file
+                .file_size
+                .and_then(|size| u64::try_from(size).ok())
+                .is_some_and(|size| size != disk.len());
+            if size_changed {
+                Some(true)
+            } else {
+                file.mtime.zip(disk_mtime).map(|(idx, disk)| idx != disk)
+            }
+        }
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Err(_) => None,
+    };
+    if let Some(stale) = stale {
+        out.insert("stale".into(), serde_json::json!(stale));
+    }
+    out
 }
 
 /// Sync-ядро get_function: вся работа на уже взятом соединении. Вызывается
 /// inline одиночным путём и из `spawn_blocking` массовым (`mass_map`).
 pub fn get_function_with(
     storage: &crate::storage::Storage,
+    root: &Path,
     name: String,
     path_glob: Option<String>,
 ) -> String {
+    // Тело функции и метаданные файла должны относиться к одному снимку SQLite.
+    let _snapshot = match storage.conn().unchecked_transaction() {
+        Ok(snapshot) => snapshot,
+        Err(e) => return serde_json::json!({"error": format!("get_function: {e}")}).to_string(),
+    };
+    let with_freshness = |mut value: serde_json::Value, path: &str| {
+        if let (Some(record), Ok(Some(file))) =
+            (value.as_object_mut(), storage.get_file_by_path(path))
+        {
+            record.extend(file_freshness(root, &file));
+        }
+        value
+    };
     match storage.get_function_by_name(&name) {
         Ok(mut r) => {
             // Точное совпадение пусто → регистронезависимый fallback (кириллица:
@@ -1139,7 +1192,10 @@ pub fn get_function_with(
                 let hits: Vec<serde_json::Value> = r
                     .iter()
                     .take(LOCATION_CAP)
-                    .map(|fr| function_search_hit(fr, &lookup_path(storage, fr.file_id)))
+                    .map(|fr| {
+                        let path = fr.path.as_deref().unwrap_or_default();
+                        with_freshness(function_search_hit(fr, path), path)
+                    })
                     .collect();
                 let extra = serde_json::json!({
                     "hint": HINT_GET_MULTI,
@@ -1164,13 +1220,15 @@ pub fn get_function_with(
             let records: Vec<serde_json::Value> = r
                 .iter()
                 .map(|fr| {
-                    cap_record_body(
+                    let path = fr.path.as_deref().unwrap_or_default();
+                    let record = cap_record_body(
                         serde_json::to_value(fr).unwrap_or_else(|_| serde_json::json!({})),
                         &fr.body,
-                        &lookup_path(storage, fr.file_id),
+                        path,
                         fr.line_start,
                         fr.line_end,
-                    )
+                    );
+                    with_freshness(record, path)
                 })
                 .collect();
             wrap_with_meta_hint(storage, &records, deps, None)
@@ -3593,7 +3651,36 @@ fn collect_derived_annotations_any(
 }
 
 /// Живость MCP + демон по каждому репо.
-pub async fn health(server: &CodeIndexServer) -> String {
+pub async fn health(server: &CodeIndexServer, brief: bool) -> String {
+    if brief {
+        let daemon = client::health().await.ok();
+        let repos = server.repos.load_full();
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for entry in repos.values() {
+            let status = match (&daemon, entry.root_path.as_deref()) {
+                (_, None) => "remote".into(),
+                (None, Some(_)) => "unknown".into(),
+                (Some(daemon), Some(root)) => {
+                    use crate::daemon_core::server::matching_tracked_path;
+                    let path =
+                        matching_tracked_path(&root.to_string_lossy(), &daemon.paths, |row| {
+                            &row.path
+                        });
+                    let status = path.map_or(PathStatus::NotStarted, |row| row.status);
+                    serde_json::to_value(status)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown".into())
+                }
+            };
+            *counts.entry(status).or_default() += 1;
+        }
+        return to_json(&serde_json::json!({
+            "mcp": {"status": "ok", "version": env!("CARGO_PKG_VERSION")},
+            "daemon": {"status": if daemon.is_some() { "online" } else { "offline" }},
+            "repos_summary": {"total": repos.len(), "by_status": counts},
+        }));
+    }
     let daemon_info = client::runtime_info();
     let config_reload = server
         .config_reload
@@ -3664,12 +3751,7 @@ pub async fn health(server: &CodeIndexServer) -> String {
         "daemon": daemon_health,
         "repos": repos,
         "config_reload": config_reload,
-        // Откуда взят список алиасов и что с ним делать после правки конфига:
-        // без этой строки `unknown_repo` после `daemon reload` читался как
-        // «папка ещё индексируется» либо как опечатка в алиасе (issue #23).
-        "aliases_note": "Список алиасов снят при старте serve. Правка daemon.toml [[paths]] \
-                         сама по себе его не меняет: в режиме --path нужен перезапуск serve, \
-                         в федеративном режиме — /reload (или перезапуск).",
+        "aliases_note": super::REPO_ALIASES_NOTE,
     });
     to_json(&obj)
 }

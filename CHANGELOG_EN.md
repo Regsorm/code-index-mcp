@@ -7,6 +7,17 @@ Versioning — [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-11-26
+
+### Added
+
+- `get_function` reports `mtime`, `indexed_at` and the result of comparing the indexed file with disk (`stale`). `get_object_structure` and `get_object_profile` report these fields in `descriptor_freshness` when they can identify a single object descriptor (#37).
+- `health` with `brief: true` returns the MCP version, daemon status and repository counts without listing aliases or paths. Calls without arguments return the full report (#38).
+
+### Fixed
+
+- `unknown_repo` and `health.aliases_note` explain when to restart `serve`, how to register a local alias in both federation configuration files and which HTTP port handles `POST /reload` (#39).
+
 ## [1.17.2] - 2026-11-24
 
 ### Fixed

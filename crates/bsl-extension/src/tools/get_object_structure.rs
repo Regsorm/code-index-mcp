@@ -125,6 +125,30 @@ impl IndexTool for GetObjectStructureTool {
                     .and_then(|v| v.as_u64())
                     .map(|n| n as usize),
             );
+            let resolve = {
+                let root = ctx.root_path.map(std::path::Path::to_owned);
+                let repo = ctx.repo.to_owned();
+                let sections = sections.clone();
+                move |storage: &code_index_core::storage::Storage, name: &str, offset, budget| {
+                    let mut value = resolve_one(
+                        storage.conn(),
+                        &repo,
+                        name,
+                        sections.as_deref(),
+                        names_only,
+                        offset,
+                        budget,
+                    );
+                    if !names_only && value.get("error").is_none() {
+                        crate::tools::add_descriptor_freshness(
+                            storage,
+                            root.as_deref(),
+                            &mut value,
+                        );
+                    }
+                    value
+                }
+            };
             // Критерий-селектор (name_like) приоритетен: сервер сам разворачивает
             // плоский предикат в список объектов и отдаёт их структуры за 1 ход
             // (общая конвенция объектно-ключевых инструментов). Массовый режим
@@ -195,8 +219,6 @@ impl IndexTool for GetObjectStructureTool {
                             .into_iter()
                             .map(|(fqn, by)| (fqn, by.as_str()))
                             .unzip();
-                    let repo_label = ctx.repo.to_string();
-                    let sections_c = sections.clone();
                     let matched_names = full_names.clone();
                     let rows = code_index_core::mcp::tools::mass_map(
                         ctx.storage,
@@ -205,15 +227,7 @@ impl IndexTool for GetObjectStructureTool {
                             // Страницы (offset/budget) — только для одиночного объекта: в массовом
                             // режиме размером управляет shrink_search_results, и постраничная выдача
                             // внутри каждого элемента сделала бы ответ невнятным.
-                            resolve_one(
-                                st.conn(),
-                                &repo_label,
-                                &fqn,
-                                sections_c.as_deref(),
-                                names_only,
-                                0,
-                                0,
-                            )
+                            resolve(st, &fqn, 0, 0)
                         },
                     )
                     .await;
@@ -268,22 +282,12 @@ impl IndexTool for GetObjectStructureTool {
                     .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
-                let repo_label = ctx.repo.to_string();
-                let sections_c = sections.clone();
                 let rows =
                     code_index_core::mcp::tools::mass_map(ctx.storage, items, move |st, fqn| {
                         // Страницы (offset/budget) — только для одиночного объекта: в массовом
                         // режиме размером управляет shrink_search_results, и постраничная выдача
                         // внутри каждого элемента сделала бы ответ невнятным.
-                        resolve_one(
-                            st.conn(),
-                            &repo_label,
-                            &fqn,
-                            sections_c.as_deref(),
-                            names_only,
-                            0,
-                            0,
-                        )
+                        resolve(st, &fqn, 0, 0)
                     })
                     .await;
                 for (pos, row) in positions.into_iter().zip(rows) {
@@ -306,15 +310,7 @@ impl IndexTool for GetObjectStructureTool {
                         }));
                     }
                 };
-                resolve_one(
-                    storage.conn(),
-                    ctx.repo,
-                    fqn,
-                    sections.as_deref(),
-                    names_only,
-                    offset,
-                    budget.applied,
-                )
+                resolve(&storage, fqn, offset, budget.applied)
             } else {
                 json!({
                     "error": "missing parameter: передайте 'full_name' — полное имя вида '<MetaType>.<Name>' (строка)"
@@ -325,11 +321,8 @@ impl IndexTool for GetObjectStructureTool {
             // частично), затем wrap БЕЗ cap. Так enum_synonyms (сотни ключей)
             // выкидывается с count, а enum_values/имена остаются полными.
             if !code_index_core::mcp::cap::is_structural_tool("get_object_structure") {
-                return crate::tools::wrap_with_meta(
-                    "get_object_structure",
-                    result_value,
-                    Vec::new(),
-                );
+                let paths = crate::tools::descriptor_paths(&result_value);
+                return crate::tools::wrap_with_meta("get_object_structure", result_value, paths);
             }
             // Ответ-ПОИСК (name_like/full_names) ужимается иначе, чем структура
             // одного объекта: там самая тяжёлая секция — сам массив results, и
@@ -340,8 +333,8 @@ impl IndexTool for GetObjectStructureTool {
                     code_index_core::mcp::cap::shrink_search_results(result_value, budget.applied);
                 // Маркеры ставим свои: общий OMIT_HINT здесь не годится (советует
                 // grep_code/grep_body и не называет ни размера, ни ручки).
-                let mut out =
-                    crate::tools::wrap_with_meta_structural(result_value, Vec::new(), false);
+                let paths = crate::tools::descriptor_paths(&result_value);
+                let mut out = crate::tools::wrap_with_meta_structural(result_value, paths, false);
                 if let Some(obj) = out.as_object_mut() {
                     if shrink.sections_omitted {
                         obj.insert("response_sections_omitted".to_string(), json!(true));
@@ -369,8 +362,8 @@ impl IndexTool for GetObjectStructureTool {
             // проставил omit выше. Нужны, чтобы подсказка называла КОНКРЕТНУЮ
             // секцию и готовый вызов, а не общий совет.
             let omitted_sections = omitted_section_names(&result_value);
-            let mut out =
-                crate::tools::wrap_with_meta_structural(result_value, Vec::new(), omitted);
+            let paths = crate::tools::descriptor_paths(&result_value);
+            let mut out = crate::tools::wrap_with_meta_structural(result_value, paths, omitted);
             if let Some(obj) = out.as_object_mut() {
                 // Готовый вызов собираем только для одиночного объекта: в массовом
                 // режиме страницы по секции выключены намеренно.

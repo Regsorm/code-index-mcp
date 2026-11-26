@@ -322,6 +322,15 @@ pub struct StatsParams {
     pub repo: Option<String>,
 }
 
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct HealthParams {
+    #[serde(default)]
+    #[schemars(
+        description = "Вернуть версию, статус демона и число репозиториев по состояниям без списка алиасов и путей. По умолчанию возвращается полный отчёт."
+    )]
+    pub brief: bool,
+}
+
 // ── Phase 1 параметры (v0.7.0) ──
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -1299,13 +1308,12 @@ impl CodeIndexServer {
 /// снят при старте `serve`, а `get_stats` с чужим алиасом отвечал прежним
 /// текстом (issue #23 — «правка daemon.toml не видна» упиралась именно в него).
 pub(crate) fn unknown_repo_message(alias: &str, aliases: &[String]) -> String {
-    format!(
-        "Неизвестный repo '{}'. Доступные: {:?}. Укажите один из алиасов, переданных в --path alias=dir при запуске сервера. \
-         Список снят при старте serve: правка daemon.toml сама по себе его не меняет — в режиме --path нужен перезапуск serve, \
-         в федеративном режиме — перечитывание конфигурации (/reload) или перезапуск.",
-        alias, aliases
-    )
+    format!("Неизвестный repo '{alias}'. Доступные: {aliases:?}. {REPO_ALIASES_NOTE}")
 }
+
+pub(crate) const REPO_ALIASES_NOTE: &str = "В нефедеративном режиме измените параметры запуска (--path alias=dir) или [[paths]] в конфигурации, переданной через --config, и перезапустите serve. \
+    В федеративном HTTP-режиме для нового локального алиаса добавьте [[paths]] и в daemon.toml (путь), и в serve.toml (алиас и IP). \
+    Если изменения ещё не видны, вызовите POST /reload на HTTP-порту serve. POST /reload на порту демона перечитывает его конфигурацию и не обновляет список алиасов serve.";
 
 // ── Conditional registration helpers ──────────────────────────────────────
 //
@@ -1577,9 +1585,10 @@ impl CodeIndexServer {
                 return serde_json::json!({ "results": [] }).to_string();
             }
             let pool = entry.storage_pool().clone();
+            let root = entry.local_root().to_owned();
             let glob = p.path_glob.clone();
             let rows = tools::mass_map(&pool, names, move |st, nm| {
-                tools::get_function_with(st, nm, glob.clone())
+                tools::get_function_with(st, &root, nm, glob.clone())
             })
             .await;
             return mass_rows_to_results(rows);
@@ -2169,10 +2178,10 @@ impl CodeIndexServer {
     }
 
     #[tool(
-        description = "Проверка живости MCP-сервера и демона индексации по всем подключённым репо. Возвращает JSON."
+        description = "Проверка живости MCP-сервера и демона индексации. brief=true возвращает компактную сводку, по умолчанию — подробности по всем репо."
     )]
-    async fn health(&self) -> String {
-        tools::health(self).await
+    async fn health(&self, Parameters(p): Parameters<HealthParams>) -> String {
+        tools::health(self, p.brief).await
     }
 }
 
@@ -2198,6 +2207,10 @@ fn is_cacheable_tool(tool: &str) -> bool {
         "health"
             | "get_stats"
             | "stat_file"
+            // Эти инструменты сравнивают mtime индекса с диском на момент вызова.
+            | "get_function"
+            | "get_object_structure"
+            | "get_object_profile"
             | "git_log"
             | "git_changed_files"
             | "git_changes_by_object"
@@ -5073,7 +5086,9 @@ mod cache_policy_tests {
         assert!(!is_cacheable_tool("git_diff"));
         assert!(!is_cacheable_tool("git_show_file"));
         // Инструменты данных кэшируются как прежде.
-        assert!(is_cacheable_tool("get_function"));
+        assert!(!is_cacheable_tool("get_function"));
+        assert!(!is_cacheable_tool("get_object_structure"));
+        assert!(!is_cacheable_tool("get_object_profile"));
         assert!(is_cacheable_tool("grep_code"));
     }
 }

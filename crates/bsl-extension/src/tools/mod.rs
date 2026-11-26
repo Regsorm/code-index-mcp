@@ -52,12 +52,59 @@ pub use structure::{GetLineContextTool, GetNodeStructureTool, QueryCallSitesTool
 
 use serde_json::{json, Value};
 
+/// Свежесть файла-описания объекта. Данные из форм, модулей и расширений
+/// могут собираться из других файлов, поэтому у всего объекта нет одного mtime.
+fn add_descriptor_freshness(
+    storage: &code_index_core::storage::Storage,
+    root: Option<&std::path::Path>,
+    object: &mut Value,
+) {
+    let Some((root, full_name)) = root.zip(object.get("full_name").and_then(Value::as_str)) else {
+        return;
+    };
+    let Some((kind, name, owner)) =
+        crate::index_extras::lookup_object_meta(storage.conn(), full_name)
+    else {
+        return;
+    };
+    let Some(folder) = crate::index_extras::plural_folder(&kind) else {
+        return;
+    };
+    let xml = format!("{folder}/{name}.xml");
+    let mdo = format!("{folder}/{name}/{name}.mdo");
+    let candidates = if owner.is_empty() {
+        vec![format!("base/{xml}"), xml, format!("src/{mdo}"), mdo]
+    } else {
+        vec![format!("{owner}/{xml}")]
+    };
+    let mut files = candidates
+        .iter()
+        .filter_map(|path| storage.get_file_by_path(path).ok().flatten());
+    if let (Some(file), None) = (files.next(), files.next()) {
+        let mut freshness = code_index_core::mcp::tools::file_freshness(root, &file);
+        freshness.insert("path".into(), json!(file.path));
+        object["descriptor_freshness"] = Value::Object(freshness);
+    }
+}
+
+fn descriptor_paths(object: &Value) -> Vec<String> {
+    let objects = match object.get("results").and_then(Value::as_array) {
+        Some(results) => results.as_slice(),
+        None => std::slice::from_ref(object),
+    };
+    objects
+        .iter()
+        .filter_map(|item| {
+            item.pointer("/descriptor_freshness/path")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 /// Завернуть результат BSL-tool'а в `{result, _meta: {dependent_files: [...]}}`
-/// для cache-ci event-based invalidation (Phase 2). BSL-tools пока не вычисляют
-/// dependent_files (XML-парсер метаданных хранит данные о объектах конфигурации
-/// не как файлы а как records в SQLite) — отдаём пустой массив. Entry попадёт
-/// в кэш без file-зависимостей и будет чиститься только по TTL (как раньше).
-/// Включение реальных dependent_files для BSL — задача следующей итерации.
+/// для cache-ci event-based invalidation (Phase 2). Инструменты без
+/// известного файла-источника передают пустой массив.
 pub(crate) fn wrap_with_meta(tool: &str, result: Value, dependent_files: Vec<String>) -> Value {
     // cap_response (обрез массивов с сэмплом) применяется ТОЛЬКО если инструмент
     // в списке `[mcp].cap_tools` (параметр сервера; дефолт — cap::DEFAULT_CAP_TOOLS).
